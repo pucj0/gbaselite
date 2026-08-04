@@ -24,7 +24,7 @@ SERVER_LOG="$WORK_DIRECTORY/server.log"
 SERVER_PID=
 
 mysql_client() {
-  docker run --rm --network host \
+  docker run --rm --interactive --network host \
     -e "MYSQL_PWD=$PASSWORD" \
     "$MYSQL_IMAGE" mysql \
     --protocol=TCP --host=127.0.0.1 --port="$PORT" --user="$USERNAME" \
@@ -140,11 +140,7 @@ while IFS= read -r database_name; do
   esac
 done <<<"$database_list"
 if [ "$database_found" -ne 1 ]; then
-  literal_probe=$(mysql_client --batch --raw --skip-column-names --execute="SELECT 'probe';" 2>&1 || true)
-  create_probe=$(mysql_client --batch --raw --skip-column-names --execute="SHOW CREATE DATABASE \`$DATABASE\`;" 2>&1 || true)
-  schema_probe=$(mysql_client --batch --raw --skip-column-names --execute="SELECT SCHEMA_NAME FROM information_schema.SCHEMATA;" 2>&1 || true)
-  table_probe=$(mysql_client --batch --raw --skip-column-names --execute="SELECT COUNT(*) FROM \`$DATABASE\`.\`order-items\`;" 2>&1 || true)
-  message="SHOW DATABASES did not return $DATABASE; actual=[$database_list]; literal=[$literal_probe]; show-create=[$create_probe]; schemata=[$schema_probe]; table-count=[$table_probe]"
+  message="SHOW DATABASES did not return $DATABASE; actual rows: $database_list"
   workflow_error "$message"
   echo "SHOW DATABASES did not return $DATABASE; actual rows:" >&2
   printf '%s\n' "$database_list" >&2
