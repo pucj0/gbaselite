@@ -1280,7 +1280,11 @@ ELF、执行权限、禁入内容和 SHA-256 校验。产物仍复制到
 - `-PrepareOnly`：创建本地发布分支、tag 和完整产物，不推送 GitHub 或 Docker Hub
 - `-Publish`：先构建 amd64 临时镜像并运行容器健康检查，再把 amd64/arm64 的
   `<VERSION>`、`major.minor`、`latest` 三组标签推送到
-  `pucj/gbaselite`，最后使用一次原子 Git push 推送发布分支和 tag
+  `pucj/gbaselite`，读取远端 manifest 确认同时包含 `linux/amd64` 和
+  `linux/arm64`，最后使用一次原子 Git push 推送发布分支和 tag
+
+Dockerfile 必须直接使用 Buildx 自动提供的 `TARGETOS` 和 `TARGETARCH`，不能为它们
+设置固定架构默认值；发布脚本会在自检和远端 manifest 验收中阻止架构不完整的发布。
 
 tag 推送后，`.github/workflows/release.yml` 会异步创建 GitHub Release 并上传
 本次版本附件，`.github/workflows/docker.yml` 会发布 GHCR 多架构镜像；Docker

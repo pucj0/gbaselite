@@ -247,9 +247,45 @@ function Invoke-DockerPush {
         "--file", (Join-Path $Worktree "docker\Dockerfile"),
         $Worktree
     ) -FailureMessage "Unable to build and push the Docker Hub release"
+
+    $manifestLines = Get-RequiredOutput -Executable $DockerExecutable -Arguments @(
+        "buildx", "imagetools", "inspect", "--raw", ("{0}:{1}" -f $Repository, $ReleaseVersion)
+    ) -FailureMessage "Unable to inspect the pushed Docker Hub manifest"
+    $manifest = (($manifestLines -join [Environment]::NewLine) | ConvertFrom-Json)
+    $platforms = @($manifest.manifests | ForEach-Object {
+        if ($null -ne $_.platform -and $_.platform.os -ne "unknown") {
+            "$($_.platform.os)/$($_.platform.architecture)"
+        }
+    })
+    foreach ($expectedPlatform in @("linux/amd64", "linux/arm64")) {
+        if ($expectedPlatform -notin $platforms) {
+            throw "Docker Hub manifest is missing $expectedPlatform"
+        }
+    }
+}
+
+function Assert-DockerfilePlatformArguments {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $contents = [System.IO.File]::ReadAllText($Path)
+    if ($contents -notmatch '(?m)^FROM --platform=\$BUILDPLATFORM\s+') {
+        throw "Dockerfile builder stage must run on BUILDPLATFORM"
+    }
+    foreach ($argument in @("TARGETOS", "TARGETARCH")) {
+        if ($contents -notmatch "(?m)^ARG $argument\s*$") {
+            throw "Dockerfile must declare ARG $argument without a fixed default"
+        }
+        if ($contents -match "(?m)^ARG $argument\s*=") {
+            throw "Dockerfile must not override the automatic $argument build argument"
+        }
+    }
+    if ($contents -notmatch 'GOOS=\$\{TARGETOS\}' -or $contents -notmatch 'GOARCH=\$\{TARGETARCH\}') {
+        throw "Dockerfile must build with the automatic TARGETOS and TARGETARCH values"
+    }
 }
 
 function Invoke-SelfTest {
+    Assert-DockerfilePlatformArguments -Path (Join-Path $repositoryRoot "docker\Dockerfile")
     foreach ($value in @("1.0.0", "1.0.001", "2.4.999")) {
         Assert-ReleaseVersion $value
     }

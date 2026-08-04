@@ -42,6 +42,11 @@ releases.
 - Release artifacts for Windows amd64, Linux amd64, and Linux arm64, plus
   multi-architecture container builds and versioned checksums.
 
+### Fixed
+
+- Docker multi-platform builds use Buildx-provided TARGETOS and TARGETARCH
+  values, with post-push manifest platform validation.
+
 ## [internal-1.0.042] - 2026-08-03
 
 ### Added
