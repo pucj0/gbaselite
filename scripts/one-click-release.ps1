@@ -701,7 +701,7 @@ foreach ($path in $versionFiles) {
     }
     $originalFiles[$path] = [System.IO.File]::ReadAllBytes($path)
 }
-foreach ($name in @("Dockerfile", "docker-compose.build.yml", "docker-compose.binary.yml", "config.example.yaml", "temp.env.example")) {
+foreach ($name in @("Dockerfile", "entrypoint.sh", "docker-compose.build.yml", "docker-compose.binary.yml", "config.example.yaml", "temp.env.example")) {
     $path = Join-Path $dockerSourceRoot $name
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Required Docker release file is missing: $path"

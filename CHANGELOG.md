@@ -32,6 +32,13 @@ releases.
   release branch packages the requested version instead of incrementing the
   development branch version.
 
+### Fixed
+
+- Docker image startup now reports the container UID/GID, host-directory
+  ownership, and the required bind-mount permission fix before starting the
+  server. The Compose documentation now distinguishes image UID 10001 from
+  external-binary UID 65532 and covers SELinux bind labels.
+
 ## [1.0.0]
 
 ### Added

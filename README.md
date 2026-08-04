@@ -358,9 +358,13 @@ cp docker/temp.env.example docker/temp.env
 
 ```bash
 # 默认拉取 pucj/gbaselite:<version>（Docker Hub）
+mkdir -p data logs
+sudo chown -R 10001:10001 data logs
 docker compose --env-file docker/temp.env -f docker/docker-compose.yml up -d
 
 # 开发者：使用当前源码构建镜像
+mkdir -p data logs
+sudo chown -R 10001:10001 data logs
 docker compose --env-file docker/temp.env -f docker/docker-compose.build.yml up -d --build
 
 # Alpine 3.21：挂载宿主机 Linux 静态二进制
@@ -377,6 +381,29 @@ docker compose -f docker/docker-compose.binary.yml up -d
 
 发布前使用 `uname -m` 确认宿主机架构，并用 `test -x` 检查执行权限。架构不匹配会
 返回 `exec format error`，缺少执行权限会返回 `permission denied`。
+
+普通镜像已经包含并执行 `/app/gbaselite`，不要再把宿主机二进制挂载到
+`/home/bin/gbaselite`；需要直接挂载裸二进制时，应改用
+`docker-compose.binary.yml`。普通镜像以固定的 `10001:10001` 运行，二进制 Compose
+以 `65532:65532` 运行，两种模式的宿主机目录所有者不能混用。
+
+Docker 在 Linux 上自动创建 bind mount 源目录时，目录通常属于 `root:root`，非 root
+数据库进程无法写入并会报告 `/app/data` 或 `/app/logs` 权限错误。先用 `stat` 确认
+路径确实是本实例的数据和日志目录，再执行对应模式的 `chown`。普通镜像也可使用只运行
+一次的 root 辅助容器修复权限，数据库主容器仍保持非 root：
+
+```bash
+docker run --rm --user 0:0 \
+  --entrypoint /bin/sh \
+  -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/logs:/app/logs" \
+  pucj/gbaselite:1.0.0 \
+  -ec 'chown -R 10001:10001 /app/data /app/logs'
+```
+
+启用 SELinux 且 `getenforce` 返回 `Enforcing` 时，还要给两个 bind mount 添加 `:Z`，
+例如 `../data:/app/data:Z`；仅修改 Unix 所有者不能绕过 SELinux 标签限制。不要把数据库
+主服务长期配置为 `user: "0:0"`，否则新文件会再次变成 root 所有，并扩大容器权限。
 
 普通镜像和源码构建 Compose 先读取挂载的 `docker/config.example.yaml`，再使用非空
 的 `DB_*` 环境变量覆盖同名配置，因此两处同时设置密码时，以 `DB_PASSWORD` 为准。
