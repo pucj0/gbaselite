@@ -24,11 +24,19 @@ SERVER_LOG="$WORK_DIRECTORY/server.log"
 SERVER_PID=
 
 mysql_client() {
-  docker run --rm --network host \
+  docker run --rm --interactive --network host \
     -e "MYSQL_PWD=$PASSWORD" \
     "$MYSQL_IMAGE" mysql \
     --protocol=TCP --host=127.0.0.1 --port="$PORT" --user="$USERNAME" \
     --default-character-set=utf8mb4 "$@"
+}
+
+workflow_error() {
+  local message=$1
+  message=${message//'%'/'%25'}
+  message=${message//$'\r'/'%0D'}
+  message=${message//$'\n'/'%0A'}
+  printf '::error title=MySQL 8 smoke test::%s\n' "$message" >&2
 }
 
 drop_temporary_database() {
@@ -111,10 +119,31 @@ CREATE VIEW `active-items` AS
   SELECT `id`, `sku`, `qty` FROM `order-items` WHERE `qty` > 0;
 SQL
 
-database_list=$(mysql_client --batch --raw --skip-column-names --execute='SHOW DATABASES;')
-printf '%s\n' "$database_list" | grep -Fx "$DATABASE" >/dev/null
-if printf '%s\n' "$database_list" | grep -Ex 'information_schema|mysql' >/dev/null; then
-  echo "SHOW DATABASES exposed a non-persistent compatibility database" >&2
+SHOW_DATABASES_ERROR="$WORK_DIRECTORY/show-databases.err"
+if ! database_list=$(mysql_client --batch --raw --skip-column-names --execute='SHOW DATABASES;' 2>"$SHOW_DATABASES_ERROR"); then
+  database_error=$(<"$SHOW_DATABASES_ERROR")
+  workflow_error "SHOW DATABASES failed through the MySQL 8 client: ${database_error:-no client error output}"
+  cat "$SHOW_DATABASES_ERROR" >&2
+  exit 1
+fi
+
+database_found=0
+while IFS= read -r database_name; do
+  case "$database_name" in
+    "$DATABASE") database_found=1 ;;
+    information_schema|mysql)
+      message="SHOW DATABASES exposed non-persistent compatibility database: $database_name"
+      workflow_error "$message"
+      echo "$message" >&2
+      exit 1
+      ;;
+  esac
+done <<<"$database_list"
+if [ "$database_found" -ne 1 ]; then
+  message="SHOW DATABASES did not return $DATABASE; actual rows: $database_list"
+  workflow_error "$message"
+  echo "SHOW DATABASES did not return $DATABASE; actual rows:" >&2
+  printf '%s\n' "$database_list" >&2
   exit 1
 fi
 
