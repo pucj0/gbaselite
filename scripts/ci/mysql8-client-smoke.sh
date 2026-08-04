@@ -31,6 +31,14 @@ mysql_client() {
     --default-character-set=utf8mb4 "$@"
 }
 
+workflow_error() {
+  local message=$1
+  message=${message//'%'/'%25'}
+  message=${message//$'\r'/'%0D'}
+  message=${message//$'\n'/'%0A'}
+  printf '::error title=MySQL 8 smoke test::%s\n' "$message" >&2
+}
+
 drop_temporary_database() {
   mysql_client --execute='DROP DATABASE IF EXISTS `gbaselite-ci-export`;' >/dev/null 2>&1
 }
@@ -111,8 +119,11 @@ CREATE VIEW `active-items` AS
   SELECT `id`, `sku`, `qty` FROM `order-items` WHERE `qty` > 0;
 SQL
 
-if ! database_list=$(mysql_client --batch --raw --skip-column-names --execute='SHOW DATABASES;'); then
-  echo "SHOW DATABASES failed through the MySQL 8 client" >&2
+SHOW_DATABASES_ERROR="$WORK_DIRECTORY/show-databases.err"
+if ! database_list=$(mysql_client --batch --raw --skip-column-names --execute='SHOW DATABASES;' 2>"$SHOW_DATABASES_ERROR"); then
+  database_error=$(<"$SHOW_DATABASES_ERROR")
+  workflow_error "SHOW DATABASES failed through the MySQL 8 client: ${database_error:-no client error output}"
+  cat "$SHOW_DATABASES_ERROR" >&2
   exit 1
 fi
 
@@ -121,12 +132,16 @@ while IFS= read -r database_name; do
   case "$database_name" in
     "$DATABASE") database_found=1 ;;
     information_schema|mysql)
-      echo "SHOW DATABASES exposed non-persistent compatibility database: $database_name" >&2
+      message="SHOW DATABASES exposed non-persistent compatibility database: $database_name"
+      workflow_error "$message"
+      echo "$message" >&2
       exit 1
       ;;
   esac
 done <<<"$database_list"
 if [ "$database_found" -ne 1 ]; then
+  message="SHOW DATABASES did not return $DATABASE; actual rows: $database_list"
+  workflow_error "$message"
   echo "SHOW DATABASES did not return $DATABASE; actual rows:" >&2
   printf '%s\n' "$database_list" >&2
   exit 1
