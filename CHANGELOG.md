@@ -14,6 +14,8 @@ releases.
 
 ## [Unreleased]
 
+## [1.0.001] - 2026-08-04
+
 ### Added
 
 - Added a dedicated remote publisher that creates an isolated
