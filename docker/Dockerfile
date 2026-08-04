@@ -11,7 +11,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w" -o /out/gbaselite ./cmd/gbaselite
 
 FROM alpine:3.21
-RUN addgroup -S -g 10001 gbaselite && \
+RUN apk add --no-cache su-exec && \
+    addgroup -S -g 10001 gbaselite && \
     adduser -S -D -H -u 10001 -G gbaselite gbaselite && \
     mkdir -p /app/data /app/logs && \
     chown -R gbaselite:gbaselite /app
@@ -21,7 +22,7 @@ COPY --chown=gbaselite:gbaselite docker/config.example.yaml /app/config.yaml
 COPY --chown=gbaselite:gbaselite --chmod=0755 docker/entrypoint.sh /app/entrypoint.sh
 ENV DB_HOST=0.0.0.0 \
     DB_DATA_PATH=/app/data
-USER gbaselite
+USER root
 EXPOSE 3307
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=5 \
     CMD ["/app/gbaselite", "healthcheck", "--host", "127.0.0.1", "--port", "3307"]
