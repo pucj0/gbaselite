@@ -358,13 +358,9 @@ cp docker/temp.env.example docker/temp.env
 
 ```bash
 # 默认拉取 pucj/gbaselite:<version>（Docker Hub）
-mkdir -p data logs
-sudo chown -R 10001:10001 data logs
 docker compose --env-file docker/temp.env -f docker/docker-compose.yml up -d
 
 # 开发者：使用当前源码构建镜像
-mkdir -p data logs
-sudo chown -R 10001:10001 data logs
 docker compose --env-file docker/temp.env -f docker/docker-compose.build.yml up -d --build
 
 # Alpine 3.21：挂载宿主机 Linux 静态二进制
@@ -384,26 +380,18 @@ docker compose -f docker/docker-compose.binary.yml up -d
 
 普通镜像已经包含并执行 `/app/gbaselite`，不要再把宿主机二进制挂载到
 `/home/bin/gbaselite`；需要直接挂载裸二进制时，应改用
-`docker-compose.binary.yml`。普通镜像以固定的 `10001:10001` 运行，二进制 Compose
-以 `65532:65532` 运行，两种模式的宿主机目录所有者不能混用。
+`docker-compose.binary.yml`。普通镜像入口与 MySQL 官方镜像采用相同的降权模式：入口
+短暂以 root 创建 `/app/data` 和 `/app/logs`，只修复所有者不匹配的挂载内容，随后通过
+`su-exec` 以固定的 `10001:10001` 执行数据库进程。因此标准镜像和源码构建模式首次启动
+不需要手工 `chown`，且数据库进程本身不是 root。不要在 Compose 中设置 `user:` 或覆盖
+`entrypoint`，否则会跳过自动初始化。
 
-Docker 在 Linux 上自动创建 bind mount 源目录时，目录通常属于 `root:root`，非 root
-数据库进程无法写入并会报告 `/app/data` 或 `/app/logs` 权限错误。先用 `stat` 确认
-路径确实是本实例的数据和日志目录，再执行对应模式的 `chown`。普通镜像也可使用只运行
-一次的 root 辅助容器修复权限，数据库主容器仍保持非 root：
-
-```bash
-docker run --rm --user 0:0 \
-  --entrypoint /bin/sh \
-  -v "$(pwd)/data:/app/data" \
-  -v "$(pwd)/logs:/app/logs" \
-  pucj/gbaselite:1.0.0 \
-  -ec 'chown -R 10001:10001 /app/data /app/logs'
-```
-
-启用 SELinux 且 `getenforce` 返回 `Enforcing` 时，还要给两个 bind mount 添加 `:Z`，
-例如 `../data:/app/data:Z`；仅修改 Unix 所有者不能绕过 SELinux 标签限制。不要把数据库
-主服务长期配置为 `user: "0:0"`，否则新文件会再次变成 root 所有，并扩大容器权限。
+裸二进制 `docker-compose.binary.yml` 没有镜像入口辅助，仍固定以 `65532:65532` 运行，
+首次使用时必须按示例手工准备目录权限；两种模式的宿主机目录所有者不能混用。普通镜像
+启动时会递归修正已有数据和日志文件的所有者，因此两个挂载目录必须专供这个 GBaseLite
+实例使用，不能与其他容器共享。启用 SELinux 且 `getenforce` 返回 `Enforcing` 时，还要
+给两个 bind mount 添加 `:Z`，例如 `../data:/app/data:Z`；容器内 root 也不能绕过宿主机
+SELinux 标签或只读文件系统，这些情况会返回带目录所有者和模式的明确错误。
 
 普通镜像和源码构建 Compose 先读取挂载的 `docker/config.example.yaml`，再使用非空
 的 `DB_*` 环境变量覆盖同名配置，因此两处同时设置密码时，以 `DB_PASSWORD` 为准。
@@ -1300,6 +1288,10 @@ ELF、执行权限、禁入内容和 SHA-256 校验。产物仍复制到
 .\publish-release.bat -Version 1.0.0 -PrepareOnly -ReplaceArtifacts
 .\publish-release.bat -Version 1.0.0 -Publish -ReplaceArtifacts
 ```
+
+`publish-release.bat` 默认在完成或失败后暂停，双击运行时可以看到完整输出；自动化或已打开的
+终端中可加 `--no-pause`（或 `-NoPause`）避免等待按键。发布失败时先阅读 PowerShell
+错误正文，末尾的退出码只用于脚本调用方判断成功或失败。
 
 三种模式互斥：
 

@@ -34,10 +34,13 @@ releases.
 
 ### Fixed
 
-- Docker image startup now reports the container UID/GID, host-directory
-  ownership, and the required bind-mount permission fix before starting the
-  server. The Compose documentation now distinguishes image UID 10001 from
-  external-binary UID 65532 and covers SELinux bind labels.
+- Docker image startup now creates and repairs ownership of the data and log
+  bind mounts before dropping privileges to UID/GID 10001. Startup still
+  reports actionable diagnostics for read-only filesystems and SELinux label
+  failures; the external-binary Compose remains fixed at UID/GID 65532.
+- The Windows release publisher now keeps interactive command windows open
+  after success or failure so PowerShell diagnostics remain visible, with a
+  `--no-pause` option for automation.
 
 ## [1.0.0]
 

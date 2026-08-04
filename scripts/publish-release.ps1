@@ -199,6 +199,13 @@ function Test-DockerImage {
             }
             $health = ($healthResult.Output | Select-Object -First 1).ToString().Trim()
             if ($health -eq "healthy") {
+                $runtimeUID = Get-RequiredOutput -Executable $DockerExecutable -Arguments @(
+                    "exec", $container, "sh", "-c",
+                    "sed -n 's/^Uid:[[:space:]]*\([0-9]*\).*/\1/p' /proc/1/status"
+                ) -FailureMessage "Unable to inspect the Docker database process UID"
+                if ($runtimeUID.Count -ne 1 -or $runtimeUID[0].Trim() -ne "10001") {
+                    throw "The Docker database process must run as UID 10001"
+                }
                 Write-Host "Docker verification container is healthy."
                 return
             }
