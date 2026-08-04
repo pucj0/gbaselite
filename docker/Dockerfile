@@ -18,11 +18,12 @@ RUN addgroup -S -g 10001 gbaselite && \
 WORKDIR /app
 COPY --from=builder --chown=gbaselite:gbaselite /out/gbaselite /app/gbaselite
 COPY --chown=gbaselite:gbaselite docker/config.example.yaml /app/config.yaml
+COPY --chown=gbaselite:gbaselite --chmod=0755 docker/entrypoint.sh /app/entrypoint.sh
 ENV DB_HOST=0.0.0.0 \
     DB_DATA_PATH=/app/data
 USER gbaselite
 EXPOSE 3307
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=5 \
     CMD ["/app/gbaselite", "healthcheck", "--host", "127.0.0.1", "--port", "3307"]
-ENTRYPOINT ["/app/gbaselite"]
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["server", "--config", "/app/config.yaml"]

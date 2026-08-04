@@ -5,6 +5,7 @@ services:
     ports:
       - "3307:3307"
     volumes:
+      # Bind sources must be writable by the image user 10001:10001.
       - ../data:/app/data
       - ../logs:/app/logs
       - ./config.example.yaml:/app/config.yaml:ro
