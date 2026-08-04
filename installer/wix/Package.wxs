@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="GBaseLite"
+           Manufacturer="GBaseLite 贡献者"
+           Version="$(var.Version)"
+           Language="2052"
+           UpgradeCode="75C0C2D1-6BB0-4C61-A4ED-F066B7427BE1"
+           ProductCode="*"
+           Scope="perMachine"
+           InstallerVersion="500"
+           Compressed="yes">
+    <SummaryInformation Description="GBaseLite 数据库服务" />
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="已安装更高版本的 GBaseLite，无法降级安装。" />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="GBaseLiteApplicationIcon" SourceFile="$(var.ApplicationIconPath)" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.LicenseRtfPath)" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.BannerBitmapPath)" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.DialogBitmapPath)" />
+
+    <Property Id="ARPCONTACT" Value="GBaseLite 贡献者" />
+    <Property Id="ARPPRODUCTICON" Value="GBaseLiteApplicationIcon" />
+    <Property Id="GBASE_PORT" Value="3307" Secure="yes" />
+    <Property Id="GBASE_ADMIN_USER" Value="root" Secure="yes" />
+    <Property Id="GBASE_ADMIN_PASSWORD" Hidden="yes" Secure="yes" />
+    <Property Id="GBASE_CONFIG_PATH" Secure="yes" />
+    <Property Id="GBASE_EXISTING_INSTALL_DIR" Secure="yes">
+      <RegistrySearch Id="FindExistingInstallDirectory"
+                      Root="HKLM"
+                      Key="Software\GBaseLite"
+                      Name="InstallDirectory"
+                      Type="raw"
+                      Bitness="always64" />
+    </Property>
+    <Property Id="GBASE_DATA_DIR" Secure="yes">
+      <RegistrySearch Id="FindExistingDataDirectory"
+                      Root="HKLM"
+                      Key="Software\GBaseLite"
+                      Name="DataDirectory"
+                      Type="directory"
+                      Bitness="always64" />
+    </Property>
+    <Property Id="GBASE_LOG_DIR" Secure="yes">
+      <RegistrySearch Id="FindExistingLogDirectory"
+                      Root="HKLM"
+                      Key="Software\GBaseLite"
+                      Name="LogDirectory"
+                      Type="directory"
+                      Bitness="always64" />
+    </Property>
+    <Property Id="GBASE_AUTO_START" Value="1" Secure="yes" />
+    <Property Id="GBASE_START_SERVICE" Value="1" Secure="yes" />
+    <Property Id="GBASE_DESKTOP_SHORTCUT" Secure="yes">
+      <RegistrySearch Id="FindExistingDesktopShortcut"
+                      Root="HKLM"
+                      Key="Software\GBaseLite"
+                      Name="DesktopShortcut"
+                      Type="raw"
+                      Bitness="always64" />
+    </Property>
+    <Property Id="GBASE_REINITIALIZE" Secure="yes" />
+    <Property Id="GBASE_REINITIALIZE_CONFIRMED" Secure="yes" />
+    <Property Id="GBASE_APPLY_CONFIGURATION" Secure="yes" />
+    <Property Id="GBASE_CONFIGURE_JOURNALS" Secure="yes" />
+    <Property Id="GBASE_AUDIT_ENABLED" Secure="yes" />
+    <Property Id="GBASE_BINLOG_ENABLED" Secure="yes" />
+    <Property Id="GBASE_AUDIT_RETENTION_DAYS" Value="7" Secure="yes" />
+    <Property Id="GBASE_BINLOG_RETENTION_DAYS" Value="7" Secure="yes" />
+    <Property Id="GBASE_PORT_VALIDATION_ERROR" Secure="yes" />
+    <Property Id="FinalizeInstallation" Hidden="yes" />
+    <Property Id="GBASE_SERVICE_EXISTS">
+      <RegistrySearch Id="FindExistingGBaseLiteService"
+                      Root="HKLM"
+                      Key="SYSTEM\CurrentControlSet\Services\GBaseLite"
+                      Name="ImagePath"
+                      Type="raw" />
+    </Property>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="GBaseLite">
+        <Component Id="ProgramFilesComponent" Guid="A99AA856-7C43-4E28-8D44-E0D895307277" Bitness="always64">
+          <File Id="GBaseLiteExecutable" Source="$(var.SourceDirectory)\gbaselite.exe" KeyPath="yes" />
+          <File Id="ReadmeFile" Source="$(var.SourceDirectory)\README.md" />
+          <File Id="LicenseFile" Source="$(var.SourceDirectory)\LICENSE" />
+          <File Id="GBaseLiteIconFile" Source="$(var.ApplicationIconPath)" Name="gbaselite.ico" />
+          <ServiceInstall Id="GBaseLiteServiceInstall"
+                          Name="GBaseLite"
+                          DisplayName="GBaseLite 数据库服务"
+                          Description="兼容 MySQL 协议的轻量级数据库服务"
+                          Type="ownProcess"
+                          Start="demand"
+                          ErrorControl="normal"
+                          Vital="yes"
+                          Arguments='service --config &quot;[GBASE_CONFIG_PATH]&quot;' />
+          <ServiceControl Id="GBaseLiteServiceControl"
+                          Name="GBaseLite"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes" />
+        </Component>
+        <Component Id="PathEnvironmentComponent" Guid="C9B39096-5F67-4B9A-9D5B-0C4FB683517A" Bitness="always64">
+          <Environment Id="AddInstallFolderToPath"
+                       Name="Path"
+                       Value="[INSTALLFOLDER]"
+                       Action="set"
+                       Part="last"
+                       Permanent="no"
+                       System="yes" />
+        </Component>
+        <Component Id="InstallDirectoryRegistryComponent"
+                   Guid="8E12A747-A49A-4B22-A146-4D7D1E00A1F6"
+                   Bitness="always64"
+                   Permanent="yes">
+          <RegistryValue Root="HKLM"
+                         Key="Software\GBaseLite"
+                         Name="InstallDirectory"
+                         Value="[INSTALLFOLDER]"
+                         Type="string"
+                         KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="GBaseLiteMenuFolder" Name="GBaseLite">
+        <Component Id="StartMenuShortcutComponent" Guid="8A829481-F2C1-4DDD-91EA-14804D034BB8" Bitness="always64">
+          <Shortcut Id="GBaseLiteStartMenuShortcut"
+                    Name="GBaseLite 命令行"
+                    Description="启动 GBaseLite 命令行客户端"
+                    Target="[#GBaseLiteExecutable]"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="GBaseLiteApplicationIcon"
+                    IconIndex="0" />
+          <RemoveFolder Id="RemoveGBaseLiteMenuFolder" On="uninstall" />
+          <RegistryValue Root="HKLM"
+                         Key="Software\GBaseLite"
+                         Name="StartMenuShortcut"
+                         Value="1"
+                         Type="integer"
+                         KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcutComponent"
+                 Guid="E2A5D179-710D-4E5C-A83E-911385425AE1"
+                 Bitness="always64">
+        <Shortcut Id="GBaseLiteDesktopShortcut"
+                  Name="GBaseLite"
+                  Description="启动 GBaseLite 命令行客户端"
+                  Target="[#GBaseLiteExecutable]"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="GBaseLiteApplicationIcon"
+                  IconIndex="0" />
+        <RegistryValue Root="HKLM"
+                       Key="Software\GBaseLite"
+                       Name="DesktopShortcut"
+                       Value="1"
+                       Type="integer"
+                       KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="PROGRAMDATAROOT" Name="GBaseLite">
+        <Directory Id="GBASE_DATA_DIR" Name="data">
+          <Component Id="DataDirectoryComponent" Guid="2FF5C7D3-A240-4712-B8D9-F0BB512737BC" Bitness="always64" Permanent="yes" NeverOverwrite="yes">
+            <CreateFolder />
+            <RegistryValue Root="HKLM" Key="Software\GBaseLite" Name="DataDirectory" Value="[GBASE_DATA_DIR]" Type="string" KeyPath="yes" />
+          </Component>
+        </Directory>
+        <Directory Id="GBASE_LOG_DIR" Name="logs">
+          <Component Id="LogDirectoryComponent" Guid="297C08C1-A276-4073-B9A2-4DAEEBB13F28" Bitness="always64" Permanent="yes" NeverOverwrite="yes">
+            <CreateFolder />
+            <RegistryValue Root="HKLM" Key="Software\GBaseLite" Name="LogDirectory" Value="[GBASE_LOG_DIR]" Type="string" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="GBaseLite" Level="1" Display="expand">
+      <ComponentRef Id="ProgramFilesComponent" />
+      <ComponentRef Id="PathEnvironmentComponent" />
+      <ComponentRef Id="InstallDirectoryRegistryComponent" />
+      <ComponentRef Id="StartMenuShortcutComponent" />
+      <ComponentRef Id="DataDirectoryComponent" />
+      <ComponentRef Id="LogDirectoryComponent" />
+      <Feature Id="DesktopShortcutFeature"
+               Title="桌面快捷方式"
+               Description="在桌面添加 GBaseLite 命令行入口"
+               Level="2"
+               Display="expand">
+        <ComponentRef Id="DesktopShortcutComponent" />
+      </Feature>
+    </Feature>
+
+    <Binary Id="GBaseLiteCustomActions" SourceFile="$(var.CustomActionPath)" />
+    <Binary Id="GBaseCustomBanner" SourceFile="$(var.BannerBitmapPath)" />
+    <CustomAction Id="UseExistingInstallFolder"
+                  Property="INSTALLFOLDER"
+                  Value="[GBASE_EXISTING_INSTALL_DIR]"
+                  Execute="firstSequence" />
+    <CustomAction Id="SetDefaultConfigPath" Property="GBASE_CONFIG_PATH" Value="[PROGRAMDATAROOT]config.yaml" Execute="firstSequence" />
+    <CustomAction Id="LoadExistingConfigDefaults"
+                  BinaryRef="GBaseLiteCustomActions"
+                  DllEntry="LoadExistingConfigDefaults"
+                  Execute="immediate"
+                  Return="check"
+                  HideTarget="yes" />
+    <CustomAction Id="ValidateSelectedPort"
+                  BinaryRef="GBaseLiteCustomActions"
+                  DllEntry="ValidateSelectedPort"
+                  Execute="immediate"
+                  Return="check"
+                  HideTarget="yes" />
+    <CustomAction Id="PrepareInstallerData"
+                  BinaryRef="GBaseLiteCustomActions"
+                  DllEntry="PrepareInstallerData"
+                  Execute="immediate"
+                  Return="check"
+                  HideTarget="yes" />
+    <CustomAction Id="FinalizeInstallation"
+                  BinaryRef="GBaseLiteCustomActions"
+                  DllEntry="FinalizeInstallation"
+                  Execute="commit"
+                  Impersonate="no"
+                  Return="check"
+                  HideTarget="yes" />
+
+    <InstallUISequence>
+      <Custom Action="UseExistingInstallFolder" After="AppSearch" Condition="GBASE_EXISTING_INSTALL_DIR" />
+      <Custom Action="SetDefaultConfigPath" After="CostFinalize" Condition="NOT GBASE_CONFIG_PATH" />
+      <Custom Action="LoadExistingConfigDefaults" After="SetDefaultConfigPath" Condition="GBASE_CONFIG_PATH" />
+    </InstallUISequence>
+    <InstallExecuteSequence>
+      <Custom Action="UseExistingInstallFolder" After="AppSearch" Condition="GBASE_EXISTING_INSTALL_DIR" />
+      <Custom Action="SetDefaultConfigPath" After="CostFinalize" Condition="NOT GBASE_CONFIG_PATH" />
+      <Custom Action="PrepareInstallerData" After="InstallServices" Condition="NOT (REMOVE ~= &quot;ALL&quot;)" />
+      <Custom Action="FinalizeInstallation" After="PrepareInstallerData" Condition="NOT (REMOVE ~= &quot;ALL&quot;)" />
+    </InstallExecuteSequence>
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <UI>
+      <TextStyle Id="GBaseTitleFont" FaceName="Microsoft YaHei UI" Size="12" Bold="yes" Red="14" Green="74" Blue="69" />
+      <TextStyle Id="GBaseCaptionFont" FaceName="Microsoft YaHei UI" Size="8" Red="74" Green="85" Blue="92" />
+      <TextStyle Id="GBaseDangerFont" FaceName="Microsoft YaHei UI" Size="10" Bold="yes" Red="171" Green="45" Blue="45" />
+      <Dialog Id="GBaseConfigDlg" Width="370" Height="270" Title="GBaseLite 配置">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="yes" Text="GBaseCustomBanner" />
+        <Control Id="Title" Type="Text" X="18" Y="7" Width="285" Height="17" Transparent="yes" NoPrefix="yes" Text="{\GBaseTitleFont}数据库配置" />
+        <Control Id="Description" Type="Text" X="18" Y="25" Width="300" Height="13" Transparent="yes" NoPrefix="yes" Text="{\GBaseCaptionFont}配置 Windows 服务；默认保留已有配置和数据。" />
+        <Control Id="PortLabel" Type="Text" X="20" Y="58" Width="100" Height="15" Text="端口：" />
+        <Control Id="PortEdit" Type="Edit" X="130" Y="55" Width="80" Height="18" Property="GBASE_PORT" Integer="yes" />
+        <Control Id="UserLabel" Type="Text" X="20" Y="82" Width="100" Height="15" Text="管理员用户名：" />
+        <Control Id="UserEdit" Type="Edit" X="130" Y="79" Width="210" Height="18" Property="GBASE_ADMIN_USER" />
+        <Control Id="PasswordLabel" Type="Text" X="20" Y="106" Width="100" Height="15" Text="管理员密码：" />
+        <Control Id="PasswordEdit" Type="Edit" X="130" Y="103" Width="210" Height="18" Property="GBASE_ADMIN_PASSWORD" Password="yes" />
+        <Control Id="DataLabel" Type="Text" X="20" Y="130" Width="100" Height="15" Text="数据目录：" />
+        <Control Id="DataEdit" Type="Edit" X="130" Y="127" Width="150" Height="18" Property="GBASE_DATA_DIR" />
+        <Control Id="DataBrowse" Type="PushButton" X="286" Y="127" Width="54" Height="18" Text="浏览...">
+          <Publish Property="_BrowseProperty" Value="GBASE_DATA_DIR" Order="1" />
+          <Publish Event="SpawnDialog" Value="BrowseDlg" Order="2" />
+        </Control>
+        <Control Id="AutoStartCheck" Type="CheckBox" X="20" Y="149" Width="320" Height="17" Property="GBASE_AUTO_START" CheckBoxValue="1" Text="随 Windows 自动启动 GBaseLite" />
+        <Control Id="StartCheck" Type="CheckBox" X="20" Y="167" Width="320" Height="17" Property="GBASE_START_SERVICE" CheckBoxValue="1" Text="安装完成后启动 GBaseLite" />
+        <Control Id="DesktopShortcutCheck" Type="CheckBox" X="20" Y="185" Width="320" Height="17" Property="GBASE_DESKTOP_SHORTCUT" CheckBoxValue="1" Text="在桌面创建 GBaseLite 快捷方式（可选）" />
+        <Control Id="ReinitializeCheck" Type="CheckBox" X="20" Y="203" Width="330" Height="17" Property="GBASE_REINITIALIZE" CheckBoxValue="1" Text="重新初始化数据（会删除原数据；默认保留）" />
+        <Control Id="ExistingServiceWarning" Type="Text" X="20" Y="222" Width="330" Height="14" Text="{\GBaseCaptionFont}安装期间会停止已有服务，或占用此端口的独立 GBaseLite 进程。" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="上一步">
+          <Publish Event="NewDialog" Value="MaintenanceTypeDlg" Condition="Installed" Order="1" />
+          <Publish Event="NewDialog" Value="InstallDirDlg" Condition="NOT Installed" Order="2" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="下一步">
+          <Publish Event="AddLocal" Value="DesktopShortcutFeature" Condition="GBASE_DESKTOP_SHORTCUT = &quot;1&quot;" Order="1" />
+          <Publish Event="Remove" Value="DesktopShortcutFeature" Condition="GBASE_DESKTOP_SHORTCUT &lt;&gt; &quot;1&quot;" Order="2" />
+          <Publish Event="DoAction" Value="ValidateSelectedPort" Order="3" />
+          <Publish Event="SpawnDialog" Value="GBasePortConflictDlg" Condition="GBASE_PORT_VALIDATION_ERROR &lt;&gt; &quot;&quot;" Order="4" />
+          <Publish Event="SpawnDialog" Value="GBaseInvalidConfigDlg" Condition="GBASE_PORT_VALIDATION_ERROR = &quot;&quot; AND (GBASE_ADMIN_USER = &quot;&quot; OR GBASE_PORT = &quot;&quot; OR GBASE_DATA_DIR = &quot;&quot; OR (GBASE_ADMIN_PASSWORD = &quot;&quot; AND ((NOT WIX_UPGRADE_DETECTED AND NOT Installed) OR GBASE_REINITIALIZE = &quot;1&quot;)))" Order="5" />
+          <Publish Property="GBASE_APPLY_CONFIGURATION" Value="1" Condition="GBASE_PORT_VALIDATION_ERROR = &quot;&quot; AND GBASE_ADMIN_USER &lt;&gt; &quot;&quot; AND GBASE_PORT &lt;&gt; &quot;&quot; AND GBASE_DATA_DIR &lt;&gt; &quot;&quot; AND (GBASE_ADMIN_PASSWORD &lt;&gt; &quot;&quot; OR ((WIX_UPGRADE_DETECTED OR Installed) AND GBASE_REINITIALIZE &lt;&gt; &quot;1&quot;))" Order="6" />
+          <Publish Event="NewDialog" Value="GBaseJournalDlg" Condition="GBASE_PORT_VALIDATION_ERROR = &quot;&quot; AND GBASE_ADMIN_USER &lt;&gt; &quot;&quot; AND GBASE_PORT &lt;&gt; &quot;&quot; AND GBASE_DATA_DIR &lt;&gt; &quot;&quot; AND (GBASE_ADMIN_PASSWORD &lt;&gt; &quot;&quot; OR ((WIX_UPGRADE_DETECTED OR Installed) AND GBASE_REINITIALIZE &lt;&gt; &quot;1&quot;))" Order="7" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="取消">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="GBaseJournalDlg" Width="370" Height="270" Title="审计与恢复日志">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="yes" Text="GBaseCustomBanner" />
+        <Control Id="Title" Type="Text" X="18" Y="7" Width="285" Height="17" Transparent="yes" NoPrefix="yes" Text="{\GBaseTitleFont}审计与恢复日志" />
+        <Control Id="Description" Type="Text" X="18" Y="27" Width="310" Height="13" Transparent="yes" NoPrefix="yes" Text="{\GBaseCaptionFont}两类日志相互独立，可按需要分别启用。" />
+        <Control Id="AuditCheck" Type="CheckBox" X="24" Y="58" Width="320" Height="18" Property="GBASE_AUDIT_ENABLED" CheckBoxValue="1" Text="启用结构化审计日志（SQL 脱敏）" />
+        <Control Id="AuditDescription" Type="Text" X="42" Y="78" Width="300" Height="18" Text="记录账号、客户端 IP、操作结果、影响行数和耗时。" />
+        <Control Id="AuditRetentionLabel" Type="Text" X="42" Y="103" Width="155" Height="15" Text="审计日志保留天数：" />
+        <Control Id="AuditRetentionEdit" Type="Edit" X="194" Y="100" Width="48" Height="18" Property="GBASE_AUDIT_RETENTION_DAYS" Integer="yes" />
+        <Control Id="AuditRetentionHint" Type="Text" X="250" Y="103" Width="90" Height="15" Text="0=永久，最大365" />
+        <Control Id="BinlogCheck" Type="CheckBox" X="24" Y="128" Width="320" Height="18" Property="GBASE_BINLOG_ENABLED" CheckBoxValue="1" Text="启用可重放逻辑 binlog（包含原始 SQL）" />
+        <Control Id="BinlogDescription" Type="Text" X="42" Y="148" Width="300" Height="18" Text="只记录已提交变更；文件可能包含密码或业务数据。" />
+        <Control Id="BinlogRetentionLabel" Type="Text" X="42" Y="173" Width="155" Height="15" Text="binlog 保留天数：" />
+        <Control Id="BinlogRetentionEdit" Type="Edit" X="194" Y="170" Width="48" Height="18" Property="GBASE_BINLOG_RETENTION_DAYS" Integer="yes" />
+        <Control Id="BinlogRetentionHint" Type="Text" X="250" Y="173" Width="90" Height="15" Text="0=永久，最大365" />
+        <Control Id="PathHint" Type="Text" X="24" Y="204" Width="320" Height="20" Text="升级保留已有路径；清理 binlog 前应具备保留期内的基础备份。" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="上一步">
+          <Publish Event="NewDialog" Value="GBaseConfigDlg" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="下一步">
+          <Publish Event="SpawnDialog" Value="GBaseInvalidRetentionDlg" Condition="GBASE_AUDIT_RETENTION_DAYS = &quot;&quot; OR GBASE_BINLOG_RETENTION_DAYS = &quot;&quot; OR GBASE_AUDIT_RETENTION_DAYS &lt; 0 OR GBASE_AUDIT_RETENTION_DAYS &gt; 365 OR GBASE_BINLOG_RETENTION_DAYS &lt; 0 OR GBASE_BINLOG_RETENTION_DAYS &gt; 365" Order="1" />
+          <Publish Property="GBASE_CONFIGURE_JOURNALS" Value="1" Condition="GBASE_AUDIT_RETENTION_DAYS &lt;&gt; &quot;&quot; AND GBASE_BINLOG_RETENTION_DAYS &lt;&gt; &quot;&quot; AND GBASE_AUDIT_RETENTION_DAYS &gt;= 0 AND GBASE_AUDIT_RETENTION_DAYS &lt;= 365 AND GBASE_BINLOG_RETENTION_DAYS &gt;= 0 AND GBASE_BINLOG_RETENTION_DAYS &lt;= 365" Order="2" />
+          <Publish Event="NewDialog" Value="GBaseReinitializeConfirmDlg" Condition="GBASE_REINITIALIZE = &quot;1&quot; AND GBASE_AUDIT_RETENTION_DAYS &lt;&gt; &quot;&quot; AND GBASE_BINLOG_RETENTION_DAYS &lt;&gt; &quot;&quot; AND GBASE_AUDIT_RETENTION_DAYS &gt;= 0 AND GBASE_AUDIT_RETENTION_DAYS &lt;= 365 AND GBASE_BINLOG_RETENTION_DAYS &gt;= 0 AND GBASE_BINLOG_RETENTION_DAYS &lt;= 365" Order="3" />
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" Condition="GBASE_REINITIALIZE &lt;&gt; &quot;1&quot; AND GBASE_AUDIT_RETENTION_DAYS &lt;&gt; &quot;&quot; AND GBASE_BINLOG_RETENTION_DAYS &lt;&gt; &quot;&quot; AND GBASE_AUDIT_RETENTION_DAYS &gt;= 0 AND GBASE_AUDIT_RETENTION_DAYS &lt;= 365 AND GBASE_BINLOG_RETENTION_DAYS &gt;= 0 AND GBASE_BINLOG_RETENTION_DAYS &lt;= 365" Order="4" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="取消">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="GBaseInvalidRetentionDlg" Width="280" Height="90" Title="日志保留天数无效">
+        <Control Id="Message" Type="Text" X="18" Y="16" Width="244" Height="34" Text="保留天数必须是 0 到 365 之间的整数；0 表示永久保留。" />
+        <Control Id="OK" Type="PushButton" X="112" Y="60" Width="56" Height="17" Default="yes" Cancel="yes" Text="确定">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="GBaseInvalidConfigDlg" Width="260" Height="85" Title="GBaseLite 配置">
+        <Control Id="Message" Type="Text" X="15" Y="13" Width="230" Height="34" Text="{\GBaseCaptionFont}端口、管理员用户名和数据目录为必填项；首次安装或重新初始化时还必须输入密码。" />
+        <Control Id="OK" Type="PushButton" X="102" Y="55" Width="56" Height="17" Default="yes" Cancel="yes" Text="确定">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="GBasePortConflictDlg" Width="300" Height="110" Title="端口不可用">
+        <Control Id="Message" Type="Text" X="18" Y="18" Width="264" Height="45" Text="[GBASE_PORT_VALIDATION_ERROR]" />
+        <Control Id="Hint" Type="Text" X="18" Y="66" Width="264" Height="17" Text="GBaseLite 自身占用的端口可继续安装并自动替换。" />
+        <Control Id="OK" Type="PushButton" X="122" Y="86" Width="56" Height="17" Default="yes" Cancel="yes" Text="确定">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="GBaseReinitializeConfirmDlg" Width="370" Height="270" Title="确认重新初始化数据">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="yes" Text="GBaseCustomBanner" />
+        <Control Id="Title" Type="Text" X="18" Y="7" Width="285" Height="17" Transparent="yes" NoPrefix="yes" Text="{\GBaseDangerFont}确认危险操作" />
+        <Control Id="Description" Type="Text" X="18" Y="27" Width="290" Height="13" Transparent="yes" NoPrefix="yes" Text="{\GBaseCaptionFont}只有确认已有可用备份时才应继续。" />
+        <Control Id="Warning" Type="Text" X="25" Y="68" Width="320" Height="70" Text="重新初始化会创建新的空数据目录，并将原目录改名保留为同级备份。安装程序默认保留配置和数据；此操作仅在安装成功后执行，并且需要在上一页主动勾选。" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="上一步">
+          <Publish Event="NewDialog" Value="GBaseJournalDlg" />
+        </Control>
+        <Control Id="Confirm" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="确认">
+          <Publish Property="GBASE_REINITIALIZE_CONFIRMED" Value="1" Order="1" />
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" Order="2" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="取消">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="GBaseConfigDlg" Condition="NOT Installed" Order="5" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="ChangeButton" Event="NewDialog" Value="GBaseConfigDlg" Condition="1" Order="2" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="GBaseJournalDlg" Condition="GBASE_CONFIGURE_JOURNALS = &quot;1&quot;" Order="5" />
+    </UI>
+  </Package>
+</Wix>

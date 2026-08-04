@@ -1,0 +1,28 @@
+services:
+  gbaselite:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: gbaselite:local
+    container_name: gbaselite
+    ports:
+      - "3307:3307"
+    volumes:
+      - ../data:/app/data
+      - ../logs:/app/logs
+      - ./config.example.yaml:/app/config.yaml:ro
+    env_file:
+      - temp.env
+    restart: always
+    mem_limit: 128m
+    healthcheck:
+      test: ["CMD", "/app/gbaselite", "healthcheck", "--host", "127.0.0.1", "--port", "3307"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"

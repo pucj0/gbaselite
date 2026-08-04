@@ -1,0 +1,52 @@
+# IDE and editor settings
+/.idea/
+/.vscode/
+*.swp
+*.swo
+
+# Local environment and machine-specific configuration
+.env
+.env.*
+!.env.example
+!temp.env.example
+temp.env
+config.yaml
+config.local.yaml
+config.*.local.yaml
+
+# Go build and test artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+
+# Project build, cache, and runtime state
+/.tmp/
+/.wix/
+/bin/
+/data/
+/logs/
+/dist/
+
+# Runtime files created outside the standard directories
+*.log
+*.pid
+backup.sql
+*.msi
+*.zip
+*.tar.gz
+
+# WiX custom action build intermediates
+/installer/wix/custom-action/bin/
+/installer/wix/custom-action/obj/
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+/skills/

@@ -1,0 +1,39 @@
+server:
+  host: 127.0.0.1
+  port: 3307
+  max_connections: 512
+  write_buffer_kb: 8
+  slow_query_ms: 100
+
+storage:
+  path: ./data
+
+auth:
+  username: root
+  password: change-this-password
+
+security:
+  login_failure_limit: 5
+  login_failure_window_seconds: 60
+  login_failure_block_seconds: 30
+
+tls:
+  enabled: false
+  cert_file: ""
+  key_file: ""
+  require_secure_transport: false
+
+log:
+  path: ./logs
+  max_size_mb: 20
+  retention_days: 7
+
+audit:
+  enabled: false
+  path: ./logs/audit.jsonl
+  retention_days: 7
+
+binlog:
+  enabled: false
+  path: ./data/binlog.jsonl
+  retention_days: 7

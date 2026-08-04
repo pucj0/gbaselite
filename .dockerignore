@@ -1,0 +1,16 @@
+.git
+.github
+.idea
+.tmp
+bin
+data
+dist
+installer
+logs
+.env
+temp.env
+config.yaml
+backup.sql
+*.msi
+*.zip
+*.tar.gz

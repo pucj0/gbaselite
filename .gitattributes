@@ -1,0 +1,15 @@
+* text=auto
+
+*.go text eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.wxs text eol=lf
+*.cs text eol=lf
+*.csproj text eol=lf
+*.config text eol=lf
+
+*.ps1 text eol=crlf
+*.bat text eol=crlf
