@@ -1,6 +1,6 @@
 services:
   gbaselite:
-    image: ${DOCKER_IMAGE:-pucj/gbaselite}:${VERSION:-1.0.0}
+    image: ${DOCKER_IMAGE:-pucj/gbaselite}:${VERSION:-1.0.001}
     container_name: gbaselite
     ports:
       - "3307:3307"

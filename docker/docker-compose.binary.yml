@@ -12,7 +12,7 @@ services:
     ports:
       - "3307:3307"
     volumes:
-      - ../dist/GBaseLite-1.0.0/gbaselite-linux-amd64:/home/bin/gbaselite:ro
+      - ../dist/GBaseLite-1.0.001/gbaselite-linux-amd64:/home/bin/gbaselite:ro
       - ../data:/app/data
       - ../logs:/app/logs
       - /etc/localtime:/etc/localtime:ro
