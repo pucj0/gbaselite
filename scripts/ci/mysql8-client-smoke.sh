@@ -111,10 +111,24 @@ CREATE VIEW `active-items` AS
   SELECT `id`, `sku`, `qty` FROM `order-items` WHERE `qty` > 0;
 SQL
 
-database_list=$(mysql_client --batch --raw --skip-column-names --execute='SHOW DATABASES;')
-printf '%s\n' "$database_list" | grep -Fx "$DATABASE" >/dev/null
-if printf '%s\n' "$database_list" | grep -Ex 'information_schema|mysql' >/dev/null; then
-  echo "SHOW DATABASES exposed a non-persistent compatibility database" >&2
+if ! database_list=$(mysql_client --batch --raw --skip-column-names --execute='SHOW DATABASES;'); then
+  echo "SHOW DATABASES failed through the MySQL 8 client" >&2
+  exit 1
+fi
+
+database_found=0
+while IFS= read -r database_name; do
+  case "$database_name" in
+    "$DATABASE") database_found=1 ;;
+    information_schema|mysql)
+      echo "SHOW DATABASES exposed non-persistent compatibility database: $database_name" >&2
+      exit 1
+      ;;
+  esac
+done <<<"$database_list"
+if [ "$database_found" -ne 1 ]; then
+  echo "SHOW DATABASES did not return $DATABASE; actual rows:" >&2
+  printf '%s\n' "$database_list" >&2
   exit 1
 fi
 
