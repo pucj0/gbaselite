@@ -31,9 +31,15 @@ releases.
 - Added exact TargetVersion support to the local one-click packager so a
   release branch packages the requested version instead of incrementing the
   development branch version.
+- Standard-image Compose now tracks `pucj/gbaselite:latest`; release version
+  synchronization leaves that file unchanged and continues updating the
+  versioned external-binary path and release metadata.
 
 ### Fixed
 
+- Docker containers now reclaim a persisted `gbaselite.pid` that names the
+  current PID 1 process, so a bind-mounted data directory restarts cleanly
+  after an ungraceful container stop without weakening live-process checks.
 - Docker image startup now creates and repairs ownership of the data and log
   bind mounts before dropping privileges to UID/GID 10001. Startup still
   reports actionable diagnostics for read-only filesystems and SELinux label
