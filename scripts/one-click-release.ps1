@@ -688,7 +688,6 @@ if ($Preview) {
 $versionFiles = @(
     (Join-Path $repositoryRoot "executor\executor.go"),
     (Join-Path $repositoryRoot "README.md"),
-    (Join-Path $dockerSourceRoot "docker-compose.yml"),
     (Join-Path $dockerSourceRoot "docker-compose.binary.yml"),
     (Join-Path $dockerSourceRoot "temp.env.example"),
     (Join-Path $repositoryRoot ".github\workflows\release.yml"),
@@ -720,7 +719,6 @@ try {
     $versionUpdated = $true
     Replace-RequiredVersion -Path (Join-Path $repositoryRoot "executor\executor.go") -OldVersion $currentVersion -NewVersion $nextVersion
     Replace-RequiredVersion -Path (Join-Path $repositoryRoot "README.md") -OldVersion $currentVersion -NewVersion $nextVersion
-    Replace-RequiredVersion -Path (Join-Path $dockerSourceRoot "docker-compose.yml") -OldVersion $currentVersion -NewVersion $nextVersion
     Replace-RequiredVersion -Path (Join-Path $dockerSourceRoot "temp.env.example") -OldVersion $currentVersion -NewVersion $nextVersion
     Update-BinaryReleasePaths -Version $nextVersion
     Replace-RequiredVersion -Path (Join-Path $repositoryRoot ".github\workflows\release.yml") -OldVersion $currentVersion -NewVersion $nextVersion

@@ -21,7 +21,7 @@ import (
 	"gbaselite/storage"
 )
 
-const Version = "1.0.001"
+const Version = "1.0.002"
 
 var ErrPersistenceUnavailable = errors.New("database persistence is unavailable")
 

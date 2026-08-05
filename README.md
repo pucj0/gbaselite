@@ -4,7 +4,7 @@ GBaseLite 是一个使用 Go 编写的单机轻量级关系型数据库服务。
 PostgreSQL，使用自己的存储文件持久化数据，并通过 MySQL 协议向 Navicat、DBeaver、
 JDBC、Go MySQL 驱动等客户端提供服务。
 
-当前版本：`1.0.001`
+当前版本：`1.0.002`
 
 > GBaseLite 是 MySQL 兼容子集，不是 MySQL 的完整替代品。生产使用前请阅读
 > [兼容范围与限制](#兼容范围与限制)，并使用真实业务 SQL 做完整验证。
@@ -347,18 +347,20 @@ Windows ZIP 便携包布局（脚本同目录的 `gbaselite.exe`），并从对�
 
 ### 方式二：Docker Compose
 
-普通镜像和源码构建 Compose 先创建 Docker 环境文件并修改密码；`docker/temp.env`
-被 Git 忽略：
+标准镜像 Compose 直接拉取 `pucj/gbaselite:latest`；启动前在
+`docker/docker-compose.yml` 中把 `DB_PASSWORD` 改为强密码。源码构建 Compose 使用
+被 Git 忽略的 `docker/temp.env`：
 
 ```bash
 cp docker/temp.env.example docker/temp.env
+# 修改 docker/temp.env 中的 DB_PASSWORD
 ```
 
 三种启动方式分别为：
 
 ```bash
-# 默认拉取 pucj/gbaselite:<version>（Docker Hub）
-docker compose --env-file docker/temp.env -f docker/docker-compose.yml up -d
+# 默认拉取 pucj/gbaselite:latest（Docker Hub）
+docker compose -f docker/docker-compose.yml up -d
 
 # 开发者：使用当前源码构建镜像
 docker compose --env-file docker/temp.env -f docker/docker-compose.build.yml up -d --build
@@ -386,6 +388,10 @@ docker compose -f docker/docker-compose.binary.yml up -d
 不需要手工 `chown`，且数据库进程本身不是 root。不要在 Compose 中设置 `user:` 或覆盖
 `entrypoint`，否则会跳过自动初始化。
 
+数据库前台进程在容器内是 PID 1。容器被强制终止时，挂载的数据目录可能保留内容为
+`1` 的 `gbaselite.pid`；下次启动会把这个与当前容器进程同 PID 的文件作为残留状态重新
+认领，不需要手工删除 PID 文件。指向其他仍存活进程的 PID 文件仍会阻止重复启动。
+
 裸二进制 `docker-compose.binary.yml` 没有镜像入口辅助，仍固定以 `65532:65532` 运行，
 首次使用时必须按示例手工准备目录权限；两种模式的宿主机目录所有者不能混用。普通镜像
 启动时会递归修正已有数据和日志文件的所有者，因此两个挂载目录必须专供这个 GBaseLite
@@ -393,9 +399,9 @@ docker compose -f docker/docker-compose.binary.yml up -d
 给两个 bind mount 添加 `:Z`，例如 `../data:/app/data:Z`；容器内 root 也不能绕过宿主机
 SELinux 标签或只读文件系统，这些情况会返回带目录所有者和模式的明确错误。
 
-普通镜像和源码构建 Compose 先读取挂载的 `docker/config.example.yaml`，再使用非空
-的 `DB_*` 环境变量覆盖同名配置，因此两处同时设置密码时，以 `DB_PASSWORD` 为准。
-二进制 Compose 不挂载配置文件：`/app/config.yaml` 不存在时程序使用内置默认值。它
+普通镜像读取镜像内的 `/app/config.yaml`，源码构建 Compose 挂载
+`docker/config.example.yaml`；两种模式都再使用非空的 `DB_*` 环境变量覆盖同名配置。
+二进制 Compose 不挂载配置文件，`/app/config.yaml` 不存在时程序使用内置默认值。它
 不依赖 `temp.env`：在 `environment:` 中直接把必需的 `DB_PASSWORD` 改为强密码，并
 固定容器外访问所需的 `DB_HOST=0.0.0.0`；其余 `DB_*` 均已注释，按需取消注释后才覆
 盖默认值。二进制 Compose 不使用 `${...}` 或默认值插值。启动前必须把示例
@@ -406,8 +412,9 @@ SELinux 标签或只读文件系统，这些情况会返回带目录所有者和
 主机创建同名目录，应先确认它确实是空目录，再使用 `rmdir config.example.yaml` 删
 除；不要对 `data` 或 `logs` 执行该操作。
 
-三套 Compose 都持久化 `./data` 与 `./logs`。容器日志使用 `json-file`，单文件上限
-20 MiB，最多保留 3 个；这是容器标准输出日志，与 `/app/logs/gbaselite.log` 自身的
+标准镜像 Compose 持久化 `./gbaselite/data` 与 `./gbaselite/logs`；源码构建和裸二进制
+Compose 持久化仓库根目录的 `./data` 与 `./logs`。容器日志使用 `json-file`，单文件
+上限 20 MiB，最多保留 3 个；这是容器标准输出日志，与 `/app/logs/gbaselite.log` 自身的
 大小轮转和按天保留相互独立。健康检查直接执行 GBaseLite 的 TCP `healthcheck`，不
 依赖 HTTP。二进制 Compose 的端口映射和健康检查会随 `DB_PORT` 同步变化。
 
@@ -512,21 +519,21 @@ MSI 的 WiX DTF 自定义操作显式使用 CLR v4，可在仅启用 .NET Framew
 Windows 系统上运行。若安装仍异常，可使用 `/L*V` 生成详细日志进行定位：
 
 ```powershell
-msiexec.exe /i .\dist\GBaseLite-1.0.001\GBaseLite-windows-amd64.msi /L*V .\gbaselite-install.log
+msiexec.exe /i .\dist\GBaseLite-1.0.002\GBaseLite-windows-amd64.msi /L*V .\gbaselite-install.log
 ```
 
 ```powershell
 # 安装
-msiexec.exe /i .\dist\GBaseLite-1.0.001\GBaseLite-windows-amd64.msi
+msiexec.exe /i .\dist\GBaseLite-1.0.002\GBaseLite-windows-amd64.msi
 
 # 使用同一 MSI 修复程序文件
-msiexec.exe /fa .\dist\GBaseLite-1.0.001\GBaseLite-windows-amd64.msi
+msiexec.exe /fa .\dist\GBaseLite-1.0.002\GBaseLite-windows-amd64.msi
 
 # 升级：运行更高版本 MSI，UpgradeCode 保持不变
-msiexec.exe /i .\dist\GBaseLite-1.0.001\GBaseLite-windows-amd64.msi
+msiexec.exe /i .\dist\GBaseLite-1.0.002\GBaseLite-windows-amd64.msi
 
 # 卸载；默认保留 config.yaml、data、users 和 logs
-msiexec.exe /x .\dist\GBaseLite-1.0.001\GBaseLite-windows-amd64.msi
+msiexec.exe /x .\dist\GBaseLite-1.0.002\GBaseLite-windows-amd64.msi
 ```
 
 升级会显示同一配置页，停止旧服务、复用已有配置，并在安装成功后恢复服务。默认不勾
@@ -1189,12 +1196,13 @@ push、GHCR push 或其他上传操作。
 Windows 可直接双击项目根目录的 `release.bat` 一键发布。脚本从源码当前版本自动计
 算下一版本：修订号从 `001` 到 `999` 使用三位补零，例如 `1.0.123` 的下一版本是
 `1.0.124`；达到 `1.0.999` 后进位到 `1.1.0`，再继续为 `1.1.001`。它会同步源码、
-README、Compose、环境示例、工作流默认版本和 CHANGELOG，在独立 `.tmp` 候选目录完
-成测试、Compose 配置检查、三平台构建、中文 MSI 与归档校验，全部成功后才创建
+README、版本化裸二进制 Compose 路径、环境示例、工作流默认版本和 CHANGELOG，
+在独立 `.tmp` 候选目录完成测试、Compose 配置检查、三平台构建、中文 MSI 与归档校验，
+全部成功后才创建
 `dist/GBaseLite-<VERSION>` 独立目录；失败会恢复原版本文件。每个版本目录都包含自
 己的 `checksums.txt`、归档、MSI 和裸 Linux 二进制，旧版本目录不会被覆盖；
-`docker` 目录中的部署示例同步更新默认版本。Docker CLI 或 Compose 不可用时会给出
-警告并跳过该项检查。
+`docker-compose.binary.yml` 同步更新版本化裸二进制路径，标准镜像 Compose 始终使用
+`latest`。Docker CLI 或 Compose 不可用时会给出警告并跳过该项检查。
 
 首次运行缺少 .NET SDK、WiX 或中文 UI 扩展时，脚本会下载到 `.tmp` 或用户 WiX 扩展
 缓存，不修改系统 `PATH`；即使手工清空 `.tmp`，下次发布也会重新下载并重建缓存。发
@@ -1210,13 +1218,13 @@ README、Compose、环境示例、工作流默认版本和 CHANGELOG，在独立
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 `
-  -Version 1.0.001 -GoExecutable D:\env\Go\bin\go.exe
+  -Version 1.0.002 -GoExecutable D:\env\Go\bin\go.exe
 ```
 
 兼容入口 `scripts/package.ps1` 会转发到同一脚本。Linux 构建机可以使用：
 
 ```bash
-VERSION=1.0.001 ./scripts/build-release.sh
+VERSION=1.0.002 ./scripts/build-release.sh
 ```
 
 MSI 单独构建：
@@ -1224,7 +1232,7 @@ MSI 单独构建：
 ```powershell
 dotnet tool install --global wix --version 5.0.2
 wix extension add --global WixToolset.UI.wixext/5.0.2
-.\scripts\build-msi.ps1 -Version 1.0.001 `
+.\scripts\build-msi.ps1 -Version 1.0.002 `
   -SourceDirectory .\.tmp\windows-package `
   -OutputPath .\dist\GBaseLite-windows-amd64.msi
 ```
@@ -1263,7 +1271,8 @@ dist/
 正式发布使用独立入口 `publish-release.bat`，版本必须显式传入。脚本不会切换或修改
 当前开发分支，而是在 `.tmp` 中基于 `HEAD` 创建
 `release/v<VERSION>` Git worktree，并只在该发布分支中同步运行时版本、
-README、Compose、环境模板、GitHub Release 默认版本和 CHANGELOG。
+README、版本化裸二进制 Compose 路径、环境模板、GitHub Release 默认版本和
+CHANGELOG。
 
 发布分支随后调用现有 `scripts/one-click-release.ps1 -TargetVersion <VERSION>`，
 完整执行 Compose 检查、`gofmt`、`go test ./... -count=1`、
@@ -1284,9 +1293,9 @@ ELF、执行权限、禁入内容和 SHA-256 校验。产物仍复制到
 
 ```powershell
 .\publish-release.bat -SelfTest
-.\publish-release.bat -Version 1.0.001 -DryRun -ReplaceArtifacts
-.\publish-release.bat -Version 1.0.001 -PrepareOnly -ReplaceArtifacts
-.\publish-release.bat -Version 1.0.001 -Publish -ReplaceArtifacts
+.\publish-release.bat -Version 1.0.002 -DryRun -ReplaceArtifacts
+.\publish-release.bat -Version 1.0.002 -PrepareOnly -ReplaceArtifacts
+.\publish-release.bat -Version 1.0.002 -Publish -ReplaceArtifacts
 ```
 
 `publish-release.bat` 默认在完成或失败后暂停，双击运行时可以看到完整输出；自动化或已打开的

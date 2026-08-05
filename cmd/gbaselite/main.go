@@ -342,13 +342,14 @@ func runStop(args []string) error {
 }
 
 func claimPIDFile(path string) error {
-	if pid, ok := readRunningPID(path); ok {
+	currentPID := os.Getpid()
+	if pid, ok := readRunningPID(path); ok && pid != currentPID {
 		return fmt.Errorf("GBaseLite is already running (PID %d)", pid)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600)
+	return os.WriteFile(path, []byte(strconv.Itoa(currentPID)), 0o600)
 }
 
 func readRunningPID(path string) (int, bool) {

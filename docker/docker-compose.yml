@@ -1,16 +1,48 @@
 services:
   gbaselite:
-    image: ${DOCKER_IMAGE:-pucj/gbaselite}:${VERSION:-1.0.001}
+    image: pucj/gbaselite:latest
     container_name: gbaselite
     ports:
       - "3307:3307"
     volumes:
-      # The entrypoint repairs bind ownership, then runs GBaseLite as 10001:10001.
-      - ../data:/app/data
-      - ../logs:/app/logs
-      - ./config.example.yaml:/app/config.yaml:ro
-    env_file:
-      - temp.env
+      - ./gbaselite/data:/app/data
+      - ./gbaselite/logs:/app/logs
+    environment:
+      # 必填：启动前直接改为强密码；此文件中的密码会以明文保存。
+      DB_PASSWORD: change-this-password
+
+      # 二进制 Compose 必需：监听容器全部网卡，宿主机映射的 3307 才能被外部客户端连接。
+      DB_HOST: 0.0.0.0
+
+      # 以下均为可选覆盖项；未设置时使用 GBaseLite 默认值。
+      # DB_USER: root # 首次初始化管理员账号，默认 root。
+      # DB_PORT: 3307 # 改端口时，同时修改 ports 与 healthcheck 中的三个 3307。
+      # DB_DATA_PATH: /app/data # 默认 ./data；当前工作目录下等同于 /app/data。
+
+      # 登录失败限速：默认 5 次 / 60 秒，封禁 30 秒。
+      # DB_LOGIN_FAILURE_LIMIT: 5
+      # DB_LOGIN_FAILURE_WINDOW_SECONDS: 60
+      # DB_LOGIN_FAILURE_BLOCK_SECONDS: 30
+
+      # TLS：启用时必须同时取消下面三项注释并挂载证书与私钥。
+      # DB_TLS_ENABLED: false
+      # DB_TLS_CERT_FILE: /app/tls/server.crt
+      # DB_TLS_KEY_FILE: /app/tls/server.key
+      # DB_REQUIRE_SECURE_TRANSPORT: false
+
+      # 主日志：默认单文件 20 MiB、保留 7 天。
+      # DB_LOG_MAX_SIZE_MB: 20
+      # DB_LOG_RETENTION_DAYS: 7
+
+      # 审计：默认关闭；启用后默认保留 7 天，0 表示永久保留。
+      # DB_AUDIT_ENABLED: false
+      # DB_AUDIT_PATH: /app/logs/audit.jsonl
+      # DB_AUDIT_RETENTION_DAYS: 7
+
+      # 可重放逻辑 binlog：默认关闭；启用后默认保留 7 天，0 表示永久保留。
+      # DB_BINLOG_ENABLED: false
+      # DB_BINLOG_PATH: /app/data/binlog.jsonl
+      # DB_BINLOG_RETENTION_DAYS: 7
     restart: always
     mem_limit: 128m
     healthcheck:
