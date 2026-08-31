@@ -54,6 +54,7 @@ func TestSessionCharacterSetRestoresDumpUserVariable(t *testing.T) {
 		"SET @saved_cs_client=@@character_set_client",
 		"SET character_set_client=latin1",
 		"SET character_set_client=@saved_cs_client",
+		"SET character_set_client=NONE",
 	} {
 		if _, err := ExecuteCompatible(engine, session, query); err != nil {
 			t.Fatalf("%s: %v", query, err)

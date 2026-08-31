@@ -81,6 +81,10 @@ func executeSessionSet(session *executor.Session, query string) (*executor.Resul
 			if global {
 				return nil, fmt.Errorf("SET GLOBAL %s is not supported", variable)
 			}
+			if variable == "character_set_client" && strings.EqualFold(value, "NONE") {
+				continue
+			}
+
 			if variable == "character_set_results" && strings.EqualFold(value, "NULL") {
 				updated.CharacterSetResults = "NULL"
 				changed = true

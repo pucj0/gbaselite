@@ -52,7 +52,8 @@ releases.
 - Release packaging now computes SHA-256 checksums through the .NET standard
   cryptography API when `Get-FileHash` is unavailable.
 - Fixed MySQL dump imports that restore `character_set_client` through a saved
-  user variable such as `@saved_cs_client`.
+  user variable such as `@saved_cs_client`, and view dumps that temporarily use
+  the `character_set_client=NONE` compatibility marker.
 
 ## [1.0.002] - 2026-08-05
 
