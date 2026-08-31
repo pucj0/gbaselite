@@ -181,6 +181,7 @@ server:
   max_connections: 512
   write_buffer_kb: 8
   slow_query_ms: 100
+  time_zone: SYSTEM
 
 storage:
   path: /app/data
@@ -219,6 +220,21 @@ binlog:
 Windows 本地运行时，`/app/data` 和 `/app/logs` 会自动映射为当前目录下的 `./data`
 和 `./logs`。
 
+`server.time_zone` 是新连接的默认 SQL 时区，默认 `SYSTEM`，也可使用 `UTC`、
+`+08:00`/`-05:00` 这类偏移或 `Asia/Shanghai` 等 IANA 时区名；配置无效时服务拒绝
+启动。连接建立后可按 MySQL 会话语法覆盖，不影响其他连接：
+
+```sql
+SET time_zone = '+08:00';
+SET SESSION time_zone = 'Asia/Shanghai';
+SELECT @@session.time_zone, NOW();
+```
+
+`NOW()`、`CURRENT_TIMESTAMP`、`CURDATE()`、`DEFAULT/ON UPDATE
+CURRENT_TIMESTAMP` 都使用当前会话时区。`DATETIME` 仍保存不带时区的墙钟字段；当前
+`TIMESTAMP` 也映射到同一存储类型，尚未实现 MySQL `TIMESTAMP` 独立的 UTC 存储/会
+话时区转换。`SET GLOBAL time_zone` 暂不支持，应修改配置并重启以更改新连接默认值。
+
 支持以下环境变量覆盖：
 
 | 环境变量 | 配置项 | 默认值 |
@@ -228,6 +244,7 @@ Windows 本地运行时，`/app/data` 和 `/app/logs` 会自动映射为当前�
 | `DB_HOST` | 监听地址 | `127.0.0.1` |
 | `DB_PORT` | 监听端口 | `3307` |
 | `DB_MAX_CONNECTIONS` | 最大活动连接数；`0` 表示不限制 | `512` |
+| `DB_TIME_ZONE` | 新连接默认 SQL 时区；支持 `SYSTEM`、UTC 偏移和 IANA 名称 | `SYSTEM` |
 | `DB_SLOW_QUERY_MS` | 慢查询阈值，包含结果发送时间；`0` 表示关闭 | `100` |
 | `DB_DATA_PATH` | 数据目录 | 配置文件中的值 |
 | `DB_LOGIN_FAILURE_LIMIT` | 同一来源 IP 与账号在窗口内允许的认证失败次数；`0` 关闭限速 | `5` |
@@ -747,7 +764,32 @@ DROP USER IF EXISTS 'app'@'%';
 | 函数 | 常用条件、字符串、数值和日期函数子集 |
 | 事务 | `BEGIN`、`COMMIT`、`ROLLBACK`；SAVEPOINT 系列为客户端兼容命令 |
 | 元数据 | Navicat/DBeaver 常用 `SHOW` 与 `information_schema` 查询子集，包括 `SHOW [FULL] COLUMNS ... LIKE/WHERE` 和按列名过滤 `information_schema.COLUMNS` |
+| 会话设置 | `SET NAMES`、`SET CHARACTER SET`、`SET character_set_client/connection/results`、`SET collation_connection`、`SET [SESSION] time_zone`、对应 `SHOW`/`@@` 变量 |
 | 协议 | MySQL 认证、查询、Prepared Statement、二进制结果及 INSERT OK 包生成 ID |
+
+- 连接字符集支持 `ascii`、`binary`、`latin1`、`utf8`（接受 `utf8mb3` 别名）和
+  `utf8mb4`。`SHOW CHARACTER SET [LIKE ...]` 会列出这些字符集；握手排序规则编号、
+  `SET NAMES charset [COLLATE collation]`、`SET CHARACTER SET charset` 以及各
+  `character_set_*` 会话变量会实际更新当前连接，未知字符集、未知排序规则或字符集
+  与排序规则不匹配会返回错误。
+- 排序规则支持 `ascii_general_ci/ascii_bin`、`binary`、
+  `latin1_swedish_ci/latin1_general_ci/latin1_bin`、
+  `utf8_general_ci/utf8_unicode_ci/utf8_bin` 和
+  `utf8mb4_general_ci/utf8mb4_unicode_ci/utf8mb4_0900_ai_ci/utf8mb4_bin`。
+  `*_ci` 当前对 Unicode 字符执行大小写不敏感的比较、`LIKE`、`ORDER BY`、
+  `DISTINCT`、`GROUP BY` 和窗口分区/排序，`*_bin`/`binary` 执行区分大小写的二进制
+  风格比较。尚未实现 MySQL Unicode collation 的完整重音、区域和版本化权重表，因此
+  不应依赖它与 MySQL 逐字符排序完全一致。
+- 底层字符串仍统一保存和传输为 UTF-8 Unicode；`ascii`/`latin1` 是协议协商、会话
+  变量和比较兼容，不会把 Go/客户端字符串转码为单字节编码。字符集和排序规则暂未作
+  为逐数据库、逐表、逐列属性持久化，相关 DDL 选项仍按兼容语法接受，元数据默认值仍
+  为 `utf8mb4_general_ci`。这不是完整 MySQL 字符集实现。
+  当前索引键和 `PRIMARY KEY`/`UNIQUE` 字符串唯一性仍按底层精确值维护，因此在 `*_ci`
+  会话下大小写不同的字符串仍可作为两个唯一键值存在。
+- 会话时区支持 `SYSTEM`、`UTC`、`+HH:MM`/`-HH:MM`（最大 `14:00`）和 IANA 时区
+  名；`SHOW VARIABLES LIKE 'time_zone'` 与 `SELECT @@session.time_zone` 返回当前值，
+  `SHOW GLOBAL VARIABLES` / `@@global.time_zone` 可只读查询服务的新连接默认值。
+  命名时区数据随二进制提供，不依赖 Windows 主机是否安装 IANA 时区数据库。
 
 明确限制：
 
@@ -765,8 +807,9 @@ DROP USER IF EXISTS 'app'@'%';
   `NULL/NOT NULL`、`ENUM`/`JSON` 载荷校验、字面量默认值和常用
   `CURRENT_TIMESTAMP` 默认值；`AUTO_INCREMENT` 会生成递增整数，INSERT OK 包和
   `SELECT LAST_INSERT_ID()` 返回本连接最近一次自动生成的 ID。无括号的
-  `CURRENT_TIMESTAMP` 与 `CURRENT_TIMESTAMP()` 等价；DATETIME 默认值与 `NOW()`
-  使用同一服务本地墙钟，不进行 UTC 墙钟转换。
+  `CURRENT_TIMESTAMP` 与 `CURRENT_TIMESTAMP()` 等价；`NOW([fsp])` 和
+  `CURRENT_TIMESTAMP([fsp])` 支持 `0..6` 位小数秒精度。DATETIME 默认值与 `NOW()`
+  使用同一会话时区的墙钟，不进行 UTC 墙钟转换。
   `ALTER TABLE ... ADD COLUMN` 会原子回填已有行并执行 `FIRST/AFTER` 列位置；非空
   新列在非空表上必须提供默认值。内联 `PRIMARY KEY`、`UNIQUE` 或 `CHECK` 应拆成后
   续独立约束语句。`ADD FOREIGN KEY/CHECK` 会先扫描已有行，不合规时不修改元数据；
@@ -1279,6 +1322,14 @@ CHANGELOG。
 `go vet ./...`、Windows amd64/Linux amd64/Linux arm64 构建、MSI、归档、
 ELF、执行权限、禁入内容和 SHA-256 校验。产物仍复制到
 `dist/GBaseLite-<VERSION>`，开发分支中的版本文件保持不变。
+
+GitHub tag 工作流也会用同一源码一次构建 `linux/amd64`、`linux/arm64`，同时推送
+GHCR 和 Docker Hub 的精确版本、`major.minor` 与 `latest` 标签。GHCR 使用
+`GITHUB_TOKEN`；Docker Hub 必须在仓库 Actions Secrets 中配置
+`DOCKERHUB_USERNAME` 和仅具备目标仓库读写权限的 `DOCKERHUB_TOKEN`。Secrets
+不会写入镜像、日志或发布产物。该路径可用于 CI 发布；本地
+`publish-release.bat -Publish` 仍会在推送 Git tag 前直接构建并推送 Docker Hub，
+因此只应选择其中一条 Docker Hub 发布路径，避免重复推送同一版本。
 
 远程发布前必须满足：
 

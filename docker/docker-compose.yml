@@ -18,6 +18,7 @@ services:
       # DB_USER: root # 首次初始化管理员账号，默认 root。
       # DB_PORT: 3307 # 改端口时，同时修改 ports 与 healthcheck 中的三个 3307。
       # DB_DATA_PATH: /app/data # 默认 ./data；当前工作目录下等同于 /app/data。
+      # DB_TIME_ZONE: SYSTEM # 新连接默认 SQL 时区，也可设为 +08:00 或 Asia/Shanghai。
 
       # 登录失败限速：默认 5 次 / 60 秒，封禁 30 秒。
       # DB_LOGIN_FAILURE_LIMIT: 5

@@ -49,27 +49,34 @@ type Result struct {
 	MetadataChanged bool
 }
 type Session struct {
-	CurrentDatabase   string
-	StreamResults     bool
-	Username          string
-	Host              string
-	RemoteIP          string
-	RemotePort        string
-	ConnectionID      uint32
-	SecureTransport   bool
-	TLSVersion        string
-	TLSCipher         string
-	JournalSessionID  string
-	LastInsertID      uint64
-	ReplayTimestamp   time.Time
-	transaction       *storage.Store
-	transactionGate   bool
-	binlogStatements  []journal.BinlogStatement
-	temporaryTables   map[string]*storage.Table
-	viewStack         map[string]bool
-	copySource        *navicatCopySource
-	copyTargets       map[string]string
-	correlationScopes []map[string]any
+	CurrentDatabase        string
+	StreamResults          bool
+	CharacterSetClient     string
+	CharacterSetConnection string
+	CharacterSetResults    string
+	CollationConnection    string
+	TimeZone               string
+	ServerTimeZone         string
+	Username               string
+	Host                   string
+	RemoteIP               string
+	RemotePort             string
+	ConnectionID           uint32
+	SecureTransport        bool
+	TLSVersion             string
+	TLSCipher              string
+	JournalSessionID       string
+	LastInsertID           uint64
+	ReplayTimestamp        time.Time
+	transaction            *storage.Store
+	transactionGate        bool
+	binlogStatements       []journal.BinlogStatement
+	temporaryTables        map[string]*storage.Table
+	viewStack              map[string]bool
+	copySource             *navicatCopySource
+	copyTargets            map[string]string
+	correlationScopes      []map[string]any
+	timeLocation           *time.Location
 }
 
 type navicatCopySource struct {
@@ -201,6 +208,9 @@ func (e *Engine) CloseSession(session *Session) {
 }
 
 func (e *Engine) Execute(session *Session, sql string) (*Result, error) {
+	if session != nil {
+		session.InitializeSettings()
+	}
 	expanded, err := parser.ExpandMySQLExecutableComments(sql)
 	if err != nil {
 		return nil, err
@@ -249,6 +259,7 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 	if session == nil {
 		session = &Session{}
 	}
+	session.InitializeSettings()
 	databaseAtStart := session.CurrentDatabase
 	_, beginning := statement.(parser.Begin)
 	if session.transaction == nil && !beginning {
@@ -1020,7 +1031,7 @@ func executeInsert(store, autoIncrementStore *storage.Store, session *Session, s
 					return nil, err
 				}
 			} else if column.HasDefault {
-				row[i], err = columnDefaultValue(column)
+				row[i], err = columnDefaultValue(column, session)
 				if err != nil {
 					return nil, err
 				}
@@ -1078,7 +1089,7 @@ func executeInsert(store, autoIncrementStore *storage.Store, session *Session, s
 		}
 		insertErr := database.Insert(table.Name(), row)
 		if errors.Is(insertErr, storage.ErrDuplicateKey) && len(statement.OnDuplicate) > 0 {
-			updated, updateErr := executeInsertDuplicateUpdate(database, table, row, statement.OnDuplicate)
+			updated, updateErr := executeInsertDuplicateUpdate(database, table, row, statement.OnDuplicate, session)
 			if updateErr != nil {
 				return 0, updateErr
 			}
@@ -1221,7 +1232,7 @@ func executeInsert(store, autoIncrementStore *storage.Store, session *Session, s
 	return &Result{AffectedRows: affected, LastInsertID: lastInsertID, Message: message}, nil
 }
 
-func executeInsertDuplicateUpdate(database *storage.Database, table *storage.Table, candidate storage.Row, assignments []parser.InsertAssignment) (bool, error) {
+func executeInsertDuplicateUpdate(database *storage.Database, table *storage.Table, candidate storage.Row, assignments []parser.InsertAssignment, session *Session) (bool, error) {
 	indexes := table.Indexes()
 	var duplicate storage.Row
 	for _, row := range table.Select(nil) {
@@ -1255,6 +1266,9 @@ func executeInsertDuplicateUpdate(database *storage.Database, table *storage.Tab
 	assigned := make(map[int]bool, len(assignments))
 	for _, assignment := range assignments {
 		value, err := evaluateExprWithLookup(assignment.Value, func(name string) (any, error) {
+			if name == sessionLookupIdentifier {
+				return session, nil
+			}
 			if strings.HasPrefix(strings.ToUpper(name), "VALUES(") {
 				columnName := strings.TrimSuffix(strings.TrimPrefix(name, "VALUES("), ")")
 				position, ok := table.ColumnIndex(columnName)
@@ -1288,7 +1302,7 @@ func executeInsertDuplicateUpdate(database *storage.Database, table *storage.Tab
 			continue
 		}
 		if strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP") || strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP()") {
-			converted, conversionErr := storage.NewValue(column.Type, time.Now())
+			converted, conversionErr := storage.NewValue(column.Type, session.Now())
 			if conversionErr != nil {
 				return false, conversionErr
 			}
@@ -1393,7 +1407,7 @@ func executeAlterTableAction(store *storage.Store, session *Session, statement p
 							err = fmt.Errorf("column %q cannot have DEFAULT NULL", column.Name)
 						}
 					} else {
-						_, err = columnDefaultValue(column)
+						_, err = columnDefaultValue(column, session)
 					}
 				}
 				if err == nil {
@@ -1418,7 +1432,7 @@ func executeAlterTableAction(store *storage.Store, session *Session, statement p
 			if err == nil {
 				fill := storage.NullValue(column.Type)
 				if column.HasDefault {
-					fill, err = columnDefaultValue(column)
+					fill, err = columnDefaultValue(column, session)
 				}
 				position := -1
 				if value.First {
@@ -1812,7 +1826,7 @@ func executeSelect(store *storage.Store, session *Session, statement parser.Sele
 	seen := make(map[string]struct{}, len(rows))
 	distinct := make([][]any, 0, len(rows))
 	for _, row := range rows {
-		key := groupedRowKey(row)
+		key := groupedRowKey(row, session)
 		if _, exists := seen[key]; exists {
 			continue
 		}
@@ -1866,7 +1880,7 @@ func executeUnion(store *storage.Store, session *Session, statement parser.Union
 			seen := make(map[string]struct{}, len(rows))
 			distinct := rows[:0]
 			for _, row := range rows {
-				key := groupedRowKey(row)
+				key := groupedRowKey(row, session)
 				if _, exists := seen[key]; exists {
 					continue
 				}
@@ -1902,7 +1916,7 @@ func executeUnion(store *storage.Store, session *Session, statement parser.Union
 		sort.SliceStable(rows, func(leftIndex, rightIndex int) bool {
 			left, right := rows[leftIndex], rows[rightIndex]
 			for index, position := range orderPositions {
-				comparison := compareAny(left[position], right[position])
+				comparison := session.Compare(left[position], right[position])
 				if comparison == 0 {
 					continue
 				}
@@ -1985,7 +1999,7 @@ func executeExplainSelect(store *storage.Store, session *Session, statement pars
 	accessType := "ALL"
 	var selectedKey any
 	estimatedRows := int64(table.RowCount())
-	plan := planIndexAccess(statement, table)
+	plan := planIndexAccess(statement, table, session)
 	if plan != nil {
 		accessType = plan.AccessType
 		selectedKey = plan.Scan.Name
@@ -2088,7 +2102,7 @@ type indexCondition struct {
 	upper *storage.IndexBound
 }
 
-func planIndexAccess(statement parser.Select, table *storage.Table) *indexAccessPlan {
+func planIndexAccess(statement parser.Select, table *storage.Table, session *Session) *indexAccessPlan {
 	if selectHasWindow(statement.Items) || len(statement.GroupBy) > 0 || statement.Having != nil || selectHasAggregate(statement.Items) && !(len(statement.Items) == 1 && isCountExpression(statement.Items[0].Expression)) {
 		return nil
 	}
@@ -2117,6 +2131,9 @@ func planIndexAccess(statement parser.Select, table *storage.Table) *indexAccess
 		}
 		position, exists := table.ColumnIndex(stripQualifier(identifier.Name))
 		if !exists {
+			return
+		}
+		if isTextColumn(table.ColumnsView()[position].Type) && !session.IsBinaryCollation() {
 			return
 		}
 		converted, err := literalToValue(literal.Value, table.ColumnsView()[position])
@@ -2167,6 +2184,15 @@ func planIndexAccess(statement parser.Select, table *storage.Table) *indexAccess
 			plan.Score += 5
 		}
 		plan.OrderSatisfied, plan.Scan.Descending = indexSatisfiesOrder(definition, len(plan.Scan.EqualPrefix), statement.OrderBy)
+		if plan.OrderSatisfied && !session.IsBinaryCollation() {
+			for _, order := range statement.OrderBy {
+				if position, exists := table.ColumnIndex(stripQualifier(order.Column)); exists && isTextColumn(table.ColumnsView()[position].Type) {
+					plan.OrderSatisfied = false
+					plan.Scan.Descending = false
+					break
+				}
+			}
+		}
 		if plan.OrderSatisfied {
 			plan.Score += 3
 		}
@@ -2482,11 +2508,11 @@ func executeSelectCoreInner(store *storage.Store, session *Session, statement pa
 	indexedRow, indexedFound, indexed := storage.Row(nil), false, false
 	var accessPlan *indexAccessPlan
 	if accessTable != nil {
-		indexedRow, indexedFound, indexed = lookupUniquePredicate(statement.Where, accessTable, accessTable.ColumnsView())
-		accessPlan = planIndexAccess(statement, accessTable)
+		indexedRow, indexedFound, indexed = lookupUniquePredicate(statement.Where, accessTable, accessTable.ColumnsView(), session)
+		accessPlan = planIndexAccess(statement, accessTable, session)
 	}
 	if selectHasWindow(statement.Items) {
-		return executeWindowSelect(table, predicate, statement, columns)
+		return executeWindowSelect(table, predicate, statement, columns, session)
 	}
 	if len(statement.GroupBy) == 0 && statement.Having == nil && len(statement.Items) == 1 && isCountExpression(statement.Items[0].Expression) {
 		name := statement.Items[0].Alias
@@ -2516,7 +2542,7 @@ func executeSelectCoreInner(store *storage.Store, session *Session, statement pa
 		return result, nil
 	}
 	if len(statement.GroupBy) > 0 || selectHasAggregate(statement.Items) {
-		return executeGroupedSelect(table, predicate, statement, columns)
+		return executeGroupedSelect(table, predicate, statement, columns, session)
 	}
 	if statement.Having != nil {
 		return nil, errors.New("HAVING requires GROUP BY or an aggregate expression")
@@ -2669,7 +2695,7 @@ func executeSelectCoreInner(store *storage.Store, session *Session, statement pa
 	rows := table.Project(predicate, scanColumns, 0, -1)
 	sort.SliceStable(rows, func(i, j int) bool {
 		for index, position := range orderPositions {
-			comparison := compareAny(rows[i][position], rows[j][position])
+			comparison := session.Compare(rows[i][position], rows[j][position])
 			if comparison != 0 {
 				if orderDescending[index] {
 					return comparison > 0
@@ -2884,6 +2910,9 @@ func joinRelations(store *storage.Store, session *Session, left, right *storage.
 	rightRows := right.Select(nil)
 	rightMatched := make([]bool, len(rightRows))
 	leftJoinColumn, rightJoinColumn, hashJoin := equalityJoinColumns(join.On, left, right)
+	if hashJoin && !session.IsBinaryCollation() && (isTextColumn(leftColumns[leftJoinColumn].Type) || isTextColumn(rightColumns[rightJoinColumn].Type)) {
+		hashJoin = false
+	}
 	var rightBuckets map[joinHashKey][]int
 	if hashJoin {
 		rightBuckets = make(map[joinHashKey][]int, len(rightRows))
@@ -3191,7 +3220,7 @@ func executeExpressionSelect(store *storage.Store, table, accessTable *storage.T
 	if len(statement.OrderBy) > 0 && !indexOrdered {
 		sort.SliceStable(rows, func(i, j int) bool {
 			for index := range statement.OrderBy {
-				comparison := compareAny(rows[i].keys[index], rows[j].keys[index])
+				comparison := session.Compare(rows[i].keys[index], rows[j].keys[index])
 				if comparison != 0 {
 					if statement.OrderBy[index].Desc {
 						return comparison > 0
@@ -3379,7 +3408,7 @@ func containsFold(value, target string) bool {
 	return false
 }
 
-func executeWindowSelect(table *storage.Table, predicate storage.Predicate, statement parser.Select, columns []storage.Column) (*Result, error) {
+func executeWindowSelect(table *storage.Table, predicate storage.Predicate, statement parser.Select, columns []storage.Column, session *Session) (*Result, error) {
 	if len(statement.GroupBy) > 0 || statement.Having != nil {
 		return nil, errors.New("window functions with GROUP BY or HAVING require a derived table")
 	}
@@ -3434,7 +3463,7 @@ func executeWindowSelect(table *storage.Table, predicate storage.Predicate, stat
 			if plan.window != nil {
 				continue
 			}
-			value, err := evaluateExpr(plan.expression, table, row)
+			value, err := evaluateExprWithContext(plan.expression, table, row, session, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -3445,7 +3474,7 @@ func executeWindowSelect(table *storage.Table, predicate storage.Predicate, stat
 		if plan.window == nil {
 			continue
 		}
-		if err := evaluateWindow(table, rows, projected, itemIndex, *plan.window, plan.column.Type); err != nil {
+		if err := evaluateWindow(table, rows, projected, itemIndex, *plan.window, plan.column.Type, session); err != nil {
 			return nil, err
 		}
 	}
@@ -3464,7 +3493,7 @@ func executeWindowSelect(table *storage.Table, predicate storage.Predicate, stat
 				if err != nil {
 					return nil, err
 				}
-				keys[rowIndex][orderIndex], err = evaluateExpr(expression, table, row)
+				keys[rowIndex][orderIndex], err = evaluateExprWithContext(expression, table, row, session, nil)
 				if err != nil {
 					return nil, err
 				}
@@ -3476,7 +3505,7 @@ func executeWindowSelect(table *storage.Table, predicate storage.Predicate, stat
 		}
 		sort.SliceStable(indexes, func(i, j int) bool {
 			for orderIndex, order := range statement.OrderBy {
-				comparison := compareAny(keys[indexes[i]][orderIndex], keys[indexes[j]][orderIndex])
+				comparison := session.Compare(keys[indexes[i]][orderIndex], keys[indexes[j]][orderIndex])
 				if comparison != 0 {
 					if order.Desc {
 						return comparison > 0
@@ -3519,7 +3548,7 @@ func resultColumnPosition(name string, columns []Column) int {
 	return -1
 }
 
-func evaluateWindow(table *storage.Table, rows []storage.Row, output [][]any, outputIndex int, window parser.WindowExpr, resultType storage.DataType) error {
+func evaluateWindow(table *storage.Table, rows []storage.Row, output [][]any, outputIndex int, window parser.WindowExpr, resultType storage.DataType, session *Session) error {
 	name := strings.ToUpper(window.Function.Name)
 	if name != "ROW_NUMBER" && name != "RANK" && name != "DENSE_RANK" && name != "COUNT" && name != "SUM" && name != "AVG" && name != "MIN" && name != "MAX" {
 		return fmt.Errorf("unsupported window function %s", window.Function.Name)
@@ -3537,20 +3566,20 @@ func evaluateWindow(table *storage.Table, rows []storage.Row, output [][]any, ou
 	for rowIndex, row := range rows {
 		partitionValues := make([]any, len(window.PartitionBy))
 		for index, expression := range window.PartitionBy {
-			value, err := evaluateExpr(expression, table, row)
+			value, err := evaluateExprWithContext(expression, table, row, session, nil)
 			if err != nil {
 				return err
 			}
 			partitionValues[index] = value
 		}
-		key := groupedRowKey(partitionValues)
+		key := groupedRowKey(partitionValues, session)
 		if _, exists := partitions[key]; !exists {
 			partitionOrder = append(partitionOrder, key)
 		}
 		partitions[key] = append(partitions[key], rowIndex)
 		orderKeys[rowIndex] = make([]any, len(window.OrderBy))
 		for index, order := range window.OrderBy {
-			value, err := evaluateExpr(order.Expression, table, row)
+			value, err := evaluateExprWithContext(order.Expression, table, row, session, nil)
 			if err != nil {
 				return err
 			}
@@ -3560,7 +3589,7 @@ func evaluateWindow(table *storage.Table, rows []storage.Row, output [][]any, ou
 	for _, partitionKey := range partitionOrder {
 		indexes := partitions[partitionKey]
 		sort.SliceStable(indexes, func(i, j int) bool {
-			return compareWindowOrder(orderKeys[indexes[i]], orderKeys[indexes[j]], window.OrderBy) < 0
+			return compareWindowOrder(orderKeys[indexes[i]], orderKeys[indexes[j]], window.OrderBy, session) < 0
 		})
 		switch name {
 		case "ROW_NUMBER":
@@ -3570,7 +3599,7 @@ func evaluateWindow(table *storage.Table, rows []storage.Row, output [][]any, ou
 		case "RANK", "DENSE_RANK":
 			rank, dense := int64(1), int64(1)
 			for position, rowIndex := range indexes {
-				if position > 0 && compareWindowOrder(orderKeys[indexes[position-1]], orderKeys[rowIndex], window.OrderBy) != 0 {
+				if position > 0 && compareWindowOrder(orderKeys[indexes[position-1]], orderKeys[rowIndex], window.OrderBy, session) != 0 {
 					rank = int64(position + 1)
 					dense++
 				}
@@ -3584,11 +3613,11 @@ func evaluateWindow(table *storage.Table, rows []storage.Row, output [][]any, ou
 			state := aggregateState{}
 			if len(window.OrderBy) == 0 {
 				for _, rowIndex := range indexes {
-					candidate, star, err := windowAggregateCandidate(table, rows[rowIndex], window.Function)
+					candidate, star, err := windowAggregateCandidate(table, rows[rowIndex], window.Function, session)
 					if err != nil {
 						return err
 					}
-					updateAggregate(&state, windowAggregateKind(name), candidate, star)
+					updateAggregate(&state, windowAggregateKind(name), candidate, star, session)
 				}
 				value := finishAggregate(state, windowAggregateKind(name), resultType)
 				for _, rowIndex := range indexes {
@@ -3600,16 +3629,16 @@ func evaluateWindow(table *storage.Table, rows []storage.Row, output [][]any, ou
 			// current row, so all peers with equal ORDER BY keys share a value.
 			for start := 0; start < len(indexes); {
 				end := start + 1
-				for end < len(indexes) && compareWindowOrder(orderKeys[indexes[start]], orderKeys[indexes[end]], window.OrderBy) == 0 {
+				for end < len(indexes) && compareWindowOrder(orderKeys[indexes[start]], orderKeys[indexes[end]], window.OrderBy, session) == 0 {
 					end++
 				}
 				for position := start; position < end; position++ {
 					rowIndex := indexes[position]
-					candidate, star, err := windowAggregateCandidate(table, rows[rowIndex], window.Function)
+					candidate, star, err := windowAggregateCandidate(table, rows[rowIndex], window.Function, session)
 					if err != nil {
 						return err
 					}
-					updateAggregate(&state, windowAggregateKind(name), candidate, star)
+					updateAggregate(&state, windowAggregateKind(name), candidate, star, session)
 				}
 				value := finishAggregate(state, windowAggregateKind(name), resultType)
 				for position := start; position < end; position++ {
@@ -3622,9 +3651,9 @@ func evaluateWindow(table *storage.Table, rows []storage.Row, output [][]any, ou
 	return nil
 }
 
-func compareWindowOrder(left, right []any, orders []parser.WindowOrder) int {
+func compareWindowOrder(left, right []any, orders []parser.WindowOrder, session *Session) int {
 	for index, order := range orders {
-		comparison := compareAny(left[index], right[index])
+		comparison := session.Compare(left[index], right[index])
 		if comparison != 0 {
 			if order.Desc {
 				return -comparison
@@ -3635,11 +3664,11 @@ func compareWindowOrder(left, right []any, orders []parser.WindowOrder) int {
 	return 0
 }
 
-func windowAggregateCandidate(table *storage.Table, row storage.Row, function parser.FunctionExpr) (any, bool, error) {
+func windowAggregateCandidate(table *storage.Table, row storage.Row, function parser.FunctionExpr, session *Session) (any, bool, error) {
 	if function.Star {
 		return nil, true, nil
 	}
-	value, err := evaluateExpr(function.Args[0], table, row)
+	value, err := evaluateExprWithContext(function.Args[0], table, row, session, nil)
 	return value, false, err
 }
 
@@ -3746,7 +3775,7 @@ func collectAggregateNodes(expression parser.Expr, nodes map[string]aggregateNod
 	}
 }
 
-func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, statement parser.Select, columns []storage.Column) (*Result, error) {
+func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, statement parser.Select, columns []storage.Column, session *Session) (*Result, error) {
 	groupExpressions := make([]parser.Expr, len(statement.GroupBy))
 	groupIndexes := make([]int, len(statement.GroupBy))
 	groupPositions := make(map[int]int, len(statement.GroupBy))
@@ -3891,13 +3920,13 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 	err := table.Visit(predicate, func(row storage.Row) error {
 		groupValues := make([]any, len(groupIndexes))
 		for index, expression := range groupExpressions {
-			value, evalErr := evaluateExpr(expression, table, row)
+			value, evalErr := evaluateExprWithContext(expression, table, row, session, nil)
 			if evalErr != nil {
 				return evalErr
 			}
 			groupValues[index] = value
 		}
-		key := groupedRowKey(groupValues)
+		key := groupedRowKey(groupValues, session)
 		bucketIndex, exists := groups[key]
 		if !exists {
 			bucketIndex = len(buckets)
@@ -3907,14 +3936,14 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 		for key, node := range aggregateNodes {
 			var candidate any
 			if !node.star && node.expression != nil {
-				value, evalErr := evaluateExpr(node.expression, table, row)
+				value, evalErr := evaluateExprWithContext(node.expression, table, row, session, nil)
 				if evalErr != nil {
 					return evalErr
 				}
 				candidate = value
 			}
 			state := buckets[bucketIndex].aggregates[key]
-			updateAggregate(&state, node.kind, candidate, node.star)
+			updateAggregate(&state, node.kind, candidate, node.star, session)
 			buckets[bucketIndex].aggregates[key] = state
 		}
 		for itemIndex, item := range items {
@@ -3925,7 +3954,7 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 			if item.aggregateColumn >= 0 {
 				candidate = row[item.aggregateColumn].Interface()
 			}
-			updateAggregate(&buckets[bucketIndex].states[itemIndex], item.aggregate, candidate, item.aggregateColumn < 0)
+			updateAggregate(&buckets[bucketIndex].states[itemIndex], item.aggregate, candidate, item.aggregateColumn < 0, session)
 		}
 		return nil
 	})
@@ -3948,7 +3977,7 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 		}
 		for itemIndex := range statement.Items {
 			if items[itemIndex].aggregate == aggregateNone && items[itemIndex].expression != nil {
-				value, evalErr := evaluateGroupedExpression(items[itemIndex].expression, resultColumns, resultRow, bucket, aggregateNodes)
+				value, evalErr := evaluateGroupedExpression(items[itemIndex].expression, resultColumns, resultRow, bucket, aggregateNodes, session)
 				if evalErr != nil {
 					return nil, evalErr
 				}
@@ -3956,7 +3985,7 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 			}
 		}
 		if statement.Having != nil {
-			value, havingErr := evaluateGroupedResult(statement.Having, statement, resultColumns, groupIndexes, bucket, resultRow, columns)
+			value, havingErr := evaluateGroupedResult(statement.Having, statement, resultColumns, groupIndexes, bucket, resultRow, columns, session)
 			if havingErr != nil {
 				return nil, havingErr
 			}
@@ -3977,7 +4006,7 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 		}
 		sort.SliceStable(resultRows, func(i, j int) bool {
 			for index, position := range positions {
-				comparison := compareAny(resultRows[i][position], resultRows[j][position])
+				comparison := session.Compare(resultRows[i][position], resultRows[j][position])
 				if comparison != 0 {
 					if statement.OrderBy[index].Desc {
 						return comparison > 0
@@ -4021,8 +4050,11 @@ func hasAggregateNode(expression parser.Expr) bool {
 	return len(nodes) > 0
 }
 
-func evaluateGroupedExpression(expression parser.Expr, resultColumns []Column, resultRow []any, bucket groupedBucket, nodes map[string]aggregateNode) (any, error) {
+func evaluateGroupedExpression(expression parser.Expr, resultColumns []Column, resultRow []any, bucket groupedBucket, nodes map[string]aggregateNode, session *Session) (any, error) {
 	return evaluateExprWithLookup(expression, func(name string) (any, error) {
+		if name == sessionLookupIdentifier {
+			return session, nil
+		}
 		if node, ok := nodes[name]; ok {
 			return finishAggregate(bucket.aggregates[name], node.kind, storage.TypeDouble), nil
 		}
@@ -4082,7 +4114,7 @@ func isNumericType(dataType storage.DataType) bool {
 	return dataType == storage.TypeInt || dataType == storage.TypeBigInt || dataType == storage.TypeFloat || dataType == storage.TypeDouble
 }
 
-func updateAggregate(state *aggregateState, kind aggregateKind, candidate any, countAll bool) {
+func updateAggregate(state *aggregateState, kind aggregateKind, candidate any, countAll bool, session *Session) {
 	if kind == aggregateCount {
 		if countAll || candidate != nil {
 			state.count++
@@ -4099,12 +4131,12 @@ func updateAggregate(state *aggregateState, kind aggregateKind, candidate any, c
 		state.count++
 		state.has = true
 	case aggregateMin:
-		if !state.has || compareAny(candidate, state.value) < 0 {
+		if !state.has || session.Compare(candidate, state.value) < 0 {
 			state.value = candidate
 			state.has = true
 		}
 	case aggregateMax:
-		if !state.has || compareAny(candidate, state.value) > 0 {
+		if !state.has || session.Compare(candidate, state.value) > 0 {
 			state.value = candidate
 			state.has = true
 		}
@@ -4195,8 +4227,11 @@ func normalizedSQL(expression string) string {
 	return strings.ToUpper(strings.Join(strings.Fields(expression), ""))
 }
 
-func evaluateGroupedResult(expr parser.Expr, statement parser.Select, resultColumns []Column, groupIndexes []int, bucket groupedBucket, resultRow []any, tableColumns []storage.Column) (any, error) {
+func evaluateGroupedResult(expr parser.Expr, statement parser.Select, resultColumns []Column, groupIndexes []int, bucket groupedBucket, resultRow []any, tableColumns []storage.Column, session *Session) (any, error) {
 	return evaluateExprWithLookup(expr, func(name string) (any, error) {
+		if name == sessionLookupIdentifier {
+			return session, nil
+		}
 		name = stripQualifier(name)
 		for index, column := range resultColumns {
 			if strings.EqualFold(column.Name, name) {
@@ -4217,11 +4252,13 @@ func evaluateGroupedResult(expr parser.Expr, statement parser.Select, resultColu
 	})
 }
 
-func groupedRowKey(values []any) string {
+func groupedRowKey(values []any, session *Session) string {
 	var key strings.Builder
 	for _, value := range values {
 		if text, ok := value.(string); ok {
-			value = strings.ToLower(text)
+			if session == nil || !strings.HasSuffix(strings.ToLower(session.CollationConnection), "_bin") && !strings.EqualFold(session.CollationConnection, "binary") {
+				value = strings.ToLower(text)
+			}
 		}
 		text := fmt.Sprintf("%T:%v", value, value)
 		fmt.Fprintf(&key, "%d:%s;", len(text), text)
@@ -4257,7 +4294,7 @@ func executeScalarSelect(session *Session, statement parser.Select) (*Result, er
 			value = int64(session.LastInsertID)
 			column.Type = storage.TypeBigInt
 		case expression == "NOW()" || expression == "CURRENT_TIMESTAMP()" || expression == "CURRENT_TIMESTAMP":
-			value = time.Now().Format("2006-01-02 15:04:05")
+			value = session.Now().Format("2006-01-02 15:04:05")
 			column.Type = storage.TypeDateTime
 		case strings.HasPrefix(expression, "@@"):
 			value = ""
@@ -4271,6 +4308,9 @@ func executeScalarSelect(session *Session, statement parser.Select) (*Result, er
 					return nil, fmt.Errorf("unsupported scalar expression %q: %w", item.Expression, parseErr)
 				}
 				value, parseErr = evaluateExprWithLookup(parsed, func(name string) (any, error) {
+					if name == sessionLookupIdentifier {
+						return session, nil
+					}
 					if correlated, exists := correlationScopeValue(session, name); exists {
 						return correlated, nil
 					}
@@ -4397,7 +4437,7 @@ func executeUpdate(store *storage.Store, session *Session, statement parser.Upda
 				continue
 			}
 			if strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP") || strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP()") {
-				candidate[position], err = storage.NewValue(column.Type, time.Now())
+				candidate[position], err = storage.NewValue(column.Type, session.Now())
 				if err != nil {
 					return nil, err
 				}
@@ -4554,7 +4594,7 @@ func executeJoinUpdate(store *storage.Store, session *Session, statement parser.
 				continue
 			}
 			if strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP") || strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP()") {
-				candidate[position], err = storage.NewValue(column.Type, time.Now())
+				candidate[position], err = storage.NewValue(column.Type, session.Now())
 				if err != nil {
 					return nil, err
 				}
@@ -5397,7 +5437,7 @@ func expressionPredicateWithContextCapture(expr parser.Expr, table *storage.Tabl
 	}
 }
 
-func lookupUniquePredicate(expr parser.Expr, table *storage.Table, columns []storage.Column) (storage.Row, bool, bool) {
+func lookupUniquePredicate(expr parser.Expr, table *storage.Table, columns []storage.Column, session *Session) (storage.Row, bool, bool) {
 	comparison, ok := expr.(parser.BinaryExpr)
 	if !ok || comparison.Operator != "=" && comparison.Operator != "<=>" {
 		return nil, false, false
@@ -5413,6 +5453,9 @@ func lookupUniquePredicate(expr parser.Expr, table *storage.Table, columns []sto
 	}
 	position, exists := queryColumnIndex(table, identifier.Name)
 	if !exists {
+		return nil, false, false
+	}
+	if isTextColumn(columns[position].Type) && !session.IsBinaryCollation() {
 		return nil, false, false
 	}
 	value, err := literalToValue(literal.Value, columns[position])
@@ -5433,6 +5476,9 @@ func evaluateExpr(expr parser.Expr, table *storage.Table, row storage.Row) (any,
 
 func evaluateExprWithContext(expr parser.Expr, table *storage.Table, row storage.Row, session *Session, store *storage.Store) (any, error) {
 	lookup := func(name string) (any, error) {
+		if name == sessionLookupIdentifier {
+			return session, nil
+		}
 		if session != nil && strings.EqualFold(name, "LAST_INSERT_ID()") {
 			return int64(session.LastInsertID), nil
 		}
@@ -5495,7 +5541,7 @@ func evaluateExprWithLookup(expr parser.Expr, lookup func(string) (any, error)) 
 			}
 			matched := truthy(condition)
 			if value.Operand != nil {
-				matched = operand != nil && condition != nil && compareAny(operand, condition) == 0
+				matched = operand != nil && condition != nil && compareWithLookup(lookup, operand, condition) == 0
 			}
 			if matched {
 				return evaluateExprWithLookup(branch.Then, lookup)
@@ -5555,7 +5601,7 @@ func evaluateExprWithLookup(expr parser.Expr, lookup func(string) (any, error)) 
 			if itemErr != nil {
 				return nil, itemErr
 			}
-			equal, unknown, compareErr := sqlInEqual(candidate, item)
+			equal, unknown, compareErr := sqlInEqualWithLookup(lookup, candidate, item)
 			if compareErr != nil {
 				return nil, compareErr
 			}
@@ -5593,7 +5639,7 @@ func evaluateExprWithLookup(expr parser.Expr, lookup func(string) (any, error)) 
 		if candidate == nil || lower == nil || upper == nil {
 			return nil, nil
 		}
-		matched := compareAny(candidate, lower) >= 0 && compareAny(candidate, upper) <= 0
+		matched := compareWithLookup(lookup, candidate, lower) >= 0 && compareWithLookup(lookup, candidate, upper) <= 0
 		if value.Not {
 			matched = !matched
 		}
@@ -5635,42 +5681,42 @@ func evaluateExprWithLookup(expr parser.Expr, lookup func(string) (any, error)) 
 			if left == nil || right == nil {
 				return nil, nil
 			}
-			return compareAny(left, right) == 0, nil
+			return compareWithLookup(lookup, left, right) == 0, nil
 		case "<=>":
 			if left == nil || right == nil {
 				return left == nil && right == nil, nil
 			}
-			return compareAny(left, right) == 0, nil
+			return compareWithLookup(lookup, left, right) == 0, nil
 		case "!=", "<>":
 			if left == nil || right == nil {
 				return nil, nil
 			}
-			return compareAny(left, right) != 0, nil
+			return compareWithLookup(lookup, left, right) != 0, nil
 		case ">":
 			if left == nil || right == nil {
 				return nil, nil
 			}
-			return compareAny(left, right) > 0, nil
+			return compareWithLookup(lookup, left, right) > 0, nil
 		case "<":
 			if left == nil || right == nil {
 				return nil, nil
 			}
-			return compareAny(left, right) < 0, nil
+			return compareWithLookup(lookup, left, right) < 0, nil
 		case ">=":
 			if left == nil || right == nil {
 				return nil, nil
 			}
-			return compareAny(left, right) >= 0, nil
+			return compareWithLookup(lookup, left, right) >= 0, nil
 		case "<=":
 			if left == nil || right == nil {
 				return nil, nil
 			}
-			return compareAny(left, right) <= 0, nil
+			return compareWithLookup(lookup, left, right) <= 0, nil
 		case "LIKE", "NOT LIKE":
 			if left == nil || right == nil {
 				return nil, nil
 			}
-			matched := likeMatch(fmt.Sprint(left), fmt.Sprint(right))
+			matched := likeMatchWithLookup(lookup, fmt.Sprint(left), fmt.Sprint(right))
 			if value.Operator == "NOT LIKE" {
 				matched = !matched
 			}
@@ -5788,7 +5834,7 @@ func evaluateFunction(function parser.FunctionExpr, lookup func(string) (any, er
 		if arguments[0] == nil || arguments[1] == nil {
 			return arguments[0], nil
 		}
-		if compareAny(arguments[0], arguments[1]) == 0 {
+		if compareWithLookup(lookup, arguments[0], arguments[1]) == 0 {
 			return nil, nil
 		}
 		return arguments[0], nil
@@ -5812,7 +5858,7 @@ func evaluateFunction(function parser.FunctionExpr, lookup func(string) (any, er
 			if argument == nil {
 				return nil, nil
 			}
-			comparison := compareAny(argument, result)
+			comparison := compareWithLookup(lookup, argument, result)
 			if (name == "GREATEST" && comparison > 0) || (name == "LEAST" && comparison < 0) {
 				result = argument
 			}
@@ -6163,15 +6209,17 @@ func evaluateFunction(function parser.FunctionExpr, lookup func(string) (any, er
 		}
 		return math.Log(number) / math.Log(base), nil
 	case "NOW", "CURRENT_TIMESTAMP":
-		if err := require(0); err != nil {
-			return nil, err
-		}
-		return time.Now().Format("2006-01-02 15:04:05"), nil
+		session := sessionFromLookup(lookup)
+		return mysqlCurrentTimestamp(name, arguments, session.Location())
 	case "CURDATE", "CURRENT_DATE":
 		if err := require(0); err != nil {
 			return nil, err
 		}
-		return normalizeSQLDate(time.Now()), nil
+		session := sessionFromLookup(lookup)
+		if session == nil {
+			return normalizeSQLDate(time.Now()), nil
+		}
+		return normalizeSQLDate(session.Now()), nil
 	case "DATE":
 		if err := require(1); err != nil || arguments[0] == nil {
 			return nil, err
@@ -6330,6 +6378,28 @@ func mysqlRound(number float64, digits int64, truncate bool) float64 {
 	return round(number/scale) * scale
 }
 
+func mysqlCurrentTimestamp(name string, arguments []any, location *time.Location) (string, error) {
+	if len(arguments) > 1 {
+		return "", fmt.Errorf("%s expects 0 or 1 arguments", name)
+	}
+	precision := 0
+	if len(arguments) == 1 {
+		number, ok := numeric(arguments[0])
+		if !ok || math.IsNaN(number) || math.IsInf(number, 0) || math.Trunc(number) != number || number < 0 || number > 6 {
+			return "", fmt.Errorf("%s precision must be an integer from 0 to 6", name)
+		}
+		precision = int(number)
+	}
+	layout := "2006-01-02 15:04:05"
+	if precision > 0 {
+		layout += "." + strings.Repeat("0", precision)
+	}
+	if location == nil {
+		location = time.Local
+	}
+	return time.Now().In(location).Format(layout), nil
+}
+
 func coerceSQLTime(value any) (time.Time, error) {
 	switch date := value.(type) {
 	case time.Time:
@@ -6429,7 +6499,6 @@ type sqlInterval struct {
 }
 
 func normalizeSQLDate(value time.Time) time.Time {
-	value = value.In(time.Local)
 	return time.Date(value.Year(), value.Month(), value.Day(), 0, 0, 0, 0, time.UTC)
 }
 
@@ -6518,8 +6587,12 @@ func sqlInEqual(left, right any) (bool, bool, error) {
 }
 
 func likeMatch(value, pattern string) bool {
-	input := []rune(strings.ToLower(value))
-	wildcard := []rune(strings.ToLower(pattern))
+	return likeMatchCaseSensitive(strings.ToLower(value), strings.ToLower(pattern))
+}
+
+func likeMatchCaseSensitive(value, pattern string) bool {
+	input := []rune(value)
+	wildcard := []rune(pattern)
 	inputPosition, patternPosition := 0, 0
 	starPosition, retryInput := -1, 0
 	for inputPosition < len(input) {
@@ -6772,13 +6845,13 @@ func storageColumnDefinition(column parser.ColumnDef) (storage.Column, error) {
 	return definition, nil
 }
 
-func columnDefaultValue(column storage.Column) (storage.Value, error) {
+func columnDefaultValue(column storage.Column, session *Session) (storage.Value, error) {
 	if column.DefaultExpression == "" {
 		return column.Default, nil
 	}
 	switch strings.ToLower(strings.TrimSpace(column.DefaultExpression)) {
 	case "current_timestamp", "current_timestamp()", "localtimestamp", "localtimestamp()", "now()":
-		return storage.NewValue(column.Type, time.Now())
+		return storage.NewValue(column.Type, session.Now())
 	default:
 		return storage.Value{}, fmt.Errorf("unsupported default expression %q for column %q", column.DefaultExpression, column.Name)
 	}

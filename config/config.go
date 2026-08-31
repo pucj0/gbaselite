@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gbaselite/internal/mysqlcompat"
 )
 
 type Config struct {
@@ -19,6 +21,7 @@ type Config struct {
 		MaxConnections  int
 		WriteBufferSize int
 		SlowQuery       time.Duration
+		TimeZone        string
 	}
 	Storage  struct{ Path string }
 	Auth     struct{ Username, Password string }
@@ -57,6 +60,7 @@ func Default() Config {
 	cfg.Server.MaxConnections = 512
 	cfg.Server.WriteBufferSize = 8 << 10
 	cfg.Server.SlowQuery = 100 * time.Millisecond
+	cfg.Server.TimeZone = "SYSTEM"
 	cfg.Storage.Path = "./data"
 	cfg.Auth.Username = "root"
 	cfg.Auth.Password = "change-this-password"
@@ -116,6 +120,8 @@ func Load(path string) (Config, error) {
 				var milliseconds int
 				milliseconds, err = strconv.Atoi(value)
 				cfg.Server.SlowQuery = time.Duration(milliseconds) * time.Millisecond
+			case "server.time_zone":
+				cfg.Server.TimeZone = value
 			case "storage.path":
 				cfg.Storage.Path = value
 			case "auth.username":
@@ -191,6 +197,9 @@ func Load(path string) (Config, error) {
 			return cfg, parseErr
 		}
 		cfg.Server.SlowQuery = time.Duration(milliseconds) * time.Millisecond
+	}
+	if value := os.Getenv("DB_TIME_ZONE"); value != "" {
+		cfg.Server.TimeZone = value
 	}
 	if value := os.Getenv("DB_DATA_PATH"); value != "" {
 		cfg.Storage.Path = value
@@ -286,6 +295,9 @@ func Load(path string) (Config, error) {
 		if cfg.Binlog.Path == "/app/data/binlog.jsonl" {
 			cfg.Binlog.Path = "./data/binlog.jsonl"
 		}
+	}
+	if _, _, err := mysqlcompat.ParseTimeZone(cfg.Server.TimeZone); err != nil {
+		return cfg, fmt.Errorf("invalid server.time_zone: %w", err)
 	}
 	if cfg.TLS.RequireSecureTransport && !cfg.TLS.Enabled {
 		return cfg, fmt.Errorf("tls.require_secure_transport requires tls.enabled")

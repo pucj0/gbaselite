@@ -24,6 +24,7 @@ const (
 const ServerCapabilities = ClientLongPassword | ClientLongFlag | ClientConnectWithDB | ClientProtocol41 | ClientTransactions | ClientSecureConnection | ClientMultiResults | ClientPluginAuth | ClientConnectAttrs | ClientPluginAuthLenEncData | ClientSessionTrack
 
 type HandshakeResponse struct {
+	CharacterSet byte
 	Capabilities uint32
 	Username     string
 	AuthResponse []byte
@@ -73,6 +74,7 @@ func ParseHandshakeResponse(data []byte) (HandshakeResponse, error) {
 		return response, fmt.Errorf("short handshake response")
 	}
 	response.Capabilities = binary.LittleEndian.Uint32(data[:4])
+	response.CharacterSet = data[8]
 	position := 32
 	username, err := ReadNullTerminated(data, &position)
 	if err != nil {

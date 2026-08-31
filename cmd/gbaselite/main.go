@@ -159,6 +159,7 @@ func runServerControlled(args []string, externalStop <-chan struct{}, ready chan
 		MaxConnections:         cfg.Server.MaxConnections,
 		WriteBufferSize:        cfg.Server.WriteBufferSize,
 		SlowQuery:              cfg.Server.SlowQuery,
+		DefaultTimeZone:        cfg.Server.TimeZone,
 		Audit:                  auditLog,
 		AuthFailureLimit:       cfg.Security.LoginFailureLimit,
 		AuthFailureWindow:      cfg.Security.LoginFailureWindow,
