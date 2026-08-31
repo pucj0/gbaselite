@@ -771,7 +771,9 @@ DROP USER IF EXISTS 'app'@'%';
   `utf8mb4`。`SHOW CHARACTER SET [LIKE ...]` 会列出这些字符集；握手排序规则编号、
   `SET NAMES charset [COLLATE collation]`、`SET CHARACTER SET charset` 以及各
   `character_set_*` 会话变量会实际更新当前连接，未知字符集、未知排序规则或字符集
-  与排序规则不匹配会返回错误。
+  与排序规则不匹配会返回错误。`mysqldump` 使用的
+  `SET @saved_cs_client=@@character_set_client` 保存与恢复语句按连接隔离，并可还原
+  对应字符集设置；这不代表支持任意 MySQL 用户变量表达式。
 - 排序规则支持 `ascii_general_ci/ascii_bin`、`binary`、
   `latin1_swedish_ci/latin1_general_ci/latin1_bin`、
   `utf8_general_ci/utf8_unicode_ci/utf8_bin` 和
@@ -1237,8 +1239,8 @@ Windows PowerShell 会先检查 `gofmt`，执行完整测试和静态检查，�
 push、GHCR push 或其他上传操作。
 
 Windows 可直接双击项目根目录的 `release.bat` 一键发布。脚本从源码当前版本自动计
-算下一版本：修订号从 `001` 到 `999` 使用三位补零，例如 `1.0.123` 的下一版本是
-`1.0.124`；达到 `1.0.999` 后进位到 `1.1.0`，再继续为 `1.1.001`。它会同步源码、
+算下一版本：patch 使用单个数字，从 `x.y.0` 递增到 `x.y.9`；例如 `1.1.8` 的下一版
+本是 `1.1.9`，随后进位到 `1.2.0`。它会同步源码、
 README、版本化裸二进制 Compose 路径、环境示例、工作流默认版本和 CHANGELOG，
 在独立 `.tmp` 候选目录完成测试、Compose 配置检查、三平台构建、中文 MSI 与归档校验，
 全部成功后才创建

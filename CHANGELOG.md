@@ -3,9 +3,9 @@
 All notable changes to GBaseLite are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Releases use numeric `major.minor.revision` versions, with non-zero revisions
-padded to at least three digits, for example `1.0.001`; revision `999` rolls
-over to revision 0 of the next minor version.
+New releases use `major.minor.patch` versions with a single-digit patch. The
+patch advances from 0 through 9, then rolls to patch 0 of the next minor
+version, for example `1.1.9` to `1.2.0`. Existing historical tags are retained.
 
 Before the first public 1.0.0 release, development snapshots used internal
 build identifiers from 1.0.0 through 1.0.042. Their detailed notes are retained
@@ -41,15 +41,18 @@ releases.
 - Tag-triggered GitHub Actions builds now publish the same multi-architecture
   image and stable semantic tags to both GHCR and Docker Hub, using repository
   secrets for the Docker Hub login.
+- Release versioning now advances from `x.y.0` through `x.y.9`, then rolls to
+  `x.(y+1).0`; the next release is `1.1.0`.
 
 ### Fixed
 
 - Fixed `NOW()` and `CURRENT_TIMESTAMP()` rejecting a fractional-seconds
   precision argument such as `NOW(3)`; precision values from 0 through 6 are
   now supported.
-
 - Release packaging now computes SHA-256 checksums through the .NET standard
   cryptography API when `Get-FileHash` is unavailable.
+- Fixed MySQL dump imports that restore `character_set_client` through a saved
+  user variable such as `@saved_cs_client`.
 
 ## [1.0.002] - 2026-08-05
 

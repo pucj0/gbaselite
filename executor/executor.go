@@ -58,6 +58,7 @@ type Session struct {
 	TimeZone               string
 	ServerTimeZone         string
 	Username               string
+	UserVariables          map[string]string
 	Host                   string
 	RemoteIP               string
 	RemotePort             string

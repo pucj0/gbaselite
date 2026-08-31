@@ -29,13 +29,9 @@ $expectedDockerRepository = "pucj/gbaselite"
 function Assert-ReleaseVersion {
     param([Parameter(Mandatory)][string]$Value)
 
-    $match = [regex]::Match($Value, '^(\d+)\.(\d+)\.(\d+)$')
+    $match = [regex]::Match($Value, '^(\d+)\.(\d+)\.([0-9])$')
     if (-not $match.Success) {
-        throw "Version must use numeric major.minor.revision format: $Value"
-    }
-    $revision = $match.Groups[3].Value
-    if ([int]$revision -ne 0 -and $revision.Length -lt 3) {
-        throw "Non-zero revisions must use at least three digits: $Value"
+        throw "Version must use major.minor.patch with a single-digit patch: $Value"
     }
 }
 
@@ -293,10 +289,10 @@ function Assert-DockerfilePlatformArguments {
 
 function Invoke-SelfTest {
     Assert-DockerfilePlatformArguments -Path (Join-Path $repositoryRoot "docker\Dockerfile")
-    foreach ($value in @("1.0.0", "1.0.001", "2.4.999")) {
+    foreach ($value in @("1.0.0", "1.1.9", "2.4.5")) {
         Assert-ReleaseVersion $value
     }
-    foreach ($value in @("1", "1.0", "v1.0.0", "1.0.1", "1.0.abc")) {
+    foreach ($value in @("1", "1.0", "v1.0.0", "1.0.10", "1.0.001", "1.0.abc")) {
         $failed = $false
         try {
             Assert-ReleaseVersion $value

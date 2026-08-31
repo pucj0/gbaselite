@@ -36,6 +36,9 @@ func (s *Session) InitializeSettings() {
 	if s.ServerTimeZone == "" {
 		s.ServerTimeZone = DefaultTimeZone
 	}
+	if s.UserVariables == nil {
+		s.UserVariables = make(map[string]string)
+	}
 }
 
 func (s *Session) SetNames(charsetName, collationName string) error {

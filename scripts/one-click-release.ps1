@@ -49,7 +49,7 @@ function Get-SHA256Hex {
 function Get-NextVersion {
     param([Parameter(Mandatory)][string]$CurrentVersion)
 
-    $match = [regex]::Match($CurrentVersion, '^(\d+)\.(\d+)\.(\d+)$')
+    $match = [regex]::Match($CurrentVersion, '^(\d+)\.(\d+)\.([0-9])$')
     if (-not $match.Success) {
         throw "Unsupported current version: $CurrentVersion"
     }
@@ -59,12 +59,12 @@ function Get-NextVersion {
     if ($major -lt 1) {
         return "1.0.0"
     }
-    if ($revision -ge 999) {
+    if ($revision -ge 9) {
         $minor++
         return "$major.$minor.0"
     }
     $revision++
-    return "$major.$minor.$($revision.ToString('000'))"
+    return "$major.$minor.$revision"
 }
 
 function Write-FileAtomically {
@@ -661,11 +661,10 @@ function Copy-ReleaseToDist {
 if ($SelfTest) {
     $cases = @{
         "0.9.0" = "1.0.0"
-        "1.0.0" = "1.0.001"
-        "1.0.001" = "1.0.002"
-        "1.0.999" = "1.1.0"
-        "1.1.0" = "1.1.001"
-        "1.2.009" = "1.2.010"
+        "1.0.0" = "1.0.1"
+        "1.1.8" = "1.1.9"
+        "1.1.9" = "1.2.0"
+        "2.9.9" = "2.10.0"
     }
     foreach ($current in $cases.Keys) {
         $actual = Get-NextVersion $current
@@ -687,12 +686,8 @@ $currentVersion = Get-CurrentVersion
 $nextVersion = if ([string]::IsNullOrWhiteSpace($TargetVersion)) {
     Get-NextVersion $currentVersion
 } else {
-    if ($TargetVersion -notmatch '^(\d+)\.(\d+)\.(\d+)$') {
-        throw "Target version must use numeric major.minor.revision format: $TargetVersion"
-    }
-    $revision = ([regex]::Match($TargetVersion, '^(\d+)\.(\d+)\.(\d+)$')).Groups[3].Value
-    if ([int]$revision -ne 0 -and $revision.Length -lt 3) {
-        throw "Non-zero target revisions must use at least three digits: $TargetVersion"
+    if ($TargetVersion -notmatch '^(\d+)\.(\d+)\.([0-9])$') {
+        throw "Target version must use major.minor.patch with a single-digit patch: $TargetVersion"
     }
     $TargetVersion
 }

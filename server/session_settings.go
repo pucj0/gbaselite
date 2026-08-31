@@ -44,14 +44,20 @@ func executeSessionSet(session *executor.Session, query string) (*executor.Resul
 	}
 
 	updated := *session
+	updated.UserVariables = cloneUserVariables(session.UserVariables)
 	changed := false
 	for _, assignment := range splitSetAssignments(body) {
 		left, right, ok := strings.Cut(assignment, "=")
 		if !ok {
 			continue
 		}
+		if userVariable, ok := normalizeUserVariable(left); ok {
+			updated.UserVariables[userVariable] = resolveSessionSettingValue(&updated, right)
+			changed = true
+			continue
+		}
 		variable, global := normalizeSetVariable(left)
-		value := settingValue(right)
+		value := resolveSessionSettingValue(&updated, right)
 		if strings.EqualFold(value, "DEFAULT") {
 			switch variable {
 			case "time_zone":
@@ -140,6 +146,47 @@ func settingValue(value string) string {
 		quote := value[:1]
 		value = value[1 : len(value)-1]
 		value = strings.ReplaceAll(value, quote+quote, quote)
+	}
+	return value
+}
+
+func normalizeUserVariable(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "@") || strings.HasPrefix(value, "@@") {
+		return "", false
+	}
+	value = strings.TrimSpace(strings.TrimPrefix(value, "@"))
+	value = strings.Trim(value, "`'\"")
+	if value == "" {
+		return "", false
+	}
+	return strings.ToLower(value), true
+}
+
+func cloneUserVariables(source map[string]string) map[string]string {
+	cloned := make(map[string]string, len(source))
+	for name, value := range source {
+		cloned[name] = value
+	}
+	return cloned
+}
+
+func resolveSessionSettingValue(session *executor.Session, raw string) string {
+	value := settingValue(raw)
+	if name, ok := normalizeUserVariable(value); ok {
+		if resolved, found := session.UserVariables[name]; found {
+			return resolved
+		}
+		return value
+	}
+	if !strings.HasPrefix(value, "@@") {
+		return value
+	}
+	variable, global := normalizeSetVariable(value)
+	for _, row := range sessionVariableValues(session, global) {
+		if strings.EqualFold(row[0].(string), variable) {
+			return fmt.Sprint(row[1])
+		}
 	}
 	return value
 }
