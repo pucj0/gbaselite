@@ -20,6 +20,7 @@ var tableTypePattern = regexp.MustCompile(`(?i)table_type\s*=\s*'([^']+)'`)
 var viewFilePattern = regexp.MustCompile(`(?i)concat\s*\(\s*@@datadir\s*,\s*'([^']+)'\s*,\s*'/'\s*,\s*'([^']+)'\s*,\s*'\.frm'\s*\)`)
 
 func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
+	session.InitializeSettings()
 	if err := engine.AvailabilityError(); err != nil {
 		return nil, err
 	}
@@ -35,7 +36,7 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 	case trimmed == "":
 		return &executor.Result{}, nil
 	case strings.HasPrefix(upper, "SET ") && !strings.HasPrefix(upper, "SET PASSWORD"):
-		return &executor.Result{Message: "setting accepted"}, nil
+		return executeSessionSet(session, trimmed)
 	case upper == "FLUSH PRIVILEGES":
 		return &executor.Result{Message: "privileges are already persistent"}, nil
 	case strings.HasPrefix(upper, "FLUSH TABLES"):
@@ -66,14 +67,14 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 		return engine.Execute(session, trimmed)
 	case strings.HasPrefix(upper, "SHOW INDEX ") || strings.HasPrefix(upper, "SHOW INDEXES ") || strings.HasPrefix(upper, "SHOW KEYS "):
 		return engine.Execute(session, trimmed)
-	case strings.HasPrefix(upper, "SHOW VARIABLES") || strings.HasPrefix(upper, "SHOW SESSION VARIABLES"):
-		return variableRows(), nil
+	case strings.HasPrefix(upper, "SHOW VARIABLES") || strings.HasPrefix(upper, "SHOW SESSION VARIABLES") || strings.HasPrefix(upper, "SHOW GLOBAL VARIABLES"):
+		return variableRows(session, trimmed)
 	case strings.HasPrefix(upper, "SHOW DATABASES") || strings.HasPrefix(upper, "SHOW SCHEMAS"):
 		return databaseRows(engine, session), nil
-	case strings.HasPrefix(upper, "SHOW CHARACTER SET"):
-		return &executor.Result{Columns: []executor.Column{{Name: "Charset", Type: storage.TypeVarchar}, {Name: "Description", Type: storage.TypeText}, {Name: "Default collation", Type: storage.TypeVarchar}, {Name: "Maxlen", Type: storage.TypeInt}}, Rows: [][]any{{"utf8mb4", "UTF-8 Unicode", "utf8mb4_general_ci", int64(4)}}}, nil
+	case strings.HasPrefix(upper, "SHOW CHARACTER SET") || strings.HasPrefix(upper, "SHOW CHARSET"):
+		return characterSetRows(trimmed)
 	case strings.HasPrefix(upper, "SHOW COLLATION"):
-		return &executor.Result{Columns: []executor.Column{{Name: "Collation", Type: storage.TypeVarchar}, {Name: "Charset", Type: storage.TypeVarchar}, {Name: "Id", Type: storage.TypeInt}, {Name: "Default", Type: storage.TypeVarchar}}, Rows: [][]any{{"utf8mb4_general_ci", "utf8mb4", int64(45), "Yes"}}}, nil
+		return collationRows(trimmed)
 	case strings.HasPrefix(upper, "SHOW ENGINES"):
 		return &executor.Result{Columns: []executor.Column{{Name: "Engine", Type: storage.TypeVarchar}, {Name: "Support", Type: storage.TypeVarchar}, {Name: "Comment", Type: storage.TypeText}}, Rows: [][]any{{"GBaseLite", "DEFAULT", "GBaseLite storage engine"}}}, nil
 	case strings.HasPrefix(upper, "SHOW PROCESSLIST"):
@@ -129,7 +130,7 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 	case metadataFromMySQLUser(metadataUpper):
 		return mysqlUserInformation(engine, session, trimmed)
 	case strings.HasPrefix(upper, "SELECT @@"):
-		return compatibilityVariables(trimmed), nil
+		return compatibilityVariables(session, trimmed), nil
 	}
 	return engine.Execute(session, trimmed)
 }
@@ -570,12 +571,6 @@ func showLikeMatch(value, pattern string) bool {
 		previous = current
 	}
 	return previous[len(valueRunes)]
-}
-
-func variableRows() *executor.Result {
-	return &executor.Result{Columns: []executor.Column{{Name: "Variable_name", Type: storage.TypeVarchar}, {Name: "Value", Type: storage.TypeVarchar}}, Rows: [][]any{
-		{"version", "5.7.44-GBaseLite"}, {"version_comment", "GBaseLite"}, {"character_set_server", "utf8mb4"}, {"collation_server", "utf8mb4_general_ci"}, {"autocommit", "ON"}, {"lower_case_table_names", "1"},
-	}}
 }
 
 type runtimeStatus struct {
@@ -1290,26 +1285,4 @@ func tableStatus(engine *executor.Engine, session *executor.Session, query strin
 		result.Rows = append(result.Rows, []any{name, "GBaseLite", int64(10), "Dynamic", rows, averageLength, dataLength, int64(0), int64(0), int64(0), nil, createdAt, updatedAt, nil, "utf8mb4_general_ci", nil, "", comment})
 	}
 	return result, nil
-}
-func compatibilityVariables(query string) *executor.Result {
-	expressions := strings.Split(strings.TrimSpace(query[len("SELECT "):]), ",")
-	result := &executor.Result{Rows: [][]any{make([]any, len(expressions))}}
-	for i, expression := range expressions {
-		name := strings.TrimSpace(expression)
-		result.Columns = append(result.Columns, executor.Column{Name: name, Type: storage.TypeVarchar})
-		upper := strings.ToUpper(name)
-		switch {
-		case strings.Contains(upper, "VERSION"):
-			result.Rows[0][i] = "5.7.44-GBaseLite"
-		case strings.Contains(upper, "CHARACTER_SET"):
-			result.Rows[0][i] = "utf8mb4"
-		case strings.Contains(upper, "COLLATION"):
-			result.Rows[0][i] = "utf8mb4_general_ci"
-		case strings.Contains(upper, "AUTOCOMMIT"):
-			result.Rows[0][i] = "1"
-		default:
-			result.Rows[0][i] = ""
-		}
-	}
-	return result
 }

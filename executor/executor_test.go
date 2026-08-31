@@ -1419,6 +1419,69 @@ func TestCommonMySQLScalarFunctions(t *testing.T) {
 	}
 }
 
+func TestCurrentTimestampFractionalSecondsPrecision(t *testing.T) {
+	engine, err := Open(t.TempDir(), "root", "123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &Session{}
+
+	result, err := engine.Execute(session, "SELECT NOW(3),CURRENT_TIMESTAMP(6),NOW(0)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	patterns := []string{
+		`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$`,
+		`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}$`,
+		`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$`,
+	}
+	if len(result.Rows) != 1 || len(result.Rows[0]) != len(patterns) {
+		t.Fatalf("unexpected timestamp result: %#v", result.Rows)
+	}
+	for index, pattern := range patterns {
+		value, ok := result.Rows[0][index].(string)
+		if !ok {
+			t.Fatalf("timestamp column %d = %#v", index, result.Rows[0][index])
+		}
+		matched, matchErr := regexp.MatchString(pattern, value)
+		if matchErr != nil || !matched {
+			t.Fatalf("timestamp column %d = %q, want pattern %q", index, value, pattern)
+		}
+		if result.Columns[index].Type != storage.TypeDateTime {
+			t.Fatalf("timestamp column %d type = %s", index, result.Columns[index].Type)
+		}
+	}
+
+	for _, query := range []string{
+		"CREATE DATABASE timestamp_precision",
+		"USE timestamp_precision",
+		"CREATE TABLE events(id INT,happened DATETIME)",
+		"INSERT INTO events SET id=1,happened=NOW(3)",
+	} {
+		if _, err := engine.Execute(session, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	stored, err := engine.Execute(session, "SELECT NOW(3),happened FROM events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Rows) != 1 {
+		t.Fatalf("unexpected stored timestamp rows: %#v", stored.Rows)
+	}
+	if value, ok := stored.Rows[0][0].(string); !ok || len(value) != len("2006-01-02 15:04:05.000") {
+		t.Fatalf("row NOW(3) = %#v", stored.Rows[0][0])
+	}
+	if value, ok := stored.Rows[0][1].(time.Time); !ok || value.Nanosecond()%int(time.Millisecond) != 0 {
+		t.Fatalf("stored NOW(3) = %#v", stored.Rows[0][1])
+	}
+
+	for _, query := range []string{"SELECT NOW(-1)", "SELECT NOW(7)", "SELECT NOW(1.5)", "SELECT NOW(NULL)", "SELECT NOW(1,2)"} {
+		if _, err := engine.Execute(session, query); err == nil {
+			t.Fatalf("expected %s to reject invalid precision", query)
+		}
+	}
+}
 func TestInnerLeftRightAndDerivedJoins(t *testing.T) {
 	engine, err := Open(t.TempDir(), "root", "123456")
 	if err != nil {

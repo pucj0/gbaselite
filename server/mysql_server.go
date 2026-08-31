@@ -29,6 +29,7 @@ type MySQLServer struct {
 	MaxConnections          int
 	WriteBufferSize         int
 	SlowQuery               time.Duration
+	DefaultTimeZone         string
 	Audit                   *journal.AuditLog
 	AuthFailureLimit        int
 	AuthFailureWindow       time.Duration
@@ -240,6 +241,14 @@ func (s *MySQLServer) handleConnection(raw net.Conn) {
 	packet.Capabilities = response.Capabilities & capabilities
 	s.Logger.Printf("client authenticated id=%d user=%s capabilities=0x%08x database=%s", id, response.Username, packet.Capabilities, response.Database)
 	session := &executor.Session{CurrentDatabase: response.Database, StreamResults: true, Username: account.Username, Host: account.Host, RemoteIP: remoteHost, RemotePort: remotePort, ConnectionID: id, SecureTransport: secureTransport, TLSVersion: tlsVersion, TLSCipher: tlsCipher, JournalSessionID: fmt.Sprintf("%d-%d", time.Now().UnixNano(), id)}
+	session.ServerTimeZone = s.DefaultTimeZone
+	if s.DefaultTimeZone != "" {
+		if err := session.SetTimeZone(s.DefaultTimeZone); err != nil {
+			_ = packet.WritePacket(protocol.ErrorPacket(1064, err.Error()))
+			return
+		}
+	}
+	initializeHandshakeCharacterSet(session, response.CharacterSet)
 	s.writeAudit(journal.AuditEvent{ConnectionID: id, Username: account.Username, RemoteIP: remoteHost, RemotePort: remotePort, Database: response.Database, Operation: "AUTHENTICATE", Result: "success"})
 	preparedStatements := make(map[uint32]*preparedStatement)
 	var nextStatementID uint32 = 1

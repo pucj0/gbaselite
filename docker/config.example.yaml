@@ -4,6 +4,7 @@ server:
   max_connections: 512
   write_buffer_kb: 8
   slow_query_ms: 100
+  time_zone: SYSTEM
 
 storage:
   path: ./data

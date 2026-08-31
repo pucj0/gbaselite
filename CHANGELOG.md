@@ -18,6 +18,42 @@ releases.
 
 ### Added
 
+- Added MySQL-compatible connection character sets `ascii`, `binary`, `latin1`,
+  `utf8`/`utf8mb3`, and `utf8mb4`, together with their documented collations,
+  handshake negotiation, session variables, `SET NAMES`, `SET CHARACTER SET`,
+  `SHOW CHARACTER SET`, and `SHOW COLLATION` support.
+- Added session-aware collation behavior for comparisons, `LIKE`, joins,
+  ordering, `DISTINCT`, grouping, and window operations within the documented
+  compatibility subset.
+- Added MySQL-style `SET [SESSION] time_zone`, session/global timezone
+  variables, `server.time_zone`, and `DB_TIME_ZONE`. `NOW()`,
+  `CURRENT_TIMESTAMP`, `CURDATE()`, and timestamp defaults now use the current
+  session timezone.
+
+### Changed
+
+- Named timezone data is embedded in the binary so IANA names work on hosts
+  without a system timezone database. `DATETIME` and the current `TIMESTAMP`
+  mapping remain wall-clock values rather than implementing MySQL's separate
+  UTC-backed `TIMESTAMP` conversion.
+- String storage and transport remain UTF-8. The added `ascii` and `latin1`
+  modes provide protocol/session/comparison compatibility but do not transcode
+  values to single-byte storage, and collations are not persisted per database,
+  table, or column.
+- Tag-triggered GitHub Actions builds now publish the same multi-architecture
+  image and stable semantic tags to both GHCR and Docker Hub, using repository
+  secrets for the Docker Hub login.
+
+### Fixed
+
+- Fixed `NOW()` and `CURRENT_TIMESTAMP()` rejecting a fractional-seconds
+  precision argument such as `NOW(3)`; precision values from 0 through 6 are
+  now supported.
+
+## [1.0.002] - 2026-08-05
+
+### Added
+
 - Added a dedicated remote publisher that creates an isolated
   release/v<VERSION> Git worktree, applies the explicit release version only in
   that branch, runs the existing complete packaging and validation workflow,
