@@ -44,6 +44,38 @@ func TestSessionCharacterSetsAndCollations(t *testing.T) {
 	}
 }
 
+func TestSessionCharacterSetRestoresDumpUserVariable(t *testing.T) {
+	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &executor.Session{}
+	for _, query := range []string{
+		"SET @saved_cs_client=@@character_set_client",
+		"SET character_set_client=latin1",
+		"SET character_set_client=@saved_cs_client",
+		"SET character_set_client=NONE",
+		"SET character_set_connection=NONE",
+		"SET character_set_results=NONE",
+		"SET collation_connection=NO",
+	} {
+		if _, err := ExecuteCompatible(engine, session, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	if session.CharacterSetClient != executor.DefaultCharacterSet {
+		t.Fatalf("character_set_client = %q, want %q", session.CharacterSetClient, executor.DefaultCharacterSet)
+	}
+
+	other := &executor.Session{}
+	if _, err := ExecuteCompatible(engine, other, "SET character_set_client=@saved_cs_client"); err == nil {
+		t.Fatal("expected saved user variables to remain connection-local")
+	}
+	if other.CharacterSetClient != executor.DefaultCharacterSet {
+		t.Fatalf("failed restore changed other session charset to %q", other.CharacterSetClient)
+	}
+}
+
 func TestSessionCollationControlsStringPredicates(t *testing.T) {
 	engine, err := executor.Open(t.TempDir(), "root", "123456")
 	if err != nil {

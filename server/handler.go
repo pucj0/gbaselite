@@ -1053,13 +1053,24 @@ func viewInformation(engine *executor.Engine, session *executor.Session, query s
 	if err != nil {
 		return nil, err
 	}
-	result := &executor.Result{Columns: []executor.Column{{Name: "TABLE_SCHEMA", Type: storage.TypeVarchar}, {Name: "TABLE_NAME", Type: storage.TypeVarchar}, {Name: "VIEW_DEFINITION", Type: storage.TypeText}, {Name: "CHECK_OPTION", Type: storage.TypeVarchar}, {Name: "IS_UPDATABLE", Type: storage.TypeVarchar}, {Name: "SECURITY_TYPE", Type: storage.TypeVarchar}, {Name: "DEFINER", Type: storage.TypeVarchar}}}
+	result := &executor.Result{Columns: []executor.Column{
+		{Name: "TABLE_CATALOG", Type: storage.TypeVarchar},
+		{Name: "TABLE_SCHEMA", Type: storage.TypeVarchar},
+		{Name: "TABLE_NAME", Type: storage.TypeVarchar},
+		{Name: "VIEW_DEFINITION", Type: storage.TypeText},
+		{Name: "CHECK_OPTION", Type: storage.TypeVarchar},
+		{Name: "IS_UPDATABLE", Type: storage.TypeVarchar},
+		{Name: "DEFINER", Type: storage.TypeVarchar},
+		{Name: "SECURITY_TYPE", Type: storage.TypeVarchar},
+		{Name: "CHARACTER_SET_CLIENT", Type: storage.TypeVarchar},
+		{Name: "COLLATION_CONNECTION", Type: storage.TypeVarchar},
+	}}
 	for _, name := range database.ListViews() {
 		if !engine.Users.HasObjectAccess(session.Username, session.Host, database.Name(), name) {
 			continue
 		}
 		view, _ := database.View(name)
-		result.Rows = append(result.Rows, []any{database.Name(), view.Name, view.Definition, "NONE", "NO", "DEFINER", "root@%"})
+		result.Rows = append(result.Rows, []any{"def", database.Name(), view.Name, view.Definition, "NONE", "NO", "root@%", "DEFINER", executor.DefaultCharacterSet, executor.DefaultCollation})
 	}
 	return projectMetadataColumns(query, result), nil
 }

@@ -771,7 +771,11 @@ DROP USER IF EXISTS 'app'@'%';
   `utf8mb4`。`SHOW CHARACTER SET [LIKE ...]` 会列出这些字符集；握手排序规则编号、
   `SET NAMES charset [COLLATE collation]`、`SET CHARACTER SET charset` 以及各
   `character_set_*` 会话变量会实际更新当前连接，未知字符集、未知排序规则或字符集
-  与排序规则不匹配会返回错误。
+  与排序规则不匹配会返回错误。`mysqldump` 使用的
+  `SET @saved_cs_client=@@character_set_client` 保存与恢复语句按连接隔离，并可还原
+  对应字符集设置；视图 dump 中对 `character_set_client/connection/results` 使用的
+  `SET ...=NONE` 和 `SET collation_connection=NO` 历史标记按无操作接受。
+  这不代表支持任意 MySQL 用户变量表达式或把 `NONE` 作为普通字符集。
 - 排序规则支持 `ascii_general_ci/ascii_bin`、`binary`、
   `latin1_swedish_ci/latin1_general_ci/latin1_bin`、
   `utf8_general_ci/utf8_unicode_ci/utf8_bin` 和
@@ -1237,8 +1241,8 @@ Windows PowerShell 会先检查 `gofmt`，执行完整测试和静态检查，�
 push、GHCR push 或其他上传操作。
 
 Windows 可直接双击项目根目录的 `release.bat` 一键发布。脚本从源码当前版本自动计
-算下一版本：修订号从 `001` 到 `999` 使用三位补零，例如 `1.0.123` 的下一版本是
-`1.0.124`；达到 `1.0.999` 后进位到 `1.1.0`，再继续为 `1.1.001`。它会同步源码、
+算下一版本：patch 使用单个数字，从 `x.y.0` 递增到 `x.y.9`；例如 `1.1.8` 的下一版
+本是 `1.1.9`，随后进位到 `1.2.0`。它会同步源码、
 README、版本化裸二进制 Compose 路径、环境示例、工作流默认版本和 CHANGELOG，
 在独立 `.tmp` 候选目录完成测试、Compose 配置检查、三平台构建、中文 MSI 与归档校验，
 全部成功后才创建
@@ -1320,7 +1324,8 @@ CHANGELOG。
 发布分支随后调用现有 `scripts/one-click-release.ps1 -TargetVersion <VERSION>`，
 完整执行 Compose 检查、`gofmt`、`go test ./... -count=1`、
 `go vet ./...`、Windows amd64/Linux amd64/Linux arm64 构建、MSI、归档、
-ELF、执行权限、禁入内容和 SHA-256 校验。产物仍复制到
+ELF、执行权限、禁入内容和 SHA-256 校验；校验和通过 .NET 标准加密库计算，不依赖
+可选的 `Get-FileHash` cmdlet。产物仍复制到
 `dist/GBaseLite-<VERSION>`，开发分支中的版本文件保持不变。
 
 GitHub tag 工作流也会用同一源码一次构建 `linux/amd64`、`linux/arm64`，同时推送

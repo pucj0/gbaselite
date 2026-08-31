@@ -46,6 +46,24 @@ function Invoke-GoCommand {
     }
 }
 
+function Get-SHA256Hex {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = $algorithm.ComputeHash($stream)
+            return ([System.BitConverter]::ToString($bytes)).Replace("-", "").ToLowerInvariant()
+        } finally {
+            $algorithm.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+
 function Build-GoTarget {
     param(
         [Parameter(Mandatory)][string]$TargetOS,
@@ -188,7 +206,7 @@ try {
         )
     } | Sort-Object Name
     $checksumLines = foreach ($artifact in $artifacts) {
-        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash.ToLowerInvariant()
+        $hash = Get-SHA256Hex -Path $artifact.FullName
         "$hash  $($artifact.Name)"
     }
     $checksumPath = Join-Path $outputRoot "checksums.txt"
