@@ -14,6 +14,8 @@ releases.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-31
+
 ### Added
 
 - Added MySQL-compatible connection character sets `ascii`, `binary`, `latin1`,

@@ -4,7 +4,7 @@ GBaseLite 是一个使用 Go 编写的单机轻量级关系型数据库服务。
 PostgreSQL，使用自己的存储文件持久化数据，并通过 MySQL 协议向 Navicat、DBeaver、
 JDBC、Go MySQL 驱动等客户端提供服务。
 
-当前版本：`1.0.0`
+当前版本：`1.1.0`
 
 > GBaseLite 是 MySQL 兼容子集，不是 MySQL 的完整替代品。生产使用前请阅读
 > [兼容范围与限制](#兼容范围与限制)，并使用真实业务 SQL 做完整验证。
@@ -536,21 +536,21 @@ MSI 的 WiX DTF 自定义操作显式使用 CLR v4，可在仅启用 .NET Framew
 Windows 系统上运行。若安装仍异常，可使用 `/L*V` 生成详细日志进行定位：
 
 ```powershell
-msiexec.exe /i .\dist\GBaseLite-1.0.0\GBaseLite-windows-amd64.msi /L*V .\gbaselite-install.log
+msiexec.exe /i .\dist\GBaseLite-1.1.0\GBaseLite-windows-amd64.msi /L*V .\gbaselite-install.log
 ```
 
 ```powershell
 # 安装
-msiexec.exe /i .\dist\GBaseLite-1.0.0\GBaseLite-windows-amd64.msi
+msiexec.exe /i .\dist\GBaseLite-1.1.0\GBaseLite-windows-amd64.msi
 
 # 使用同一 MSI 修复程序文件
-msiexec.exe /fa .\dist\GBaseLite-1.0.0\GBaseLite-windows-amd64.msi
+msiexec.exe /fa .\dist\GBaseLite-1.1.0\GBaseLite-windows-amd64.msi
 
 # 升级：运行更高版本 MSI，UpgradeCode 保持不变
-msiexec.exe /i .\dist\GBaseLite-1.0.0\GBaseLite-windows-amd64.msi
+msiexec.exe /i .\dist\GBaseLite-1.1.0\GBaseLite-windows-amd64.msi
 
 # 卸载；默认保留 config.yaml、data、users 和 logs
-msiexec.exe /x .\dist\GBaseLite-1.0.0\GBaseLite-windows-amd64.msi
+msiexec.exe /x .\dist\GBaseLite-1.1.0\GBaseLite-windows-amd64.msi
 ```
 
 升级会显示同一配置页，停止旧服务、复用已有配置，并在安装成功后恢复服务。默认不勾
@@ -1265,13 +1265,13 @@ README、版本化裸二进制 Compose 路径、环境示例、工作流默认�
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 `
-  -Version 1.0.0 -GoExecutable D:\env\Go\bin\go.exe
+  -Version 1.1.0 -GoExecutable D:\env\Go\bin\go.exe
 ```
 
 兼容入口 `scripts/package.ps1` 会转发到同一脚本。Linux 构建机可以使用：
 
 ```bash
-VERSION=1.0.0 ./scripts/build-release.sh
+VERSION=1.1.0 ./scripts/build-release.sh
 ```
 
 MSI 单独构建：
@@ -1279,7 +1279,7 @@ MSI 单独构建：
 ```powershell
 dotnet tool install --global wix --version 5.0.2
 wix extension add --global WixToolset.UI.wixext/5.0.2
-.\scripts\build-msi.ps1 -Version 1.0.0 `
+.\scripts\build-msi.ps1 -Version 1.1.0 `
   -SourceDirectory .\.tmp\windows-package `
   -OutputPath .\dist\GBaseLite-windows-amd64.msi
 ```
@@ -1349,9 +1349,9 @@ GHCR 和 Docker Hub 的精确版本、`major.minor` 与 `latest` 标签。GHCR �
 
 ```powershell
 .\publish-release.bat -SelfTest
-.\publish-release.bat -Version 1.0.0 -DryRun -ReplaceArtifacts
-.\publish-release.bat -Version 1.0.0 -PrepareOnly -ReplaceArtifacts
-.\publish-release.bat -Version 1.0.0 -Publish -ReplaceArtifacts
+.\publish-release.bat -Version 1.1.0 -DryRun -ReplaceArtifacts
+.\publish-release.bat -Version 1.1.0 -PrepareOnly -ReplaceArtifacts
+.\publish-release.bat -Version 1.1.0 -Publish -ReplaceArtifacts
 ```
 
 `publish-release.bat` 默认在完成或失败后暂停，双击运行时可以看到完整输出；自动化或已打开的
