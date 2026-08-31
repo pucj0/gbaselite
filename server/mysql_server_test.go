@@ -1021,6 +1021,10 @@ func TestNavicatViewMetadata(t *testing.T) {
 	if err != nil || len(views.Columns) != 3 || len(views.Rows) != 1 || views.Rows[0][0] != "user_names" {
 		t.Fatalf("information_schema.VIEWS = %#v, %v", views, err)
 	}
+	dumpView, err := ExecuteCompatible(engine, session, "SELECT CHECK_OPTION,DEFINER,SECURITY_TYPE,CHARACTER_SET_CLIENT,COLLATION_CONNECTION FROM information_schema.VIEWS WHERE TABLE_SCHEMA='view_metadata'")
+	if err != nil || len(dumpView.Columns) != 5 || len(dumpView.Rows) != 1 || dumpView.Rows[0][0] != "NONE" || dumpView.Rows[0][1] != "root@%" || dumpView.Rows[0][2] != "DEFINER" || dumpView.Rows[0][3] != executor.DefaultCharacterSet || dumpView.Rows[0][4] != executor.DefaultCollation {
+		t.Fatalf("mysqldump view metadata = %#v, %v", dumpView, err)
+	}
 	tables, err := ExecuteCompatible(engine, session, "SELECT TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA='view_metadata' AND TABLE_TYPE='BASE TABLE'")
 	if err != nil || len(tables.Columns) != 3 || len(tables.Rows) != 1 || tables.Rows[0][0] != "view_metadata" || tables.Rows[0][1] != "users" || tables.Rows[0][2] != "BASE TABLE" {
 		t.Fatalf("base table metadata = %#v, %v", tables, err)

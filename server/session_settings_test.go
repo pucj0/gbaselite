@@ -57,6 +57,7 @@ func TestSessionCharacterSetRestoresDumpUserVariable(t *testing.T) {
 		"SET character_set_client=NONE",
 		"SET character_set_connection=NONE",
 		"SET character_set_results=NONE",
+		"SET collation_connection=NO",
 	} {
 		if _, err := ExecuteCompatible(engine, session, query); err != nil {
 			t.Fatalf("%s: %v", query, err)

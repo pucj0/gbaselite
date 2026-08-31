@@ -81,7 +81,8 @@ func executeSessionSet(session *executor.Session, query string) (*executor.Resul
 			if global {
 				return nil, fmt.Errorf("SET GLOBAL %s is not supported", variable)
 			}
-			if variable != "collation_connection" && strings.EqualFold(value, "NONE") {
+			if strings.HasPrefix(variable, "character_set_") && strings.EqualFold(value, "NONE") ||
+				variable == "collation_connection" && strings.EqualFold(value, "NO") {
 				continue
 			}
 
