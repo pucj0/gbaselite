@@ -536,21 +536,21 @@ MSI 的 WiX DTF 自定义操作显式使用 CLR v4，可在仅启用 .NET Framew
 Windows 系统上运行。若安装仍异常，可使用 `/L*V` 生成详细日志进行定位：
 
 ```powershell
-msiexec.exe /i .\dist\GBaseLite-1.1.0\GBaseLite-windows-amd64.msi /L*V .\gbaselite-install.log
+msiexec.exe /i .\dist\GBaseLite-1.0.002\GBaseLite-windows-amd64.msi /L*V .\gbaselite-install.log
 ```
 
 ```powershell
 # 安装
-msiexec.exe /i .\dist\GBaseLite-1.1.0\GBaseLite-windows-amd64.msi
+msiexec.exe /i .\dist\GBaseLite-1.0.002\GBaseLite-windows-amd64.msi
 
 # 使用同一 MSI 修复程序文件
-msiexec.exe /fa .\dist\GBaseLite-1.1.0\GBaseLite-windows-amd64.msi
+msiexec.exe /fa .\dist\GBaseLite-1.0.002\GBaseLite-windows-amd64.msi
 
 # 升级：运行更高版本 MSI，UpgradeCode 保持不变
-msiexec.exe /i .\dist\GBaseLite-1.1.0\GBaseLite-windows-amd64.msi
+msiexec.exe /i .\dist\GBaseLite-1.0.002\GBaseLite-windows-amd64.msi
 
 # 卸载；默认保留 config.yaml、data、users 和 logs
-msiexec.exe /x .\dist\GBaseLite-1.1.0\GBaseLite-windows-amd64.msi
+msiexec.exe /x .\dist\GBaseLite-1.0.002\GBaseLite-windows-amd64.msi
 ```
 
 升级会显示同一配置页，停止旧服务、复用已有配置，并在安装成功后恢复服务。默认不勾
