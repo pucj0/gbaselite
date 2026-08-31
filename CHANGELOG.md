@@ -48,6 +48,9 @@ releases.
   precision argument such as `NOW(3)`; precision values from 0 through 6 are
   now supported.
 
+- Release packaging now computes SHA-256 checksums through the .NET standard
+  cryptography API when `Get-FileHash` is unavailable.
+
 ## [1.0.002] - 2026-08-05
 
 ### Added

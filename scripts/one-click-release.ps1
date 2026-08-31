@@ -28,6 +28,24 @@ function Get-CurrentVersion {
     return $match.Groups[1].Value
 }
 
+function Get-SHA256Hex {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = $algorithm.ComputeHash($stream)
+            return ([System.BitConverter]::ToString($bytes)).Replace("-", "").ToLowerInvariant()
+        } finally {
+            $algorithm.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+
 function Get-NextVersion {
     param([Parameter(Mandatory)][string]$CurrentVersion)
 
@@ -378,7 +396,7 @@ function Test-ReleaseCandidate {
         if (-not $checksumEntries.ContainsKey($name)) {
             throw "checksums.txt does not contain $name"
         }
-        $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $OutputDirectory $name)).Hash.ToLowerInvariant()
+        $actual = Get-SHA256Hex -Path (Join-Path $OutputDirectory $name)
         if ($actual -ne $checksumEntries[$name]) {
             throw "Checksum mismatch for $name"
         }

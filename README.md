@@ -1320,7 +1320,8 @@ CHANGELOG。
 发布分支随后调用现有 `scripts/one-click-release.ps1 -TargetVersion <VERSION>`，
 完整执行 Compose 检查、`gofmt`、`go test ./... -count=1`、
 `go vet ./...`、Windows amd64/Linux amd64/Linux arm64 构建、MSI、归档、
-ELF、执行权限、禁入内容和 SHA-256 校验。产物仍复制到
+ELF、执行权限、禁入内容和 SHA-256 校验；校验和通过 .NET 标准加密库计算，不依赖
+可选的 `Get-FileHash` cmdlet。产物仍复制到
 `dist/GBaseLite-<VERSION>`，开发分支中的版本文件保持不变。
 
 GitHub tag 工作流也会用同一源码一次构建 `linux/amd64`、`linux/arm64`，同时推送
