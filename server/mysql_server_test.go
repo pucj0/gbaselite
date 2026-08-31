@@ -215,6 +215,7 @@ func TestNavicatDatabaseDumpMetadataOverPreparedProtocol(t *testing.T) {
 		"SET character_set_client=latin1",
 		"SET character_set_client=@OLD_CHARACTER_SET_CLIENT",
 		"/*!50001 SET character_set_client = NONE */",
+		"/*!50001 SET character_set_results = NONE */",
 		"CREATE DATABASE `navicat-export-test`",
 		"USE `navicat-export-test`",
 		"CREATE TABLE `order-items` (`id` BIGINT NOT NULL AUTO_INCREMENT, `sku` VARCHAR(32) NOT NULL, `qty` INT NOT NULL DEFAULT 0, PRIMARY KEY (`id`), UNIQUE KEY `uq_sku` (`sku`), KEY `idx_qty` (`qty`))",

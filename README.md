@@ -773,7 +773,8 @@ DROP USER IF EXISTS 'app'@'%';
   `character_set_*` 会话变量会实际更新当前连接，未知字符集、未知排序规则或字符集
   与排序规则不匹配会返回错误。`mysqldump` 使用的
   `SET @saved_cs_client=@@character_set_client` 保存与恢复语句按连接隔离，并可还原
-  对应字符集设置；视图 dump 中的 `SET character_set_client=NONE` 标记按无操作接受。
+  对应字符集设置；视图 dump 中对 `character_set_client/connection/results` 使用的
+  `SET ...=NONE` 标记按无操作接受。
   这不代表支持任意 MySQL 用户变量表达式或把 `NONE` 作为普通字符集。
 - 排序规则支持 `ascii_general_ci/ascii_bin`、`binary`、
   `latin1_swedish_ci/latin1_general_ci/latin1_bin`、
