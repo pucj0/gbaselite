@@ -1786,3 +1786,5 @@ MVCC 对乱序导入的父子依赖保存独立版本化反向目录，父表晚
 发布说明：本次完整差异汇总见 [1.1.1 更新说明](docs/发布说明/1.1.1更新说明.md)。标签发布流程从版本说明文件填写 GitHub Release，并将 docker/发布说明.md 同步为 Docker Hub 仓库描述；镜像包含 amd64/arm64，稳定标签更新版本号、主次版本和 latest。
 
 对比报告及其源码快照在 Git 中保留原始字节，不进行换行转换，以保持 SHA-256 证据可验证。
+
+Docker Hub 仓库说明可通过 Docker Hub Description 工作流单独同步，无需重建镜像。普通镜像 Compose 的密码直接在 docker/docker-compose.yml 中配置；temp.env 参数文件主要用于对应的二进制部署模板。
