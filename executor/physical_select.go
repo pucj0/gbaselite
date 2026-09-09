@@ -5,12 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"gbaselite/parser"
+	"gbaselite/physical"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
 )
 
-func executeMVCCSelect(ctx context.Context, tx storageengine.Txn, session *Session, statement parser.Select) (*Result, error) {
+func executePhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Session, statement parser.Select) (*Result, error) {
 	if err := validateMVCCSelectShape(statement); err != nil {
 		return nil, err
 	}
@@ -18,11 +19,11 @@ func executeMVCCSelect(ctx context.Context, tx storageengine.Txn, session *Sessi
 		return executeScalarSelect(session, statement)
 	}
 	if len(statement.Joins) > 0 {
-		schema, source, err := mvccJoinedSource(ctx, tx, session, statement)
+		schema, source, err := joinedSource(ctx, tx, session, statement)
 		if err != nil {
 			return nil, err
 		}
-		return finishMVCCSelect(session, statement, schema, source, false)
+		return finishPhysicalSelect(session, statement, schema, source, false)
 	}
 	definition, schema, _, err := loadVersionedTableForRead(tx, session, statement.Table)
 	if err != nil {
@@ -36,66 +37,50 @@ func executeMVCCSelect(ctx context.Context, tx storageengine.Txn, session *Sessi
 	}
 	needed := mvccProjectionMask(statement, schema)
 	plan := planMVCCAccess(statement, definition, schema, session)
-	if batchPlan := planIntegerBatch(statement, definition, schema, plan); batchPlan != nil {
-		return executeIntegerBatch(ctx, tx, session, statement, definition, plan, batchPlan)
-	}
-	point := plan.kind == mvccAccessPoint
 	ordered := plan.ordered
-	var filter func(storage.Row) (any, error)
-	if !point && statement.Where != nil {
-		filter = bindMVCCFilter(statement.Where, schema, session)
-	}
-	aggregate := selectHasAggregate(statement.Items)
-	source := func(yield func(storage.Row) error) error {
-		var scratch storage.Row
-		visit := func(encoded []byte) error {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if err := checkQuery(session); err != nil {
-				return err
-			}
-			row, err := decodeMVCCRowInto(definition, encoded, needed, scratch)
-			if aggregate {
-				scratch = row
-			}
-			if err != nil {
-				return err
-			}
-			if statement.Where != nil {
-				var value any
-				var err error
-				if filter != nil {
-					value, err = filter(row)
-				} else {
-					value, err = evaluateExprWithContext(statement.Where, schema, row, session, nil)
-				}
-				if err != nil {
-					return err
-				}
-				if !truthy(value) {
-					return nil
-				}
-			}
-			return yield(row)
+	op := bindScan(tx, definition, plan, func(encoded []byte) (storage.Row, error) {
+		if err := checkQuery(session); err != nil {
+			return nil, err
 		}
-		batchRows := mvccBatchRows
-		// LIMIT can terminate within the first batch; avoid unnecessary lookups.
-		if statement.HasLimit && !aggregate && len(statement.OrderBy) == 0 && statement.Limit < batchRows {
-			batchRows = max(1, statement.Limit)
-		}
-		return plan.scanBatches(ctx, tx, definition, batchRows, func(batch []mvccBatchEntry) error {
-			for _, entry := range batch {
-				if err := visit(entry.value); err != nil {
-					return err
-				}
+		return decodeMVCCRowInto(definition, encoded, needed, nil)
+	})
+	if statement.Where != nil {
+		evaluate := bindMVCCFilter(statement.Where, schema, session)
+		op = physical.Filter[storage.Row]{Input: op, Predicate: func(row storage.Row) (bool, error) {
+			var value any
+			var err error
+			if evaluate != nil {
+				value, err = evaluate(row)
+			} else {
+				value, err = evaluateExprWithContext(statement.Where, schema, row, session, nil)
 			}
-			return nil
-		})
+			return truthy(value), err
+		}}
 	}
-	return finishMVCCSelect(session, statement, schema, source, ordered)
+	source := rowSource(ctx, op)
+	return finishPhysicalSelect(session, statement, schema, source, ordered)
 }
-func finishMVCCSelect(session *Session, statement parser.Select, schema *storage.Table, source func(func(storage.Row) error) error, ordered bool) (*Result, error) {
+func finishPhysicalSelect(session *Session, statement parser.Select, schema *storage.Table, source func(func(storage.Row) error) error, ordered bool) (*Result, error) {
+	if selectHasWindow(statement.Items) {
+		base := statement
+		base.Distinct = false
+		if statement.Distinct {
+			base.HasLimit = false
+			base.Offset = 0
+		}
+		result, err := executeWindowWithSource(schema, base, schema.ColumnsView(), session, source)
+		if err != nil || !statement.Distinct {
+			return result, err
+		}
+		limit := -1
+		if statement.HasLimit {
+			limit = statement.Limit
+		}
+		local := *session
+		local.StreamResults = false
+		return executeBudgetedDistinct(&local, result, statement.Offset, limit)
+	}
+
 	if len(statement.GroupBy) > 0 || statement.Having != nil {
 		if statement.Distinct {
 			base := statement
@@ -118,7 +103,7 @@ func finishMVCCSelect(session *Session, statement parser.Select, schema *storage
 	}
 	aggregate := selectHasAggregate(statement.Items)
 	if aggregate {
-		return mvccAggregate(session, statement, schema, source)
+		return executeGlobalAggregate(session, statement, schema, source)
 	}
 	if statement.Distinct {
 		base := statement
@@ -126,7 +111,7 @@ func finishMVCCSelect(session *Session, statement parser.Select, schema *storage
 		base.HasLimit = false
 		base.Offset = 0
 		base.Limit = 0
-		result, err := finishMVCCSelect(session, base, schema, source, ordered)
+		result, err := finishPhysicalSelect(session, base, schema, source, ordered)
 		if err != nil {
 			return nil, err
 		}
@@ -187,33 +172,21 @@ func finishMVCCSelect(session *Session, statement parser.Select, schema *storage
 		return executeBudgetedExpressionOrderWithSource(nil, &local, statement, schema, result.Columns, project, source)
 	}
 	used := int64(0)
-	offset, emitted := statement.Offset, 0
-	if statement.HasLimit && statement.Limit == 0 {
-		return result, nil
+	count := -1
+	if statement.HasLimit {
+		count = statement.Limit
 	}
-	err := source(func(row storage.Row) error {
-		if offset > 0 {
-			offset--
-			return nil
-		}
-		values, err := project(row)
-		if err != nil {
-			return err
-		}
+	input := physical.Limit[storage.Row]{Input: sourceOperator(source), Offset: statement.Offset, Count: count}
+	op := physical.Projection[storage.Row, []any]{Input: input, Project: project}
+	err := op.Run(operatorContext(session), func(values []any) error {
+		var err error
 		used, err = checkResultMemory(session.query.options.ResultMemoryBytes, used, values)
 		if err != nil {
 			return err
 		}
 		result.Rows = append(result.Rows, values)
-		emitted++
-		if statement.HasLimit && emitted >= statement.Limit {
-			return errBudgetedRowsDone
-		}
 		return nil
 	})
-	if errors.Is(err, errBudgetedRowsDone) {
-		err = nil
-	}
 	return result, err
 }
 func mvccPointKey(expression parser.Expr, table versionedTable, schema *storage.Table, session *Session) ([]byte, bool) {
@@ -251,7 +224,7 @@ func mvccPointKey(expression parser.Expr, table versionedTable, schema *storage.
 	}
 	return nil, false
 }
-func mvccAggregate(session *Session, statement parser.Select, schema *storage.Table, source func(func(storage.Row) error) error) (*Result, error) {
+func executeGlobalAggregate(session *Session, statement parser.Select, schema *storage.Table, source func(func(storage.Row) error) error) (*Result, error) {
 	kinds := make([]aggregateKind, len(statement.Items))
 	expressions := make([]parser.Expr, len(kinds))
 	positions := make([]int, len(kinds))
@@ -303,7 +276,7 @@ func mvccAggregate(session *Session, statement parser.Select, schema *storage.Ta
 		}
 		result.Columns[i] = Column{Name: name, Type: typ}
 	}
-	err := source(func(row storage.Row) error {
+	add := func(row storage.Row) error {
 		for i, kind := range kinds {
 			var candidate any
 			if expressions[i] != nil {
@@ -325,24 +298,26 @@ func mvccAggregate(session *Session, statement parser.Select, schema *storage.Ta
 			}
 		}
 		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	if statement.Offset > 0 || statement.HasLimit && statement.Limit == 0 {
-		return result, nil
-	}
-	values := make([]any, len(kinds))
-	for i, kind := range kinds {
-		values[i], err = finishAggregate(states[i], kind, result.Columns[i].Type)
-		if err != nil {
-			return nil, fmt.Errorf("aggregate: %w", err)
+	op := physical.Aggregate[storage.Row, []any]{Input: sourceOperator(source), New: func() (physical.Accumulator[storage.Row, []any], error) {
+		return &aggregateBinding[storage.Row, []any]{add: add, finish: func(y physical.Yield[[]any]) error {
+			values := make([]any, len(kinds))
+			for i, kind := range kinds {
+				value, err := finishAggregate(states[i], kind, result.Columns[i].Type)
+				if err != nil {
+					return fmt.Errorf("aggregate: %w", err)
+				}
+				values[i] = value
+			}
+			return y(values)
+		}}, nil
+	}}
+	err := op.Run(operatorContext(session), func(values []any) error {
+		if statement.Offset > 0 || statement.HasLimit && statement.Limit == 0 {
+			return nil
 		}
-	}
-	result.Rows = [][]any{values}
-	return result, nil
-}
-
-func scanMVCCRows(ctx context.Context, tx storageengine.Txn, table versionedTable, schema *storage.Table, session *Session, where parser.Expr, yield func([]byte, []byte) error) error {
-	return planMVCCAccess(parser.Select{Where: where}, table, schema, session).scan(ctx, tx, table, yield)
+		result.Rows = append(result.Rows, values)
+		return nil
+	})
+	return result, err
 }

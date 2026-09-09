@@ -314,7 +314,7 @@ func TestSQLRunsOnIndependentStorageEngine(t *testing.T) {
 }
 
 func TestSQLPackagesDoNotImportPhysicalBackends(t *testing.T) {
-	for _, dir := range []string{"executor", "server", "parser", "planner", "sql"} {
+	for _, dir := range []string{"executor", "server", "parser", "planner", "sql", "physical"} {
 		root := filepath.Join("..", dir)
 		if _, err := os.Stat(root); os.IsNotExist(err) {
 			continue

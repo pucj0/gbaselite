@@ -9,6 +9,30 @@ import (
 )
 
 func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Query) (*Result, error) {
+	if union, ok := query.(parser.Union); ok {
+		var combined *Result
+		for i, branch := range union.Queries {
+			result, err := executeMVCCExplain(tx, session, branch)
+			if err != nil {
+				return nil, err
+			}
+			for _, row := range result.Rows {
+				row[0] = int64(i + 1)
+				if i > 0 {
+					row[1] = "UNION"
+				}
+			}
+			if combined == nil {
+				combined = result
+			} else {
+				combined.Rows = append(combined.Rows, result.Rows...)
+			}
+		}
+		if combined == nil {
+			return nil, fmt.Errorf("empty UNION")
+		}
+		return combined, nil
+	}
 	s, ok := query.(parser.Select)
 	if !ok {
 		return nil, fmt.Errorf("MVCC EXPLAIN supports a single SELECT")
@@ -18,7 +42,7 @@ func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Que
 	}
 	columns := []Column{{Name: "id", Type: storage.TypeBigInt}, {Name: "select_type", Type: storage.TypeVarchar}, {Name: "table", Type: storage.TypeVarchar, Nullable: true}, {Name: "partitions", Type: storage.TypeVarchar, Nullable: true}, {Name: "type", Type: storage.TypeVarchar, Nullable: true}, {Name: "possible_keys", Type: storage.TypeVarchar, Nullable: true}, {Name: "key", Type: storage.TypeVarchar, Nullable: true}, {Name: "key_len", Type: storage.TypeVarchar, Nullable: true}, {Name: "ref", Type: storage.TypeVarchar, Nullable: true}, {Name: "rows", Type: storage.TypeBigInt, Nullable: true}, {Name: "filtered", Type: storage.TypeDouble, Nullable: true}, {Name: "Extra", Type: storage.TypeText}}
 	if len(s.Joins) > 0 {
-		inputs, err := bindMVCCJoins(tx, session, s)
+		inputs, err := bindJoins(tx, session, s)
 		if err != nil {
 			return nil, err
 		}
@@ -47,7 +71,7 @@ func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Que
 			if name == "" {
 				_, name = splitTableName(input.join.Table)
 			}
-			extra := "MVCC nested loop; Statistics unavailable"
+			extra := "Physical nested loop; Statistics unavailable"
 			if i > 0 {
 				extra += "; integer equality index checked per outer row"
 			}
@@ -188,6 +212,12 @@ func bindMVCCExplainExpr(expr parser.Expr, schema *storage.Table, aliases ...map
 		children = v.Values
 	case parser.FunctionExpr:
 		children = v.Args
+	case parser.WindowExpr:
+		children = append(children, v.Function.Args...)
+		children = append(children, v.PartitionBy...)
+		for _, order := range v.OrderBy {
+			children = append(children, order.Expression)
+		}
 	case parser.IntervalExpr:
 		children = []parser.Expr{v.Value}
 	case parser.InExpr:

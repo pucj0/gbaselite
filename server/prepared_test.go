@@ -137,9 +137,24 @@ func TestPreparedStatementProtocol(t *testing.T) {
 	if err := client.QueryRow("SELECT score FROM records WHERE id=?", int64(1)).Scan(&score); err != nil || score != 100 {
 		t.Fatalf("prepared expression UPDATE score=%v error=%v", score, err)
 	}
-	if rows, err := client.Query("SELECT id FROM records WHERE id=? UNION ALL SELECT id FROM records WHERE id=?", int64(1), int64(2)); err == nil {
-		rows.Close()
-		t.Fatal("unsupported prepared UNION accepted")
+	rows, err = client.Query("SELECT id FROM records WHERE id=? UNION ALL SELECT id FROM records WHERE id=?", int64(1), int64(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unionIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		unionIDs = append(unionIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	if len(unionIDs) != 2 || unionIDs[0] != 1 || unionIDs[1] != 2 {
+		t.Fatalf("prepared UNION rows: %v", unionIDs)
 	}
 
 }

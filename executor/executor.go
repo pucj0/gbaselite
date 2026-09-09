@@ -18,11 +18,12 @@ import (
 	"gbaselite/catalog"
 	"gbaselite/internal/atomicfile"
 	"gbaselite/parser"
+	"gbaselite/physical"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 )
 
-const Version = "1.1.1"
+const Version = "1.1.2"
 
 var ErrPersistenceUnavailable = errors.New("database persistence is unavailable")
 
@@ -1490,40 +1491,58 @@ func executeQuery(store *storage.Store, session *Session, query parser.Query) (*
 }
 
 func executeUnion(store *storage.Store, session *Session, statement parser.Union) (*Result, error) {
+	return executeUnionWithSelect(session, statement, func(query parser.Select) (*Result, error) { return executeSelect(store, session, query) })
+}
+func executeUnionWithSelect(session *Session, statement parser.Union, selectQuery func(parser.Select) (*Result, error)) (*Result, error) {
 	if len(statement.Queries) == 0 || len(statement.All) != len(statement.Queries)-1 {
 		return nil, errors.New("invalid UNION query")
 	}
 	var columns []Column
-	rows := make([][]any, 0)
-	for queryIndex, query := range statement.Queries {
-		result, err := executeSelect(store, session, query)
+	var current *Result
+	local := *session
+	local.StreamResults = false
+	for index, query := range statement.Queries {
+		result, err := selectQuery(query)
 		if err != nil {
 			return nil, err
 		}
-		queryRows, err := collectResultRows(result)
-		if err != nil {
-			return nil, err
-		}
-		if queryIndex == 0 {
+		if index == 0 {
 			columns = append([]Column(nil), result.Columns...)
 		} else if len(result.Columns) != len(columns) {
-			return nil, fmt.Errorf("%w: UNION query %d returns %d columns, expected %d", storage.ErrColumnCount, queryIndex+1, len(result.Columns), len(columns))
+			return nil, fmt.Errorf("%w: UNION column count", storage.ErrColumnCount)
 		}
-		rows = append(rows, queryRows...)
-		if queryIndex > 0 && !statement.All[queryIndex-1] {
-			seen := make(map[string]struct{}, len(rows))
-			distinct := rows[:0]
-			for _, row := range rows {
-				key := groupedRowKey(row, session)
-				if _, exists := seen[key]; exists {
-					continue
+		previous := current
+		inputs := []physical.Operator[[]any]{}
+		if previous != nil {
+			inputs = append(inputs, physical.Source[[]any](func(_ context.Context, y physical.Yield[[]any]) error {
+				return visitQueryResult(session.query, previous, y)
+			}))
+		}
+		inputs = append(inputs, physical.Source[[]any](func(_ context.Context, y physical.Yield[[]any]) error {
+			return visitQueryResult(session.query, result, y)
+		}))
+		union := physical.Union[[]any]{Inputs: inputs}
+		combined := &Result{Columns: columns, StreamRows: func(y func([]any) error) error { return union.Run(operatorContext(session), y) }}
+		if index > 0 && !statement.All[index-1] {
+			current, err = executeBudgetedDistinct(&local, combined, 0, -1)
+		} else {
+			current = &Result{Columns: columns}
+			used := int64(0)
+			err = combined.StreamRows(func(row []any) error {
+				var err error
+				used, err = checkResultMemory(session.query.options.ResultMemoryBytes, used, row)
+				if err != nil {
+					return err
 				}
-				seen[key] = struct{}{}
-				distinct = append(distinct, row)
-			}
-			rows = distinct
+				current.Rows = append(current.Rows, append([]any(nil), row...))
+				return nil
+			})
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
+	rows := current.Rows
 	orderPositions := make([]int, len(statement.OrderBy))
 	for index, order := range statement.OrderBy {
 		name := strings.TrimSpace(order.Column)
@@ -1546,31 +1565,38 @@ func executeUnion(store *storage.Store, session *Session, statement parser.Union
 		}
 		orderPositions[index] = position
 	}
-	if len(orderPositions) > 0 {
-		sort.SliceStable(rows, func(leftIndex, rightIndex int) bool {
-			left, right := rows[leftIndex], rows[rightIndex]
-			for index, position := range orderPositions {
-				comparison := session.Compare(left[position], right[position])
-				if comparison == 0 {
-					continue
-				}
-				if statement.OrderBy[index].Desc {
-					return comparison > 0
-				}
-				return comparison < 0
+
+	limit := -1
+	if statement.HasLimit {
+		limit = statement.Limit
+	}
+	source := func(y func([]any) error) error {
+		for _, row := range rows {
+			if err := y(row); err != nil {
+				return err
 			}
-			return false
-		})
+		}
+		return nil
 	}
-	start := statement.Offset
-	if start > len(rows) {
-		start = len(rows)
+	if len(orderPositions) > 0 {
+		compare := func(left, right []any) int {
+			for i, position := range orderPositions {
+				cmp := session.Compare(left[position], right[position])
+				if cmp != 0 {
+					if statement.OrderBy[i].Desc {
+						return -cmp
+					}
+					return cmp
+				}
+			}
+			return 0
+		}
+		return executeBudgetedOrder(&local, columns, compare, source, statement.Offset, limit)
 	}
-	end := len(rows)
-	if statement.HasLimit && statement.Limit < end-start {
-		end = start + statement.Limit
-	}
-	return &Result{Columns: columns, Rows: rows[start:end]}, nil
+	result := &Result{Columns: columns}
+	op := physical.Limit[[]any]{Input: physical.Source[[]any](func(_ context.Context, y physical.Yield[[]any]) error { return source(y) }), Offset: statement.Offset, Count: limit}
+	err := op.Run(operatorContext(session), func(row []any) error { result.Rows = append(result.Rows, row); return nil })
+	return result, err
 }
 
 func executeExplain(store *storage.Store, session *Session, query parser.Query) (*Result, error) {
@@ -2628,82 +2654,41 @@ func joinRelations(store *storage.Store, session *Session, left, right *storage.
 	if err != nil {
 		return nil, err
 	}
-	rightRows := right.Select(nil)
-	rightMatched := make([]bool, len(rightRows))
-	leftJoinColumn, rightJoinColumn, hashJoin := equalityJoinColumns(join.On, left, right)
-	if hashJoin && !session.IsBinaryCollation() && (isTextColumn(leftColumns[leftJoinColumn].Type) || isTextColumn(rightColumns[rightJoinColumn].Type)) {
-		hashJoin = false
+	leftInput, rightInput := left, right
+	if join.Type == "RIGHT" {
+		leftInput, rightInput = right, left
 	}
-	var rightBuckets map[joinHashKey][]int
-	if hashJoin {
-		rightBuckets = make(map[joinHashKey][]int, len(rightRows))
-		for index, row := range rightRows {
-			if key, comparable := valueJoinHashKey(row[rightJoinColumn]); comparable {
-				rightBuckets[key] = append(rightBuckets[key], index)
+	input := sourceOperator(func(y func(storage.Row) error) error { return visitQueryTable(session.query, leftInput, nil, y) })
+	op := physical.Join[storage.Row]{Left: input, Right: func(storage.Row) (physical.Operator[storage.Row], error) {
+		return sourceOperator(func(y func(storage.Row) error) error { return visitQueryTable(session.query, rightInput, nil, y) }), nil
+	}, Combine: func(l, r storage.Row) storage.Row {
+		if join.Type == "RIGHT" {
+			l, r = r, l
+		}
+		row := append(storage.Row(nil), l...)
+		return append(row, r...)
+	}, Predicate: func(row storage.Row) (bool, error) {
+		if join.Type == "CROSS" || join.On == nil {
+			return true, nil
+		}
+		v, err := evaluateExprWithContext(join.On, joined, row, session, store)
+		return truthy(v), err
+	}}
+	if join.Type == "LEFT" || join.Type == "RIGHT" {
+		op.NullRight = func(l storage.Row) storage.Row {
+			var nulls storage.Row
+			for _, c := range rightInput.ColumnsView() {
+				nulls = append(nulls, storage.NullValue(c.Type))
 			}
+			if join.Type == "RIGHT" {
+				return append(nulls, l...)
+			}
+			return append(append(storage.Row(nil), l...), nulls...)
 		}
 	}
-	err = left.Visit(nil, func(leftRow storage.Row) error {
-		matched := false
-		insertMatch := func(rightIndex int) error {
-			rightRow := rightRows[rightIndex]
-			candidate := make(storage.Row, 0, len(columns))
-			candidate = append(candidate, leftRow...)
-			candidate = append(candidate, rightRow...)
-			if !hashJoin && join.Type != "CROSS" && join.On != nil {
-				matchedValue, evaluationErr := evaluateExprWithContext(join.On, joined, candidate, session, store)
-				if evaluationErr != nil {
-					return evaluationErr
-				}
-				if !truthy(matchedValue) {
-					return nil
-				}
-			}
-			matched = true
-			rightMatched[rightIndex] = true
-			return joined.Insert(candidate)
-		}
-		if hashJoin {
-			if key, comparable := valueJoinHashKey(leftRow[leftJoinColumn]); comparable {
-				for _, rightIndex := range rightBuckets[key] {
-					if err := insertMatch(rightIndex); err != nil {
-						return err
-					}
-				}
-			}
-		} else {
-			for rightIndex := range rightRows {
-				if err := insertMatch(rightIndex); err != nil {
-					return err
-				}
-			}
-		}
-		if !matched && join.Type == "LEFT" {
-			candidate := append(storage.Row(nil), leftRow...)
-			for _, column := range rightColumns {
-				candidate = append(candidate, storage.NullValue(column.Type))
-			}
-			return joined.Insert(candidate)
-		}
-		return nil
-	})
+	err = op.Run(operatorContext(session), joined.Insert)
 	if err != nil {
 		return nil, err
-	}
-	if join.Type == "RIGHT" {
-		for index, rightRow := range rightRows {
-			if rightMatched[index] {
-				continue
-			}
-			candidate := make(storage.Row, 0, len(columns))
-			for _, column := range leftColumns {
-				candidate = append(candidate, storage.NullValue(column.Type))
-			}
-			candidate = append(candidate, rightRow...)
-			if err := joined.Insert(candidate); err != nil {
-				return nil, err
-			}
-		}
 	}
 	return joined, nil
 }
@@ -3182,6 +3167,9 @@ func containsFold(value, target string) bool {
 }
 
 func executeWindowSelect(table *storage.Table, predicate storage.Predicate, statement parser.Select, columns []storage.Column, session *Session) (*Result, error) {
+	return executeWindowWithSource(table, statement, columns, session, func(y func(storage.Row) error) error { return visitQueryTable(session.query, table, predicate, y) })
+}
+func executeWindowWithSource(table *storage.Table, statement parser.Select, columns []storage.Column, session *Session, source func(func(storage.Row) error) error) (*Result, error) {
 	if len(statement.GroupBy) > 0 || statement.Having != nil {
 		return nil, errors.New("window functions with GROUP BY or HAVING require a derived table")
 	}
@@ -3223,91 +3211,81 @@ func executeWindowSelect(table *storage.Table, predicate storage.Predicate, stat
 	}
 
 	account := newQueryMemoryAccount(session, "window query")
-	rows := make([]storage.Row, 0)
-	if err := visitQueryTable(session.query, table, predicate, func(row storage.Row) error {
-		if err := account.Reserve(queryStorageRowBytes(row) + int64(128+len(plans)*128)); err != nil {
-			return err
-		}
-		rows = append(rows, append(storage.Row(nil), row...))
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	projected := make([][]any, len(rows))
-	for rowIndex, row := range rows {
-		projected[rowIndex] = make([]any, len(plans))
-		for itemIndex, plan := range plans {
-			if plan.window != nil {
-				continue
-			}
-			value, err := evaluateExprWithContext(plan.expression, table, row, session, nil)
-			if err != nil {
-				return nil, err
-			}
-			projected[rowIndex][itemIndex] = value
-		}
-	}
-	for itemIndex, plan := range plans {
-		if plan.window == nil {
-			continue
-		}
-		if err := evaluateWindow(table, rows, projected, itemIndex, *plan.window, plan.column.Type, session); err != nil {
-			return nil, err
-		}
-	}
-
-	if len(statement.OrderBy) > 0 {
-		keys := make([][]any, len(rows))
+	materialize := physical.Materialize[storage.Row]{Input: sourceOperator(source), Clone: func(row storage.Row) storage.Row { return append(storage.Row(nil), row...) }, Charge: func(row storage.Row) error {
+		return account.Reserve(queryStorageRowBytes(row) + int64(128+len(plans)*128))
+	}}
+	window := physical.Window[storage.Row, []any]{Input: materialize, Evaluate: func(rows []storage.Row, y physical.Yield[[]any]) error {
+		projected := make([][]any, len(rows))
 		for rowIndex, row := range rows {
-			keys[rowIndex] = make([]any, len(statement.OrderBy))
-			for orderIndex, order := range statement.OrderBy {
-				position := resultColumnPosition(order.Column, result.Columns)
-				if position >= 0 {
-					keys[rowIndex][orderIndex] = projected[rowIndex][position]
+			projected[rowIndex] = make([]any, len(plans))
+			for itemIndex, plan := range plans {
+				if plan.window != nil {
 					continue
 				}
-				expression, err := parser.ParseExpression(order.Column)
+				value, err := evaluateExprWithContext(plan.expression, table, row, session, nil)
 				if err != nil {
-					return nil, err
+					return err
 				}
-				keys[rowIndex][orderIndex], err = evaluateExprWithContext(expression, table, row, session, nil)
-				if err != nil {
-					return nil, err
-				}
+				projected[rowIndex][itemIndex] = value
 			}
 		}
-		indexes := make([]int, len(rows))
-		for index := range indexes {
-			indexes[index] = index
+		for itemIndex, plan := range plans {
+			if plan.window == nil {
+				continue
+			}
+			if err := evaluateWindow(table, rows, projected, itemIndex, *plan.window, plan.column.Type, session); err != nil {
+				return err
+			}
 		}
-		sort.SliceStable(indexes, func(i, j int) bool {
-			for orderIndex, order := range statement.OrderBy {
-				comparison := session.Compare(keys[indexes[i]][orderIndex], keys[indexes[j]][orderIndex])
-				if comparison != 0 {
+
+		for rowIndex, row := range rows {
+			values := append([]any(nil), projected[rowIndex]...)
+			for _, order := range statement.OrderBy {
+				position := resultColumnPosition(order.Column, result.Columns)
+				if position >= 0 {
+					values = append(values, projected[rowIndex][position])
+					continue
+				}
+				expr, err := parser.ParseExpression(order.Column)
+				if err != nil {
+					return err
+				}
+				value, err := evaluateExprWithContext(expr, table, row, session, nil)
+				if err != nil {
+					return err
+				}
+				values = append(values, value)
+			}
+			if err := y(values); err != nil {
+				return err
+			}
+		}
+		return nil
+	}}
+	limit := -1
+	if statement.HasLimit {
+		limit = statement.Limit
+	}
+	if len(statement.OrderBy) > 0 {
+		compare := func(left, right []any) int {
+			for i, order := range statement.OrderBy {
+				cmp := session.Compare(left[len(plans)+i], right[len(plans)+i])
+				if cmp != 0 {
 					if order.Desc {
-						return comparison > 0
+						return -cmp
 					}
-					return comparison < 0
+					return cmp
 				}
 			}
-			return false
-		})
-		ordered := make([][]any, len(projected))
-		for index, source := range indexes {
-			ordered[index] = projected[source]
+			return 0
 		}
-		projected = ordered
+		local := *session
+		local.StreamResults = false
+		return executeBudgetedOrder(&local, result.Columns, compare, func(y func([]any) error) error { return window.Run(operatorContext(session), y) }, statement.Offset, limit)
 	}
-	start := statement.Offset
-	if start > len(projected) {
-		start = len(projected)
-	}
-	end := len(projected)
-	if statement.HasLimit && statement.Limit < end-start {
-		end = start + statement.Limit
-	}
-	result.Rows = projected[start:end]
-	return result, nil
+	op := physical.Limit[[]any]{Input: window, Offset: statement.Offset, Count: limit}
+	err := op.Run(operatorContext(session), func(row []any) error { result.Rows = append(result.Rows, row); return nil })
+	return result, err
 }
 
 func resultColumnPosition(name string, columns []Column) int {
@@ -3721,7 +3699,7 @@ func executeGroupedSelectWithSource(table *storage.Table, statement parser.Selec
 		groups[""] = 0
 		buckets = append(buckets, groupedBucket{states: make([]aggregateState, len(items)), aggregates: make(map[string]aggregateState)})
 	}
-	err := source(func(row storage.Row) error {
+	add := func(row storage.Row) error {
 		groupValues := make([]any, len(groupIndexes))
 		for index, expression := range groupExpressions {
 			value, evalErr := evaluateExprWithContext(expression, table, row, session, nil)
@@ -3777,13 +3755,9 @@ func executeGroupedSelectWithSource(table *storage.Table, statement parser.Selec
 			}
 		}
 		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-
 	resultRows := make([][]any, 0, len(buckets))
-	for _, bucket := range buckets {
+	emit := func(bucket groupedBucket) error {
 		resultRow := make([]any, len(items))
 		for itemIndex, item := range items {
 			if item.aggregate == aggregateNone {
@@ -3794,7 +3768,7 @@ func executeGroupedSelectWithSource(table *storage.Table, statement parser.Selec
 			} else {
 				value, err := finishAggregate(bucket.states[itemIndex], item.aggregate, item.resultType)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				resultRow[itemIndex] = value
 			}
@@ -3803,7 +3777,7 @@ func executeGroupedSelectWithSource(table *storage.Table, statement parser.Selec
 			if items[itemIndex].aggregate == aggregateNone && items[itemIndex].expression != nil {
 				value, evalErr := evaluateGroupedExpression(items[itemIndex].expression, resultColumns, resultRow, bucket, aggregateNodes, session)
 				if evalErr != nil {
-					return nil, evalErr
+					return evalErr
 				}
 				resultRow[itemIndex] = value
 			}
@@ -3811,16 +3785,30 @@ func executeGroupedSelectWithSource(table *storage.Table, statement parser.Selec
 		if statement.Having != nil {
 			value, havingErr := evaluateGroupedResult(statement.Having, statement, resultColumns, groupIndexes, bucket, resultRow, columns, session)
 			if havingErr != nil {
-				return nil, havingErr
+				return havingErr
 			}
 			if !truthy(value) {
-				continue
+				return nil
 			}
 		}
 		if err := account.Reserve(queryRowBytes(resultRow)); err != nil {
-			return nil, err
+			return err
 		}
 		resultRows = append(resultRows, resultRow)
+		return nil
+	}
+	op := physical.Aggregate[storage.Row, groupedBucket]{Input: sourceOperator(source), New: func() (physical.Accumulator[storage.Row, groupedBucket], error) {
+		return &aggregateBinding[storage.Row, groupedBucket]{add: add, finish: func(y physical.Yield[groupedBucket]) error {
+			for _, bucket := range buckets {
+				if err := y(bucket); err != nil {
+					return err
+				}
+			}
+			return nil
+		}}, nil
+	}}
+	if err := op.Run(operatorContext(session), emit); err != nil {
+		return nil, err
 	}
 
 	if len(statement.OrderBy) > 0 {
@@ -3831,18 +3819,32 @@ func executeGroupedSelectWithSource(table *storage.Table, statement parser.Selec
 				return nil, fmt.Errorf("%w: %s", storage.ErrColumnNotFound, order.Column)
 			}
 		}
-		sort.SliceStable(resultRows, func(i, j int) bool {
+		compare := func(left, right []any) int {
 			for index, position := range positions {
-				comparison := session.Compare(resultRows[i][position], resultRows[j][position])
+				comparison := session.Compare(left[position], right[position])
 				if comparison != 0 {
 					if statement.OrderBy[index].Desc {
-						return comparison > 0
+						return -comparison
 					}
-					return comparison < 0
+					return comparison
 				}
 			}
-			return false
-		})
+			return 0
+		}
+		limit := -1
+		if statement.HasLimit {
+			limit = statement.Limit
+		}
+		local := *session
+		local.StreamResults = false
+		return executeBudgetedOrder(&local, resultColumns, compare, func(y func([]any) error) error {
+			for _, row := range resultRows {
+				if err := y(row); err != nil {
+					return err
+				}
+			}
+			return nil
+		}, statement.Offset, limit)
 	}
 	start := statement.Offset
 	if start > len(resultRows) {

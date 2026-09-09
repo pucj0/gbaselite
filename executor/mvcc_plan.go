@@ -36,8 +36,8 @@ func validateMVCCSelectShape(s parser.Select) error {
 	if s.Table == "" && s.Subquery == nil {
 		return nil
 	}
-	if s.Subquery != nil || selectHasWindow(s.Items) {
-		return errors.New("MVCC derived tables and window functions are not supported")
+	if s.Subquery != nil {
+		return errors.New("derived tables are not supported")
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"gbaselite/parser"
+	"gbaselite/physical"
 	"gbaselite/storage"
 )
 
@@ -41,58 +42,46 @@ func tryIndexedJoinRelations(store *storage.Store, session *Session, left, right
 	}
 	account := newQueryMemoryAccount(session, "indexed JOIN result")
 	q := session.query
-	err = visitQueryTable(q, left, nil, func(leftRow storage.Row) error {
-		matched := false
-		emit := func(rightRow storage.Row) error {
-			candidate := make(storage.Row, 0, len(joinedColumns))
-			candidate = append(candidate, leftRow...)
-			candidate = append(candidate, rightRow...)
-			accepted, evaluationErr := evaluateExprWithContext(join.On, joined, candidate, session, store)
-			if evaluationErr != nil {
-				return evaluationErr
-			}
-			if !truthy(accepted) {
+	if err := q.check(); err != nil {
+		return nil, true, err
+	}
+	op := physical.Join[storage.Row]{Left: sourceOperator(func(y func(storage.Row) error) error { return visitQueryTable(q, left, nil, y) }), Right: func(leftRow storage.Row) (physical.Operator[storage.Row], error) {
+		return sourceOperator(func(y func(storage.Row) error) error {
+			value := leftRow[leftPosition]
+			if value.Null {
 				return nil
 			}
-			if err := account.Reserve(queryStorageRowBytes(candidate)); err != nil {
-				return err
+			if !safeIndexedJoinValue(value) {
+				return visitQueryTable(q, right, nil, y)
 			}
-			matched = true
-			return joined.Insert(candidate)
+			value.Type = target.Type
+			row, found, indexed := right.LookupUnique(target.Name, value)
+			if !indexed {
+				return storage.ErrIndexNotFound
+			}
+			if found {
+				return y(row)
+			}
+			return nil
+		}), nil
+	}, Combine: func(l, r storage.Row) storage.Row { return append(append(storage.Row(nil), l...), r...) }, Predicate: func(row storage.Row) (bool, error) {
+		v, err := evaluateExprWithContext(join.On, joined, row, session, store)
+		return truthy(v), err
+	}}
+	if join.Type == "LEFT" {
+		op.NullRight = func(l storage.Row) storage.Row {
+			row := append(storage.Row(nil), l...)
+			for _, c := range rightColumns {
+				row = append(row, storage.NullValue(c.Type))
+			}
+			return row
 		}
-		value := leftRow[leftPosition]
-		if !value.Null {
-			if safeIndexedJoinValue(value) {
-				value.Type = target.Type
-				rightRow, found, indexed := right.LookupUnique(target.Name, value)
-				if !indexed {
-					return storage.ErrIndexNotFound
-				}
-				if found {
-					if err := emit(rightRow); err != nil {
-						return err
-					}
-				}
-			} else {
-				// Legacy mixed numeric comparisons around 2^53 can compare
-				// neighboring integers equal. Preserve that path by scanning
-				// only for exceptional source values instead of missing rows.
-				if err := visitQueryTable(q, right, nil, emit); err != nil {
-					return err
-				}
-			}
+	}
+	err = op.Run(operatorContext(session), func(row storage.Row) error {
+		if err := account.Reserve(queryStorageRowBytes(row)); err != nil {
+			return err
 		}
-		if !matched && join.Type == "LEFT" {
-			candidate := append(storage.Row(nil), leftRow...)
-			for _, column := range rightColumns {
-				candidate = append(candidate, storage.NullValue(column.Type))
-			}
-			if err := account.Reserve(queryStorageRowBytes(candidate)); err != nil {
-				return err
-			}
-			return joined.Insert(candidate)
-		}
-		return nil
+		return joined.Insert(row)
 	})
 	if err != nil {
 		return nil, true, err
