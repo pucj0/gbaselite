@@ -1,14 +1,12 @@
+// Historical vector-kernel benchmark fixture. SQL uses physical operators.
 package executor
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
-	"errors"
 	"gbaselite/parser"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
-	"math"
 	"strconv"
 	"strings"
 )
@@ -273,101 +271,4 @@ func (p *integerBatchPlan) selectRows(n, stride int, values []int64, nulls []boo
 		selection = selection[:kept]
 	}
 	return selection
-}
-func executeIntegerBatch(ctx context.Context, tx storageengine.Txn, session *Session, s parser.Select, table versionedTable, access mvccAccessPlan, p *integerBatchPlan) (*Result, error) {
-	rows := min(mvccBatchRows, mvccBatchBytes/max(1, p.width*9+2))
-	if !p.aggregate && s.HasLimit {
-		rows = min(rows, max(1, s.Limit))
-	}
-	result := &Result{Columns: p.columns}
-	if !p.aggregate && s.HasLimit && s.Limit == 0 {
-		return result, nil
-	}
-	values := make([]int64, p.width*rows)
-	nulls := make([]bool, len(values))
-	selection := make([]uint16, rows)
-	states := make([]aggregateState, len(p.outputs))
-	offset := s.Offset
-	used := int64(0)
-	err := access.scanBatches(ctx, tx, table, rows, func(batch []mvccBatchEntry) error {
-		if err := checkQuery(session); err != nil {
-			return err
-		}
-		if err := decodeIntegerBatch(table, p, batch, rows, values, nulls); err != nil {
-			return err
-		}
-		selected := p.selectRows(len(batch), rows, values, nulls, selection)
-		if p.aggregate {
-			for i, out := range p.outputs {
-				if out.position < 0 {
-					states[i].count += int64(len(selected))
-					continue
-				}
-				base := p.positions[out.position] * rows
-				for _, r := range selected {
-					at := base + int(r)
-					if nulls[at] {
-						continue
-					}
-					v := values[at]
-					state := &states[i]
-					if out.kind == aggregateCount {
-						state.count++
-						continue
-					}
-					if (out.kind == aggregateSum || out.kind == aggregateAvg) && !state.decimal.has && !(v > 0 && state.integerSum > math.MaxInt64-v) && !(v < 0 && state.integerSum < math.MinInt64-v) {
-						state.integerSum += v
-						state.count++
-						state.has = true
-						continue
-					}
-					// Preserve overflow promotion and existing comparison semantics.
-					if err := updateAggregate(state, out.kind, v, false, session); err != nil {
-						return err
-					}
-				}
-			}
-			return nil
-		}
-		for _, r := range selected {
-			if offset > 0 {
-				offset--
-				continue
-			}
-			record := make([]any, len(p.outputs))
-			for i, out := range p.outputs {
-				at := p.positions[out.position]*rows + int(r)
-				if !nulls[at] {
-					record[i] = values[at]
-				}
-			}
-			var err error
-			used, err = checkResultMemory(session.query.options.ResultMemoryBytes, used, record)
-			if err != nil {
-				return err
-			}
-			result.Rows = append(result.Rows, record)
-			if s.HasLimit && len(result.Rows) >= s.Limit {
-				return errBudgetedRowsDone
-			}
-		}
-		return nil
-	})
-	if errors.Is(err, errBudgetedRowsDone) {
-		err = nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if p.aggregate && s.Offset == 0 && (!s.HasLimit || s.Limit > 0) {
-		record := make([]any, len(p.outputs))
-		for i, out := range p.outputs {
-			record[i], err = finishAggregate(states[i], out.kind, p.columns[i].Type)
-			if err != nil {
-				return nil, err
-			}
-		}
-		result.Rows = [][]any{record}
-	}
-	return result, nil
 }

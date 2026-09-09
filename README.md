@@ -4,7 +4,7 @@ GBaseLite 是一个使用 Go 编写、默认单机运行的轻量级关系型数
 PostgreSQL，使用自己的存储文件持久化数据，并通过 MySQL 协议向 Navicat、DBeaver、
 JDBC、Go MySQL 驱动等客户端提供服务。
 
-当前版本：`1.1.1`（工作区开发改造；历史发布包以对应发布说明为准）
+当前版本：`1.1.2`（工作区开发改造；历史发布包以对应发布说明为准）
 
 **MVCC 是唯一运行事务引擎。snapshot/paged 仅作为离线迁移源格式保留。**
 
@@ -757,7 +757,7 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 | 连接 | MySQL TCP、认证、TLS、COM_QUERY、Prepared Statement、二进制结果 | 不是完整 MySQL 协议实现 |
 | DDL | 数据库/表创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引 | 不支持视图、CTAS/LIKE、RENAME TABLE；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
 | 写入 | INSERT VALUES/表达式/参数、单表 UPDATE/DELETE | 不支持 INSERT SELECT/SET/IGNORE、REPLACE、ON DUPLICATE KEY、JOIN 写入、子查询写入 |
-| 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT JOIN | 不支持 UNION、CTE、窗口、派生表、子查询及锁定读；复杂形态以实际验证为准 |
+| 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT JOIN、UNION/UNION ALL、排名与聚合窗口 | 不支持 CTE、派生表、子查询及锁定读；窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
 | 事务 | BEGIN/COMMIT/ROLLBACK、SET autocommit=0/1、断连回滚、语句失败回滚 | 快照隔离；不支持 SAVEPOINT、LOCK TABLES、隔离级别切换或串行化保证 |
 | 约束 | PRIMARY KEY、UNIQUE、CHECK、同库 RESTRICT/NO ACTION 外键 | 不支持级联、自引用、跨库外键；受引用表 ALTER 有限制 |
 | 类型 | INT/BIGINT、文本、日期时间、BOOLEAN、精确 DECIMAL、JSON 列及现有标量函数 | 不支持 ON UPDATE 列表达式；TIMESTAMP 尚无独立 UTC 存储语义 |
@@ -901,13 +901,31 @@ MVCC 的 local WAL、临时写集及备份格式详见 [MVCC 文档](docs/使用
 SQL 执行、访问计划和事务编排依赖 `storageengine.Engine/Txn/Iterator/Table/Index/ScanRequest`，
 不直接导入 bbolt、具体 MVCC 或复制实现。默认由 `enginefactory` 装配现有 MVCC/bbolt adapter；
 `OpenOptions.BackendFactory` 或 `NewWithStorage` 可注入替代后端，SQL 算子无需改动。
-正常启动仍不需要 mode，数据格式和现有 SQL 支持范围保持不变。
+正常启动仍不需要 mode，数据格式保持不变；当前 SQL 支持范围以功能矩阵为准。
 
 `executor.Engine.Backend` 替代具体 `MVCC` 句柄。自增号通过中立接口持久预留，维护为可选能力；
 不支持的能力明确报错。迭代器字节只借用到下一次读取，批量算子显式复制保留的数据。
 详情、生命周期约定和测试边界见[接口设计](docs/设计/StorageEngine接口.md)。
 
 已有独立内存后端的 SQL 回归测试与导入边界检查；该后端仅用于测试，不是第二个生产引擎。
+
+## 统一 Physical Operator
+
+查询统一组合 physical.Operator[T].Run(ctx, yield)：Scan、Filter、Projection、Join、
+Aggregate、Sort、TopN、Union、Materialize、Window、Modify。关系算子只消费上游行，
+Scan 通过 Iterator 读数据；SQL 绑定层把 Txn、访问计划、行解码、表达式和约束写入接到算子。
+公共算子不导入 MVCC、bbolt 或具体后端，索引探测与全表扫描共用同一个 Join。
+
+Sort 和 TopN 共用有预算、可溢写的排序器；TopN 当前为排序后分页，未采用独立堆优化。
+GROUP BY 和 Window 保留内存预算，超限报错；窗口物化尚不溢写。
+支持 ROW_NUMBER/RANK/DENSE_RANK，以及 COUNT/SUM/AVG/MIN/MAX 的默认窗口：
+无排序时整个分区，有排序时累积至当前同值组。窗口与 GROUP BY/HAVING 混用、显式 frame
+仍不支持。UNION DISTINCT 复用排序去重，混合 ALL/DISTINCT 按分支顺序组合。
+
+增删改使用行级 Modify，提交仍由语句子事务及外层事务负责，失败不留下部分语句写入。
+独立整数 Executor 已移除，旧向量内核只留在测试基准中；当前 SQL 不选择独立整数执行路径。
+LIMIT 提前结束、消费错误和取消均释放已打开的迭代器/排序临时文件。
+详见[物理算子设计](docs/设计/PhysicalOperator管线.md)。
 
 ## 单引擎改造与验证
 
@@ -955,7 +973,7 @@ go test ./...
 go vet ./...
 ```
 
-可重复性能基准使用项目临时目录，不连接已安装服务或业务数据。以下命令覆盖 MVCC 批量写入、表结构读取及多连接 MySQL 协议查询：
+可重复性能基准使用项目临时目录，不连接已安装服务或业务数据。以下命令覆盖历史整数内核对比、表结构读取及多连接 MySQL 协议查询；整数内核基准不代表当前统一管线的端到端性能：
 
 ```powershell
 $env:GOCACHE="$PWD\.tmp\gocache"
@@ -1015,13 +1033,13 @@ README、版本化裸二进制 Compose 路径、环境示例、工作流默认�
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 `
-  -Version 1.1.1 -GoExecutable D:\env\Go\bin\go.exe
+  -Version 1.1.2 -GoExecutable D:\env\Go\bin\go.exe
 ```
 
 兼容入口 `scripts/package.ps1` 会转发到同一脚本。Linux 构建机可以使用：
 
 ```bash
-VERSION=1.1.1 ./scripts/build-release.sh
+VERSION=1.1.2 ./scripts/build-release.sh
 ```
 
 MSI 单独构建：
@@ -1029,7 +1047,7 @@ MSI 单独构建：
 ```powershell
 dotnet tool install --global wix --version 5.0.2
 wix extension add --global WixToolset.UI.wixext/5.0.2
-.\scripts\build-msi.ps1 -Version 1.1.1 `
+.\scripts\build-msi.ps1 -Version 1.1.2 `
   -SourceDirectory .\.tmp\windows-package `
   -OutputPath .\dist\GBaseLite-windows-amd64.msi
 ```
@@ -1099,9 +1117,9 @@ GHCR 和 Docker Hub 的精确版本、`major.minor` 与 `latest` 标签。GHCR �
 
 ```powershell
 .\publish-release.bat -SelfTest
-.\publish-release.bat -Version 1.1.1 -DryRun -ReplaceArtifacts
-.\publish-release.bat -Version 1.1.1 -PrepareOnly -ReplaceArtifacts
-.\publish-release.bat -Version 1.1.1 -Publish -ReplaceArtifacts
+.\publish-release.bat -Version 1.1.2 -DryRun -ReplaceArtifacts
+.\publish-release.bat -Version 1.1.2 -PrepareOnly -ReplaceArtifacts
+.\publish-release.bat -Version 1.1.2 -Publish -ReplaceArtifacts
 ```
 
 `publish-release.bat` 默认在完成或失败后暂停，双击运行时可以看到完整输出；自动化或已打开的

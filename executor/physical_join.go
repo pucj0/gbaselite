@@ -4,31 +4,32 @@ import (
 	"context"
 	"fmt"
 	"gbaselite/parser"
+	"gbaselite/physical"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strconv"
 )
 
-type mvccJoinInput struct {
+type joinInput struct {
 	definition versionedTable
 	schema     *storage.Table
 	combined   *storage.Table
 	join       parser.Join
 }
 
-func bindMVCCJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]mvccJoinInput, error) {
+func bindJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]joinInput, error) {
 	if len(s.Joins) > 16 {
-		return nil, fmt.Errorf("MVCC join exceeds 16 inputs")
+		return nil, fmt.Errorf("join exceeds 16 inputs")
 	}
-	inputs := make([]mvccJoinInput, 0, len(s.Joins)+1)
+	inputs := make([]joinInput, 0, len(s.Joins)+1)
 	joins := append([]parser.Join{{Table: s.Table, TableAlias: s.TableAlias}}, s.Joins...)
 	var columns []storage.Column
 	for i, j := range joins {
 		if j.Subquery != nil {
-			return nil, fmt.Errorf("MVCC derived join input is not supported")
+			return nil, fmt.Errorf("derived join input is not supported")
 		}
 		if i > 0 && j.Type != "INNER" && j.Type != "LEFT" {
-			return nil, fmt.Errorf("MVCC supports INNER and LEFT JOIN")
+			return nil, fmt.Errorf("supports INNER and LEFT JOIN")
 		}
 		table, schema, _, err := loadVersionedTable(tx, session, j.Table)
 		if err != nil {
@@ -59,12 +60,12 @@ func bindMVCCJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]m
 				return nil, err
 			}
 		}
-		inputs = append(inputs, mvccJoinInput{table, schema, combined, j})
+		inputs = append(inputs, joinInput{table, schema, combined, j})
 	}
 	return inputs, nil
 }
-func mvccJoinedSource(ctx context.Context, tx storageengine.Txn, session *Session, s parser.Select) (*storage.Table, func(func(storage.Row) error) error, error) {
-	inputs, err := bindMVCCJoins(tx, session, s)
+func joinedSource(ctx context.Context, tx storageengine.Txn, session *Session, s parser.Select) (*storage.Table, func(func(storage.Row) error) error, error) {
+	inputs, err := bindJoins(tx, session, s)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -72,84 +73,64 @@ func mvccJoinedSource(ctx context.Context, tx storageengine.Txn, session *Sessio
 	if err = bindMVCCExplainExpr(s.Where, schema); err != nil {
 		return nil, nil, err
 	}
-	source := func(yield func(storage.Row) error) error {
-		var next func(int, storage.Row) error
-		next = func(level int, left storage.Row) error {
-			if err := checkQuery(session); err != nil {
-				return err
-			}
-			if level == len(inputs) {
-				if s.Where != nil {
-					v, err := evaluateExprWithContext(s.Where, schema, left, session, nil)
-					if err != nil {
-						return err
-					}
-					if !truthy(v) {
-						return nil
-					}
-				}
-				return yield(left)
-			}
-			input := inputs[level]
+	op := bindScan(tx, inputs[0].definition, mvccAccessPlan{kind: mvccAccessAll}, func(v []byte) (storage.Row, error) { return decodeMVCCRow(inputs[0].definition, v) })
+	for level := 1; level < len(inputs); level++ {
+		input := inputs[level]
+		leftSchema := inputs[level-1].combined
+		join := physical.Join[storage.Row]{Left: op, Right: func(left storage.Row) (physical.Operator[storage.Row], error) {
 			access := mvccAccessPlan{kind: mvccAccessAll}
-			if level > 0 {
-				if where, ok := mvccJoinLookup(input.join.On, inputs[level-1].combined, input.schema, left); ok {
-					access = planMVCCAccess(parser.Select{Where: where}, input.definition, input.schema, session)
-				}
+			if where, ok := joinLookup(input.join.On, leftSchema, input.schema, left); ok {
+				access = planMVCCAccess(parser.Select{Where: where}, input.definition, input.schema, session)
 			}
-			matched := false
-			err := access.scanBatches(ctx, tx, input.definition, 1, func(batch []mvccBatchEntry) error {
-				for _, entry := range batch {
-					right, err := decodeMVCCRow(input.definition, entry.value)
-					if err != nil {
-						return err
-					}
-					row := make(storage.Row, len(left)+len(right))
-					copy(row, left)
-					copy(row[len(left):], right)
-					if level > 0 && input.join.On != nil {
-						v, err := evaluateExprWithContext(input.join.On, input.combined, row, session, nil)
-						if err != nil {
-							return err
-						}
-						if !truthy(v) {
-							continue
-						}
-					}
-					matched = true
-					if err = next(level+1, row); err != nil {
-						return err
-					}
+			return bindScan(tx, input.definition, access, func(v []byte) (storage.Row, error) {
+				if err := checkQuery(session); err != nil {
+					return nil, err
 				}
-				return nil
-			})
-			if err != nil {
-				return err
+				return decodeMVCCRow(input.definition, v)
+			}), nil
+		}, Combine: func(left, right storage.Row) storage.Row {
+			row := make(storage.Row, len(left)+len(right))
+			copy(row, left)
+			copy(row[len(left):], right)
+			return row
+		}, Predicate: func(row storage.Row) (bool, error) {
+			if input.join.On == nil {
+				return true, checkQuery(session)
 			}
-			if !matched && input.join.Type == "LEFT" {
+			value, err := evaluateExprWithContext(input.join.On, input.combined, row, session, nil)
+			return truthy(value), err
+		}}
+		if input.join.Type == "LEFT" {
+			join.NullRight = func(left storage.Row) storage.Row {
 				row := make(storage.Row, len(left)+len(input.schema.ColumnsView()))
 				copy(row, left)
 				for i, c := range input.schema.ColumnsView() {
 					row[len(left)+i] = storage.NullValue(c.Type)
 				}
-				return next(level+1, row)
+				return row
 			}
-			return nil
 		}
-		return next(0, nil)
+		op = join
 	}
+	if s.Where != nil {
+		op = physical.Filter[storage.Row]{Input: op, Predicate: func(row storage.Row) (bool, error) {
+			v, err := evaluateExprWithContext(s.Where, schema, row, session, nil)
+			return truthy(v), err
+		}}
+	}
+	source := rowSource(ctx, op)
 	return schema, source, nil
 }
-func mvccJoinLookup(on parser.Expr, left, right *storage.Table, row storage.Row) (parser.Expr, bool) {
+func joinLookup(on parser.Expr, left, right *storage.Table, row storage.Row) (parser.Expr, bool) {
 	expr, ok := on.(parser.BinaryExpr)
 	if !ok {
 		return nil, false
 	}
 	if expr.Operator == "AND" {
-		if p, ok := mvccJoinLookup(expr.Left, left, right, row); ok {
+		if p, ok := joinLookup(expr.Left, left, right, row); ok {
 			return p, true
 		}
-		return mvccJoinLookup(expr.Right, left, right, row)
+		return joinLookup(expr.Right, left, right, row)
 	}
 	if expr.Operator != "=" {
 		return nil, false

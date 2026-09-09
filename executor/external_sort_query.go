@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"context"
+	"gbaselite/physical"
 	"gbaselite/storage"
 )
 
@@ -33,33 +35,19 @@ func visitQueryTable(q *queryControl, table *storage.Table, predicate storage.Pr
 func executeBudgetedOrder(session *Session, columns []Column, compare func([]any, []any) int, visit func(func([]any) error) error, offset, limit int) (*Result, error) {
 	q := session.query
 	run := func(yield func([]any) error) error {
-		sorter, err := newExternalRowSorter(q, compare)
-		if err != nil {
-			return err
+		input := physical.Source[[]any](func(_ context.Context, y physical.Yield[[]any]) error { return visit(y) })
+		sorter := physical.Sort[[]any]{Input: input, New: func() (physical.Sorter[[]any], error) { return newExternalRowSorter(q, compare) }}
+		var op physical.Operator[[]any] = physical.Limit[[]any]{Input: sorter, Offset: offset, Count: limit}
+		if limit >= 0 {
+			op = physical.TopN[[]any]{Sort: sorter, Offset: offset, Count: limit}
 		}
-		defer sorter.Close()
-		if err = visit(sorter.Add); err != nil {
-			return err
-		}
-		seen, emitted := 0, 0
-		err = sorter.Finish(func(row []any) error {
-			if seen < offset {
-				seen++
-				return nil
-			}
-			if limit >= 0 && emitted >= limit {
-				return errBudgetedRowsDone
-			}
-			emitted++
+		project := physical.Projection[[]any, []any]{Input: op, Project: func(row []any) ([]any, error) {
 			if len(row) < len(columns) {
-				return errors.New("sort projection has fewer values than result columns")
+				return nil, errors.New("sort projection has fewer values than result columns")
 			}
-			return yield(row[:len(columns)])
-		})
-		if errors.Is(err, errBudgetedRowsDone) {
-			return nil
-		}
-		return err
+			return row[:len(columns)], nil
+		}}
+		return project.Run(operatorContext(session), yield)
 	}
 	result := &Result{Columns: columns}
 	if session.StreamResults {
@@ -130,6 +118,9 @@ func executeBudgetedDistinct(session *Session, source *Result, offset, limit int
 	run := func(yield func([]any) error) error {
 		split := *q
 		split.options.SortMemoryBytes = q.options.SortMemoryBytes / 2
+		if q.options.SortMemoryBytes == 0 {
+			split.options.SortMemoryBytes = 2 << 20
+		}
 		if split.options.SortMemoryBytes < 64<<10 {
 			return fmt.Errorf("%w: DISTINCT requires at least 131072 bytes of sort memory", ErrQueryResourceLimit)
 		}

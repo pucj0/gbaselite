@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"gbaselite/parser"
+	"gbaselite/physical"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
@@ -205,26 +206,13 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 				return nil, err
 			}
 		}
-		var scratch, updated storage.Row
+		var updated storage.Row
 		count := 0
-		err = scanMVCCRows(ctx, read, definition, schema, session, value.Where, func(key, encoded []byte) error {
-			if value.HasLimit && count >= value.Limit {
-				return nil
-			}
-			row, err := decodeMVCCRowInto(definition, encoded, nil, scratch)
-			scratch = row
-			if err != nil {
-				return err
-			}
-			if value.Where != nil {
-				match, err := evaluateExprWithContext(value.Where, schema, row, session, nil)
-				if err != nil {
-					return err
-				}
-				if !truthy(match) {
-					return nil
-				}
-			}
+		limit := -1
+		if value.HasLimit {
+			limit = value.Limit
+		}
+		err = runRowModification(ctx, read, definition, schema, session, value.Where, limit, func(key []byte, row storage.Row) error {
 			if cap(updated) < len(row) {
 				updated = make(storage.Row, len(row))
 			} else {
@@ -263,26 +251,13 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 		if err = write.Guard("catalog", k); err != nil {
 			return nil, err
 		}
-		var scratch storage.Row
+
 		count := 0
-		err = scanMVCCRows(ctx, read, definition, schema, session, value.Where, func(key, encoded []byte) error {
-			if value.HasLimit && count >= value.Limit {
-				return nil
-			}
-			row, err := decodeMVCCRowInto(definition, encoded, nil, scratch)
-			scratch = row
-			if err != nil {
-				return err
-			}
-			if value.Where != nil {
-				matched, err := evaluateExprWithContext(value.Where, schema, row, session, nil)
-				if err != nil {
-					return err
-				}
-				if !truthy(matched) {
-					return nil
-				}
-			}
+		limit := -1
+		if value.HasLimit {
+			limit = value.Limit
+		}
+		err = runRowModification(ctx, read, definition, schema, session, value.Where, limit, func(key []byte, row storage.Row) error {
 			if err := writeVersionedRow(ctx, write, definition, key, row, nil, ""); err != nil {
 				return err
 			}
@@ -337,12 +312,21 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, 
 		sent[i] = floors[i]
 		return nil
 	}
-	for rowIndex, literals := range statement.Values {
+	input := physical.Source[int](func(_ context.Context, y physical.Yield[int]) error {
+		for i := range statement.Values {
+			if err := y(i); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	modify := physical.Modify[int, struct{}]{Input: input, Apply: func(ctx context.Context, rowIndex int) (struct{}, error) {
+		literals := statement.Values[rowIndex]
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return struct{}{}, err
 		}
 		if len(literals) != len(positions) {
-			return nil, errors.New("INSERT value count does not match columns")
+			return struct{}{}, errors.New("INSERT value count does not match columns")
 		}
 		row := make(storage.Row, len(columns))
 		for i, column := range columns {
@@ -350,7 +334,7 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, 
 			if column.HasDefault {
 				row[i], err = columnDefaultValue(column, session)
 				if err != nil {
-					return nil, err
+					return struct{}{}, err
 				}
 			}
 		}
@@ -359,16 +343,16 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, 
 			if expression, ok := statement.ValueExpressions[[2]int{rowIndex, valueIndex}]; ok {
 				raw, err := evaluateExprWithContext(expression, schema, row, session, nil)
 				if err != nil {
-					return nil, err
+					return struct{}{}, err
 				}
 				row[position], err = interfaceToColumnValue(raw, columns[position])
 				if err != nil {
-					return nil, err
+					return struct{}{}, err
 				}
 			} else {
 				row[position], err = literalToValue(literal, columns[position])
 				if err != nil {
-					return nil, err
+					return struct{}{}, err
 				}
 			}
 		}
@@ -388,12 +372,12 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, 
 			if row[i].Null {
 				if next[i] == 0 || next[i] > last[i] {
 					if err := advance(i); err != nil {
-						return nil, err
+						return struct{}{}, err
 					}
 					count := uint64(len(statement.Values) - rowIndex)
 					reserved, err := e.Backend.ReserveCounter(ctx, definition.counterKey(column.Name), count)
 					if err != nil {
-						return nil, err
+						return struct{}{}, err
 					}
 					next[i] = reserved
 					last[i] = reserved + count - 1
@@ -402,7 +386,7 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, 
 				next[i]++
 				row[i], err = storage.NewValue(column.Type, int64(id))
 				if err != nil {
-					return nil, err
+					return struct{}{}, err
 				}
 				if result.LastInsertID == 0 {
 					result.LastInsertID = id
@@ -411,10 +395,15 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, 
 			}
 		}
 		if err := writeVersionedRow(ctx, write, definition, nil, nil, row, fmt.Sprintf("%s/%020d", write.ID(), rowIndex)); err != nil {
-			return nil, err
+			return struct{}{}, err
 		}
 		result.AffectedRows++
+		return struct{}{}, nil
+	}}
+	if err := modify.Run(ctx, func(struct{}) error { return nil }); err != nil {
+		return nil, err
 	}
+
 	for i := range columns {
 		if err := advance(i); err != nil {
 			return nil, err

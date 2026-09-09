@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"gbaselite/parser"
+	"gbaselite/physical"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
@@ -242,7 +243,9 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 		session.CurrentDatabase = strings.ToLower(value.Database)
 		return &Result{Message: "database changed"}, nil
 	case parser.Select:
-		return executeMVCCSelect(ctx, tx, session, value)
+		return executePhysicalSelect(ctx, tx, session, value)
+	case parser.Union:
+		return executeUnionWithSelect(session, value, func(query parser.Select) (*Result, error) { return executePhysicalSelect(ctx, tx, session, query) })
 	case parser.Explain:
 		return executeMVCCExplain(tx, session, value.Query)
 	case parser.Show:
@@ -256,7 +259,11 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 		return nil, err
 	}
 	defer child.Rollback()
-	result, err := e.mutateMVCC(ctx, tx, child, session, statement)
+	var result *Result
+	modify := physical.Modify[parser.Statement, *Result]{Input: physical.Source[parser.Statement](func(_ context.Context, y physical.Yield[parser.Statement]) error { return y(statement) }), Apply: func(ctx context.Context, s parser.Statement) (*Result, error) {
+		return e.mutateMVCC(ctx, tx, child, session, s)
+	}}
+	err = modify.Run(ctx, func(r *Result) error { result = r; return nil })
 	if err != nil {
 		return nil, err
 	}
