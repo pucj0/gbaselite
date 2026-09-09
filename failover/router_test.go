@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"gbaselite/executor"
 	"gbaselite/failover"
-	"gbaselite/replication"
 	"gbaselite/server"
+	"gbaselite/storageengine"
 	"github.com/go-sql-driver/mysql"
 	"io"
 	"log"
@@ -18,13 +18,13 @@ import (
 )
 
 func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
-	var peers []replication.Peer
+	var peers []storageengine.Peer
 	for i := 0; i < 3; i++ {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		peers = append(peers, replication.Peer{ID: fmt.Sprint(i), Address: l.Addr().String()})
+		peers = append(peers, storageengine.Peer{ID: fmt.Sprint(i), Address: l.Addr().String()})
 		l.Close()
 	}
 	engines := make([]*executor.Engine, 3)
@@ -43,7 +43,7 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 		}
 	}()
 	for i := 0; i < 3; i++ {
-		e, err := executor.OpenWithOptions(t.TempDir(), "root", "pw", executor.OpenOptions{StorageMode: "mvcc", Replication: &replication.Options{ID: peers[i].ID, Bind: peers[i].Address, Peers: peers, Bootstrap: i == 0}})
+		e, err := executor.OpenWithOptions(t.TempDir(), "root", "pw", executor.OpenOptions{StorageMode: "mvcc", Replication: &storageengine.ReplicationOptions{ID: peers[i].ID, Bind: peers[i].Address, Peers: peers, Bootstrap: i == 0}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -130,7 +130,7 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 	for i, p := range sqlPeers {
 		if p.Address == first {
 			listeners[i].Close()
-			if err = engines[i].Replica.Close(); err != nil {
+			if err = engines[i].Close(); err != nil {
 				t.Fatal(err)
 			}
 		}

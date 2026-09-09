@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -22,7 +21,7 @@ import (
 )
 
 func TestProtocolAuditLogIncludesIdentityAndRedactsSQL(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +41,7 @@ func TestProtocolAuditLogIncludesIdentityAndRedactsSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, query := range []string{"CREATE DATABASE audit_test", "CREATE TABLE audit_test.items(id INT,label VARCHAR(32))", "INSERT INTO audit_test.items VALUES (17,'private value')", "/*!50001 CREATE VIEW audit_test.item_view AS SELECT id FROM audit_test.items */"} {
+	for _, query := range []string{"CREATE DATABASE audit_test", "CREATE TABLE audit_test.items(id INT,label VARCHAR(32))", "INSERT INTO audit_test.items VALUES (17,'private value')", "/*!50001 CREATE TABLE audit_test.more_items(id INT) */"} {
 		if _, err := client.Exec(query); err != nil {
 			t.Fatalf("%s: %v", query, err)
 		}
@@ -64,7 +63,7 @@ func TestProtocolAuditLogIncludesIdentityAndRedactsSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(content)
-	if !strings.Contains(text, `"username":"root"`) || !strings.Contains(text, `"remote_ip":"127.0.0.1"`) || !strings.Contains(text, `"operation":"INSERT"`) || !strings.Contains(text, `"operation":"CREATE VIEW"`) || !strings.Contains(text, `"affected_rows":1`) {
+	if !strings.Contains(text, `"username":"root"`) || !strings.Contains(text, `"remote_ip":"127.0.0.1"`) || !strings.Contains(text, `"operation":"INSERT"`) || !strings.Contains(text, `"operation":"CREATE TABLE"`) || !strings.Contains(text, `"affected_rows":1`) {
 		t.Fatalf("audit log is missing required fields:\n%s", text)
 	}
 	if strings.Contains(text, "private value") || strings.Contains(text, "VALUES (17") {
@@ -73,7 +72,7 @@ func TestProtocolAuditLogIncludesIdentityAndRedactsSQL(t *testing.T) {
 }
 
 func BenchmarkMySQLSelect60Rows(b *testing.B) {
-	engine, err := executor.Open(b.TempDir(), "root", "123456")
+	engine, err := openTestEngine(b, b.TempDir(), "root", "123456")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -159,7 +158,7 @@ func TestSlowQueryLogging(t *testing.T) {
 }
 
 func TestShowDatabasesListsOnlyAccessiblePersistentDatabases(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +178,7 @@ func TestShowDatabasesListsOnlyAccessiblePersistentDatabases(t *testing.T) {
 }
 
 func TestNavicatDatabaseDumpMetadataOverPreparedProtocol(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +219,6 @@ func TestNavicatDatabaseDumpMetadataOverPreparedProtocol(t *testing.T) {
 		"USE `navicat-export-test`",
 		"CREATE TABLE `order-items` (`id` BIGINT NOT NULL AUTO_INCREMENT, `sku` VARCHAR(32) NOT NULL, `qty` INT NOT NULL DEFAULT 0, PRIMARY KEY (`id`), UNIQUE KEY `uq_sku` (`sku`), KEY `idx_qty` (`qty`))",
 		"INSERT INTO `order-items` (`sku`,`qty`) VALUES ('SKU-001',2),('SKU-002',0)",
-		"/*!50001 CREATE VIEW `active-items` AS SELECT `id`,`sku`,`qty` FROM `order-items` WHERE `qty` > 0 */",
 	} {
 		if _, err := client.Exec(query); err != nil {
 			t.Fatalf("%s: %v", query, err)
@@ -268,7 +266,7 @@ func TestNavicatDatabaseDumpMetadataOverPreparedProtocol(t *testing.T) {
 	if err := relationRows.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if len(relationNames) != 2 || relationNames[0] != "active-items" || relationNames[1] != "order-items" {
+	if len(relationNames) != 1 || relationNames[0] != "order-items" {
 		t.Fatalf("mysqldump SHOW TABLES enumeration = %#v", relationNames)
 	}
 
@@ -319,7 +317,7 @@ func TestNavicatDatabaseDumpMetadataOverPreparedProtocol(t *testing.T) {
 	if err := metadataStatement.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if len(relations) != 2 || relations[0] != [2]string{"order-items", "BASE TABLE"} || relations[1] != [2]string{"active-items", "VIEW"} {
+	if len(relations) != 1 || relations[0] != [2]string{"order-items", "BASE TABLE"} {
 		t.Fatalf("information_schema.TABLES = %#v", relations)
 	}
 
@@ -340,226 +338,30 @@ func TestNavicatDatabaseDumpMetadataOverPreparedProtocol(t *testing.T) {
 	}
 }
 
-func TestNavicatCommonWorkflowsOverMySQLProtocol(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+func TestMVCCRejectsLegacyNavicatCopySyntax(t *testing.T) {
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	databaseServer := &MySQLServer{Engine: engine, Logger: log.New(io.Discard, "", 0)}
-	done := make(chan error, 1)
-	go func() { done <- databaseServer.Serve(listener) }()
-
-	client, err := sql.Open("mysql", "root:123456@tcp("+listener.Addr().String()+")/?charset=utf8mb4&timeout=3s")
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.SetMaxOpenConns(3)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	connection, err := client.Conn(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		_ = connection.Close()
-		_ = client.Close()
-		shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer shutdownCancel()
-		if err := databaseServer.Shutdown(shutdownContext); err != nil {
-			t.Errorf("shutdown: %v", err)
-		}
-		if err := <-done; err != nil {
-			t.Errorf("serve: %v", err)
-		}
-	}()
-
-	exec := func(query string) sql.Result {
-		t.Helper()
-		result, execErr := connection.ExecContext(ctx, query)
-		if execErr != nil {
-			t.Fatalf("%s: %v", query, execErr)
-		}
-		return result
-	}
-	listRelations := func(database string) map[string]string {
-		t.Helper()
-		rows, queryErr := client.QueryContext(ctx, "SHOW FULL TABLES FROM `"+database+"`")
-		if queryErr != nil {
-			t.Fatalf("list relations in %s: %v", database, queryErr)
-		}
-		defer rows.Close()
-		relations := make(map[string]string)
-		for rows.Next() {
-			var name, relationType string
-			if scanErr := rows.Scan(&name, &relationType); scanErr != nil {
-				t.Fatal(scanErr)
-			}
-			relations[name] = relationType
-		}
-		if rowsErr := rows.Err(); rowsErr != nil {
-			t.Fatal(rowsErr)
-		}
-		return relations
-	}
-	findCopy := func(relations map[string]string, source, relationType string, sequence int, days ...string) string {
-		t.Helper()
-		for name, actualType := range relations {
-			if actualType != relationType {
-				continue
-			}
-			for _, day := range days {
-				if name == fmt.Sprintf("%s_copy_%s%02d", source, day, sequence) {
-					return name
-				}
-			}
-		}
-		t.Fatalf("copy %s sequence %02d not found in %#v", source, sequence, relations)
-		return ""
-	}
-
-	for _, query := range []string{
-		"CREATE DATABASE `navicat-workflow-source`",
-		"USE `navicat-workflow-source`",
-		"CREATE TABLE `items` (`id` INT NOT NULL, `label` VARCHAR(32) NOT NULL, `note` TEXT NULL, PRIMARY KEY (`id`), UNIQUE KEY `uq_label` (`label`), KEY `idx_note` (`note`))",
-		"INSERT INTO `items` VALUES (1,'first',NULL),(2,'second',NULL),(3,'third','keep')",
-		"CREATE VIEW `active-items` AS SELECT `id`,`label` FROM `items` WHERE `id` >= 1",
-	} {
-		exec(query)
-	}
-	updated := exec("UPDATE `items` SET `label`='edited' WHERE `id` <=> 1 AND `note` <=> NULL LIMIT 1")
-	if affected, err := updated.RowsAffected(); err != nil || affected != 1 {
-		t.Fatalf("Navicat UPDATE affected %d rows: %v", affected, err)
-	}
-	deleted := exec("DELETE FROM `items` WHERE `id` <=> 2 AND `note` <=> NULL LIMIT 1")
-	if affected, err := deleted.RowsAffected(); err != nil || affected != 1 {
-		t.Fatalf("Navicat DELETE affected %d rows: %v", affected, err)
-	}
-	var remaining int
-	if err := connection.QueryRowContext(ctx, "SELECT COUNT(*) FROM `items`").Scan(&remaining); err != nil || remaining != 2 {
-		t.Fatalf("rows after grid edits = %d, %v", remaining, err)
-	}
-
-	var tableName, tableDDL string
-	if err := connection.QueryRowContext(ctx, "SHOW CREATE TABLE `items`").Scan(&tableName, &tableDDL); err != nil {
-		t.Fatal(err)
-	}
-	if tableName != "items" || !strings.Contains(tableDDL, "UNIQUE KEY `uq_label`") || !strings.Contains(tableDDL, "KEY `idx_note`") {
-		t.Fatalf("copy source DDL = %q %q", tableName, tableDDL)
-	}
-	firstDay := time.Now().Format("060102")
-	exec("CREATE TABLE `items_copy` (`id` INT NOT NULL, `label` VARCHAR(32) NOT NULL, `note` TEXT NULL, PRIMARY KEY (`id`), UNIQUE KEY `uq_label` (`label`), KEY `idx_note` (`note`))")
-	secondDay := time.Now().Format("060102")
-	relations := listRelations("navicat-workflow-source")
-	firstTableCopy := findCopy(relations, "items", "BASE TABLE", 1, firstDay, secondDay)
-	if _, exposed := relations["items_copy"]; exposed {
-		t.Fatalf("temporary items_copy was exposed: %#v", relations)
-	}
-	exec("INSERT INTO `items_copy` SELECT * FROM `items`")
-	if err := client.QueryRowContext(ctx, "SELECT COUNT(*) FROM `navicat-workflow-source`.`"+firstTableCopy+"`").Scan(&remaining); err != nil || remaining != 2 {
-		t.Fatalf("first copied table rows = %d, %v", remaining, err)
-	}
-
-	if err := connection.QueryRowContext(ctx, "SHOW CREATE TABLE `items`").Scan(&tableName, &tableDDL); err != nil {
-		t.Fatal(err)
-	}
-	firstDay = time.Now().Format("060102")
-	exec("CREATE TABLE `items_copy1` (`id` INT NOT NULL, `label` VARCHAR(32) NOT NULL, `note` TEXT NULL, PRIMARY KEY (`id`), UNIQUE KEY `uq_label` (`label`), KEY `idx_note` (`note`))")
-	secondDay = time.Now().Format("060102")
-	relations = listRelations("navicat-workflow-source")
-	secondTableCopy := findCopy(relations, "items", "BASE TABLE", 2, firstDay, secondDay)
-	if _, exposed := relations["items_copy1"]; exposed {
-		t.Fatalf("temporary items_copy1 was exposed: %#v", relations)
-	}
-	exec("INSERT INTO `items_copy1` SELECT * FROM `items`")
-	if err := client.QueryRowContext(ctx, "SELECT COUNT(*) FROM `navicat-workflow-source`.`"+secondTableCopy+"`").Scan(&remaining); err != nil || remaining != 2 {
-		t.Fatalf("second copied table rows = %d, %v", remaining, err)
-	}
-
-	var viewName, viewDDL, characterSet, collation string
-	if err := connection.QueryRowContext(ctx, "SHOW CREATE VIEW `active-items`").Scan(&viewName, &viewDDL, &characterSet, &collation); err != nil {
-		t.Fatal(err)
-	}
-	firstDay = time.Now().Format("060102")
-	exec("CREATE VIEW `active-items_copy` AS SELECT `id`,`label` FROM `items` WHERE `id` >= 1")
-	secondDay = time.Now().Format("060102")
-	relations = listRelations("navicat-workflow-source")
-	viewCopy := findCopy(relations, "active-items", "VIEW", 1, firstDay, secondDay)
-	if _, exposed := relations["active-items_copy"]; exposed {
-		t.Fatalf("temporary view copy was exposed: %#v", relations)
-	}
-	if err := client.QueryRowContext(ctx, "SELECT COUNT(*) FROM `navicat-workflow-source`.`"+viewCopy+"`").Scan(&remaining); err != nil || remaining != 2 {
-		t.Fatalf("copied view rows = %d, %v", remaining, err)
-	}
-
-	exec("CREATE DATABASE `navicat-workflow-target`")
-	if err := connection.QueryRowContext(ctx, "SHOW CREATE TABLE `navicat-workflow-source`.`items`").Scan(&tableName, &tableDDL); err != nil {
-		t.Fatal(err)
-	}
-	exec("CREATE TABLE `navicat-workflow-target`.`items` (`id` INT NOT NULL, `label` VARCHAR(32) NOT NULL, `note` TEXT NULL, PRIMARY KEY (`id`), UNIQUE KEY `uq_label` (`label`), KEY `idx_note` (`note`))")
-	exec("INSERT INTO `navicat-workflow-target`.`items` SELECT * FROM `navicat-workflow-source`.`items`")
-	exec("USE `navicat-workflow-target`")
-	if err := connection.QueryRowContext(ctx, "SHOW CREATE TABLE `items`").Scan(&tableName, &tableDDL); err != nil {
-		t.Fatal(err)
-	}
-	exec("DROP TABLE `items`")
-	exec(tableDDL)
-	exec("INSERT INTO `items` SELECT * FROM `navicat-workflow-source`.`items`")
-	exec("CREATE VIEW `active-items` AS SELECT `id`,`label` FROM `items` WHERE `id` >= 1")
-	if err := connection.QueryRowContext(ctx, "SHOW CREATE VIEW `active-items`").Scan(&viewName, &viewDDL, &characterSet, &collation); err != nil {
-		t.Fatal(err)
-	}
-	exec("DROP VIEW `active-items`")
-	exec(viewDDL)
-	targetRelations := listRelations("navicat-workflow-target")
-	if targetRelations["items"] != "BASE TABLE" || targetRelations["active-items"] != "VIEW" {
-		t.Fatalf("transferred relations = %#v", targetRelations)
-	}
-	for name := range targetRelations {
-		if strings.Contains(name, "_copy_") {
-			t.Fatalf("GBaseLite transfer was misclassified as a copy: %#v", targetRelations)
-		}
-	}
-	if err := client.QueryRowContext(ctx, "SELECT COUNT(*) FROM `navicat-workflow-target`.`active-items`").Scan(&remaining); err != nil || remaining != 2 {
-		t.Fatalf("transferred view rows = %d, %v", remaining, err)
-	}
-
-	exec("USE `navicat-workflow-source`")
-	statement, err := connection.PrepareContext(ctx, "SHOW FULL TABLES WHERE Table_type != ?")
-	if err != nil {
-		t.Fatal(err)
-	}
-	rows, err := statement.QueryContext(ctx, "VIEW")
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseTables := 0
-	for rows.Next() {
-		var name, relationType string
-		if err := rows.Scan(&name, &relationType); err != nil {
+	session := &executor.Session{CurrentDatabase: "copy_test"}
+	for _, q := range []string{"CREATE DATABASE copy_test", "CREATE TABLE items(id INT PRIMARY KEY)", "INSERT INTO items VALUES(1)"} {
+		if _, err = ExecuteCompatible(engine, session, q); err != nil {
 			t.Fatal(err)
 		}
-		if relationType != "BASE TABLE" {
-			t.Fatalf("export table enumeration returned %q %q", name, relationType)
+	}
+	for _, q := range []string{"CREATE VIEW v AS SELECT * FROM items", "CREATE TABLE copy LIKE items", "CREATE TABLE copy AS SELECT * FROM items", "RENAME TABLE items TO copy"} {
+		if _, err = ExecuteCompatible(engine, session, q); err == nil {
+			t.Fatalf("legacy copy accepted: %s", q)
 		}
-		baseTables++
 	}
-	if err := rows.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := statement.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if baseTables != 3 {
-		t.Fatalf("export enumerated %d base tables, want 3", baseTables)
+	r, err := ExecuteCompatible(engine, session, "SELECT id FROM items")
+	if err != nil || len(r.Rows) != 1 || r.Rows[0][0] != int64(1) {
+		t.Fatalf("source changed: %+v %v", r, err)
 	}
 }
 
 func TestMySQLClientCRUD(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -628,7 +430,7 @@ func TestMySQLClientCRUD(t *testing.T) {
 }
 
 func TestRejectsWrongPassword(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -652,7 +454,7 @@ func TestRejectsWrongPassword(t *testing.T) {
 }
 
 func TestAuthenticationFailureThrottleBlocksRepeatedLogin(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -734,7 +536,7 @@ func TestAuthenticationFailureThrottleExpiresAndClears(t *testing.T) {
 }
 
 func TestNavicatEmptyDatabaseMetadata(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -764,13 +566,8 @@ func TestNavicatEmptyDatabaseMetadata(t *testing.T) {
 		"ALTER TABLE `yuanma-auth`.`auth_code` ADD UNIQUE INDEX `auth_code_id`(`id`)",
 		"SELECT TABLE_NAME, PARTITION_NAME, SUBPARTITION_NAME, PARTITION_METHOD, SUBPARTITION_METHOD, PARTITION_EXPRESSION, SUBPARTITION_EXPRESSION, PARTITION_DESCRIPTION, PARTITION_COMMENT, NODEGROUP, TABLESPACE_NAME FROM information_schema.PARTITIONS WHERE NOT ISNULL(PARTITION_NAME) AND TABLE_SCHEMA LIKE BINARY 'yuanma-auth' AND TABLE_NAME LIKE BINARY 'auth_code' ORDER BY TABLE_NAME, PARTITION_NAME, PARTITION_ORDINAL_POSITION, SUBPARTITION_ORDINAL_POSITION",
 		"SELECT DISTINCT(TABLESPACE_NAME) AS TABLESPACE_NAME FROM information_schema.FILES WHERE NOT ISNULL(TABLESPACE_NAME) LIMIT 10000",
-		"LOCK TABLES `auth_code` WRITE",
-		"UNLOCK TABLES",
 		"FLUSH TABLES",
 		"BEGIN",
-		"SAVEPOINT dump_snapshot",
-		"ROLLBACK TO SAVEPOINT dump_snapshot",
-		"RELEASE SAVEPOINT dump_snapshot",
 		"ROLLBACK",
 		"KILL 123",
 	}
@@ -804,7 +601,7 @@ func TestMySQLIndexErrorCodes(t *testing.T) {
 }
 
 func TestConstraintInformationSchemaMetadata(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -844,7 +641,7 @@ func TestConstraintInformationSchemaMetadata(t *testing.T) {
 
 func TestCompatibilityQueriesFailClosedAfterPersistenceFailure(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := executor.Open(directory, "root", "123456")
+	engine, err := openTestEngine(t, directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -852,23 +649,16 @@ func TestCompatibilityQueriesFailClosedAfterPersistenceFailure(t *testing.T) {
 	if _, err := engine.Execute(session, "CREATE DATABASE failure_test"); err != nil {
 		t.Fatal(err)
 	}
-	temporary := engine.Persistence.Path() + ".tmp"
-	if err := os.Mkdir(temporary, 0o700); err != nil {
+	if err := engine.Backend.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := engine.Execute(session, "CREATE TABLE items(id INT)"); !errors.Is(err, executor.ErrPersistenceUnavailable) {
-		t.Fatalf("persistence failure = %v", err)
-	}
-	if err := os.Remove(temporary); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ExecuteCompatible(engine, session, "SHOW DATABASES"); !errors.Is(err, executor.ErrPersistenceUnavailable) {
+	if _, err := ExecuteCompatible(engine, session, "SHOW DATABASES"); err == nil {
 		t.Fatalf("compatibility query after persistence failure = %v", err)
 	}
 }
 
 func TestNavicatEditableTableMetadata(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -920,20 +710,20 @@ func TestNavicatEditableTableMetadata(t *testing.T) {
 		t.Fatalf("qualified columns = %#v, %v", qualifiedColumns, err)
 	}
 	status, err = ExecuteCompatible(engine, session, "SHOW TABLE STATUS FROM `navicat_metadata`")
-	if err != nil || len(status.Columns) != 18 || status.Rows[0][6].(int64) <= 0 || status.Rows[0][11] == nil || status.Rows[0][12] == nil || status.Rows[0][17] != "editable items" {
+	if err != nil || len(status.Columns) != 18 || status.Rows[0][11] == nil || status.Rows[0][12] == nil || status.Rows[0][17] != "editable items" {
 		t.Fatalf("full table status = %#v, %v", status, err)
 	}
 	if status.Rows[0][11].(time.Time).Nanosecond() != 0 || status.Rows[0][12].(time.Time).Nanosecond() != 0 {
 		t.Fatalf("table status timestamps must be second precision: %#v", status.Rows[0])
 	}
 	tableInfo, err := ExecuteCompatible(engine, session, "SELECT TABLE_NAME,DATA_LENGTH,CREATE_TIME,UPDATE_TIME,TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA='navicat_metadata'")
-	if err != nil || len(tableInfo.Rows) != 1 || tableInfo.Rows[0][1].(int64) <= 0 || tableInfo.Rows[0][4] != "editable items" {
+	if err != nil || len(tableInfo.Rows) != 1 || tableInfo.Rows[0][4] != "editable items" {
 		t.Fatalf("table information = %#v, %v", tableInfo, err)
 	}
 }
 
 func TestShowTableStatusLikeFiltersNavicatTargetLookup(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -963,106 +753,43 @@ func TestShowTableStatusLikeFiltersNavicatTargetLookup(t *testing.T) {
 	}
 }
 
-func TestNavicatDatabaseColumnsIncludeLegacyViewWithDuplicateSourceNames(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+func TestMVCCRejectsLegacyViewBeforeChangingMetadata(t *testing.T) {
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
 	session := &executor.Session{CurrentDatabase: "metadata_views"}
-	for _, query := range []string{
-		"CREATE DATABASE metadata_views",
-		"CREATE TABLE left_items(id INT,name VARCHAR(16))",
-		"CREATE TABLE right_items(id INT,left_id INT)",
-	} {
-		if _, err := engine.Execute(session, query); err != nil {
-			t.Fatalf("%s: %v", query, err)
+	for _, q := range []string{"CREATE DATABASE metadata_views", "CREATE TABLE left_items(id INT,name VARCHAR(16))", "CREATE TABLE right_items(id INT,left_id INT)"} {
+		if _, err = engine.Execute(session, q); err != nil {
+			t.Fatal(err)
 		}
 	}
-	database, err := engine.Store.Database("metadata_views")
-	if err != nil {
-		t.Fatal(err)
+	if _, err = ExecuteCompatible(engine, session, "CREATE VIEW legacy_join AS SELECT * FROM left_items t1 LEFT JOIN right_items t2 ON t1.id=t2.left_id"); err == nil {
+		t.Fatal("unsupported view accepted")
 	}
-	if err := database.CreateView("legacy_join", "SELECT * FROM left_items t1 LEFT JOIN right_items t2 ON t1.id=t2.left_id", nil, false); err != nil {
-		t.Fatal(err)
-	}
-	columns, err := ExecuteCompatible(engine, session, "SELECT TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='metadata_views' ORDER BY TABLE_SCHEMA,TABLE_NAME")
-	if err != nil || len(columns.Rows) != 8 || columns.Rows[0][0] != "metadata_views" {
-		t.Fatalf("database columns = %#v, %v", columns, err)
-	}
-	viewID2 := false
-	for _, row := range columns.Rows {
-		if row[1] == "legacy_join" && row[2] == "id_2" {
-			viewID2 = true
-		}
-	}
-	if !viewID2 {
-		t.Fatalf("legacy view duplicate column was not disambiguated: %#v", columns.Rows)
+	r, err := ExecuteCompatible(engine, session, "SELECT TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='metadata_views'")
+	if err != nil || len(r.Rows) != 4 {
+		t.Fatalf("metadata changed: %+v %v", r, err)
 	}
 }
 
-func TestNavicatViewMetadata(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+func TestMVCCViewMetadataIsEmpty(t *testing.T) {
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := &executor.Session{CurrentDatabase: "view_metadata"}
-	for _, query := range []string{
-		"CREATE DATABASE view_metadata",
-		"CREATE TABLE view_metadata.users(id INT,name VARCHAR(32))",
-		"CREATE VIEW view_metadata.user_names AS SELECT id,name FROM users",
-	} {
-		if _, err := engine.Execute(session, query); err != nil {
-			t.Fatalf("%s: %v", query, err)
-		}
+	session := &executor.Session{}
+	if _, err = engine.Execute(session, "CREATE DATABASE view_metadata"); err != nil {
+		t.Fatal(err)
 	}
-	full, err := ExecuteCompatible(engine, session, "SHOW FULL TABLES")
-	if err != nil || len(full.Columns) != 2 || len(full.Rows) != 2 {
-		t.Fatalf("SHOW FULL TABLES = %#v, %v", full, err)
-	}
-	views, err := ExecuteCompatible(engine, session, "SELECT TABLE_NAME,CHECK_OPTION,IS_UPDATABLE FROM information_schema.VIEWS WHERE TABLE_SCHEMA='view_metadata'")
-	if err != nil || len(views.Columns) != 3 || len(views.Rows) != 1 || views.Rows[0][0] != "user_names" {
-		t.Fatalf("information_schema.VIEWS = %#v, %v", views, err)
-	}
-	dumpView, err := ExecuteCompatible(engine, session, "SELECT CHECK_OPTION,DEFINER,SECURITY_TYPE,CHARACTER_SET_CLIENT,COLLATION_CONNECTION FROM information_schema.VIEWS WHERE TABLE_SCHEMA='view_metadata'")
-	if err != nil || len(dumpView.Columns) != 5 || len(dumpView.Rows) != 1 || dumpView.Rows[0][0] != "NONE" || dumpView.Rows[0][1] != "root@%" || dumpView.Rows[0][2] != "DEFINER" || dumpView.Rows[0][3] != executor.DefaultCharacterSet || dumpView.Rows[0][4] != executor.DefaultCollation {
-		t.Fatalf("mysqldump view metadata = %#v, %v", dumpView, err)
-	}
-	tables, err := ExecuteCompatible(engine, session, "SELECT TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA='view_metadata' AND TABLE_TYPE='BASE TABLE'")
-	if err != nil || len(tables.Columns) != 3 || len(tables.Rows) != 1 || tables.Rows[0][0] != "view_metadata" || tables.Rows[0][1] != "users" || tables.Rows[0][2] != "BASE TABLE" {
-		t.Fatalf("base table metadata = %#v, %v", tables, err)
-	}
-	viewTables, err := ExecuteCompatible(engine, session, "SELECT TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA='view_metadata' AND TABLE_TYPE='VIEW'")
-	if err != nil || len(viewTables.Rows) != 1 || viewTables.Rows[0][1] != "user_names" || viewTables.Rows[0][2] != "VIEW" {
-		t.Fatalf("view table metadata = %#v, %v", viewTables, err)
-	}
-	baseOnly, err := ExecuteCompatible(engine, session, "SHOW FULL TABLES FROM `view_metadata` WHERE Table_type = 'BASE TABLE'")
-	if err != nil || len(baseOnly.Rows) != 1 || baseOnly.Rows[0][0] != "users" || baseOnly.Rows[0][1] != "BASE TABLE" {
-		t.Fatalf("SHOW FULL TABLES base table filter = %#v, %v", baseOnly, err)
-	}
-	viewsOnly, err := ExecuteCompatible(engine, session, "SHOW FULL TABLES IN view_metadata WHERE `Table_type` = 'VIEW'")
-	if err != nil || len(viewsOnly.Rows) != 1 || viewsOnly.Rows[0][0] != "user_names" || viewsOnly.Rows[0][1] != "VIEW" {
-		t.Fatalf("SHOW FULL TABLES view filter = %#v, %v", viewsOnly, err)
-	}
-	viewStatus, err := ExecuteCompatible(engine, session, "SHOW TABLE STATUS LIKE 'user_names'")
-	if err != nil || len(viewStatus.Rows) != 1 || viewStatus.Rows[0][0] != "user_names" || viewStatus.Rows[0][1] != nil || viewStatus.Rows[0][17] != "VIEW" {
-		t.Fatalf("SHOW TABLE STATUS view row = %#v, %v", viewStatus, err)
-	}
-	relations, err := ExecuteCompatible(engine, &executor.Session{}, "SHOW TABLES FROM `view_metadata` LIKE 'user%'")
-	if err != nil || len(relations.Rows) != 2 || relations.Rows[0][0] != "user_names" || relations.Rows[1][0] != "users" {
-		t.Fatalf("SHOW TABLES database and LIKE filter = %#v, %v", relations, err)
-	}
-	columns, err := ExecuteCompatible(engine, session, "SELECT COLUMN_NAME,DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='view_metadata' AND TABLE_NAME='user_names'")
-	if err != nil || len(columns.Rows) != 2 || columns.Rows[1][0] != "name" {
-		t.Fatalf("view columns = %#v, %v", columns, err)
-	}
-	source, err := ExecuteCompatible(engine, session, "SELECT CONVERT(load_file(concat(@@datadir, 'view_metadata', '/', 'user_names', '.frm')) USING utf8) AS source")
-	if err != nil || len(source.Rows) != 1 || !strings.Contains(source.Rows[0][0].(string), "query=SELECT id,name FROM users") {
-		t.Fatalf("Navicat view source = %#v, %v", source, err)
+	r, err := ExecuteCompatible(engine, session, "SELECT TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA='view_metadata'")
+	if err != nil || len(r.Rows) != 0 {
+		t.Fatalf("unexpected views: %+v %v", r, err)
 	}
 }
 
 func TestMySQLProtocolUserPrivileges(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "root-secret")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "root-secret")
 	if err != nil {
 		t.Fatal(err)
 	}

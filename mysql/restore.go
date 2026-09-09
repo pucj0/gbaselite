@@ -19,6 +19,7 @@ func RestoreSQL(engine *executor.Engine, path string) (int, error) {
 		return 0, err
 	}
 	session := &executor.Session{}
+	defer engine.CloseSession(session)
 	if _, err := engine.Execute(session, "BEGIN"); err != nil {
 		return 0, err
 	}

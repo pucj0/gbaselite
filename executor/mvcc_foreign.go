@@ -5,8 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"gbaselite/mvcc"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"strings"
 )
 
@@ -33,7 +33,7 @@ func mvccColumnPosition(table versionedTable, name string) int {
 	}
 	return -1
 }
-func prepareMVCCForeignKeys(tx *mvcc.Tx, table *versionedTable, session *Session) error {
+func prepareMVCCForeignKeys(tx storageengine.Txn, table *versionedTable, session *Session) error {
 	seen := map[string]bool{}
 	for i := range table.Definition.ForeignKeys {
 		fk := &table.Definition.ForeignKeys[i]
@@ -136,7 +136,7 @@ func mvccFKParentRow(child, parent versionedTable, fk storage.ForeignKey, row st
 
 type foreignChecksContextKey struct{}
 
-func validateMVCCReferences(ctx context.Context, tx *mvcc.Tx, table versionedTable, oldRow, newRow storage.Row) error {
+func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table versionedTable, oldRow, newRow storage.Row) error {
 	if disabled, _ := ctx.Value(foreignChecksContextKey{}).(bool); disabled {
 		return nil
 	}
@@ -174,7 +174,7 @@ func validateMVCCReferences(ctx context.Context, tx *mvcc.Tx, table versionedTab
 			if !exists {
 				return storage.ErrForeignKey
 			}
-			if _, exists, err = tx.Get("row/"+parent.ID, owner); err != nil {
+			if _, exists, err = tx.Table(parent.ID).Get(owner); err != nil {
 				return err
 			}
 			if !exists {
@@ -183,7 +183,7 @@ func validateMVCCReferences(ctx context.Context, tx *mvcc.Tx, table versionedTab
 			if err = tx.Guard("catalog", catalog); err != nil {
 				return err
 			}
-			if err = tx.Guard("row/"+parent.ID, owner); err != nil {
+			if err = tx.Table(parent.ID).Guard(owner); err != nil {
 				return err
 			}
 		}
@@ -227,7 +227,7 @@ func validateMVCCReferences(ctx context.Context, tx *mvcc.Tx, table versionedTab
 			if err = tx.GuardRange("row/" + child.ID); err != nil {
 				return err
 			}
-			err = tx.ScanRange(ctx, "row/"+child.ID, mvcc.KeyRange{}, func(_, v []byte) error {
+			err = tx.ScanRange(ctx, "row/"+child.ID, storageengine.KeyRange{}, func(_, v []byte) error {
 				row, err := decodeMVCCRow(child, v)
 				if err != nil {
 					return err
@@ -249,7 +249,7 @@ func validateMVCCReferences(ctx context.Context, tx *mvcc.Tx, table versionedTab
 	}
 	return nil
 }
-func rejectMVCCReferencedDrop(tx *mvcc.Tx, table versionedTable, disabled ...bool) error {
+func rejectMVCCReferencedDrop(tx storageengine.Txn, table versionedTable, disabled ...bool) error {
 	if len(disabled) > 0 && disabled[0] {
 		return nil
 	}
@@ -274,7 +274,7 @@ func rejectMVCCReferencedDrop(tx *mvcc.Tx, table versionedTable, disabled ...boo
 	return nil
 }
 
-func mvccForeignReferrers(tx *mvcc.Tx, table versionedTable) ([]string, error) {
+func mvccForeignReferrers(tx storageengine.Txn, table versionedTable) ([]string, error) {
 	refs := append([]string(nil), table.Referrers...)
 	seen := map[string]bool{}
 	for _, ref := range refs {

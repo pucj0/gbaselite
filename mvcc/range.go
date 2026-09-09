@@ -3,18 +3,14 @@ package mvcc
 import (
 	"bytes"
 	"context"
+	"gbaselite/storageengine"
 	bolt "go.etcd.io/bbolt"
 )
 
 // KeyRange bounds raw keys within one namespace. Nil bounds are unbounded.
 // Stats, when supplied, belongs to this call and must not be shared concurrently.
-type KeyRange struct {
-	Lower, Upper                   []byte
-	LowerInclusive, UpperInclusive bool
-	Reverse                        bool
-	Stats                          *ScanStats
-}
-type ScanStats struct{ StoredKeys, StagedKeys uint64 }
+type KeyRange = storageengine.KeyRange
+type ScanStats = storageengine.ScanStats
 type rangeEntry struct {
 	key, value     []byte
 	deleted, check bool

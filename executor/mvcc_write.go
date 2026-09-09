@@ -5,13 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"strings"
 )
 
-func (e *Engine) mutateMVCC(ctx context.Context, read, write *mvcc.Tx, session *Session, statement parser.Statement) (*Result, error) {
+func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Statement) (*Result, error) {
 	if tableName, ok := mvccAlterTarget(statement); ok {
 		return e.alterMVCC(ctx, read, write, session, tableName, statement)
 	}
@@ -106,7 +106,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write *mvcc.Tx, session *
 		table.SetNamedConstraints(nil, checks)
 		snapshot := table.Snapshot()
 		snapshot.Comment = value.Comment
-		definition := versionedTable{CatalogName: db + "." + name, ID: write.ID + "/" + name, Definition: snapshot, RowEncoding: mvccCompactRowEncoding, SecondaryEncoding: 1}
+		definition := versionedTable{CatalogName: db + "." + name, ID: write.ID() + "/" + name, Definition: snapshot, RowEncoding: mvccCompactRowEncoding, SecondaryEncoding: 1}
 		if _, ok := mvccIntegerPrimary(definition); ok {
 			definition.KeyEncoding = mvccIntegerKeyEncoding
 		}
@@ -163,7 +163,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write *mvcc.Tx, session *
 			return nil, err
 		}
 		definition.CounterKeys = nil
-		definition.ID = write.ID + "/truncate"
+		definition.ID = write.ID() + "/truncate"
 		encoded, err := encodeVersioned(definition)
 		if err != nil {
 			return nil, err
@@ -294,7 +294,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write *mvcc.Tx, session *
 		return nil, fmt.Errorf("MVCC backend does not support statement %T", statement)
 	}
 }
-func (e *Engine) insertMVCC(ctx context.Context, read, write *mvcc.Tx, session *Session, statement parser.Insert) (*Result, error) {
+func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Insert) (*Result, error) {
 	if statement.Replace || statement.Ignore || statement.Select != nil || len(statement.SetValues) > 0 || len(statement.OnDuplicate) > 0 {
 		return nil, errors.New("MVCC insert currently accepts VALUES without IGNORE/REPLACE/ON DUPLICATE")
 	}
@@ -331,11 +331,7 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write *mvcc.Tx, session *
 		if floors[i] <= sent[i] {
 			return nil
 		}
-		r, err := e.mvccProposer.Propose(ctx, mvcc.Command{Kind: "advance", Counter: definition.counterKey(columns[i].Name), Floor: floors[i]})
-		if err != nil {
-			return err
-		}
-		if err = r.Err(); err != nil {
+		if err := e.Backend.AdvanceCounter(ctx, definition.counterKey(columns[i].Name), floors[i]); err != nil {
 			return err
 		}
 		sent[i] = floors[i]
@@ -395,15 +391,12 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write *mvcc.Tx, session *
 						return nil, err
 					}
 					count := uint64(len(statement.Values) - rowIndex)
-					reserved, err := e.mvccProposer.Propose(ctx, mvcc.Command{Kind: "reserve", Counter: definition.counterKey(column.Name), Count: count})
+					reserved, err := e.Backend.ReserveCounter(ctx, definition.counterKey(column.Name), count)
 					if err != nil {
 						return nil, err
 					}
-					if err = reserved.Err(); err != nil {
-						return nil, err
-					}
-					next[i] = reserved.Number
-					last[i] = reserved.Number + count - 1
+					next[i] = reserved
+					last[i] = reserved + count - 1
 				}
 				id := next[i]
 				next[i]++
@@ -417,7 +410,7 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write *mvcc.Tx, session *
 				}
 			}
 		}
-		if err := writeVersionedRow(ctx, write, definition, nil, nil, row, fmt.Sprintf("%s/%020d", write.ID, rowIndex)); err != nil {
+		if err := writeVersionedRow(ctx, write, definition, nil, nil, row, fmt.Sprintf("%s/%020d", write.ID(), rowIndex)); err != nil {
 			return nil, err
 		}
 		result.AffectedRows++
@@ -429,12 +422,12 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write *mvcc.Tx, session *
 	}
 	return result, nil
 }
-func writeVersionedRow(ctx context.Context, tx *mvcc.Tx, table versionedTable, oldKey []byte, oldRow, newRow storage.Row, fallback string) error {
+func writeVersionedRow(ctx context.Context, tx storageengine.Txn, table versionedTable, oldKey []byte, oldRow, newRow storage.Row, fallback string) error {
 	columns := table.Definition.Columns
 	if err := validateMVCCReferences(ctx, tx, table, oldRow, newRow); err != nil {
 		return err
 	}
-	space := "row/" + table.ID
+	rows := tx.Table(table.ID)
 	var newKey []byte
 	if newRow != nil {
 		if err := validateVersionedChecks(table, newRow); err != nil {
@@ -457,7 +450,7 @@ func writeVersionedRow(ctx context.Context, tx *mvcc.Tx, table versionedTable, o
 			}
 		}
 		if !bytes.Equal(newKey, oldKey) {
-			if _, exists, err := tx.Get(space, newKey); err != nil {
+			if _, exists, err := rows.Get(newKey); err != nil {
 				return err
 			} else if exists {
 				return storage.ErrDuplicateKey
@@ -477,13 +470,13 @@ func writeVersionedRow(ctx context.Context, tx *mvcc.Tx, table versionedTable, o
 			}
 			k, ok := storage.IndexValueKey(index, columns, oldRow)
 			if ok {
-				if err := tx.Delete("index/"+table.ID+"/"+index.Name, []byte(k)); err != nil {
+				if err := rows.Index(index.Name, storageengine.UniqueIndex).Delete([]byte(k)); err != nil {
 					return err
 				}
 			}
 		}
 		if newRow == nil || !bytes.Equal(oldKey, newKey) {
-			if err := tx.Delete(space, oldKey); err != nil {
+			if err := rows.Delete(oldKey); err != nil {
 				return err
 			}
 		}
@@ -502,13 +495,13 @@ func writeVersionedRow(ctx context.Context, tx *mvcc.Tx, table versionedTable, o
 		if !ok {
 			continue
 		}
-		indexSpace := "index/" + table.ID + "/" + index.Name
-		if owner, exists, err := tx.Get(indexSpace, []byte(k)); err != nil {
+		indexHandle := rows.Index(index.Name, storageengine.UniqueIndex)
+		if owner, exists, err := indexHandle.Get([]byte(k)); err != nil {
 			return err
 		} else if exists && !bytes.Equal(owner, oldKey) {
 			return storage.ErrDuplicateKey
 		}
-		if err := tx.Put(indexSpace, []byte(k), newKey); err != nil {
+		if err := indexHandle.Put([]byte(k), newKey); err != nil {
 			return err
 		}
 	}
@@ -516,5 +509,5 @@ func writeVersionedRow(ctx context.Context, tx *mvcc.Tx, table versionedTable, o
 	if err != nil {
 		return err
 	}
-	return tx.Put(space, newKey, encoded)
+	return rows.Put(newKey, encoded)
 }

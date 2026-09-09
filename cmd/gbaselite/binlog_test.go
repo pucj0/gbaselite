@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"gbaselite/executor"
 	"gbaselite/journal"
 )
 
@@ -36,20 +35,13 @@ func TestReplayBinlogCommand(t *testing.T) {
 	if err := binlog.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := runReplayBinlog([]string{"--config", configPath, "--input", binlogPath}); err != nil {
-		t.Fatal(err)
+	if err := runReplayBinlog([]string{"--config", configPath, "--input", binlogPath}); err == nil {
+		t.Fatal("legacy runtime replay accepted")
 	}
-	engine, err := executor.Open(dataPath, "root", "secret")
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(dataPath); !os.IsNotExist(err) {
+		t.Fatal("rejected replay created data")
 	}
-	result, err := engine.Execute(&executor.Session{CurrentDatabase: "recovered"}, "SELECT * FROM items")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result.Rows) != 1 || result.Rows[0][0] != int64(1) || result.Rows[0][1] != "restored" {
-		t.Fatalf("replayed rows = %#v", result.Rows)
-	}
+
 }
 
 func TestReplayBinlogCheckOnlyDoesNotOpenData(t *testing.T) {

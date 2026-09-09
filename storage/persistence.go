@@ -137,7 +137,7 @@ func (p *Persistence) rejectPagedDirectory() error {
 	for _, name := range []string{"store.pages", "store.checkpoint", "store.wal"} {
 		path := filepath.Join(filepath.Dir(p.path), name)
 		if _, err := os.Stat(path); err == nil {
-			return fmt.Errorf("paged storage marker %s exists; use storage mode paged, or export and restore a snapshot into a new directory before switching modes", path)
+			return fmt.Errorf("paged storage marker %s exists; use migrate-legacy to convert the complete directory into a new MVCC instance", path)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("inspect storage mode marker: %w", err)
 		}

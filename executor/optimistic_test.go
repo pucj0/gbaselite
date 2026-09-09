@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func TestOptimisticTransactionsReadSnapshotAndConflict(t *testing.T) {
+func TestLegacyOptimisticTransactionsReadSnapshotAndConflict(t *testing.T) {
 	e, s, run := savepointEngine(t)
 	e.OptimisticTransactions = true
 	run(`INSERT INTO items(value) VALUES(10)`)
@@ -46,7 +46,7 @@ func TestOptimisticTransactionsReadSnapshotAndConflict(t *testing.T) {
 	if _, err := e.Execute(b, "COMMIT"); !errors.Is(err, ErrSerializationConflict) {
 		t.Fatalf("expected conflict got %v", err)
 	}
-	if b.transaction != nil {
+	if e.legacyState(b).transaction != nil {
 		t.Fatal("conflicted transaction retained")
 	}
 	if run(`SELECT value FROM items WHERE id=1`).Rows[0][0] != int64(20) {
@@ -66,7 +66,7 @@ func TestOptimisticTransactionsReadSnapshotAndConflict(t *testing.T) {
 	}
 }
 
-func TestLiteralBatchInsertAtomicFailure(t *testing.T) {
+func TestLegacyLiteralBatchInsertAtomicFailure(t *testing.T) {
 	e, s, run := savepointEngine(t)
 	if _, err := e.Execute(s, `INSERT INTO items(id,value) VALUES(1,10),(2,10)`); err == nil {
 		t.Fatal("expected duplicate unique")
@@ -84,7 +84,7 @@ func TestLiteralBatchInsertAtomicFailure(t *testing.T) {
 	run("COMMIT")
 }
 
-func TestOptimisticConcurrentAutoIncrementReservationsSurviveRollback(t *testing.T) {
+func TestLegacyOptimisticConcurrentAutoIncrementReservationsSurviveRollback(t *testing.T) {
 	e, _, run := savepointEngine(t)
 	e.OptimisticTransactions = true
 	const count = 8
@@ -137,7 +137,7 @@ func TestOptimisticConcurrentAutoIncrementReservationsSurviveRollback(t *testing
 	}
 }
 
-func TestOptimisticDMLWaitsForCommitGateAndCanTimeout(t *testing.T) {
+func TestLegacyOptimisticDMLWaitsForCommitGateAndCanTimeout(t *testing.T) {
 	e, _, _ := savepointEngine(t)
 	e.OptimisticTransactions = true
 	session := &Session{CurrentDatabase: "sp"}

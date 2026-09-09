@@ -2,12 +2,12 @@ package server
 
 import (
 	"fmt"
-	"gbaselite/mvcc"
+	"gbaselite/storageengine"
 	"testing"
 )
 
 func TestMVCCWriteBudgetErrorCode(t *testing.T) {
-	if code := mysqlExecutionErrorCode(fmt.Errorf("limit: %w", mvcc.ErrWriteSetLimit)); code != 1041 {
+	if code := mysqlExecutionErrorCode(fmt.Errorf("limit: %w", storageengine.ErrWriteSetLimit)); code != 1041 {
 		t.Fatal(code)
 	}
 }

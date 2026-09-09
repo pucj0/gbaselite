@@ -8,7 +8,7 @@ import (
 )
 
 func TestSessionCharacterSetsAndCollations(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestSessionCharacterSetsAndCollations(t *testing.T) {
 }
 
 func TestSessionCharacterSetRestoresDumpUserVariable(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestSessionCharacterSetRestoresDumpUserVariable(t *testing.T) {
 }
 
 func TestSessionCollationControlsStringPredicates(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestSessionCollationControlsStringPredicates(t *testing.T) {
 }
 
 func TestSessionTimeZoneControlsCurrentTimestamp(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}

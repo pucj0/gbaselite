@@ -3,7 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
-	"gbaselite/mvcc"
+	"gbaselite/storageengine"
 	"testing"
 )
 
@@ -50,14 +50,14 @@ func TestMVCCForeignKeyRaces(t *testing.T) {
 			run(b, "BEGIN")
 			run(b, "INSERT INTO child VALUES(3,2)")
 			run(b, "COMMIT")
-			if _, err = e.Execute(a, "COMMIT"); !errors.Is(err, mvcc.ErrConflict) {
+			if _, err = e.Execute(a, "COMMIT"); !errors.Is(err, storageengine.ErrConflict) {
 				t.Fatal("parent deletion missed phantom", err)
 			}
 			run(s, "INSERT INTO parent VALUES(4,40)")
 			run(a, "BEGIN")
 			run(a, "INSERT INTO child VALUES(4,4)")
 			run(b, "DELETE FROM parent WHERE id=4")
-			if _, err = e.Execute(a, "COMMIT"); !errors.Is(err, mvcc.ErrConflict) {
+			if _, err = e.Execute(a, "COMMIT"); !errors.Is(err, storageengine.ErrConflict) {
 				t.Fatal("child accepted removed parent", err)
 			}
 			run(s, "ALTER TABLE child DROP FOREIGN KEY fk_parent")

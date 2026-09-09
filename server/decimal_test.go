@@ -7,7 +7,7 @@ import (
 )
 
 func TestDecimalPreparedBindingIsExactAndSafe(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "password")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "password")
 	if err != nil {
 		t.Fatal(err)
 	}

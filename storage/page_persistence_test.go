@@ -437,10 +437,10 @@ func TestSnapshotModeRefusesPagedDirectory(t *testing.T) {
 	if err := p.Save(store); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := legacy.Load(); err == nil || !strings.Contains(err.Error(), "use storage mode paged") {
+	if _, err := legacy.Load(); err == nil || !strings.Contains(err.Error(), "use migrate-legacy") {
 		t.Fatalf("downgrade load = %v", err)
 	}
-	if err := legacy.Save(store); err == nil || !strings.Contains(err.Error(), "use storage mode paged") {
+	if err := legacy.Save(store); err == nil || !strings.Contains(err.Error(), "use migrate-legacy") {
 		t.Fatalf("downgrade save = %v", err)
 	}
 }

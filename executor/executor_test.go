@@ -14,8 +14,8 @@ import (
 	"gbaselite/storage"
 )
 
-func TestSQLCRUDAndPersistence(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacySQLCRUDAndPersistence(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,9 +38,9 @@ func TestSQLCRUDAndPersistence(t *testing.T) {
 	}
 }
 
-func TestMySQLMigrationDDLForeignKeyRestrictAndPersistence(t *testing.T) {
+func TestLegacyMySQLMigrationDDLForeignKeyRestrictAndPersistence(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestMySQLMigrationDDLForeignKeyRestrictAndPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := Open(directory, "root", "123456")
+	reopened, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,9 +112,9 @@ func TestMySQLMigrationDDLForeignKeyRestrictAndPersistence(t *testing.T) {
 	}
 }
 
-func TestMultiActionAlterTableIsAtomicAndPersistent(t *testing.T) {
+func TestLegacyMultiActionAlterTableIsAtomicAndPersistent(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestMultiActionAlterTableIsAtomicAndPersistent(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(directory, "root", "123456")
+	reopened, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,9 +195,9 @@ func TestMultiActionAlterTableIsAtomicAndPersistent(t *testing.T) {
 	}
 }
 
-func TestColumnLifecycleDDLIsAtomicAndPersistent(t *testing.T) {
+func TestLegacyColumnLifecycleDDLIsAtomicAndPersistent(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestColumnLifecycleDDLIsAtomicAndPersistent(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(directory, "root", "123456")
+	reopened, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,8 +243,8 @@ func TestColumnLifecycleDDLIsAtomicAndPersistent(t *testing.T) {
 	}
 }
 
-func TestRenameReferencedColumnAndRejectDependentDrop(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyRenameReferencedColumnAndRejectDependentDrop(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -272,8 +272,8 @@ func TestRenameReferencedColumnAndRejectDependentDrop(t *testing.T) {
 	}
 }
 
-func TestAlterConstraintRejectsInvalidHistoryAtomically(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyAlterConstraintRejectsInvalidHistoryAtomically(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,8 +302,8 @@ func TestAlterConstraintRejectsInvalidHistoryAtomically(t *testing.T) {
 	}
 }
 
-func TestCompositeIndexRangeOrderAndExplain(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyCompositeIndexRangeOrderAndExplain(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,8 +333,8 @@ func TestCompositeIndexRangeOrderAndExplain(t *testing.T) {
 	}
 }
 
-func TestNavicatTableAndViewCopyUsesDailySequenceName(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyNavicatTableAndViewCopyUsesDailySequenceName(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,8 +465,8 @@ func TestNavicatTableAndViewCopyUsesDailySequenceName(t *testing.T) {
 	}
 }
 
-func TestNavicatTransferDropThenCreatePreservesOriginalNames(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyNavicatTransferDropThenCreatePreservesOriginalNames(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -558,8 +558,8 @@ func TestNavicatTransferDropThenCreatePreservesOriginalNames(t *testing.T) {
 	}
 }
 
-func TestNavicatParallelTransferDefersDecoratedViewDependencyValidation(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyNavicatParallelTransferDefersDecoratedViewDependencyValidation(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +629,7 @@ func findBackupRelation(t *testing.T, names []string, prefix string) string {
 	return ""
 }
 
-func findBackupRelationWithRows(t *testing.T, engine *Engine, session *Session, names []string, prefix string, wantRows int) string {
+func findBackupRelationWithRows(t *testing.T, engine *legacyEngine, session *Session, names []string, prefix string, wantRows int) string {
 	t.Helper()
 	for _, name := range names {
 		if !strings.HasPrefix(name, prefix) {
@@ -644,8 +644,8 @@ func findBackupRelationWithRows(t *testing.T, engine *Engine, session *Session, 
 	return ""
 }
 
-func TestCommentOnlyQueryIsNoOp(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyCommentOnlyQueryIsNoOp(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -656,9 +656,9 @@ func TestCommentOnlyQueryIsNoOp(t *testing.T) {
 	}
 }
 
-func TestIndexDDLMetadataAndPersistence(t *testing.T) {
+func TestLegacyIndexDDLMetadataAndPersistence(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -684,7 +684,7 @@ func TestIndexDDLMetadataAndPersistence(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(directory, "root", "123456")
+	reopened, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -697,9 +697,9 @@ func TestIndexDDLMetadataAndPersistence(t *testing.T) {
 	}
 }
 
-func TestCreateTableInlineIndexesPersistAndExport(t *testing.T) {
+func TestLegacyCreateTableInlineIndexesPersistAndExport(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -754,7 +754,7 @@ func TestCreateTableInlineIndexesPersistAndExport(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(directory, "root", "123456")
+	reopened, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -765,9 +765,9 @@ func TestCreateTableInlineIndexesPersistAndExport(t *testing.T) {
 	}
 }
 
-func TestPrimaryKeyColumnMetadataDefaultsAndPersistence(t *testing.T) {
+func TestLegacyPrimaryKeyColumnMetadataDefaultsAndPersistence(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -807,7 +807,7 @@ func TestPrimaryKeyColumnMetadataDefaultsAndPersistence(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(directory, "root", "123456")
+	reopened, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -818,8 +818,8 @@ func TestPrimaryKeyColumnMetadataDefaultsAndPersistence(t *testing.T) {
 	}
 }
 
-func TestAlterTableAddPrimaryKeyIsAtomic(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyAlterTableAddPrimaryKeyIsAtomic(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -838,9 +838,9 @@ func TestAlterTableAddPrimaryKeyIsAtomic(t *testing.T) {
 	}
 }
 
-func TestAlterColumnDateTimeMetadataAndPersistence(t *testing.T) {
+func TestLegacyAlterColumnDateTimeMetadataAndPersistence(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -877,7 +877,7 @@ func TestAlterColumnDateTimeMetadataAndPersistence(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(directory, "root", "123456")
+	reopened, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -895,8 +895,8 @@ func TestAlterColumnDateTimeMetadataAndPersistence(t *testing.T) {
 	}
 }
 
-func TestNavicatStyleUpdateLimit(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyNavicatStyleUpdateLimit(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -931,8 +931,8 @@ func TestNavicatStyleUpdateLimit(t *testing.T) {
 	}
 }
 
-func TestUpdateExpressionsAreRowAwareAndAtomic(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyUpdateExpressionsAreRowAwareAndAtomic(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -968,8 +968,8 @@ func TestUpdateExpressionsAreRowAwareAndAtomic(t *testing.T) {
 	}
 }
 
-func TestNavicatStyleDeleteLimit(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyNavicatStyleDeleteLimit(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1004,8 +1004,8 @@ func TestNavicatStyleDeleteLimit(t *testing.T) {
 	}
 }
 
-func TestNavicatStyleDateUpdateMatchesStoredDate(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyNavicatStyleDateUpdateMatchesStoredDate(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1040,8 +1040,8 @@ func TestNavicatStyleDateUpdateMatchesStoredDate(t *testing.T) {
 	}
 }
 
-func TestSelectProjectionOrderByUnselectedColumn(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacySelectProjectionOrderByUnselectedColumn(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1065,8 +1065,8 @@ func TestSelectProjectionOrderByUnselectedColumn(t *testing.T) {
 	}
 }
 
-func TestOrderByPredicateExpressions(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyOrderByPredicateExpressions(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1113,8 +1113,8 @@ func TestOrderByPredicateExpressions(t *testing.T) {
 	}
 }
 
-func TestSelectLikeAndGroupBy(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacySelectLikeAndGroupBy(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1145,8 +1145,8 @@ func TestSelectLikeAndGroupBy(t *testing.T) {
 	}
 }
 
-func TestAggregateGroupHavingAndOrdering(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyAggregateGroupHavingAndOrdering(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1197,8 +1197,8 @@ func TestAggregateGroupHavingAndOrdering(t *testing.T) {
 	}
 }
 
-func TestScalarAggregatesAndAliasOrdering(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyScalarAggregatesAndAliasOrdering(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1249,8 +1249,8 @@ func TestScalarAggregatesAndAliasOrdering(t *testing.T) {
 	}
 }
 
-func TestDerivedTableAggregationFilteringAndStreaming(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyDerivedTableAggregationFilteringAndStreaming(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1306,8 +1306,8 @@ func TestDerivedTableAggregationFilteringAndStreaming(t *testing.T) {
 	}
 }
 
-func TestScalarFunctionProjectionAndLockingRead(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyScalarFunctionProjectionAndLockingRead(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1355,8 +1355,8 @@ func TestScalarFunctionProjectionAndLockingRead(t *testing.T) {
 	}
 }
 
-func TestCommonMySQLScalarFunctions(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyCommonMySQLScalarFunctions(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1424,8 +1424,8 @@ func TestCommonMySQLScalarFunctions(t *testing.T) {
 	}
 }
 
-func TestCurrentTimestampFractionalSecondsPrecision(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyCurrentTimestampFractionalSecondsPrecision(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1487,8 +1487,8 @@ func TestCurrentTimestampFractionalSecondsPrecision(t *testing.T) {
 		}
 	}
 }
-func TestInnerLeftRightAndDerivedJoins(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyInnerLeftRightAndDerivedJoins(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1554,8 +1554,8 @@ func TestInnerLeftRightAndDerivedJoins(t *testing.T) {
 	}
 }
 
-func TestDistinctCreateIfNotExistsDescribeAndTruncate(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyDistinctCreateIfNotExistsDescribeAndTruncate(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1601,8 +1601,8 @@ func TestDistinctCreateIfNotExistsDescribeAndTruncate(t *testing.T) {
 	}
 }
 
-func TestTopLevelUnionAllDistinctOrderAndLimit(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyTopLevelUnionAllDistinctOrderAndLimit(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1633,8 +1633,8 @@ func TestTopLevelUnionAllDistinctOrderAndLimit(t *testing.T) {
 	}
 }
 
-func TestUnionQueryInputsAndMultipleCTEs(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyUnionQueryInputsAndMultipleCTEs(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1679,8 +1679,8 @@ func TestUnionQueryInputsAndMultipleCTEs(t *testing.T) {
 	}
 }
 
-func TestCreateTableAsSelectAndLike(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyCreateTableAsSelectAndLike(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1740,8 +1740,8 @@ func TestCreateTableAsSelectAndLike(t *testing.T) {
 	}
 }
 
-func TestShowFullColumnsLikeAndWhere(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyShowFullColumnsLikeAndWhere(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1766,8 +1766,8 @@ func TestShowFullColumnsLikeAndWhere(t *testing.T) {
 	}
 }
 
-func TestReplaceValuesSetSelectAndStatementAtomicity(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyReplaceValuesSetSelectAndStatementAtomicity(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1815,8 +1815,8 @@ func TestReplaceValuesSetSelectAndStatementAtomicity(t *testing.T) {
 	}
 }
 
-func TestUpdateJoinAndMultiTableDelete(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyUpdateJoinAndMultiTableDelete(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1876,8 +1876,8 @@ func TestUpdateJoinAndMultiTableDelete(t *testing.T) {
 	}
 }
 
-func TestForeignKeyCascadeAndSetNullActions(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyForeignKeyCascadeAndSetNullActions(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1939,8 +1939,8 @@ func TestForeignKeyCascadeAndSetNullActions(t *testing.T) {
 	}
 }
 
-func TestCascadingMutationCyclesAndCheckFailureAreAtomic(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyCascadingMutationCyclesAndCheckFailureAreAtomic(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1978,8 +1978,8 @@ func TestCascadingMutationCyclesAndCheckFailureAreAtomic(t *testing.T) {
 	}
 }
 
-func TestInsertIgnoreSkipsDuplicateKeys(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyInsertIgnoreSkipsDuplicateKeys(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2010,8 +2010,8 @@ func TestInsertIgnoreSkipsDuplicateKeys(t *testing.T) {
 	}
 }
 
-func TestCommonWherePredicates(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyCommonWherePredicates(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2061,8 +2061,8 @@ func TestCommonWherePredicates(t *testing.T) {
 	}
 }
 
-func TestInSubqueryForSelectUpdateAndDelete(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyInSubqueryForSelectUpdateAndDelete(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2114,8 +2114,8 @@ func TestInSubqueryForSelectUpdateAndDelete(t *testing.T) {
 	}
 }
 
-func TestExistsAndNestedScalarSubqueries(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyExistsAndNestedScalarSubqueries(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2170,8 +2170,8 @@ func TestExistsAndNestedScalarSubqueries(t *testing.T) {
 	}
 }
 
-func TestCorrelatedSubqueriesForUpdateAndDelete(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyCorrelatedSubqueriesForUpdateAndDelete(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2271,8 +2271,8 @@ func TestCorrelatedSubqueriesForUpdateAndDelete(t *testing.T) {
 	}
 }
 
-func TestFitnessStyleSchemaDDL(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyFitnessStyleSchemaDDL(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2304,8 +2304,8 @@ func TestFitnessStyleSchemaDDL(t *testing.T) {
 	}
 }
 
-func TestCommonMySQLMigrationDDLAndInsertSet(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyCommonMySQLMigrationDDLAndInsertSet(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2376,8 +2376,8 @@ func TestCommonMySQLMigrationDDLAndInsertSet(t *testing.T) {
 	}
 }
 
-func TestSelectStreamsUnorderedResults(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacySelectStreamsUnorderedResults(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2410,8 +2410,8 @@ func TestSelectStreamsUnorderedResults(t *testing.T) {
 		t.Fatalf("unexpected streamed rows: %#v", rows)
 	}
 }
-func TestTransactionRollback(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyTransactionRollback(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2427,8 +2427,8 @@ func TestTransactionRollback(t *testing.T) {
 	}
 }
 
-func TestExplicitTransactionProvidesExclusiveIsolationAndDisconnectRollback(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyExplicitTransactionProvidesExclusiveIsolationAndDisconnectRollback(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2502,9 +2502,9 @@ func TestExplicitTransactionProvidesExclusiveIsolationAndDisconnectRollback(t *t
 	}
 }
 
-func TestPersistenceFailureFailsClosedWithoutRetryingDivergentMemory(t *testing.T) {
+func TestLegacyPersistenceFailureFailsClosedWithoutRetryingDivergentMemory(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2577,7 +2577,7 @@ func TestPersistenceFailureFailsClosedWithoutRetryingDivergentMemory(t *testing.
 		t.Fatalf("close after persistence failure = %v", err)
 	}
 
-	reopened, err := Open(directory, "root", "123456")
+	reopened, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2591,8 +2591,8 @@ func TestPersistenceFailureFailsClosedWithoutRetryingDivergentMemory(t *testing.
 	}
 }
 
-func TestCommitAndRollbackWithoutTransactionAreNoOps(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyCommitAndRollbackWithoutTransactionAreNoOps(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2604,8 +2604,8 @@ func TestCommitAndRollbackWithoutTransactionAreNoOps(t *testing.T) {
 	}
 }
 
-func TestMySQLUserManagementAndPrivilegeEnforcement(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "root-secret")
+func TestLegacyMySQLUserManagementAndPrivilegeEnforcement(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "root-secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2673,8 +2673,8 @@ func TestMySQLUserManagementAndPrivilegeEnforcement(t *testing.T) {
 	}
 }
 
-func TestConcurrentTransactionsDoNotLoseTables(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyConcurrentTransactionsDoNotLoseTables(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2724,8 +2724,8 @@ func TestConcurrentTransactionsDoNotLoseTables(t *testing.T) {
 	}
 }
 
-func TestDropMultipleQualifiedTables(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyDropMultipleQualifiedTables(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2757,8 +2757,8 @@ func TestDropMultipleQualifiedTables(t *testing.T) {
 	}
 }
 
-func TestCreateQualifiedTableWithoutSelectedDatabase(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyCreateQualifiedTableWithoutSelectedDatabase(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2778,8 +2778,8 @@ func TestCreateQualifiedTableWithoutSelectedDatabase(t *testing.T) {
 	}
 }
 
-func TestShowTableTypesUseMySQLLowercase(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyShowTableTypesUseMySQLLowercase(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2810,8 +2810,8 @@ func TestShowTableTypesUseMySQLLowercase(t *testing.T) {
 	}
 }
 
-func TestShowColumnsReportsIndexKeys(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyShowColumnsReportsIndexKeys(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2836,9 +2836,9 @@ func TestShowColumnsReportsIndexKeys(t *testing.T) {
 	}
 }
 
-func TestMySQLColumnTypeMetadataPersists(t *testing.T) {
+func TestLegacyMySQLColumnTypeMetadataPersists(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2885,7 +2885,7 @@ func TestMySQLColumnTypeMetadataPersists(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(directory, "root", "123456")
+	reopened, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2897,9 +2897,9 @@ func TestMySQLColumnTypeMetadataPersists(t *testing.T) {
 		t.Fatalf("unexpected persisted types: %#v", describe.Rows)
 	}
 }
-func TestExport(t *testing.T) {
+func TestLegacyExport(t *testing.T) {
 	dir := t.TempDir()
-	engine, err := Open(dir, "root", "123456")
+	engine, err := openLegacy(dir, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2930,9 +2930,9 @@ func TestExport(t *testing.T) {
 	}
 }
 
-func TestStoppedDataDirectoryCopyRestoresDataObjectsAndPrivileges(t *testing.T) {
+func TestLegacyStoppedDataDirectoryCopyRestoresDataObjectsAndPrivileges(t *testing.T) {
 	sourceDirectory := t.TempDir()
-	engine, err := Open(sourceDirectory, "root", "root-secret")
+	engine, err := openLegacy(sourceDirectory, "root", "root-secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2955,7 +2955,7 @@ func TestStoppedDataDirectoryCopyRestoresDataObjectsAndPrivileges(t *testing.T) 
 
 	restoredDirectory := t.TempDir()
 	copyDirectoryTree(t, sourceDirectory, restoredDirectory)
-	restored, err := Open(restoredDirectory, "root", "")
+	restored, err := openLegacy(restoredDirectory, "root", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3016,8 +3016,8 @@ func copyDirectoryTree(t *testing.T, source, destination string) {
 	}
 }
 
-func TestRecursiveDateRangeCTEWithLeftJoinAggregation(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyRecursiveDateRangeCTEWithLeftJoinAggregation(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3076,8 +3076,8 @@ func TestRecursiveDateRangeCTEWithLeftJoinAggregation(t *testing.T) {
 	}
 }
 
-func TestRankingAndAggregateWindowFunctions(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyRankingAndAggregateWindowFunctions(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3126,9 +3126,9 @@ func TestRankingAndAggregateWindowFunctions(t *testing.T) {
 	}
 }
 
-func TestPersistentViewsNestedViewsAndMetadata(t *testing.T) {
+func TestLegacyPersistentViewsNestedViewsAndMetadata(t *testing.T) {
 	dataDir := t.TempDir()
-	engine, err := Open(dataDir, "root", "123456")
+	engine, err := openLegacy(dataDir, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3217,7 +3217,7 @@ func TestPersistentViewsNestedViewsAndMetadata(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(dataDir, "root", "123456")
+	reopened, err := openLegacy(dataDir, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3232,7 +3232,7 @@ func TestPersistentViewsNestedViewsAndMetadata(t *testing.T) {
 }
 
 func TestLegacyViewWithDuplicateJoinColumnNames(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}

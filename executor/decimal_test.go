@@ -6,9 +6,9 @@ import (
 	"testing"
 )
 
-func TestDecimalSQLExactOperationsAndPersistence(t *testing.T) {
+func TestLegacyDecimalSQLExactOperationsAndPersistence(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "password")
+	engine, err := openLegacy(directory, "root", "password")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +84,7 @@ func TestDecimalSQLExactOperationsAndPersistence(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	engine, err = Open(directory, "root", "password")
+	engine, err = openLegacy(directory, "root", "password")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,8 +94,8 @@ func TestDecimalSQLExactOperationsAndPersistence(t *testing.T) {
 		t.Fatalf("persisted %#v", restored.Rows)
 	}
 }
-func TestDecimalFunctionsGroupingAndWindow(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "password")
+func TestLegacyDecimalFunctionsGroupingAndWindow(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "password")
 	if err != nil {
 		t.Fatal(err)
 	}

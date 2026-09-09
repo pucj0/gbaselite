@@ -15,7 +15,7 @@ var errColdSelectDone = errors.New("cold select limit reached")
 // transaction gate. Only independently safe streaming shapes bypass legacy
 // materialization; complex queries and writes receive explicit I/O/budget
 // errors before any legacy API can observe an unloaded table as empty.
-func (e *Engine) prepareColdStatement(store *storage.Store, session *Session, statement parser.Statement) (*Result, bool, error) {
+func (e *legacyEngine) prepareColdStatement(store *storage.Store, session *Session, statement parser.Statement) (*Result, bool, error) {
 	if !e.ColdRead || !store.HasColdTables() {
 		return nil, false, nil
 	}
@@ -79,7 +79,7 @@ func (e *Engine) prepareColdStatement(store *storage.Store, session *Session, st
 func coldSelectShape(statement parser.Select) bool {
 	for _, order := range statement.OrderBy {
 		expression, err := parser.ParseExpression(order.Column)
-		if err != nil || !coldScalarExpression(expression) {
+		if err != nil || !scalarExpressionSupported(expression) {
 			return false
 		}
 	}
@@ -90,7 +90,7 @@ func coldSelectShape(statement parser.Select) bool {
 	if selectHasAggregate(statement.Items) && !count {
 		return false
 	}
-	if !coldScalarExpression(statement.Where) {
+	if !scalarExpressionSupported(statement.Where) {
 		return false
 	}
 	for _, item := range statement.Items {
@@ -98,68 +98,11 @@ func coldSelectShape(statement parser.Select) bool {
 			continue
 		}
 		expression, err := parser.ParseExpression(item.Expression)
-		if err != nil || !coldScalarExpression(expression) {
+		if err != nil || !scalarExpressionSupported(expression) {
 			return false
 		}
 	}
 	return true
-}
-
-func coldScalarExpression(expression parser.Expr) bool {
-	switch value := expression.(type) {
-	case nil, parser.Identifier, parser.LiteralExpr:
-		return true
-	case parser.BinaryExpr:
-		return coldScalarExpression(value.Left) && coldScalarExpression(value.Right)
-	case parser.UnaryExpr:
-		return coldScalarExpression(value.Value)
-	case parser.InExpr:
-		if value.Subquery != nil || !coldScalarExpression(value.Value) {
-			return false
-		}
-		for _, item := range value.Values {
-			if !coldScalarExpression(item) {
-				return false
-			}
-		}
-		return true
-	case parser.BetweenExpr:
-		return coldScalarExpression(value.Value) && coldScalarExpression(value.Lower) && coldScalarExpression(value.Upper)
-	case parser.IsExpr:
-		return coldScalarExpression(value.Value) && coldScalarExpression(value.Target)
-	case parser.FunctionExpr:
-		switch strings.ToUpper(value.Name) {
-		case "COUNT", "SUM", "AVG", "MIN", "MAX":
-			return false
-		}
-		for _, argument := range value.Args {
-			if !coldScalarExpression(argument) {
-				return false
-			}
-		}
-		return true
-	case parser.IntervalExpr:
-		return coldScalarExpression(value.Value)
-	case parser.RowExpr:
-		for _, item := range value.Values {
-			if !coldScalarExpression(item) {
-				return false
-			}
-		}
-		return true
-	case parser.CaseExpr:
-		if !coldScalarExpression(value.Operand) || !coldScalarExpression(value.Else) {
-			return false
-		}
-		for _, branch := range value.Whens {
-			if !coldScalarExpression(branch.When) || !coldScalarExpression(branch.Then) {
-				return false
-			}
-		}
-		return true
-	default:
-		return false
-	}
 }
 
 func executeColdSelect(store *storage.Store, session *Session, table *storage.Table, statement parser.Select) (*Result, error) {
@@ -379,7 +322,7 @@ func executeColdSelect(store *storage.Store, session *Session, table *storage.Ta
 }
 
 func coldShowMetadataOnly(store *storage.Store, session *Session, statement parser.Show) bool {
-	if !coldScalarExpression(statement.Where) {
+	if !scalarExpressionSupported(statement.Where) {
 		return false
 	}
 	if statement.What != "COLUMNS" {
@@ -432,22 +375,22 @@ func coldSelectOrderSupported(statement parser.Select, table *storage.Table, ses
 func coldStandaloneSelect(statement parser.Select) bool {
 	for _, order := range statement.OrderBy {
 		expression, err := parser.ParseExpression(order.Column)
-		if err != nil || !coldScalarExpression(expression) {
+		if err != nil || !scalarExpressionSupported(expression) {
 			return false
 		}
 	}
 	for _, group := range statement.GroupBy {
 		expression, err := parser.ParseExpression(group)
-		if err != nil || !coldScalarExpression(expression) {
+		if err != nil || !scalarExpressionSupported(expression) {
 			return false
 		}
 	}
-	if statement.Table != "" || statement.Subquery != nil || len(statement.Joins) > 0 || !coldScalarExpression(statement.Where) || !coldScalarExpression(statement.Having) {
+	if statement.Table != "" || statement.Subquery != nil || len(statement.Joins) > 0 || !scalarExpressionSupported(statement.Where) || !scalarExpressionSupported(statement.Having) {
 		return false
 	}
 	for _, item := range statement.Items {
 		expression, err := parser.ParseExpression(item.Expression)
-		if err == nil && coldScalarExpression(expression) {
+		if err == nil && scalarExpressionSupported(expression) {
 			continue
 		}
 		variable := strings.Join(strings.Fields(item.Expression), "")

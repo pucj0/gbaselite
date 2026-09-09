@@ -7,13 +7,13 @@ import (
 	"gbaselite/journal"
 )
 
-func TestBinlogRecordsCommittedChangesOnly(t *testing.T) {
+func TestLegacyBinlogRecordsCommittedChangesOnly(t *testing.T) {
 	binlogPath := filepath.Join(t.TempDir(), "binlog.jsonl")
 	binlog, err := journal.OpenBinlog(binlogPath, journal.DefaultRetentionDays)
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := Open(t.TempDir(), "root", "secret")
+	engine, err := openLegacy(t.TempDir(), "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,13 +65,13 @@ func TestBinlogRecordsCommittedChangesOnly(t *testing.T) {
 	}
 }
 
-func TestDisconnectDropsPendingBinlogStatements(t *testing.T) {
+func TestLegacyDisconnectDropsPendingBinlogStatements(t *testing.T) {
 	binlogPath := filepath.Join(t.TempDir(), "binlog.jsonl")
 	binlog, err := journal.OpenBinlog(binlogPath, journal.DefaultRetentionDays)
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := Open(t.TempDir(), "root", "secret")
+	engine, err := openLegacy(t.TempDir(), "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}

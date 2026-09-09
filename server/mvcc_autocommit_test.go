@@ -7,7 +7,7 @@ import (
 )
 
 func TestMVCCAutocommitState(t *testing.T) {
-	e, err := executor.OpenWithOptions(t.TempDir(), "root", "pw", executor.OpenOptions{StorageMode: "mvcc"})
+	e, err := openTestEngineWithOptions(t, t.TempDir(), "root", "pw", executor.OpenOptions{StorageMode: "mvcc"})
 	if err != nil {
 		t.Fatal(err)
 	}

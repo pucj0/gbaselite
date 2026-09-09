@@ -107,7 +107,7 @@ func TestSecurityEnvironmentAndValidation(t *testing.T) {
 
 func TestLoadAuditAndBinlogSettings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
-	contents := "storage:\n  path: data-dir\nlog:\n  path: log-dir\naudit:\n  enabled: true\n  retention_days: 14\nbinlog:\n  enabled: true\n  path: changes.jsonl\n  retention_days: 30\n"
+	contents := "storage:\n  path: data-dir\nlog:\n  path: log-dir\naudit:\n  enabled: true\n  retention_days: 14\nbinlog:\n  enabled: false\n  path: changes.jsonl\n  retention_days: 30\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestLoadAuditAndBinlogSettings(t *testing.T) {
 	if !cfg.Audit.Enabled || cfg.AuditPath() != filepath.Join("log-dir", "audit.jsonl") || cfg.Audit.RetentionDays != 14 {
 		t.Fatalf("audit config = %#v path=%q", cfg.Audit, cfg.AuditPath())
 	}
-	if !cfg.Binlog.Enabled || cfg.BinlogPath() != "changes.jsonl" || cfg.Binlog.RetentionDays != 30 {
+	if cfg.Binlog.Enabled || cfg.BinlogPath() != "changes.jsonl" || cfg.Binlog.RetentionDays != 30 {
 		t.Fatalf("binlog config = %#v path=%q", cfg.Binlog, cfg.BinlogPath())
 	}
 }

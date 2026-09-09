@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-func TestPagedEngineSQLCommitRollbackAndReopen(t *testing.T) {
+func TestLegacyPagedEngineSQLCommitRollbackAndReopen(t *testing.T) {
 	directory := t.TempDir()
 	options := OpenOptions{StorageMode: "paged", PageCacheBytes: 16 << 10}
-	engine, err := OpenWithOptions(directory, "root", "secret", options)
+	engine, err := openLegacyWithOptions(directory, "root", "secret", options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +37,7 @@ func TestPagedEngineSQLCommitRollbackAndReopen(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	engine, err = OpenWithOptions(directory, "root", "secret", options)
+	engine, err = openLegacyWithOptions(directory, "root", "secret", options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,14 +50,14 @@ func TestPagedEngineSQLCommitRollbackAndReopen(t *testing.T) {
 	if !engine.Persistence.PagedStats().Enabled {
 		t.Fatal("paged persistence was not selected")
 	}
-	if _, err := OpenWithOptions(directory, "root", "secret", OpenOptions{StorageMode: "snapshot"}); err == nil {
+	if _, err := openLegacyWithOptions(directory, "root", "secret", OpenOptions{StorageMode: "snapshot"}); err == nil {
 		t.Fatal("mode downgrade served stale data")
 	}
 }
 
-func TestOpenWithOptionsValidatesStorageOptions(t *testing.T) {
+func TestLegacyOpenWithOptionsValidatesStorageOptions(t *testing.T) {
 	for _, options := range []OpenOptions{{StorageMode: "unknown"}, {PageCacheBytes: -1}} {
-		if _, err := OpenWithOptions(t.TempDir(), "root", "secret", options); err == nil {
+		if _, err := openLegacyWithOptions(t.TempDir(), "root", "secret", options); err == nil {
 			t.Fatalf("accepted %#v", options)
 		}
 	}

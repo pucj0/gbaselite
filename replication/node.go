@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"gbaselite/mvcc"
+	"gbaselite/storageengine"
 	"github.com/hashicorp/raft"
 	raftbolt "github.com/hashicorp/raft-boltdb/v2"
 	bolt "go.etcd.io/bbolt"
@@ -21,7 +22,7 @@ import (
 	"time"
 )
 
-var ErrNotLeader = errors.New("node is not the leader")
+var ErrNotLeader = storageengine.ErrNotLeader
 
 type Peer struct {
 	ID      string

@@ -8,7 +8,7 @@ import (
 )
 
 func TestSessionCollationControlsOrderingDistinctAndGrouping(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestSessionCollationControlsOrderingDistinctAndGrouping(t *testing.T) {
 }
 
 func TestSessionTimeZoneControlsTimestampDefaults(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,9 +68,9 @@ func TestSessionTimeZoneControlsTimestampDefaults(t *testing.T) {
 		"USE timezone_defaults",
 		"CREATE TABLE events(id INT,created DATETIME DEFAULT CURRENT_TIMESTAMP)",
 		"SET time_zone='+00:00'",
-		"INSERT INTO events SET id=1",
+		"INSERT INTO events(id) VALUES(1)",
 		"SET time_zone='+08:00'",
-		"INSERT INTO events SET id=2",
+		"INSERT INTO events(id) VALUES(2)",
 	} {
 		if _, err := ExecuteCompatible(engine, session, query); err != nil {
 			t.Fatalf("%s: %v", query, err)

@@ -6,9 +6,9 @@ import (
 	"testing"
 )
 
-func round3BenchmarkEngine(b *testing.B) (*Engine, *Session) {
+func round3BenchmarkEngine(b *testing.B) (*legacyEngine, *Session) {
 	b.Helper()
-	e, err := Open(b.TempDir(), "root", "secret")
+	e, err := openLegacy(b.TempDir(), "root", "secret")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func round3BenchmarkEngine(b *testing.B) (*Engine, *Session) {
 	b.Cleanup(func() { e.CloseSession(s); e.Close() })
 	return e, s
 }
-func BenchmarkRound3PlainUpdate(b *testing.B) {
+func BenchmarkLegacyRound3PlainUpdate(b *testing.B) {
 	e, s := round3BenchmarkEngine(b)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -48,7 +48,7 @@ func BenchmarkRound3PlainUpdate(b *testing.B) {
 		}
 	}
 }
-func BenchmarkRound3IndexedUpdate(b *testing.B) {
+func BenchmarkLegacyRound3IndexedUpdate(b *testing.B) {
 	e, s := round3BenchmarkEngine(b)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -58,7 +58,7 @@ func BenchmarkRound3IndexedUpdate(b *testing.B) {
 		}
 	}
 }
-func BenchmarkRound3TopK(b *testing.B) {
+func BenchmarkLegacyRound3TopK(b *testing.B) {
 	e, s := round3BenchmarkEngine(b)
 	b.ReportAllocs()
 	b.ResetTimer()

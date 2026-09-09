@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"strings"
 )
 
-func executeMVCCSelect(ctx context.Context, tx *mvcc.Tx, session *Session, statement parser.Select) (*Result, error) {
+func executeMVCCSelect(ctx context.Context, tx storageengine.Txn, session *Session, statement parser.Select) (*Result, error) {
 	if err := validateMVCCSelectShape(statement); err != nil {
 		return nil, err
 	}
@@ -151,7 +151,7 @@ func finishMVCCSelect(session *Session, statement parser.Select, schema *storage
 		if err != nil {
 			return nil, err
 		}
-		if !coldScalarExpression(expression) {
+		if !scalarExpressionSupported(expression) {
 			return nil, errors.New("MVCC scalar subqueries are not supported")
 		}
 		kind, err := expressionTypeWithSession(expression, schema, columns, session)
@@ -343,6 +343,6 @@ func mvccAggregate(session *Session, statement parser.Select, schema *storage.Ta
 	return result, nil
 }
 
-func scanMVCCRows(ctx context.Context, tx *mvcc.Tx, table versionedTable, schema *storage.Table, session *Session, where parser.Expr, yield func([]byte, []byte) error) error {
+func scanMVCCRows(ctx context.Context, tx storageengine.Txn, table versionedTable, schema *storage.Table, session *Session, where parser.Expr, yield func([]byte, []byte) error) error {
 	return planMVCCAccess(parser.Select{Where: where}, table, schema, session).scan(ctx, tx, table, yield)
 }

@@ -11,7 +11,7 @@ import (
 	"gbaselite/storage"
 )
 
-func TestBudgetedOrderAndDistinctOperators(t *testing.T) {
+func TestLegacyBudgetedOrderAndDistinctOperators(t *testing.T) {
 	directory := t.TempDir()
 	session := &Session{query: newQueryControl(context.Background(), QueryOptions{SortMemoryBytes: 128 << 10, ResultMemoryBytes: 1 << 20, TempDirectory: directory, MaxTempBytes: 8 << 20})}
 	columns := []Column{{Name: "id", Type: storage.TypeBigInt}, {Name: "payload", Type: storage.TypeVarchar}}
@@ -66,7 +66,7 @@ func TestBudgetedOrderAndDistinctOperators(t *testing.T) {
 	}
 }
 
-func TestBudgetedSortSharedDiskBudgetAndLazyCleanup(t *testing.T) {
+func TestLegacyBudgetedSortSharedDiskBudgetAndLazyCleanup(t *testing.T) {
 	directory := t.TempDir()
 	q := newQueryControl(nil, QueryOptions{SortMemoryBytes: 128 << 10, MaxTempBytes: 100, TempDirectory: directory})
 	first, err := newExternalRowSorter(q, func(a, b []any) int { return 0 })
@@ -120,14 +120,14 @@ func TestBudgetedSortSharedDiskBudgetAndLazyCleanup(t *testing.T) {
 	}
 }
 
-func TestBudgetedDistinctRejectsTooSmallBudget(t *testing.T) {
+func TestLegacyBudgetedDistinctRejectsTooSmallBudget(t *testing.T) {
 	session := &Session{query: newQueryControl(nil, QueryOptions{SortMemoryBytes: 64 << 10, TempDirectory: t.TempDir()})}
 	if _, err := executeBudgetedDistinct(session, &Result{}, 0, -1); !errors.Is(err, ErrQueryResourceLimit) {
 		t.Fatalf("got %v", err)
 	}
 }
 
-func TestQueryVisitCancelsEvenWhenPredicateRejectsEveryRow(t *testing.T) {
+func TestLegacyQueryVisitCancelsEvenWhenPredicateRejectsEveryRow(t *testing.T) {
 	_, _, table, _ := indexedJoinFixture(t, 10)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -5,19 +5,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	driver "github.com/go-sql-driver/mysql"
 	"io"
 	"log"
 	"net"
 	"strings"
 	"testing"
 	"time"
-
-	"gbaselite/executor"
-	driver "github.com/go-sql-driver/mysql"
 )
 
 func TestJSONOverMySQLProtocol(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "secret")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}

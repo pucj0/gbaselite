@@ -9,9 +9,9 @@ import (
 	"testing"
 )
 
-func savepointEngine(t *testing.T) (*Engine, *Session, func(string) *Result) {
+func savepointEngine(t *testing.T) (*legacyEngine, *Session, func(string) *Result) {
 	t.Helper()
-	e, err := Open(t.TempDir(), "root", "secret")
+	e, err := openLegacy(t.TempDir(), "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +31,7 @@ func savepointEngine(t *testing.T) (*Engine, *Session, func(string) *Result) {
 	return e, s, run
 }
 
-func TestSavepointRollbackAndPersistence(t *testing.T) {
+func TestLegacySavepointRollbackAndPersistence(t *testing.T) {
 	e, s, run := savepointEngine(t)
 	run("INSERT INTO items(value) VALUES(10)")
 	run("BEGIN")
@@ -51,7 +51,7 @@ func TestSavepointRollbackAndPersistence(t *testing.T) {
 	run("INSERT INTO items(value) VALUES(40)")
 	run("RELEASE SAVEPOINT A")
 	run("COMMIT")
-	if s.savepoints != nil || s.binlogStatements != nil {
+	if e.legacyState(s).savepoints != nil || e.legacyState(s).binlogStatements != nil {
 		t.Fatal("commit retained transaction references")
 	}
 	got := run("SELECT id,value FROM items ORDER BY id").Rows
@@ -62,7 +62,7 @@ func TestSavepointRollbackAndPersistence(t *testing.T) {
 
 }
 
-func TestSavepointLifecycleAndLimits(t *testing.T) {
+func TestLegacySavepointLifecycleAndLimits(t *testing.T) {
 	e, s, run := savepointEngine(t)
 	run("SAVEPOINT ignored")
 	for _, q := range []string{"ROLLBACK TO ignored", "RELEASE SAVEPOINT ignored"} {
@@ -79,25 +79,25 @@ func TestSavepointLifecycleAndLimits(t *testing.T) {
 	}
 	run("SAVEPOINT S0") // replacement is permitted at the limit and moves to the end
 	run("RELEASE SAVEPOINT s1")
-	if len(s.savepoints) != 31 {
-		t.Fatal(len(s.savepoints))
+	if len(e.legacyState(s).savepoints) != 31 {
+		t.Fatal(len(e.legacyState(s).savepoints))
 	}
 	run("ROLLBACK TO s2")
-	if len(s.savepoints) != 1 || s.savepoints[0].name != "s2" {
+	if len(e.legacyState(s).savepoints) != 1 || e.legacyState(s).savepoints[0].name != "s2" {
 		t.Fatal("replacement/release order")
 	}
 	run("INSERT INTO items(value) VALUES(1)")
-	if len(s.binlogStatements) != 0 {
+	if len(e.legacyState(s).binlogStatements) != 0 {
 		t.Fatal("disabled binlog retained SQL")
 	}
-	backing := s.savepoints[:cap(s.savepoints)]
+	backing := e.legacyState(s).savepoints[:cap(e.legacyState(s).savepoints)]
 	for _, point := range backing[1:] {
 		if point.snapshot.Databases != nil {
 			t.Fatal("discarded savepoint retained rows")
 		}
 	}
 	e.CloseSession(s)
-	if s.savepoints != nil || s.transaction != nil {
+	if e.legacyState(s).savepoints != nil || e.legacyState(s).transaction != nil {
 		t.Fatal("disconnect retained transaction")
 	}
 	if len(run("SELECT * FROM items").Rows) != 0 {
@@ -106,12 +106,12 @@ func TestSavepointLifecycleAndLimits(t *testing.T) {
 	run("BEGIN")
 	run("SAVEPOINT end")
 	run("ROLLBACK")
-	if s.savepoints != nil {
+	if e.legacyState(s).savepoints != nil {
 		t.Fatal("rollback retained savepoints")
 	}
 }
 
-func TestSavepointDDLAndConstraints(t *testing.T) {
+func TestLegacySavepointDDLAndConstraints(t *testing.T) {
 	e, s, run := savepointEngine(t)
 	run("CREATE TABLE child(id INT PRIMARY KEY,parent INT,FOREIGN KEY(parent) REFERENCES items(id) ON DELETE CASCADE)")
 	run("INSERT INTO items(value) VALUES(1)")
@@ -152,7 +152,7 @@ func TestSavepointDDLAndConstraints(t *testing.T) {
 	run("ROLLBACK")
 }
 
-func TestSavepointRandomModel(t *testing.T) {
+func TestLegacySavepointRandomModel(t *testing.T) {
 	_, _, run := savepointEngine(t)
 	run("BEGIN")
 	type point struct {
@@ -201,9 +201,9 @@ func TestSavepointRandomModel(t *testing.T) {
 	run("COMMIT")
 }
 
-func TestSavepointCommitFailureKeepsDurableSnapshot(t *testing.T) {
+func TestLegacySavepointCommitFailureKeepsDurableSnapshot(t *testing.T) {
 	path := t.TempDir()
-	e, err := Open(path, "root", "secret")
+	e, err := openLegacy(path, "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestSavepointCommitFailureKeepsDurableSnapshot(t *testing.T) {
 	if _, err := e.Execute(s, "COMMIT"); !errors.Is(err, ErrPersistenceUnavailable) {
 		t.Fatalf("commit: %v", err)
 	}
-	if s.savepoints != nil || s.transaction != nil || s.transactionGate {
+	if e.legacyState(s).savepoints != nil || e.legacyState(s).transaction != nil || e.legacyState(s).transactionGate {
 		t.Fatal("failed commit retained state/lock")
 	}
 	if _, err := e.Execute(s, "SAVEPOINT a"); !errors.Is(err, ErrPersistenceUnavailable) {
@@ -235,7 +235,7 @@ func TestSavepointCommitFailureKeepsDurableSnapshot(t *testing.T) {
 	if err := e.Close(); !errors.Is(err, ErrPersistenceUnavailable) {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, "root", "secret")
+	reopened, err := openLegacy(path, "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}

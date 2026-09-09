@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"gbaselite/storageengine"
 	bolt "go.etcd.io/bbolt"
 	"os"
 	"path/filepath"
@@ -18,10 +19,10 @@ import (
 )
 
 const MaxChunkBytes = 64 << 10
-const MaxValueBytes = 48 << 10
+const MaxValueBytes = storageengine.MaxValueBytes
 
-var ErrConflict = errors.New("row version conflict; retry transaction")
-var ErrClosed = errors.New("MVCC store closed")
+var ErrConflict = storageengine.ErrConflict
+var ErrClosed = storageengine.ErrClosed
 var dataBucket = []byte("versions")
 var metaBucket = []byte("meta")
 var pendingBucket = []byte("pending")

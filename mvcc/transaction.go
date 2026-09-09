@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"gbaselite/storageengine"
 	bolt "go.etcd.io/bbolt"
 	"os"
 	"path/filepath"
@@ -14,7 +15,7 @@ import (
 )
 
 // ErrWriteSetLimit reports an explicitly configured logical write-set budget.
-var ErrWriteSetLimit = errors.New("MVCC transaction write set exceeds configured budget")
+var ErrWriteSetLimit = storageengine.ErrWriteSetLimit
 
 type Tx struct {
 	generation  uint64

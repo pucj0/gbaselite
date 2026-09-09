@@ -285,21 +285,16 @@
         </Control>
       </Dialog>
 
-      <Dialog Id="GBaseJournalDlg" Width="370" Height="270" Title="审计与恢复日志">
+      <Dialog Id="GBaseJournalDlg" Width="370" Height="270" Title="审计日志">
         <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="yes" Text="GBaseCustomBanner" />
-        <Control Id="Title" Type="Text" X="18" Y="7" Width="285" Height="17" Transparent="yes" NoPrefix="yes" Text="{\GBaseTitleFont}审计与恢复日志" />
-        <Control Id="Description" Type="Text" X="18" Y="27" Width="310" Height="13" Transparent="yes" NoPrefix="yes" Text="{\GBaseCaptionFont}两类日志相互独立，可按需要分别启用。" />
+        <Control Id="Title" Type="Text" X="18" Y="7" Width="285" Height="17" Transparent="yes" NoPrefix="yes" Text="{\GBaseTitleFont}审计日志" />
+        <Control Id="Description" Type="Text" X="18" Y="27" Width="310" Height="13" Transparent="yes" NoPrefix="yes" Text="{\GBaseCaptionFont}配置 SQL 审计；事务持久化统一由 MVCC 管理。" />
         <Control Id="AuditCheck" Type="CheckBox" X="24" Y="58" Width="320" Height="18" Property="GBASE_AUDIT_ENABLED" CheckBoxValue="1" Text="启用结构化审计日志（SQL 脱敏）" />
         <Control Id="AuditDescription" Type="Text" X="42" Y="78" Width="300" Height="18" Text="记录账号、客户端 IP、操作结果、影响行数和耗时。" />
         <Control Id="AuditRetentionLabel" Type="Text" X="42" Y="103" Width="155" Height="15" Text="审计日志保留天数：" />
         <Control Id="AuditRetentionEdit" Type="Edit" X="194" Y="100" Width="48" Height="18" Property="GBASE_AUDIT_RETENTION_DAYS" Integer="yes" />
         <Control Id="AuditRetentionHint" Type="Text" X="250" Y="103" Width="90" Height="15" Text="0=永久，最大365" />
-        <Control Id="BinlogCheck" Type="CheckBox" X="24" Y="128" Width="320" Height="18" Property="GBASE_BINLOG_ENABLED" CheckBoxValue="1" Text="启用可重放逻辑 binlog（包含原始 SQL）" />
-        <Control Id="BinlogDescription" Type="Text" X="42" Y="148" Width="300" Height="18" Text="只记录已提交变更；文件可能包含密码或业务数据。" />
-        <Control Id="BinlogRetentionLabel" Type="Text" X="42" Y="173" Width="155" Height="15" Text="binlog 保留天数：" />
-        <Control Id="BinlogRetentionEdit" Type="Edit" X="194" Y="170" Width="48" Height="18" Property="GBASE_BINLOG_RETENTION_DAYS" Integer="yes" />
-        <Control Id="BinlogRetentionHint" Type="Text" X="250" Y="173" Width="90" Height="15" Text="0=永久，最大365" />
-        <Control Id="PathHint" Type="Text" X="24" Y="204" Width="320" Height="20" Text="升级保留已有路径；清理 binlog 前应具备保留期内的基础备份。" />
+        <Control Id="PathHint" Type="Text" X="24" Y="204" Width="320" Height="20" Text="MVCC 不再生成逻辑 binlog；旧数据需先离线迁移。" />
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="上一步">
           <Publish Event="NewDialog" Value="GBaseConfigDlg" />
         </Control>

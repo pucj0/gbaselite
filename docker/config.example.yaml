@@ -13,6 +13,7 @@ resources:
   max_procs: 0
 
 storage:
+  # MVCC is the only runtime engine. Legacy data requires migrate-legacy.
   path: ./data
 
 auth:
@@ -38,9 +39,4 @@ log:
 audit:
   enabled: false
   path: ./logs/audit.jsonl
-  retention_days: 7
-
-binlog:
-  enabled: false
-  path: ./data/binlog.jsonl
   retention_days: 7

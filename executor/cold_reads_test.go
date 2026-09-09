@@ -10,10 +10,10 @@ import (
 	"gbaselite/storage"
 )
 
-func coldTestEngine(t *testing.T, materializeBytes int64) (*Engine, *Session, *storage.Table) {
+func coldTestEngine(t *testing.T, materializeBytes int64) (*legacyEngine, *Session, *storage.Table) {
 	t.Helper()
 	directory := t.TempDir()
-	warm, err := OpenWithOptions(directory, "root", "secret", OpenOptions{StorageMode: "paged"})
+	warm, err := openLegacyWithOptions(directory, "root", "secret", OpenOptions{StorageMode: "paged"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +36,7 @@ func coldTestEngine(t *testing.T, materializeBytes int64) (*Engine, *Session, *s
 	if err := warm.Close(); err != nil {
 		t.Fatal(err)
 	}
-	engine, err := OpenWithOptions(directory, "root", "secret", OpenOptions{StorageMode: "paged", PageCacheBytes: 4 << 10, ColdRead: true, ColdMaterializeBytes: materializeBytes})
+	engine, err := openLegacyWithOptions(directory, "root", "secret", OpenOptions{StorageMode: "paged", PageCacheBytes: 4 << 10, ColdRead: true, ColdMaterializeBytes: materializeBytes})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +50,7 @@ func coldTestEngine(t *testing.T, materializeBytes int64) (*Engine, *Session, *s
 	return engine, &Session{CurrentDatabase: "cold"}, table
 }
 
-func TestColdSQLStreamsAndCountsWithoutMaterialization(t *testing.T) {
+func TestLegacyColdSQLStreamsAndCountsWithoutMaterialization(t *testing.T) {
 	engine, session, table := coldTestEngine(t, 1024)
 	session.StreamResults = true
 	result, err := engine.Execute(session, "SELECT i.id, LENGTH(i.payload) AS bytes FROM items i WHERE i.id >= 1000 LIMIT 3")
@@ -88,7 +88,7 @@ func TestColdSQLStreamsAndCountsWithoutMaterialization(t *testing.T) {
 	}
 }
 
-func TestColdSQLExplicitFallbackPreservesRowsAndTransactions(t *testing.T) {
+func TestLegacyColdSQLExplicitFallbackPreservesRowsAndTransactions(t *testing.T) {
 	engine, session, table := coldTestEngine(t, 32<<20)
 	if _, err := engine.Execute(session, "BEGIN"); err != nil {
 		t.Fatal(err)
@@ -111,7 +111,7 @@ func TestColdSQLExplicitFallbackPreservesRowsAndTransactions(t *testing.T) {
 	}
 }
 
-func TestColdSQLIndexPointAndOrderedRangeStayCold(t *testing.T) {
+func TestLegacyColdSQLIndexPointAndOrderedRangeStayCold(t *testing.T) {
 	engine, session, table := coldTestEngine(t, 1024)
 	before := engine.Persistence.PagedStats()
 	result, err := engine.Execute(session, "SELECT id, LENGTH(payload) FROM items WHERE id=999")
@@ -136,7 +136,7 @@ func TestColdSQLIndexPointAndOrderedRangeStayCold(t *testing.T) {
 	}
 }
 
-func TestColdShowViewCannotBypassMaterializationBudget(t *testing.T) {
+func TestLegacyColdShowViewCannotBypassMaterializationBudget(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		engine, session, table := coldTestEngine(t, 1024)
 		session.StreamResults = stream
@@ -159,7 +159,7 @@ func TestColdShowViewCannotBypassMaterializationBudget(t *testing.T) {
 	}
 }
 
-func TestColdExternalSortAndDistinctStayWithinConfiguredExecutionPath(t *testing.T) {
+func TestLegacyColdExternalSortAndDistinctStayWithinConfiguredExecutionPath(t *testing.T) {
 	engine, session, table := coldTestEngine(t, 1024)
 	temporary := t.TempDir()
 	engine.QueryOptions = QueryOptions{SortMemoryBytes: 256 << 10, ResultMemoryBytes: 64 << 10, MaxTempBytes: 16 << 20, TempDirectory: temporary}
@@ -192,9 +192,9 @@ func TestColdExternalSortAndDistinctStayWithinConfiguredExecutionPath(t *testing
 	}
 }
 
-func TestColdAndFullSelectExposeIdenticalSourceColumnMetadata(t *testing.T) {
+func TestLegacyColdAndFullSelectExposeIdenticalSourceColumnMetadata(t *testing.T) {
 	directory := t.TempDir()
-	warm, err := OpenWithOptions(directory, "root", "secret", OpenOptions{StorageMode: "paged"})
+	warm, err := openLegacyWithOptions(directory, "root", "secret", OpenOptions{StorageMode: "paged"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +216,7 @@ func TestColdAndFullSelectExposeIdenticalSourceColumnMetadata(t *testing.T) {
 	if err := warm.Close(); err != nil {
 		t.Fatal(err)
 	}
-	cold, err := OpenWithOptions(directory, "root", "secret", OpenOptions{StorageMode: "paged", ColdRead: true, ColdMaterializeBytes: 1024})
+	cold, err := openLegacyWithOptions(directory, "root", "secret", OpenOptions{StorageMode: "paged", ColdRead: true, ColdMaterializeBytes: 1024})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestColdAndFullSelectExposeIdenticalSourceColumnMetadata(t *testing.T) {
 	}
 }
 
-func TestColdSystemSchemaCannotHideUserTableSubquery(t *testing.T) {
+func TestLegacyColdSystemSchemaCannotHideUserTableSubquery(t *testing.T) {
 	engine, session, table := coldTestEngine(t, 1024)
 	if _, err := engine.Execute(session, "SELECT (SELECT payload FROM cold.items LIMIT 1) FROM information_schema.tables"); !errors.Is(err, storage.ErrColdMaterializationLimit) {
 		t.Fatalf("system schema bypassed cold subquery budget: %v", err)

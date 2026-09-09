@@ -3,18 +3,16 @@ package server
 import (
 	"context"
 	"database/sql"
+	"gbaselite/storage"
 	"io"
 	"log"
 	"net"
 	"testing"
 	"time"
-
-	"gbaselite/executor"
-	"gbaselite/storage"
 )
 
 func BenchmarkMySQLConcurrentPrimaryKeySelect(b *testing.B) {
-	engine, err := executor.Open(b.TempDir(), "root", "123456")
+	engine, err := openTestEngine(b, b.TempDir(), "root", "123456")
 	if err != nil {
 		b.Fatal(err)
 	}

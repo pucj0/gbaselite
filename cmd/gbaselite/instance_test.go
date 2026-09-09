@@ -7,29 +7,38 @@ import (
 	"strings"
 	"testing"
 
-	"gbaselite/executor"
+	"gbaselite/catalog"
+	"gbaselite/storage"
 )
 
 func TestInspectInstanceCopyValidatesDataIndexesUsersAndGrants(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := executor.Open(directory, "private_admin", "private-admin-password")
+	store := storage.NewStore()
+	db, err := store.CreateDatabase("private_database")
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := &executor.Session{Username: "private_admin", Host: "%"}
-	for _, query := range []string{
-		"CREATE DATABASE private_database",
-		"CREATE TABLE private_database.private_table(id INT NOT NULL,label VARCHAR(32),PRIMARY KEY(id),KEY private_index(label))",
-		"INSERT INTO private_database.private_table VALUES(1,'private row value')",
-		"CREATE VIEW private_database.private_view AS SELECT id,label FROM private_database.private_table",
-		"CREATE USER 'private_reader'@'%' IDENTIFIED BY 'private-reader-password'",
-		"GRANT SELECT ON private_database.* TO 'private_reader'@'%'",
-	} {
-		if _, err := engine.Execute(session, query); err != nil {
-			t.Fatalf("%s: %v", query, err)
-		}
+	table, err := db.CreateTableWithIndexes("private_table", []storage.Column{{Name: "id", Type: storage.TypeInt}, {Name: "label", Type: storage.TypeVarchar, Length: 32}}, []string{"id"}, []storage.Index{{Name: "private_index", Columns: []string{"label"}}})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := engine.Close(); err != nil {
+	if err = table.Insert(storage.Row{storage.MustValue(storage.TypeInt, int64(1)), storage.MustValue(storage.TypeVarchar, "private row value")}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.CreateView("private_view", "SELECT id,label FROM private_table", nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if err = storage.NewPersistence(directory).Save(store); err != nil {
+		t.Fatal(err)
+	}
+	users, err := catalog.OpenUsers(directory, "private_admin", "private-admin-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = users.CreateAccount("private_reader", "%", "private-reader-password", false); err != nil {
+		t.Fatal(err)
+	}
+	if err = users.GrantPrivileges("private_reader", "%", []string{"SELECT"}, "private_database", "*", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -84,11 +93,7 @@ func TestInspectInstanceCopyValidatesDataIndexesUsersAndGrants(t *testing.T) {
 
 func TestInspectInstanceCopyRejectsRecoveryCandidate(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := executor.Open(directory, "root", "secret")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := engine.Close(); err != nil {
+	if err := storage.NewPersistence(directory).Save(storage.NewStore()); err != nil {
 		t.Fatal(err)
 	}
 	candidate := filepath.Join(directory, "databases", "store.gob.tmp")
@@ -110,18 +115,14 @@ func TestInspectInstanceRejectsPagedDirectoryWithStaleGob(t *testing.T) {
 	for _, marker := range []string{"store.pages", "store.checkpoint", "store.wal"} {
 		t.Run(marker, func(t *testing.T) {
 			directory := t.TempDir()
-			engine, err := executor.Open(directory, "root", "secret")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := engine.Close(); err != nil {
+			if err := storage.NewPersistence(directory).Save(storage.NewStore()); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(directory, "databases", marker), []byte("paged marker"), 0600); err != nil {
 				t.Fatal(err)
 			}
 			var output bytes.Buffer
-			err = inspectInstanceCopy([]string{"--directory", directory}, &output)
+			err := inspectInstanceCopy([]string{"--directory", directory}, &output)
 			if err == nil || !strings.Contains(err.Error(), "paged instance inspection") || output.Len() != 0 {
 				t.Fatalf("inspection output=%s error=%v", output.String(), err)
 			}

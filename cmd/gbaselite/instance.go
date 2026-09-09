@@ -44,7 +44,7 @@ func inspectInstanceCopy(args []string, output io.Writer) error {
 	for _, marker := range []string{"store.pages", "store.checkpoint", "store.wal"} {
 		path := filepath.Join(absDirectory, "databases", marker)
 		if _, err := os.Stat(path); err == nil {
-			return fmt.Errorf("paged instance inspection is not supported by inspect-instance; preserve the complete directory and validate an isolated copy in paged mode (legacy store.gob may be stale)")
+			return fmt.Errorf("paged instance inspection is not supported by inspect-instance; preserve the complete directory and use migrate-legacy with a new target (legacy store.gob may be stale)")
 		} else if !os.IsNotExist(err) {
 			return fmt.Errorf("inspect paged marker %s: %w", path, err)
 		}

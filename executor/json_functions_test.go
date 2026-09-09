@@ -29,7 +29,7 @@ func assertJSONEqual(t *testing.T, actual any, expected string) {
 	}
 }
 
-func TestJSONSQLFunctions(t *testing.T) {
+func TestLegacyJSONSQLFunctions(t *testing.T) {
 	_, _, run := savepointEngine(t)
 	for _, tc := range []struct{ sql, want string }{
 		{`JSON_OBJECT()`, `{}`}, {`JSON_ARRAY()`, `[]`},
@@ -90,7 +90,7 @@ func TestJSONSQLFunctions(t *testing.T) {
 	}
 }
 
-func TestJSONFunctionErrorsAndLimits(t *testing.T) {
+func TestLegacyJSONFunctionErrorsAndLimits(t *testing.T) {
 	e, s, _ := savepointEngine(t)
 	for _, tc := range []struct {
 		sql  string
@@ -128,7 +128,7 @@ func TestJSONFunctionErrorsAndLimits(t *testing.T) {
 	}
 }
 
-func TestJSONColumnsAtomicityAndMaterialization(t *testing.T) {
+func TestLegacyJSONColumnsAtomicityAndMaterialization(t *testing.T) {
 	e, s, run := savepointEngine(t)
 	run(`CREATE TABLE documents(id INT PRIMARY KEY, body JSON, plain TEXT)`)
 	run(`INSERT INTO documents VALUES(1,JSON_OBJECT('a',1),'[1]'),(2,JSON_OBJECT('a',2),'bad')`)
@@ -154,9 +154,9 @@ func TestJSONColumnsAtomicityAndMaterialization(t *testing.T) {
 	}
 }
 
-func TestJSONPersistence(t *testing.T) {
+func TestLegacyJSONPersistence(t *testing.T) {
 	dir := t.TempDir()
-	e, err := Open(dir, "root", "secret")
+	e, err := openLegacy(dir, "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestJSONPersistence(t *testing.T) {
 	if err := e.Close(); err != nil {
 		t.Fatal(err)
 	}
-	e, err = Open(dir, "root", "secret")
+	e, err = openLegacy(dir, "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestJSONPersistence(t *testing.T) {
 	assertJSONEqual(t, result.Rows[0][0], `[{"n":9223372036854775807,"v":[null,true]}]`)
 }
 
-func BenchmarkJSONFunctions(b *testing.B) {
+func BenchmarkLegacyJSONFunctions(b *testing.B) {
 	for _, tc := range []struct {
 		name string
 		args []any
@@ -202,7 +202,7 @@ func BenchmarkJSONFunctions(b *testing.B) {
 	}
 }
 
-func TestJSONCorrelatedSubqueryKeepsEachRow(t *testing.T) {
+func TestLegacyJSONCorrelatedSubqueryKeepsEachRow(t *testing.T) {
 	_, _, run := savepointEngine(t)
 	run(`INSERT INTO items(value) VALUES(10),(20)`)
 	rows := run(`SELECT JSON_OBJECT('value',(SELECT b.value FROM items b WHERE b.id=a.id)) FROM items a ORDER BY a.id`).Rows
@@ -210,7 +210,7 @@ func TestJSONCorrelatedSubqueryKeepsEachRow(t *testing.T) {
 	assertJSONEqual(t, rows[1][0], `{"value":20}`)
 }
 
-func TestJSONInsertFormsAndAtomicity(t *testing.T) {
+func TestLegacyJSONInsertFormsAndAtomicity(t *testing.T) {
 	e, s, run := savepointEngine(t)
 	run(`CREATE TABLE forms(id INT PRIMARY KEY,body JSON)`)
 	run(`INSERT INTO forms SET id=1,body=JSON_OBJECT('a',1)`)
@@ -227,7 +227,7 @@ func TestJSONInsertFormsAndAtomicity(t *testing.T) {
 	assertJSONEqual(t, run(`WITH j AS (SELECT body FROM forms WHERE id=1) SELECT JSON_ARRAY(body) FROM j`).Rows[0][0], `[{"a":1}]`)
 }
 
-func TestJSONInsertSubqueryAuthorization(t *testing.T) {
+func TestLegacyJSONInsertSubqueryAuthorization(t *testing.T) {
 	e, _, run := savepointEngine(t)
 	run(`CREATE TABLE target(id INT, body JSON)`)
 	run(`INSERT INTO items(value) VALUES(10)`)
@@ -245,7 +245,7 @@ func TestJSONInsertSubqueryAuthorization(t *testing.T) {
 	assertJSONEqual(t, run(`SELECT body FROM target`).Rows[0][0], `{"secret":10}`)
 }
 
-func TestJSONInsertSelectRollback(t *testing.T) {
+func TestLegacyJSONInsertSelectRollback(t *testing.T) {
 	e, s, run := savepointEngine(t)
 	run(`CREATE TABLE source_json(id INT, raw TEXT)`)
 	run(`CREATE TABLE target_json(id INT PRIMARY KEY, body JSON)`)

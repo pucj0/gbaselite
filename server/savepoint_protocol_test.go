@@ -3,10 +3,6 @@ package server
 import (
 	"context"
 	"database/sql"
-	"errors"
-	"fmt"
-	"gbaselite/executor"
-	driver "github.com/go-sql-driver/mysql"
 	"io"
 	"log"
 	"net"
@@ -14,8 +10,8 @@ import (
 	"time"
 )
 
-func TestSavepointsOverMySQLProtocol(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "secret")
+func TestMVCCRejectsSavepointsOverMySQLProtocol(t *testing.T) {
+	engine, err := openTestEngine(t, t.TempDir(), "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,34 +49,15 @@ func TestSavepointsOverMySQLProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := prepared.Exec(); err != nil {
-		t.Fatal(err)
+	if _, err := prepared.Exec(); err == nil {
+		t.Fatal("legacy prepared savepoint accepted")
 	}
 	prepared.Close()
-	for _, q := range []string{"INSERT INTO items VALUES(1)", "SAVEPOINT later", "ROLLBACK TO prepared_point"} {
-		if _, err := tx.Exec(q); err != nil {
-			t.Fatal(err)
+	for _, q := range []string{"SAVEPOINT p", "ROLLBACK TO p", "RELEASE SAVEPOINT p"} {
+		if _, err := tx.Exec(q); err == nil {
+			t.Fatalf("legacy savepoint accepted: %s", q)
 		}
 	}
-	assertCode := func(q string, code uint16) {
-		t.Helper()
-		_, err := tx.Exec(q)
-		var driverErr *driver.MySQLError
-		if !errors.As(err, &driverErr) || driverErr.Number != code {
-			t.Fatalf("%s: want %d, got %v", q, code, err)
-		}
-	}
-	assertCode("RELEASE SAVEPOINT later", 1305)
-	var count int
-	if err := tx.QueryRow("SELECT COUNT(*) FROM items").Scan(&count); err != nil || count != 0 {
-		t.Fatalf("rollback result: %d %v", count, err)
-	}
-	for i := 0; i < 31; i++ {
-		if _, err := tx.Exec(fmt.Sprintf("SAVEPOINT p%d", i)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	assertCode("SAVEPOINT overflow", 1041)
 	if _, err := tx.Exec("INSERT INTO items VALUES(2)"); err != nil {
 		t.Fatal(err)
 	}
@@ -89,6 +66,6 @@ func TestSavepointsOverMySQLProtocol(t *testing.T) {
 	}
 	var id int
 	if err := db.QueryRow("SELECT id FROM items").Scan(&id); err != nil || id != 2 {
-		t.Fatalf("commit result: %d %v", id, err)
+		t.Fatalf("rejected statement poisoned transaction: %d %v", id, err)
 	}
 }

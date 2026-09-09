@@ -14,6 +14,15 @@ releases.
 
 ## [Unreleased]
 
+### Changed
+
+- 定义 Storage Engine/Txn/Iterator/Table/Index/ScanRequest 契约，封装现有 MVCC/bbolt adapter，SQL/计划改用接口；支持注入工厂并增加独立后端与导入边界测试。
+
+- MVCC 是唯一运行事务引擎，默认打开使用 MVCC；snapshot/paged 与旧 optimistic/cold-read 配置不再可用于服务。
+- 新增 `migrate-legacy --source <旧目录> --target <新目录>`，在隔离副本读取旧格式，重开校验后发布独立 MVCC 目录；源数据保留。
+- 状态和诊断统一报告 MVCC；旧事务执行器仅作为测试夹具编译，生产只保留旧格式迁移读取器，离线旧命令停止写入。
+- MSI 移除启用 legacy binlog 的界面控件，写入关闭配置并保留旧日志文件；更新 Docker 样例及 README 当前 SQL 矩阵。
+
 ## [1.1.1] - 2026-09-09
 
 ### 更新摘要

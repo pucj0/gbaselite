@@ -89,9 +89,9 @@ func Default() Config {
 	cfg.Server.SlowQuery = 100 * time.Millisecond
 	cfg.Server.TimeZone = "SYSTEM"
 	cfg.Storage.Path = "./data"
-	cfg.Storage.Mode = "snapshot"
-	cfg.Storage.PageCacheMB = 16
-	cfg.Storage.ColdMaterializeMB = 64
+	cfg.Storage.Mode = "mvcc"
+	cfg.Storage.PageCacheMB = 0
+	cfg.Storage.ColdMaterializeMB = 0
 	cfg.Auth.Username = "root"
 	cfg.Auth.Password = "change-this-password"
 	cfg.Security.LoginFailureLimit = 5
@@ -422,20 +422,18 @@ func Load(path string) (Config, error) {
 			return cfg, err
 		}
 	}
-	if cfg.Replication.Enabled && cfg.Storage.Mode != "mvcc" {
-		return cfg, fmt.Errorf("replication requires storage.mode=mvcc")
+	if cfg.Storage.Mode != "" && cfg.Storage.Mode != "mvcc" {
+		return cfg, fmt.Errorf("storage.mode=%s was removed; MVCC is the only transaction engine; use migrate-legacy with a new target directory", cfg.Storage.Mode)
 	}
-	if cfg.Storage.Mode == "mvcc" && cfg.Binlog.Enabled {
+	cfg.Storage.Mode = "mvcc"
+	if cfg.Binlog.Enabled {
 		return cfg, fmt.Errorf("MVCC uses its own durable log; legacy binlog is not supported")
 	}
-	if cfg.Storage.ColdRead && cfg.Storage.Mode != "paged" {
-		return cfg, fmt.Errorf("storage.cold_reads requires storage.mode=paged")
+	if cfg.Storage.ColdRead || cfg.Storage.PageCacheMB != 0 || cfg.Storage.ColdMaterializeMB != 0 || cfg.Resources.OptimisticTransactions {
+		return cfg, fmt.Errorf("paged cache, cold reads and optimistic_transactions were removed; migrate legacy data to MVCC and remove these settings")
 	}
-	if cfg.Storage.ColdMaterializeMB < 1 || cfg.Storage.ColdMaterializeMB > 1048576 {
-		return cfg, fmt.Errorf("storage.cold_materialize_mb must be 1..1048576")
-	}
-	if cfg.Storage.Mode != "snapshot" && cfg.Storage.Mode != "paged" && cfg.Storage.Mode != "mvcc" {
-		return cfg, fmt.Errorf("storage.mode must be snapshot, paged or mvcc")
+	if cfg.Storage.LocalWAL && cfg.Replication.Enabled {
+		return cfg, fmt.Errorf("local WAL requires standalone MVCC")
 	}
 	if cfg.Resources.TransactionWriteMB > 1048576 {
 		return cfg, fmt.Errorf("transaction_write_mb must be 0..1048576 MiB")

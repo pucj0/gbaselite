@@ -6,15 +6,10 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"gbaselite/catalog"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
-	"gbaselite/replication"
 	"gbaselite/storage"
-	"os"
-	"path/filepath"
+	"gbaselite/storageengine"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -32,57 +27,13 @@ type versionedTable struct {
 func encodeVersioned(value any) ([]byte, error) {
 	var b bytes.Buffer
 	err := gob.NewEncoder(&b).Encode(value)
-	if err == nil && b.Len() > mvcc.MaxValueBytes {
-		err = fmt.Errorf("%w: encoded row/schema exceeds %d bytes", ErrQueryResourceLimit, mvcc.MaxValueBytes)
+	if err == nil && b.Len() > storageengine.MaxValueBytes {
+		err = fmt.Errorf("%w: encoded row/schema exceeds %d bytes", ErrQueryResourceLimit, storageengine.MaxValueBytes)
 	}
 	return b.Bytes(), err
 }
 func decodeVersioned(value []byte, out any) error {
 	return gob.NewDecoder(bytes.NewReader(value)).Decode(out)
-}
-func openMVCC(directory, user, password string, options OpenOptions) (*Engine, error) {
-	for _, marker := range []string{"store.gob", "store.pages", "store.wal", "store.checkpoint", "store.gob.tmp", "store.pages.tmp", "store.wal.tmp", "store.checkpoint.tmp"} {
-		if _, err := os.Stat(filepath.Join(directory, "databases", marker)); err == nil {
-			return nil, errors.New("MVCC requires a separate data directory; migrate explicitly with SQL")
-		} else if !os.IsNotExist(err) {
-			return nil, err
-		}
-	}
-	if options.Replication == nil {
-		if _, err := os.Stat(filepath.Join(directory, "replication", "raft.db")); err == nil {
-			return nil, errors.New("replicated data cannot be opened as a standalone node")
-		} else if !os.IsNotExist(err) {
-			return nil, err
-		}
-	}
-	database, err := mvcc.OpenWithOptions(filepath.Join(directory, "versioned"), mvcc.Options{WriteSetLimitBytes: options.TransactionWriteBytes, LocalWAL: options.LocalWAL})
-	if err != nil {
-		return nil, err
-	}
-	users, err := catalog.OpenUsers(directory, user, password)
-	if err != nil {
-		database.Close()
-		return nil, err
-	}
-	engine := &Engine{MVCC: database, Store: storage.NewStore(), Users: users, mvccProposer: database}
-	engine.persistCond = sync.NewCond(&engine.persistMu)
-	engine.QueryOptions = QueryOptions{SortMemoryBytes: 4 << 20, ResultMemoryBytes: 16 << 20, MaxTempBytes: 256 << 20}
-	if options.Replication != nil {
-		settings := *options.Replication
-		settings.Directory = filepath.Join(directory, "replication")
-		node, err := replication.Open(database, settings)
-		if err != nil {
-			database.Close()
-			return nil, err
-		}
-		engine.Replica = node
-		engine.mvccProposer = node
-	}
-	if err := engine.refreshMVCCMetadata(context.Background()); err != nil {
-		engine.Close()
-		return nil, err
-	}
-	return engine, nil
 }
 func versionedName(session *Session, table string) (string, string, error) {
 	database, name := splitTableName(table)
@@ -98,12 +49,9 @@ func versionedName(session *Session, table string) (string, string, error) {
 	return strings.ToLower(database), strings.ToLower(name), nil
 }
 func (e *Engine) refreshMVCCMetadata(ctx context.Context) error {
-	if e.MVCC == nil {
-		return nil
-	}
 	e.mvccMetadata.Lock()
 	defer e.mvccMetadata.Unlock()
-	head, err := e.MVCC.CatalogHead()
+	head, err := e.Backend.CatalogHead()
 	if err != nil {
 		return err
 	}
@@ -113,7 +61,7 @@ func (e *Engine) refreshMVCCMetadata(ctx context.Context) error {
 	mirror := storage.NewStore()
 	var tables []versionedTable
 	var names []string
-	err = e.MVCC.Scan(ctx, head, "catalog", func(k, v []byte) error {
+	err = e.Backend.Scan(ctx, head, "catalog", func(k, v []byte) error {
 		name := string(k)
 		if strings.HasPrefix(name, "db/") {
 			_, err := mirror.CreateDatabase(strings.TrimPrefix(name, "db/"))
@@ -135,26 +83,19 @@ func (e *Engine) refreshMVCCMetadata(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	metadata := mirror.SharedSnapshot()
 	for i, table := range tables {
 		parts := strings.SplitN(names[i], "/", 3)
-		db, err := mirror.Database(parts[1])
-		if err != nil {
-			return err
-		}
-		var primary []string
-		var indexes []storage.Index
-		for _, index := range table.Definition.Indexes {
-			if index.Primary {
-				primary = index.Columns
-			} else {
-				indexes = append(indexes, index)
+		definition := table.Definition
+		definition.Rows = nil
+		for j := range metadata.Databases {
+			if strings.EqualFold(metadata.Databases[j].Name, parts[1]) {
+				metadata.Databases[j].Tables = append(metadata.Databases[j].Tables, definition)
 			}
 		}
-		created, createErr := db.CreateTableWithIndexes(parts[2], table.Definition.Columns, primary, indexes)
-		if err = createErr; err != nil {
-			return err
-		}
-		created.SetNamedConstraints(table.Definition.ForeignKeys, table.Definition.CheckConstraints)
+	}
+	if err = mirror.ReplaceShared(metadata); err != nil {
+		return err
 	}
 	if err = e.Store.ReplaceShared(mirror.SharedSnapshot()); err != nil {
 		return err
@@ -169,13 +110,13 @@ type mvccReadTableCache struct {
 	schema       *storage.Table
 }
 
-func loadVersionedTable(tx *mvcc.Tx, session *Session, name string) (versionedTable, *storage.Table, []byte, error) {
+func loadVersionedTable(tx storageengine.Txn, session *Session, name string) (versionedTable, *storage.Table, []byte, error) {
 	return loadVersionedTableInternal(tx, session, name, false)
 }
-func loadVersionedTableForRead(tx *mvcc.Tx, session *Session, name string) (versionedTable, *storage.Table, []byte, error) {
+func loadVersionedTableForRead(tx storageengine.Txn, session *Session, name string) (versionedTable, *storage.Table, []byte, error) {
 	return loadVersionedTableInternal(tx, session, name, true)
 }
-func loadVersionedTableInternal(tx *mvcc.Tx, session *Session, name string, cacheRead bool) (versionedTable, *storage.Table, []byte, error) {
+func loadVersionedTableInternal(tx storageengine.Txn, session *Session, name string, cacheRead bool) (versionedTable, *storage.Table, []byte, error) {
 	db, table, err := versionedName(session, name)
 	if err != nil {
 		return versionedTable{}, nil, nil, err
@@ -226,18 +167,25 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 		// Bound quorum discovery, not the entire SQL statement. Large replicated
 		// transactions obey the user's query deadline instead of a hidden 30s cap.
 		barrierCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := e.mvccProposer.Barrier(barrierCtx)
+		err := e.Backend.Barrier(barrierCtx)
 		cancel()
 		if err != nil {
 			return nil, err
 		}
 	}
 	switch statement.(type) {
+	case parser.CreateUser, parser.AlterUser, parser.DropUser, parser.RenameUser, parser.SetPassword, parser.Grant, parser.Revoke, parser.ShowGrants, parser.ShowCreateUser:
+		if e.Replica != nil {
+			return nil, fmt.Errorf("replicated account SQL is not supported; provision matching users on stopped nodes")
+		}
+		return e.executeAccountStatement(session, statement)
+	}
+	switch statement.(type) {
 	case parser.Begin:
 		if session.mvccTransaction != nil {
 			return nil, errors.New("transaction already active")
 		}
-		tx, err := e.MVCC.Begin(ctx, e.mvccProposer)
+		tx, err := e.Backend.Begin(ctx)
 		session.mvccTransaction = tx
 		return &Result{Message: "MVCC transaction started"}, err
 	case parser.Commit:
@@ -261,7 +209,7 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 	tx := session.mvccTransaction
 	if tx == nil && session.AutocommitDisabled && mvccStartsImplicitTransaction(statement) {
 		var err error
-		tx, err = e.MVCC.Begin(ctx, e.mvccProposer)
+		tx, err = e.Backend.Begin(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -270,7 +218,7 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 	automatic := tx == nil
 	if automatic {
 		var err error
-		tx, err = e.MVCC.Begin(ctx, e.mvccProposer)
+		tx, err = e.Backend.Begin(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -333,9 +281,6 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 // PrepareCompatibilityRead refreshes the metadata view used by protocol-level
 // compatibility queries and checks quorum before serving them.
 func (e *Engine) PrepareCompatibilityRead(ctx context.Context) error {
-	if e.MVCC == nil {
-		return nil
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -369,9 +314,6 @@ func mvccStartsImplicitTransaction(statement parser.Statement) bool {
 	}
 }
 func (e *Engine) SetMVCCAutocommit(session *Session, enabled bool) error {
-	if e.MVCC == nil {
-		return errors.New("MVCC autocommit requires the MVCC backend")
-	}
 	if enabled && session.AutocommitDisabled && session.InTransaction() {
 		if _, err := e.Execute(session, "COMMIT"); err != nil {
 			return err

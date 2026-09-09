@@ -5,9 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"math"
 	"strconv"
 	"strings"
@@ -192,7 +192,7 @@ func planIntegerBatch(s parser.Select, table versionedTable, schema *storage.Tab
 func decodeIntegerBatch(table versionedTable, p *integerBatchPlan, batch []mvccBatchEntry, stride int, values []int64, nulls []bool) error {
 	for row, entry := range batch {
 		encoded := entry.value
-		if !bytes.HasPrefix(encoded, mvccRowMagic) || len(encoded) > mvcc.MaxValueBytes {
+		if !bytes.HasPrefix(encoded, mvccRowMagic) || len(encoded) > storageengine.MaxValueBytes {
 			return errMVCCRowEncoding
 		}
 		n, k := binary.Uvarint(encoded[4:])
@@ -274,7 +274,7 @@ func (p *integerBatchPlan) selectRows(n, stride int, values []int64, nulls []boo
 	}
 	return selection
 }
-func executeIntegerBatch(ctx context.Context, tx *mvcc.Tx, session *Session, s parser.Select, table versionedTable, access mvccAccessPlan, p *integerBatchPlan) (*Result, error) {
+func executeIntegerBatch(ctx context.Context, tx storageengine.Txn, session *Session, s parser.Select, table versionedTable, access mvccAccessPlan, p *integerBatchPlan) (*Result, error) {
 	rows := min(mvccBatchRows, mvccBatchBytes/max(1, p.width*9+2))
 	if !p.aggregate && s.HasLimit {
 		rows = min(rows, max(1, s.Limit))

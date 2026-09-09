@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-func TestPagedStatusUsesActualPersistenceAndFilters(t *testing.T) {
-	engine, err := executor.OpenWithOptions(t.TempDir(), "root", "secret", executor.OpenOptions{StorageMode: "paged", PageCacheBytes: 4096, ColdRead: true})
+func TestMVCCStatusOmitsRetiredPageMetrics(t *testing.T) {
+	engine, err := openTestEngineWithOptions(t, t.TempDir(), "root", "secret", executor.OpenOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -19,18 +19,11 @@ func TestPagedStatusUsesActualPersistenceAndFilters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := map[string]string{}
-	for _, row := range result.Rows {
-		found[row[0].(string)] = row[1].(string)
-	}
-	if found["Gbaselite_page_cache_budget_bytes"] != "4096" || found["Gbaselite_page_generation"] == "0" {
-		t.Fatalf("paged status %#v", found)
-	}
-	if _, ok := found["Gbaselite_storage_mode"]; ok {
-		t.Fatal("LIKE filter ignored")
+	if len(result.Rows) != 0 {
+		t.Fatalf("retired paged metrics: %+v", result.Rows)
 	}
 	result, err = server.executeCompatible(&executor.Session{}, "SHOW STATUS LIKE 'Gbaselite_storage_mode'")
-	if err != nil || len(result.Rows) != 1 || result.Rows[0][1] != "paged" {
+	if err != nil || len(result.Rows) != 1 || result.Rows[0][1] != "mvcc" {
 		t.Fatalf("mode %+v %v", result, err)
 	}
 }

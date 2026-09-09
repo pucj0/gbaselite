@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"math"
 	"reflect"
 	"strings"
@@ -85,7 +85,7 @@ func TestCompactMVCCRowRoundTripAndMalformed(t *testing.T) {
 		t.Fatal("unknown format")
 	}
 	table, row = compactTestRow()
-	row[5].Text = strings.Repeat("x", mvcc.MaxValueBytes)
+	row[5].Text = strings.Repeat("x", storageengine.MaxValueBytes)
 	if _, err = encodeMVCCRow(table, row); !errors.Is(err, ErrQueryResourceLimit) {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func FuzzCompactMVCCRowDecode(f *testing.F) {
 	f.Add([]byte{})
 	f.Add(append(bytes.Clone(mvccRowMagic), binary.MaxVarintLen64))
 	f.Fuzz(func(t *testing.T, b []byte) {
-		if len(b) > mvcc.MaxValueBytes+1 {
+		if len(b) > storageengine.MaxValueBytes+1 {
 			return
 		}
 		_, _ = decodeMVCCRow(table, b)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"gbaselite/executor"
 	"gbaselite/internal/processmemory"
+	"gbaselite/storageengine"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -50,7 +51,7 @@ func run() error {
 	var e *executor.Engine
 	open := func() error {
 		var err error
-		e, err = executor.OpenWithOptions(dir, "root", "probe", executor.OpenOptions{StorageMode: "mvcc"})
+		e, err = executor.Open(dir, "root", "probe")
 		return err
 	}
 	if err = open(); err != nil {
@@ -165,7 +166,7 @@ func run() error {
 	if err = verify(); err != nil {
 		return err
 	}
-	pending, err := e.MVCC.PendingBytes()
+	pending, err := e.Backend.(storageengine.Diagnostics).PendingBytes()
 	if err != nil || pending != 0 {
 		return fmt.Errorf("pending bytes %d: %v", pending, err)
 	}
