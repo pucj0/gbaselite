@@ -12,7 +12,7 @@ import (
 
 // A transaction must not advance the autoincrement counter of a table that a
 // concurrent commit has already replaced in the live store.
-func TestReviewOptimisticCommitPreservesConcurrentReservations(t *testing.T) {
+func TestLegacyReviewOptimisticCommitPreservesConcurrentReservations(t *testing.T) {
 	engine, _, run := savepointEngine(t)
 	engine.OptimisticTransactions = true
 	run("INSERT INTO items(value) VALUES(10)")
@@ -27,7 +27,7 @@ func TestReviewOptimisticCommitPreservesConcurrentReservations(t *testing.T) {
 	if _, err := engine.Execute(first, "UPDATE items SET value=20 WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
-	db, _ := second.transaction.Database("sp")
+	db, _ := engine.legacyState(second).transaction.Database("sp")
 	table, _ := db.Table("items")
 	locked, release := make(chan struct{}), make(chan struct{})
 	holderDone := make(chan error, 1)

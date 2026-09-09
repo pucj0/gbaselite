@@ -5,8 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"gbaselite/mvcc"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"math"
 )
 
@@ -48,7 +48,7 @@ func encodeMVCCRow(table versionedTable, row storage.Row) ([]byte, error) {
 				out = append(out, 0)
 			}
 		case storage.TypeDecimal, storage.TypeText, storage.TypeVarchar:
-			if len(v.Text) > mvcc.MaxValueBytes {
+			if len(v.Text) > storageengine.MaxValueBytes {
 				return nil, fmt.Errorf("%w: compact row value exceeds limit", ErrQueryResourceLimit)
 			}
 			out = binary.AppendUvarint(out, uint64(len(v.Text)))
@@ -63,8 +63,8 @@ func encodeMVCCRow(table versionedTable, row storage.Row) ([]byte, error) {
 		default:
 			return nil, errMVCCRowEncoding
 		}
-		if len(out) > mvcc.MaxValueBytes {
-			return nil, fmt.Errorf("%w: encoded row exceeds %d bytes", ErrQueryResourceLimit, mvcc.MaxValueBytes)
+		if len(out) > storageengine.MaxValueBytes {
+			return nil, fmt.Errorf("%w: encoded row exceeds %d bytes", ErrQueryResourceLimit, storageengine.MaxValueBytes)
 		}
 	}
 	return out, nil
@@ -104,7 +104,7 @@ func decodeMVCCRowInto(table versionedTable, encoded []byte, needed []bool, dst 
 		err := decodeVersioned(encoded, &row)
 		return row, err
 	}
-	if table.RowEncoding != mvccCompactRowEncoding || !bytes.HasPrefix(encoded, mvccRowMagic) || len(encoded) > mvcc.MaxValueBytes {
+	if table.RowEncoding != mvccCompactRowEncoding || !bytes.HasPrefix(encoded, mvccRowMagic) || len(encoded) > storageengine.MaxValueBytes {
 		return nil, errMVCCRowEncoding
 	}
 	columns := table.Definition.Columns

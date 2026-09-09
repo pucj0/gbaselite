@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"gbaselite/executor"
 	driver "github.com/go-sql-driver/mysql"
 	"io"
 	"log"
@@ -14,7 +13,7 @@ import (
 )
 
 func TestPreparedStatementLimitOverTCP(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "test")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "test")
 	if err != nil {
 		t.Fatal(err)
 	}

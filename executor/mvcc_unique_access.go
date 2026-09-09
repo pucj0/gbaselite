@@ -2,9 +2,9 @@ package executor
 
 import (
 	"context"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"strings"
 )
 
@@ -115,7 +115,7 @@ func mvccUniqueCandidates(where parser.Expr, table versionedTable, schema *stora
 	return candidates
 }
 
-func scanMVCCUnique(ctx context.Context, tx *mvcc.Tx, table versionedTable, space string, key []byte, yield func([]byte, []byte) error) error {
+func scanMVCCUnique(ctx context.Context, tx storageengine.Txn, table versionedTable, space string, key []byte, yield func([]byte, []byte) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -123,7 +123,7 @@ func scanMVCCUnique(ctx context.Context, tx *mvcc.Tx, table versionedTable, spac
 	if err != nil || !exists {
 		return err
 	}
-	row, exists, err := tx.Get("row/"+table.ID, owner)
+	row, exists, err := tx.Table(table.ID).Get(owner)
 	if err != nil || !exists {
 		return err
 	}

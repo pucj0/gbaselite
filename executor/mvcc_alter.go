@@ -3,9 +3,9 @@ package executor
 import (
 	"context"
 	"fmt"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"strings"
 )
 
@@ -44,7 +44,7 @@ func mvccAlterTarget(statement parser.Statement) (string, bool) {
 	}
 	return "", false
 }
-func (e *Engine) alterMVCC(ctx context.Context, read, write *mvcc.Tx, session *Session, name string, statement parser.Statement) (*Result, error) {
+func (e *Engine) alterMVCC(ctx context.Context, read, write storageengine.Txn, session *Session, name string, statement parser.Statement) (*Result, error) {
 	old, _, catalog, err := loadVersionedTable(read, session, name)
 	if err != nil {
 		return nil, err
@@ -137,7 +137,7 @@ func (e *Engine) alterMVCC(ctx context.Context, read, write *mvcc.Tx, session *S
 			delete(origins, strings.ToLower(v.Name))
 		}
 	}
-	definition := versionedTable{CatalogName: dbName + "." + tableName, ID: write.ID + "/" + tableName, RowEncoding: mvccCompactRowEncoding, SecondaryEncoding: 1, Definition: table.Snapshot(), CounterKeys: make(map[string]string)}
+	definition := versionedTable{CatalogName: dbName + "." + tableName, ID: write.ID() + "/" + tableName, RowEncoding: mvccCompactRowEncoding, SecondaryEncoding: 1, Definition: table.Snapshot(), CounterKeys: make(map[string]string)}
 	if _, ok := mvccIntegerPrimary(definition); ok {
 		definition.KeyEncoding = mvccIntegerKeyEncoding
 	}
@@ -160,7 +160,7 @@ func (e *Engine) alterMVCC(ctx context.Context, read, write *mvcc.Tx, session *S
 		return nil, err
 	}
 	count := uint64(0)
-	err = read.ScanRange(ctx, "row/"+old.ID, mvcc.KeyRange{}, func(k, v []byte) error {
+	err = read.ScanRange(ctx, "row/"+old.ID, storageengine.KeyRange{}, func(k, v []byte) error {
 		row, err := decodeMVCCRow(old, v)
 		if err != nil {
 			return err

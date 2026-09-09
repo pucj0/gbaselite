@@ -318,7 +318,7 @@ func sessionVariableValues(session *executor.Session, global bool) [][]any {
 	}
 }
 
-func compatibilityVariables(session *executor.Session, query string, mvccMode bool) *executor.Result {
+func compatibilityVariables(session *executor.Session, query string) *executor.Result {
 	expressions := splitSetAssignments(strings.TrimSpace(query[len("SELECT "):]))
 	values := make(map[string]any)
 	for _, row := range sessionVariableValues(session, false) {
@@ -341,7 +341,7 @@ func compatibilityVariables(session *executor.Session, query string, mvccMode bo
 			variable = strings.TrimPrefix(variable, prefix)
 		}
 		result.Columns = append(result.Columns, executor.Column{Name: label, Type: storage.TypeVarchar})
-		if mvccMode && (variable == "tx_isolation" || variable == "transaction_isolation") {
+		if variable == "tx_isolation" || variable == "transaction_isolation" {
 			result.Rows[0][index] = "REPEATABLE-READ"
 		} else if variable == "autocommit" {
 			result.Columns[index].Type = storage.TypeBigInt

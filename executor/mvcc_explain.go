@@ -2,13 +2,13 @@ package executor
 
 import (
 	"fmt"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"strings"
 )
 
-func executeMVCCExplain(tx *mvcc.Tx, session *Session, query parser.Query) (*Result, error) {
+func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Query) (*Result, error) {
 	s, ok := query.(parser.Select)
 	if !ok {
 		return nil, fmt.Errorf("MVCC EXPLAIN supports a single SELECT")

@@ -1,5 +1,8 @@
 # GBaseLite SQL 兼容参考
 
+> 本文包含历史 snapshot/paged 功能。当前运行引擎仅为 MVCC；语法与配置请以 [README 当前矩阵](../../README.md#兼容范围与限制)为准，旧选项不再提供运行模式。
+
+
 更新日期：2026-08-04
 
 本文按语法类别说明当前 GBaseLite 源码已经实现的 MySQL 兼容范围。它是开发、迁移和

@@ -5,9 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"strings"
 )
 
@@ -96,13 +96,13 @@ func secondaryEntry(table versionedTable, positions []int, owner []byte, row sto
 	copy(value[2+len(owner):], encoded)
 	return k, value, nil
 }
-func writeSecondaryEntries(tx *mvcc.Tx, table versionedTable, oldKey, newKey []byte, oldRow, newRow storage.Row) error {
+func writeSecondaryEntries(tx storageengine.Txn, table versionedTable, oldKey, newKey []byte, oldRow, newRow storage.Row) error {
 	for _, idx := range table.Definition.Indexes {
 		positions, ok := secondaryColumns(table, idx)
 		if !ok {
 			continue
 		}
-		space := "secondary/" + table.ID + "/" + idx.Name
+		indexHandle := tx.Table(table.ID).Index(idx.Name, storageengine.SecondaryIndex)
 		var okKey, ov, nk, nv []byte
 		var err error
 		if oldRow != nil {
@@ -121,12 +121,12 @@ func writeSecondaryEntries(tx *mvcc.Tx, table versionedTable, oldKey, newKey []b
 			continue
 		}
 		if oldRow != nil {
-			if err = tx.Delete(space, okKey); err != nil {
+			if err = indexHandle.Delete(okKey); err != nil {
 				return err
 			}
 		}
 		if newRow != nil {
-			if err = tx.Put(space, nk, nv); err != nil {
+			if err = indexHandle.Put(nk, nv); err != nil {
 				return err
 			}
 		}
@@ -231,13 +231,17 @@ func planMVCCSecondary(s parser.Select, table versionedTable, schema *storage.Ta
 		}
 		if n > bestPrefix || n == bestPrefix && covered && !best.covering {
 			bestPrefix = n
-			best = mvccAccessPlan{kind: "ref", index: idx.Name, space: "secondary/" + table.ID + "/" + idx.Name, bounds: mvcc.KeyRange{Lower: prefix, LowerInclusive: true, Upper: prefixSuccessor(prefix)}, covering: covered}
+			best = mvccAccessPlan{kind: "ref", index: idx.Name, space: "secondary/" + table.ID + "/" + idx.Name, bounds: storageengine.KeyRange{Lower: prefix, LowerInclusive: true, Upper: prefixSuccessor(prefix)}, covering: covered}
 		}
 	}
 	return best, bestPrefix > 0
 }
-func (p mvccAccessPlan) scanSecondary(ctx context.Context, tx *mvcc.Tx, table versionedTable, yield func([]byte, []byte) error) error {
-	return tx.ScanRange(ctx, p.space, p.bounds, func(k, v []byte) error {
+func (p mvccAccessPlan) scanSecondary(ctx context.Context, tx storageengine.Txn, table versionedTable, yield func([]byte, []byte) error) error {
+	iterator, err := tx.Table(table.ID).Index(p.index, storageengine.SecondaryIndex).Scan(ctx, storageengine.ScanRequest{Range: p.bounds})
+	if err != nil {
+		return err
+	}
+	return storageengine.Consume(iterator, func(k, v []byte) error {
 		if len(v) < 2 {
 			return fmt.Errorf("invalid covering index record")
 		}
@@ -249,7 +253,7 @@ func (p mvccAccessPlan) scanSecondary(ctx context.Context, tx *mvcc.Tx, table ve
 		if p.covering {
 			return yield(owner, v[2+n:])
 		}
-		row, ok, err := tx.Get("row/"+table.ID, owner)
+		row, ok, err := tx.Table(table.ID).Get(owner)
 		if err != nil || !ok {
 			return err
 		}

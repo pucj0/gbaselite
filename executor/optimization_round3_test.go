@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestBoundedSortMatchesFullSort(t *testing.T) {
+func TestLegacyBoundedSortMatchesFullSort(t *testing.T) {
 	_, _, run := savepointEngine(t)
 	run("BEGIN")
 	for i := 0; i < 150; i++ {
@@ -54,7 +54,7 @@ func TestBoundedSortMatchesFullSort(t *testing.T) {
 	}
 	run("ROLLBACK")
 }
-func TestMutationIndexKeepsLimitOrderAndErrors(t *testing.T) {
+func TestLegacyMutationIndexKeepsLimitOrderAndErrors(t *testing.T) {
 	e, s, run := savepointEngine(t)
 	run("INSERT INTO items(id,value) VALUES(30,3),(10,1),(20,2)")
 	run("BEGIN")
@@ -74,7 +74,7 @@ func TestMutationIndexKeepsLimitOrderAndErrors(t *testing.T) {
 	run("ROLLBACK")
 }
 
-func TestBoundedHeapRandomStableReference(t *testing.T) {
+func TestLegacyBoundedHeapRandomStableReference(t *testing.T) {
 	random := rand.New(rand.NewSource(9718))
 	type item struct{ key, ordinal int }
 	for trial := 0; trial < 100; trial++ {
@@ -100,7 +100,7 @@ func TestBoundedHeapRandomStableReference(t *testing.T) {
 	}
 }
 
-func TestMutationIndexPreservesLegacyNumericComparison(t *testing.T) {
+func TestLegacyMutationIndexPreservesLegacyNumericComparison(t *testing.T) {
 	_, _, run := savepointEngine(t)
 	run("CREATE TABLE numbers(id BIGINT PRIMARY KEY,v INT)")
 	run("INSERT INTO numbers VALUES(9007199254740992,0),(9007199254740993,0)")

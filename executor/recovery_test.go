@@ -14,7 +14,7 @@ const (
 	crashRecoveryDataEnvironment   = "GBASELITE_CRASH_RECOVERY_DATA"
 )
 
-func TestAcknowledgedWritesSurviveAbruptProcessExit(t *testing.T) {
+func TestLegacyAcknowledgedWritesSurviveAbruptProcessExit(t *testing.T) {
 	if os.Getenv(crashRecoveryHelperEnvironment) == "1" {
 		if err := writeCrashRecoveryFixture(os.Getenv(crashRecoveryDataEnvironment)); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -24,7 +24,7 @@ func TestAcknowledgedWritesSurviveAbruptProcessExit(t *testing.T) {
 	}
 
 	directory := t.TempDir()
-	command := exec.Command(os.Args[0], "-test.run=^TestAcknowledgedWritesSurviveAbruptProcessExit$")
+	command := exec.Command(os.Args[0], "-test.run=^TestLegacyAcknowledgedWritesSurviveAbruptProcessExit$")
 	command.Env = append(os.Environ(),
 		crashRecoveryHelperEnvironment+"=1",
 		crashRecoveryDataEnvironment+"="+directory,
@@ -33,7 +33,7 @@ func TestAcknowledgedWritesSurviveAbruptProcessExit(t *testing.T) {
 		t.Fatalf("abrupt-exit helper: %v\n%s", err, output)
 	}
 
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestAcknowledgedWritesSurviveAbruptProcessExit(t *testing.T) {
 }
 
 func writeCrashRecoveryFixture(directory string) error {
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		return err
 	}
@@ -85,9 +85,9 @@ func writeCrashRecoveryFixture(directory string) error {
 	return nil
 }
 
-func TestDeterministicRandomWritesMatchModelAcrossRestarts(t *testing.T) {
+func TestLegacyDeterministicRandomWritesMatchModelAcrossRestarts(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestDeterministicRandomWritesMatchModelAcrossRestarts(t *testing.T) {
 			if err := engine.Close(); err != nil {
 				t.Fatal(err)
 			}
-			engine, err = Open(directory, "root", "123456")
+			engine, err = openLegacy(directory, "root", "123456")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -167,7 +167,7 @@ func TestDeterministicRandomWritesMatchModelAcrossRestarts(t *testing.T) {
 	assertRowsMatchModel(t, engine, session, model)
 }
 
-func assertRowsMatchModel(t testing.TB, engine *Engine, session *Session, model map[int]string) {
+func assertRowsMatchModel(t testing.TB, engine *legacyEngine, session *Session, model map[int]string) {
 	t.Helper()
 	result, err := engine.Execute(session, "SELECT id,value FROM items ORDER BY id")
 	if err != nil {

@@ -1,7 +1,8 @@
 # MVCC、低内存写入与三节点复制
 
-这是可选的实验性 `storage.mode: mvcc` 后端。默认 snapshot/paged 的 SQL 兼容范围不变；
-新后端的兼容范围更窄，见下表。它不是完整 MySQL，也没有经过长期生产故障认证。
+MVCC 是唯一运行事务引擎，默认打开即使用 MVCC；snapshot/paged 仅用于离线旧数据迁移。
+当前 SQL 范围见下表与 [README](../../README.md#兼容范围与限制)。它不是完整 MySQL，也没有长期生产故障认证。
+迁移使用 `migrate-legacy --source <旧目录> --target <新目录>`，源目录保留。
 
 ## 已实现的路径
 
@@ -24,7 +25,7 @@
 - `gbaselite proxy` 自动探测可用主节点。切换时关闭旧连接；新连接进入新主。
   代理不重放 SQL、不恢复会话变量，不保证正在执行的事务透明续跑。
 
-## SQL 范围（仅 MVCC 模式）
+## 当前 SQL 范围
 
 | 支持 | 限制 |
 | --- | --- |
@@ -37,9 +38,9 @@
 | 精确 DECIMAL、JSON 列及函数、显式列排序规则 | 仍适用现有标量兼容限制；不是完整 MySQL JSON/字符权重实现 |
 | 已提交表结构元数据、SHOW REPLICATION STATUS | 普通 SHOW/信息模式行数统计不代表真实表行数；准确计数用 SELECT COUNT(*) |
 
-常用 ALTER、后建索引、CHECK 与 RESTRICT/NO ACTION 外键已接入；账号/授权修改等仍受 MVCC 路径限制。详细范围见业务演进设计，不应与旧后端功能混同。
+常用 ALTER、后建索引、CHECK 与 RESTRICT/NO ACTION 外键已接入；单机账号/授权 SQL 使用独立用户目录，复制节点拒绝账号 SQL。详细范围见业务演进设计，不应与旧后端功能混同。
 账号文件目前是各节点本地文件，**不经过 Raft**；三个新节点须使用一致的初始化账号密码。
-不要把其它模式的功能矩阵当成 MVCC 支持清单。
+旧模式的历史功能矩阵不适用于当前运行引擎。
 
 ## 新建表格式与性能改造
 
@@ -131,10 +132,10 @@ go build -o .tmp/gbaselite.exe ./cmd/gbaselite
 .tmp/gbaselite.exe server --config mvcc-local.yaml
 ```
 
-旧存储模式拒绝打开 MVCC 目录；复制目录拒绝改成单机模式打开。旧 CLI 的
-shell/import/export/backup/restore/replay-binlog 和 inspect-instance 不适用，明确拒绝，
+snapshot/paged 配置不再可用于运行；复制目录拒绝改成单机打开。旧 CLI 的
+shell/import/export/backup/restore 和 binlog 写入回放明确拒绝，
 防止把元数据镜像导出成空数据备份。通过在线 SQL 导入已验证的受支持语句；不应直接对
-业务目录试验。旧 SQL binlog 不能与 MVCC 配置同时开启。
+业务目录试验。replay-binlog --check-only 与 inspect-instance 仅检查旧格式迁移源。旧 SQL binlog 不能开启。
 
 ## 本地三节点与固定入口
 

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -22,7 +21,6 @@ import (
 	"gbaselite/internal/processmemory"
 	"gbaselite/internal/rotatinglog"
 	"gbaselite/journal"
-	gbmysql "gbaselite/mysql"
 	"gbaselite/server"
 )
 
@@ -58,26 +56,14 @@ func run(args []string) error {
 			return err
 		}
 		return runStart(args)
-	case "shell":
-		return runShell(args)
+	case "shell", "import", "export", "backup", "restore":
+		return fmt.Errorf("legacy offline %s was removed; use the server MySQL interface and BACKUP/RESTORE MVCC", command)
 	case "client", "connect":
 		return runClient(args)
-	case "import":
-		if len(args) == 0 || args[0] != "mysql" {
-			return fmt.Errorf("usage: gbaselite import mysql [options]")
-		}
-		return runImport(args[1:])
-	case "export":
-		if len(args) == 0 || args[0] != "mysql" {
-			return fmt.Errorf("usage: gbaselite export mysql [options]")
-		}
-		return runExport(args[1:])
+	case "migrate-legacy":
+		return runMigrateLegacy(args)
 	case "migrate-layout":
 		return runMigrateLayout(args)
-	case "backup":
-		return runBackup(args)
-	case "restore":
-		return runRestore(args)
 	case "replay-binlog":
 		return runReplayBinlog(args)
 	case "healthcheck":
@@ -140,7 +126,7 @@ func runServerControlled(args []string, externalStop <-chan struct{}, ready chan
 		return startupFailure(fmt.Errorf("listen on %s: %w", cfg.Address(), err))
 	}
 	defer listener.Close()
-	openOptions, err := engineOptions(cfg, true)
+	openOptions, err := engineOptions(cfg)
 	if err != nil {
 		return err
 	}
@@ -155,7 +141,6 @@ func runServerControlled(args []string, externalStop <-chan struct{}, ready chan
 		MaxTempBytes:      int64(cfg.Resources.QueryTempMB) << 20,
 		TempDirectory:     cfg.Resources.QueryTempPath,
 	}
-	engine.OptimisticTransactions = cfg.Resources.OptimisticTransactions
 	var auditLog *journal.AuditLog
 	if cfg.Audit.Enabled {
 		auditLog, err = journal.OpenAudit(cfg.AuditPath(), cfg.Audit.RetentionDays)
@@ -163,15 +148,6 @@ func runServerControlled(args []string, externalStop <-chan struct{}, ready chan
 			return startupFailure(fmt.Errorf("open audit log: %w", err))
 		}
 		defer auditLog.Close()
-	}
-	var binlog *journal.Binlog
-	if cfg.Binlog.Enabled {
-		binlog, err = journal.OpenBinlog(cfg.BinlogPath(), cfg.Binlog.RetentionDays)
-		if err != nil {
-			return startupFailure(fmt.Errorf("open binlog: %w", err))
-		}
-		defer binlog.Close()
-		engine.SetBinlog(binlog)
 	}
 	pidPath := filepath.Join(cfg.Storage.Path, "gbaselite.pid")
 	if err := claimPIDFile(pidPath); err != nil {
@@ -392,190 +368,6 @@ func readRunningPID(path string) (int, bool) {
 	}
 	return pid, processIsAlive(pid)
 }
-func runShell(args []string) error {
-	flags := flag.NewFlagSet("shell", flag.ContinueOnError)
-	configPath := flags.String("config", "config.yaml", "configuration file")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return err
-	}
-	openOptions, err := engineOptions(cfg, false)
-	if err != nil {
-		return err
-	}
-	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
-	if err != nil {
-		return err
-	}
-	defer engine.Close()
-	session := &executor.Session{}
-	scanner := bufio.NewScanner(os.Stdin)
-	var statement strings.Builder
-	for {
-		fmt.Print("gbase> ")
-		if !scanner.Scan() {
-			break
-		}
-		statement.WriteString(scanner.Text())
-		statement.WriteByte('\n')
-		if !strings.Contains(scanner.Text(), ";") {
-			continue
-		}
-		result, err := engine.Execute(session, statement.String())
-		statement.Reset()
-		if err != nil {
-			fmt.Println("ERROR:", err)
-			continue
-		}
-		printResult(result)
-	}
-	return scanner.Err()
-}
-func runImport(args []string) error {
-	flags := flag.NewFlagSet("import mysql", flag.ContinueOnError)
-	configPath := flags.String("config", "config.yaml", "GBaseLite configuration")
-	host := flags.String("host", "127.0.0.1", "MySQL host")
-	port := flags.Int("port", 3306, "MySQL port")
-	user := flags.String("user", "root", "MySQL user")
-	password := flags.String("password", "", "MySQL password")
-	database := flags.String("database", "", "database to import")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if *database == "" {
-		return fmt.Errorf("--database is required")
-	}
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return err
-	}
-	openOptions, err := engineOptions(cfg, false)
-	if err != nil {
-		return err
-	}
-	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
-	if err != nil {
-		return err
-	}
-	count, err := gbmysql.Import(engine.Store, gbmysql.ImportOptions{Host: *host, Port: *port, User: *user, Password: *password, Database: *database})
-	if err == nil {
-		err = engine.Close()
-	}
-	if err == nil {
-		fmt.Printf("imported %d rows into %s\n", count, *database)
-	}
-	return err
-}
-func runExport(args []string) error {
-	flags := flag.NewFlagSet("export mysql", flag.ContinueOnError)
-	configPath := flags.String("config", "config.yaml", "GBaseLite configuration")
-	database := flags.String("database", "", "database to export")
-	output := flags.String("output", "backup.sql", "output SQL file")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if *database == "" {
-		return fmt.Errorf("--database is required")
-	}
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return err
-	}
-	openOptions, err := engineOptions(cfg, false)
-	if err != nil {
-		return err
-	}
-	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
-	if err != nil {
-		return err
-	}
-	if err = gbmysql.Export(engine.Store, *database, *output); err == nil {
-		fmt.Println("exported", *output)
-	}
-	return err
-}
-
-func runBackup(args []string) error {
-	flags := flag.NewFlagSet("backup", flag.ContinueOnError)
-	configPath := flags.String("config", "config.yaml", "GBaseLite configuration")
-	database := flags.String("database", "", "database to back up")
-	allDatabases := flags.Bool("all-databases", false, "back up every database")
-	output := flags.String("output", "backup.sql", "output SQL file")
-	schemaOnly := flags.Bool("no-data", false, "write schema without table rows")
-	dataOnly := flags.Bool("no-create-info", false, "write table rows without schema")
-	addDropDatabase := flags.Bool("add-drop-database", false, "write DROP DATABASE before CREATE DATABASE")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if *allDatabases == (*database != "") {
-		return fmt.Errorf("specify exactly one of --database or --all-databases")
-	}
-	if *schemaOnly && *dataOnly {
-		return fmt.Errorf("--no-data and --no-create-info cannot be combined")
-	}
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return err
-	}
-	openOptions, err := engineOptions(cfg, false)
-	if err != nil {
-		return err
-	}
-	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
-	if err != nil {
-		return err
-	}
-	options := executor.BackupOptions{SchemaOnly: *schemaOnly, DataOnly: *dataOnly, AddDropDatabase: *addDropDatabase}
-	if !*allDatabases {
-		options.Databases = []string{*database}
-	}
-	if err := executor.BackupSQL(engine.Store, *output, options); err != nil {
-		return err
-	}
-	fmt.Println("backup written to", *output)
-	return nil
-}
-
-func runRestore(args []string) error {
-	flags := flag.NewFlagSet("restore", flag.ContinueOnError)
-	configPath := flags.String("config", "config.yaml", "GBaseLite configuration")
-	input := flags.String("input", "", "SQL backup file")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	if *input == "" {
-		return fmt.Errorf("--input is required")
-	}
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		return err
-	}
-	pidPath := filepath.Join(cfg.Storage.Path, "gbaselite.pid")
-	if pid, running := readRunningPID(pidPath); running {
-		return fmt.Errorf("stop GBaseLite before restore (currently PID %d)", pid)
-	}
-	openOptions, err := engineOptions(cfg, false)
-	if err != nil {
-		return err
-	}
-	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
-	if err != nil {
-		return err
-	}
-	executed, err := gbmysql.RestoreSQL(engine, *input)
-	if err != nil {
-		return err
-	}
-	if err := engine.Close(); err != nil {
-		return err
-	}
-	fmt.Printf("restored %d statements from %s\n", executed, *input)
-	return nil
-}
-
 func runReplayBinlog(args []string) error {
 	flags := flag.NewFlagSet("replay-binlog", flag.ContinueOnError)
 	configPath := flags.String("config", "config.yaml", "GBaseLite configuration")
@@ -617,65 +409,9 @@ func runReplayBinlog(args []string) error {
 		}
 		return nil
 	}
-	pidPath := filepath.Join(cfg.Storage.Path, "gbaselite.pid")
-	if pid, running := readRunningPID(pidPath); running {
-		return fmt.Errorf("stop GBaseLite before replaying binlog (currently PID %d)", pid)
-	}
-	openOptions, err := engineOptions(cfg, false)
-	if err != nil {
-		return err
-	}
-	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
-	if err != nil {
-		return err
-	}
-	sessions := make(map[string]*executor.Session)
-	applied, last, replayErr := journal.ReadBinlog(*input, options, func(record journal.BinlogRecord) error {
-		sessionKey := record.SessionID
-		if sessionKey == "" {
-			sessionKey = record.Transaction
-		}
-		session := sessions[sessionKey]
-		if session == nil {
-			session = &executor.Session{}
-			sessions[sessionKey] = session
-		}
-		session.ReplayTimestamp = record.Timestamp
-		if _, err := engine.Execute(session, "BEGIN"); err != nil {
-			return err
-		}
-		for _, statement := range record.Statements {
-			if len(statement.AutoIncrement) > 0 {
-				if err := engine.ReplayAutoIncrement(session, statement.AutoIncrement); err != nil {
-					_, _ = engine.Execute(session, "ROLLBACK")
-					return err
-				}
-				if statement.SQL == "" {
-					continue
-				}
-			}
-			session.ForeignKeyChecksDisabled = statement.ForeignKeyChecksDisabled
-			session.CurrentDatabase = statement.Database
-			if _, err := engine.Execute(session, statement.SQL); err != nil {
-				_, _ = engine.Execute(session, "ROLLBACK")
-				return err
-			}
-		}
-		if _, err := engine.Execute(session, "COMMIT"); err != nil {
-			return err
-		}
-		return nil
-	})
-	if replayErr != nil {
-		_ = engine.Close()
-		return replayErr
-	}
-	if err := engine.Close(); err != nil {
-		return err
-	}
-	fmt.Printf("replayed %d transactions through binlog sequence %d\n", applied, last)
-	return nil
+	return fmt.Errorf("legacy binlog replay is no longer a runtime command; use --check-only to inspect a log and migrate a recovered legacy directory with migrate-legacy")
 }
+
 func runHealthcheck(args []string) error {
 	flags := flag.NewFlagSet("healthcheck", flag.ContinueOnError)
 	host := flags.String("host", "127.0.0.1", "server host")
@@ -724,17 +460,16 @@ func printHelp() {
   gbaselite start [--config config.yaml]
   gbaselite stop [--config config.yaml]
   gbaselite restart [--config config.yaml]
-  gbaselite shell [--config config.yaml]
-  gbaselite import mysql --host HOST --port 3306 --user USER --password PASS --database DB
-  gbaselite export mysql --database DB [--output backup.sql]
-  gbaselite backup (--database DB | --all-databases) [--output backup.sql] [--no-data | --no-create-info] [--add-drop-database]
-  gbaselite restore --input backup.sql [--config config.yaml]
-	  gbaselite replay-binlog [--input binlog.jsonl] [--after-sequence N] [--until RFC3339] [--check-only] [--config config.yaml]
+  gbaselite replay-binlog --check-only --input binlog.jsonl [--after-sequence N] [--until RFC3339]
   gbaselite healthcheck [--host 127.0.0.1 --port 3307]
   gbaselite diagnose [--config config.yaml]
-	  gbaselite inspect-snapshot --file store.gob [--compare store.gob.tmp]
-	  gbaselite inspect-instance --directory copied-data-directory
+  gbaselite migrate-legacy --source <old-directory> --target <new-directory>
+  gbaselite inspect-snapshot --file store.gob [--compare store.gob.tmp]
+  gbaselite inspect-instance --directory copied-data-directory
   gbaselite migrate-layout --source <stopped-versioned-dir> --target <new-dir> --layout flat|nested
   gbaselite version
+
+MVCC is the only runtime engine. Legacy offline shell/import/export/backup/restore
+commands have been removed; use a MySQL client and SQL BACKUP/RESTORE MVCC.
 `)
 }

@@ -3,9 +3,9 @@ package executor
 import (
 	"context"
 	"fmt"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"strconv"
 )
 
@@ -16,7 +16,7 @@ type mvccJoinInput struct {
 	join       parser.Join
 }
 
-func bindMVCCJoins(tx *mvcc.Tx, session *Session, s parser.Select) ([]mvccJoinInput, error) {
+func bindMVCCJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]mvccJoinInput, error) {
 	if len(s.Joins) > 16 {
 		return nil, fmt.Errorf("MVCC join exceeds 16 inputs")
 	}
@@ -63,7 +63,7 @@ func bindMVCCJoins(tx *mvcc.Tx, session *Session, s parser.Select) ([]mvccJoinIn
 	}
 	return inputs, nil
 }
-func mvccJoinedSource(ctx context.Context, tx *mvcc.Tx, session *Session, s parser.Select) (*storage.Table, func(func(storage.Row) error) error, error) {
+func mvccJoinedSource(ctx context.Context, tx storageengine.Txn, session *Session, s parser.Select) (*storage.Table, func(func(storage.Row) error) error, error) {
 	inputs, err := bindMVCCJoins(tx, session, s)
 	if err != nil {
 		return nil, nil, err

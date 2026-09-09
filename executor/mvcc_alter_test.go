@@ -3,7 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
-	"gbaselite/mvcc"
+	"gbaselite/storageengine"
 	"testing"
 )
 
@@ -42,7 +42,7 @@ func TestMVCCAlterAtomicSnapshotAndPhantom(t *testing.T) {
 	if _, err = e.Execute(other, "INSERT INTO alt(v) VALUES(40)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = e.Execute(s, "COMMIT"); !errors.Is(err, mvcc.ErrConflict) {
+	if _, err = e.Execute(s, "COMMIT"); !errors.Is(err, storageengine.ErrConflict) {
 		t.Fatal("DDL missed phantom", err)
 	}
 	if r := run("SELECT * FROM alt"); len(r.Columns) != 2 || len(r.Rows) != 3 {

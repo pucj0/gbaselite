@@ -3,9 +3,9 @@ package executor
 import (
 	"encoding/binary"
 	"errors"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"strconv"
 	"strings"
 )
@@ -82,8 +82,8 @@ func mvccSafeRangeExpression(expr parser.Expr, schema *storage.Table) bool {
 
 // Reject ranges with unsafe conversions/unknown columns. Residual predicates
 // are still evaluated on every candidate; these bounds do not replace WHERE.
-func mvccPrimaryRange(where parser.Expr, table versionedTable, schema *storage.Table) (mvcc.KeyRange, bool) {
-	var r mvcc.KeyRange
+func mvccPrimaryRange(where parser.Expr, table versionedTable, schema *storage.Table) (storageengine.KeyRange, bool) {
+	var r storageengine.KeyRange
 	if table.KeyEncoding != mvccIntegerKeyEncoding || !mvccSafeRangeExpression(where, schema) {
 		return r, false
 	}

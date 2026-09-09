@@ -4,8 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"gbaselite/mvcc"
-	"gbaselite/replication"
+	"gbaselite/storageengine"
 	"strings"
 	"testing"
 	"time"
@@ -35,7 +34,7 @@ func TestMVCCConfiguredBudgetFailureAndOldSnapshot(t *testing.T) {
 	old := &Session{CurrentDatabase: "test"}
 	defer e.CloseSession(old)
 	run(old, "BEGIN")
-	if _, err = e.Execute(s, "UPDATE items SET v=v+1"); !errors.Is(err, mvcc.ErrWriteSetLimit) {
+	if _, err = e.Execute(s, "UPDATE items SET v=v+1"); !errors.Is(err, storageengine.ErrWriteSetLimit) {
 		t.Fatal("budget error", err)
 	}
 	if r := run(s, "SELECT COUNT(*),SUM(v) FROM items"); fmt.Sprint(r.Rows) != "[[100 100]]" {
@@ -50,21 +49,28 @@ func TestMVCCConfiguredBudgetFailureAndOldSnapshot(t *testing.T) {
 	}
 }
 
-type deadlineRecordingProposer struct {
-	store     *mvcc.Store
+type deadlineRecordingBackend struct {
+	storageengine.Engine
 	deadlines []time.Duration
 }
 
-func (p *deadlineRecordingProposer) Barrier(ctx context.Context) error {
+func (p *deadlineRecordingBackend) record(ctx context.Context) {
 	if d, ok := ctx.Deadline(); ok {
 		p.deadlines = append(p.deadlines, time.Until(d))
 	} else {
 		p.deadlines = append(p.deadlines, 0)
 	}
-	return p.store.Barrier(ctx)
 }
-func (p *deadlineRecordingProposer) Propose(ctx context.Context, c mvcc.Command) (mvcc.Result, error) {
-	return p.store.Propose(ctx, c)
+func (p *deadlineRecordingBackend) Barrier(ctx context.Context) error {
+	p.record(ctx)
+	return p.Engine.Barrier(ctx)
+}
+func (p *deadlineRecordingBackend) Begin(ctx context.Context) (storageengine.Txn, error) {
+	p.record(ctx)
+	return p.Engine.Begin(ctx)
+}
+func (p *deadlineRecordingBackend) Status() storageengine.ReplicationStatus {
+	return storageengine.ReplicationStatus{}
 }
 func TestMVCCReplicationDeadlineOnlyBoundsQuorum(t *testing.T) {
 	e, err := OpenWithOptions(t.TempDir(), "root", "pw", OpenOptions{StorageMode: "mvcc"})
@@ -72,11 +78,11 @@ func TestMVCCReplicationDeadlineOnlyBoundsQuorum(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { e.Replica = nil; e.Close() }()
-	p := &deadlineRecordingProposer{store: e.MVCC}
-	e.mvccProposer = p
+	p := &deadlineRecordingBackend{Engine: e.Backend}
+	e.Backend = p
 	// Marker enables the replicated SQL branch; a recording proposer avoids any
 	// real sleeping or dependency on network timing in this deadline policy test.
-	e.Replica = &replication.Node{}
+	e.Replica = p
 	for _, limit := range []time.Duration{0, 90 * time.Second} {
 		e.QueryOptions.Timeout = limit
 		p.deadlines = nil

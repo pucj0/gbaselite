@@ -40,7 +40,7 @@ func indexedJoinFixture(t testing.TB, rightRows int) (*storage.Store, *Session, 
 	return storage.NewStore(), &Session{}, left, right
 }
 
-func TestIndexedJoinMatchesGeneralInnerAndLeft(t *testing.T) {
+func TestLegacyIndexedJoinMatchesGeneralInnerAndLeft(t *testing.T) {
 	for _, kind := range []string{"INNER", "LEFT"} {
 		t.Run(kind, func(t *testing.T) {
 			store, session, left, right := indexedJoinFixture(t, 100)
@@ -71,7 +71,7 @@ func TestIndexedJoinMatchesGeneralInnerAndLeft(t *testing.T) {
 	}
 }
 
-func TestIndexedJoinFallbackAndResourceLimits(t *testing.T) {
+func TestLegacyIndexedJoinFallbackAndResourceLimits(t *testing.T) {
 	store, session, left, right := indexedJoinFixture(t, 10)
 	on, _ := parser.ParseExpression("l.id = r.id")
 	for _, join := range []parser.Join{{Type: "RIGHT", On: on}, {Type: "INNER", On: parser.BinaryExpr{Operator: "AND", Left: on, Right: on}}} {
@@ -91,7 +91,7 @@ func TestIndexedJoinFallbackAndResourceLimits(t *testing.T) {
 	}
 }
 
-func TestIndexedJoinDoesNotUseIncompatibleTextIndex(t *testing.T) {
+func TestLegacyIndexedJoinDoesNotUseIncompatibleTextIndex(t *testing.T) {
 	session := &Session{}
 	a := storage.Column{Name: "a", Type: storage.TypeVarchar, Length: 20}
 	b := storage.Column{Name: "b", Type: storage.TypeVarchar, Length: 20}
@@ -108,7 +108,7 @@ func TestIndexedJoinDoesNotUseIncompatibleTextIndex(t *testing.T) {
 	}
 }
 
-func BenchmarkIndexedJoinSelective(b *testing.B) {
+func BenchmarkLegacyIndexedJoinSelective(b *testing.B) {
 	store, session, left, right := indexedJoinFixture(b, 10000)
 	on, _ := parser.ParseExpression("l.id = r.id")
 	join := parser.Join{Type: "LEFT", On: on}

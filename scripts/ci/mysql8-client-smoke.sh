@@ -115,8 +115,9 @@ CREATE TABLE `order-items` (
   KEY `idx_qty` (`qty`)
 );
 INSERT INTO `order-items` (`sku`, `qty`) VALUES ('SKU-001', 2), ('SKU-002', 0);
-CREATE VIEW `active-items` AS
-  SELECT `id`, `sku`, `qty` FROM `order-items` WHERE `qty` > 0;
+BEGIN;
+INSERT INTO `order-items` (`sku`, `qty`) VALUES ('ROLLED-BACK', 1);
+ROLLBACK;
 SQL
 
 SHOW_DATABASES_ERROR="$WORK_DIRECTORY/show-databases.err"
@@ -160,19 +161,17 @@ grep -Eiq 'CREATE[[:space:]]+DATABASE' "$DUMP"
 grep -Fq 'USE `gbaselite-ci-export`' "$DUMP"
 grep -Eiq 'CREATE[[:space:]]+TABLE[[:space:]]+`order-items`' "$DUMP"
 grep -Eiq 'INSERT[[:space:]]+INTO[[:space:]]+`order-items`' "$DUMP"
-grep -Eiq 'active-items' "$DUMP"
-grep -Eiq '/\*![0-9]+.*VIEW' "$DUMP"
 
 drop_temporary_database
 mysql_client <"$DUMP"
 
 counts=$(mysql_client --batch --raw --skip-column-names <<'SQL'
 SELECT COUNT(*) FROM `gbaselite-ci-export`.`order-items`;
-SELECT COUNT(*) FROM `gbaselite-ci-export`.`active-items`;
+SELECT COUNT(*) FROM `gbaselite-ci-export`.`order-items` WHERE qty > 0;
 SQL
 )
 if [ "$counts" != $'2\n1' ]; then
-  echo "Unexpected restored table/view counts: $counts" >&2
+  echo "Unexpected restored table/filter counts: $counts" >&2
   exit 1
 fi
 
@@ -181,8 +180,12 @@ for index_name in PRIMARY idx_qty uq_sku; do
   printf '%s\n' "$indexes" | grep -Fx "$index_name" >/dev/null
 done
 
-view_definition=$(mysql_client --batch --raw --skip-column-names --execute='SHOW CREATE VIEW `gbaselite-ci-export`.`active-items`;')
-printf '%s\n' "$view_definition" | grep -Fq 'CREATE VIEW `active-items`'
+if mysql_client --execute='CREATE VIEW `gbaselite-ci-export`.`active-items` AS SELECT * FROM `gbaselite-ci-export`.`order-items`;' >"$WORK_DIRECTORY/unsupported-view.out" 2>&1; then
+  echo "MVCC unexpectedly accepted an unsupported view" >&2
+  exit 1
+fi
+storage_mode=$(mysql_client --batch --raw --skip-column-names --execute="SHOW STATUS LIKE 'Gbaselite_storage_mode';")
+printf '%s\n' "$storage_mode" | grep -Eq '[[:space:]]mvcc$'
 
 drop_temporary_database
 echo "MySQL 8 client dump/import smoke test passed."

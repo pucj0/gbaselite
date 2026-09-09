@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 	"math"
 	"reflect"
 	"strings"
@@ -49,7 +49,7 @@ func TestMVCCRangeSQLMatchesFullScan(t *testing.T) {
 	run("CREATE TABLE fast(id BIGINT PRIMARY KEY,v INT,payload VARCHAR(20))")
 	run("CREATE TABLE slow(id BIGINT PRIMARY KEY,v INT,payload VARCHAR(20))")
 	// Encode the old catalog struct without KeyEncoding, as written by old binaries.
-	tx, _ := e.MVCC.Begin(context.Background(), nil)
+	tx, _ := e.Backend.Begin(context.Background())
 	def, _, k, err := loadVersionedTable(tx, s, "slow")
 	if err != nil {
 		t.Fatal(err)
@@ -114,7 +114,7 @@ func TestMVCCRangeSQLMatchesFullScan(t *testing.T) {
 	if a, b := run("SELECT * FROM fast ORDER BY id"), run("SELECT * FROM slow ORDER BY id"); !reflect.DeepEqual(a.Rows, b.Rows) {
 		t.Fatalf("range DML %v %v", a.Rows, b.Rows)
 	}
-	read, _ := e.MVCC.Begin(context.Background(), nil)
+	read, _ := e.Backend.Begin(context.Background())
 	defer read.Rollback()
 	fast, schema, _, _ := loadVersionedTable(read, s, "fast")
 	slow, _, _, _ := loadVersionedTable(read, s, "slow")
@@ -123,7 +123,7 @@ func TestMVCCRangeSQLMatchesFullScan(t *testing.T) {
 	if !ok {
 		t.Fatal("no range plan")
 	}
-	stats := mvcc.ScanStats{}
+	stats := storageengine.ScanStats{}
 	plan.Stats = &stats
 	count := 0
 	err = read.ScanRange(context.Background(), "row/"+fast.ID, plan, func(k, v []byte) error { count++; return nil })
@@ -210,7 +210,7 @@ func TestMVCCUnsupportedKeyLayouts(t *testing.T) {
 	for _, q := range []string{"CREATE TABLE txt(id VARCHAR(8) PRIMARY KEY)", "CREATE TABLE pair(a INT,b INT,PRIMARY KEY(a,b))", "CREATE TABLE heap(id INT)"} {
 		run(q)
 	}
-	tx, _ := e.MVCC.Begin(context.Background(), nil)
+	tx, _ := e.Backend.Begin(context.Background())
 	defer tx.Rollback()
 	for _, name := range []string{"txt", "pair", "heap"} {
 		d, _, _, err := loadVersionedTable(tx, s, name)

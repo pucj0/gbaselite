@@ -21,8 +21,8 @@ func statementChangesData(statement parser.Statement) bool {
 	}
 }
 
-func (e *Engine) beginOptimistic(session *Session) (*Result, error) {
-	if session.transaction != nil {
+func (e *legacyEngine) beginOptimistic(session *Session) (*Result, error) {
+	if e.legacyState(session).transaction != nil {
 		return nil, errors.New("transaction already active")
 	}
 	if err := acquireQueryMutex(session.query, &e.txGate, false); err != nil {
@@ -36,18 +36,18 @@ func (e *Engine) beginOptimistic(session *Session) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	session.transaction = snapshot
-	session.transactionVersion = e.commitVersion
-	session.transactionDirty = false
-	session.binlogStatements = nil
+	e.legacyState(session).transaction = snapshot
+	e.legacyState(session).transactionVersion = e.commitVersion
+	e.legacyState(session).transactionDirty = false
+	e.legacyState(session).binlogStatements = nil
 	return &Result{Message: "transaction started"}, nil
 }
 
-func (e *Engine) commitOptimistic(session *Session) (*Result, error) {
-	if session.transaction == nil {
+func (e *legacyEngine) commitOptimistic(session *Session) (*Result, error) {
+	if e.legacyState(session).transaction == nil {
 		return &Result{Message: "no active transaction"}, nil
 	}
-	if !session.transactionDirty {
+	if !e.legacyState(session).transactionDirty {
 		e.finishTransaction(session)
 		return &Result{Message: "read-only transaction committed"}, nil
 	}
@@ -59,22 +59,22 @@ func (e *Engine) commitOptimistic(session *Session) (*Result, error) {
 		e.finishTransaction(session)
 		return nil, err
 	}
-	if session.transactionVersion != e.commitVersion {
+	if e.legacyState(session).transactionVersion != e.commitVersion {
 		e.finishTransaction(session)
 		return nil, ErrSerializationConflict
 	}
 	// Reservations can advance even in transactions that are later rolled back.
-	if err := mergeAutoIncrementReservations(session.transaction, e.Store); err != nil {
+	if err := mergeAutoIncrementReservations(e.legacyState(session).transaction, e.Store); err != nil {
 		e.finishTransaction(session)
 		return nil, err
 	}
-	err := e.Store.ReplaceShared(session.transaction.SharedSnapshot())
+	err := e.Store.ReplaceShared(e.legacyState(session).transaction.SharedSnapshot())
 	if err == nil {
 		err = e.persist()
 	}
 	if err == nil {
 		e.commitVersion++
-		err = e.appendBinlog(session, session.binlogStatements)
+		err = e.appendBinlog(session, e.legacyState(session).binlogStatements)
 	}
 	e.finishTransaction(session)
 	if err != nil {

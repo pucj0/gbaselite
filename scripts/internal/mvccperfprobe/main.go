@@ -48,7 +48,7 @@ func run() error {
 		return err
 	}
 	defer os.RemoveAll(dir)
-	e, err := executor.OpenWithOptions(dir, "root", "probe", executor.OpenOptions{StorageMode: "mvcc"})
+	e, err := executor.Open(dir, "root", "probe")
 	if err != nil {
 		return err
 	}

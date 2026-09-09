@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"gbaselite/parser"
+	"gbaselite/storageengine"
 )
 
 func (e *Engine) executeMVCCMaintenance(ctx context.Context, session *Session, s parser.MVCCMaintenance) (*Result, error) {
@@ -13,12 +14,16 @@ func (e *Engine) executeMVCCMaintenance(ctx context.Context, session *Session, s
 	if session.InTransaction() || session.AutocommitDisabled {
 		return nil, fmt.Errorf("MVCC maintenance requires autocommit outside a transaction")
 	}
+	maintenance, ok := e.Backend.(storageengine.Maintenance)
+	if !ok {
+		return nil, storageengine.ErrUnsupported
+	}
 	switch s.Kind {
 	case "BACKUP":
-		m, err := e.MVCC.Backup(ctx, s.Path)
+		m, err := maintenance.Backup(ctx, s.Path)
 		return &Result{Message: fmt.Sprintf("MVCC backup bytes=%d head=%d sha256=%s", m.Bytes, m.Head, m.SHA256)}, err
 	case "RESTORE":
-		if err := e.MVCC.RestoreBackup(ctx, s.Path); err != nil {
+		if err := maintenance.RestoreBackup(ctx, s.Path); err != nil {
 			return nil, err
 		}
 		e.mvccMetadata.Lock()
@@ -29,12 +34,12 @@ func (e *Engine) executeMVCCMaintenance(ctx context.Context, session *Session, s
 		}
 		return &Result{Message: "MVCC backup restored; previous transactions invalidated", MetadataChanged: true}, nil
 	case "GC":
-		return &Result{Message: "MVCC history collection completed"}, e.MVCC.CompactHistory(ctx)
+		return &Result{Message: "MVCC history collection completed"}, maintenance.CompactHistory(ctx)
 	case "COMPACT":
-		if err := e.MVCC.CompactHistory(ctx); err != nil {
+		if err := maintenance.CompactHistory(ctx); err != nil {
 			return nil, err
 		}
-		return &Result{Message: "compact MVCC copy verified; source preserved, explicit cutover required"}, e.MVCC.ExportLayout(ctx, s.Path, "flat")
+		return &Result{Message: "compact MVCC copy verified; source preserved, explicit cutover required"}, maintenance.Compact(ctx, s.Path)
 	default:
 		return nil, fmt.Errorf("unknown MVCC maintenance operation")
 	}

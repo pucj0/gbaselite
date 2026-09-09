@@ -22,7 +22,7 @@ func TestMVCCUniqueLookupAndOverlay(t *testing.T) {
 	for _, w := range []string{"a=10 AND b=20", "20=b AND 10=a", "a=10 AND b=99", "a=10", "a=NULL AND b=20", "a=9007199254740992 AND b=20", "a=10 AND b=20 AND id=2"} {
 		compare(w)
 	}
-	tx, err := e.MVCC.Begin(context.Background(), nil)
+	tx, err := e.Backend.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

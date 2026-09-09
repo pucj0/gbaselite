@@ -1,6 +1,6 @@
 # 使用文档
 
-安装、命令、配置与备份总入口见[项目 README](../../README.md)。先确认使用的存储后端；MVCC 与 snapshot/paged 的 SQL 和运维范围不同。
+安装、命令、配置与备份总入口见[项目 README](../../README.md)。MVCC 是唯一运行事务引擎；snapshot/paged 文档仅用于理解旧数据迁移。当前 SQL 范围以项目 README 的兼容矩阵为准。
 
 - [SQL 使用教程](SQL使用教程.md)
 - [SQL 兼容性参考](SQL兼容性参考.md)

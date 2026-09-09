@@ -9,13 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"gbaselite/executor"
-
 	_ "github.com/go-sql-driver/mysql"
 )
 
 func TestProtocolSessionInheritsTimeZoneAndAcceptsDSNCharset(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}

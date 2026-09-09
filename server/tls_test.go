@@ -20,8 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"gbaselite/executor"
-
 	driver "github.com/go-sql-driver/mysql"
 )
 
@@ -53,7 +51,7 @@ func TestRequireSecureTransportRejectsPlaintextAndAcceptsTLS(t *testing.T) {
 
 func startTLSTestServer(t *testing.T, requireSecureTransport bool) (*MySQLServer, string, func()) {
 	t.Helper()
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}

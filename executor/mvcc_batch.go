@@ -1,8 +1,9 @@
 package executor
 
 import (
+	"bytes"
 	"context"
-	"gbaselite/mvcc"
+	"gbaselite/storageengine"
 )
 
 const mvccBatchBytes = 64 << 10
@@ -13,7 +14,7 @@ type mvccBatchEntry struct{ value []byte }
 // scanBatches owns its encoded values. Consumers run outside storage read views;
 // the batch is released before more input is fetched. A single wide row is
 // permitted, so the byte target is not a process-memory limit.
-func (p mvccAccessPlan) scanBatches(ctx context.Context, tx *mvcc.Tx, table versionedTable, rowLimit int, consume func([]mvccBatchEntry) error) error {
+func (p mvccAccessPlan) scanBatches(ctx context.Context, tx storageengine.Txn, table versionedTable, rowLimit int, consume func([]mvccBatchEntry) error) error {
 	if rowLimit <= 0 || rowLimit > mvccBatchRows {
 		rowLimit = mvccBatchRows
 	}
@@ -36,7 +37,7 @@ func (p mvccAccessPlan) scanBatches(ctx context.Context, tx *mvcc.Tx, table vers
 				return err
 			}
 		}
-		batch = append(batch, mvccBatchEntry{value: value})
+		batch = append(batch, mvccBatchEntry{value: bytes.Clone(value)})
 		used += cost
 		if len(batch) >= rowLimit {
 			return flush()
@@ -45,7 +46,7 @@ func (p mvccAccessPlan) scanBatches(ctx context.Context, tx *mvcc.Tx, table vers
 	}
 	var err error
 	if p.kind == mvccAccessAll {
-		err = tx.ScanRange(ctx, "row/"+table.ID, mvcc.KeyRange{}, visit)
+		err = tx.ScanRange(ctx, "row/"+table.ID, storageengine.KeyRange{}, visit)
 	} else {
 		err = p.scan(ctx, tx, table, visit)
 	}

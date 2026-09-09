@@ -34,7 +34,7 @@ func TestMVCCExplainMatchesAccessPlan(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tx, err := e.MVCC.Begin(context.Background(), nil)
+		tx, err := e.Backend.Begin(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -57,10 +57,10 @@ func TestMVCCExplainMatchesAccessPlan(t *testing.T) {
 func TestMVCCExplainDoesNotExecuteAndUsesCatalogSnapshot(t *testing.T) {
 	e, s, run := rangeTestEngine(t)
 	run("CREATE TABLE p(id INT PRIMARY KEY)")
-	before, _ := e.MVCC.Head()
+	before, _ := e.Backend.Head()
 	s.LastInsertID = 42
 	run("EXPLAIN SELECT LAST_INSERT_ID(99) FROM p")
-	after, _ := e.MVCC.Head()
+	after, _ := e.Backend.Head()
 	if before != after || s.LastInsertID != 42 {
 		t.Fatal("EXPLAIN changed data/session state")
 	}

@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestIndexOrderSkipsEqualityConstrainedColumns(t *testing.T) {
+func TestLegacyIndexOrderSkipsEqualityConstrainedColumns(t *testing.T) {
 	index := storage.Index{Columns: []string{"tenant", "score", "id"}}
 	for _, test := range []struct {
 		order               []parser.Order
@@ -23,7 +23,7 @@ func TestIndexOrderSkipsEqualityConstrainedColumns(t *testing.T) {
 			t.Fatalf("order %+v: got %v/%v", test.order, ordered, descending)
 		}
 	}
-	engine, err := Open(t.TempDir(), "root", "test")
+	engine, err := openLegacy(t.TempDir(), "root", "test")
 	if err != nil {
 		t.Fatal(err)
 	}

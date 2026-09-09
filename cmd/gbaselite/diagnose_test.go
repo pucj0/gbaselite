@@ -15,12 +15,12 @@ func TestDiagnoseReportsRuntimePathsWithoutSecrets(t *testing.T) {
 	root := t.TempDir()
 	dataPath := filepath.Join(root, "data")
 	logPath := filepath.Join(root, "logs")
-	for _, directory := range []string{filepath.Join(dataPath, "databases"), filepath.Join(dataPath, "users"), logPath} {
+	for _, directory := range []string{filepath.Join(dataPath, "versioned"), filepath.Join(dataPath, "users"), logPath} {
 		if err := os.MkdirAll(directory, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(dataPath, "databases", "store.gob"), []byte("snapshot"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dataPath, "versioned", "mvcc.db"), []byte("snapshot"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dataPath, "users", "users.gob"), []byte("catalog"), 0o600); err != nil {
@@ -47,7 +47,7 @@ func TestDiagnoseReportsRuntimePathsWithoutSecrets(t *testing.T) {
 	defer listener.Close()
 	port := listener.Addr().(*net.TCPAddr).Port
 	configPath := filepath.Join(root, "config.yaml")
-	contents := fmt.Sprintf("server:\n  host: 127.0.0.1\n  port: %d\nstorage:\n  path: '%s'\nauth:\n  username: root\n  password: 'do-not-print-this'\nlog:\n  path: '%s'\naudit:\n  enabled: true\n  path: '%s'\nbinlog:\n  enabled: true\n  path: '%s'\n", port, filepath.ToSlash(dataPath), filepath.ToSlash(logPath), filepath.ToSlash(auditPath), filepath.ToSlash(binlogPath))
+	contents := fmt.Sprintf("server:\n  host: 127.0.0.1\n  port: %d\nstorage:\n  path: '%s'\nauth:\n  username: root\n  password: 'do-not-print-this'\nlog:\n  path: '%s'\naudit:\n  enabled: true\n  path: '%s'\nbinlog:\n  enabled: false\n  path: '%s'\n", port, filepath.ToSlash(dataPath), filepath.ToSlash(logPath), filepath.ToSlash(auditPath), filepath.ToSlash(binlogPath))
 	if err := os.WriteFile(configPath, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestDiagnoseReportsRuntimePathsWithoutSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	report := output.String()
-	for _, expected := range []string{"GBaseLite diagnostic", "TCP listener:", "reachable", "Data volume: total=", "available=", "Snapshot:", "User catalog:", "Log volume: total=", "Main log: " + mainLogPath + " (available, 4 bytes", "rotated=1 files, 7 bytes", "max_size=20 MiB, retention=7 days", "TLS: disabled", "Audit: enabled", auditPath, "available, 5 bytes", "Binlog: enabled", binlogPath, "available, 6 bytes"} {
+	for _, expected := range []string{"GBaseLite diagnostic", "TCP listener:", "reachable", "Data volume: total=", "available=", "MVCC database:", "User catalog:", "Log volume: total=", "Main log: " + mainLogPath + " (available, 4 bytes", "rotated=1 files, 7 bytes", "max_size=20 MiB, retention=7 days", "TLS: disabled", "Audit: enabled", auditPath, "available, 5 bytes", "Binlog: disabled", binlogPath, "available, 6 bytes"} {
 		if !strings.Contains(report, expected) {
 			t.Fatalf("diagnostic report is missing %q:\n%s", expected, report)
 		}
@@ -71,7 +71,7 @@ func TestDiagnoseFailsClosedForRecoveryCandidate(t *testing.T) {
 	root := t.TempDir()
 	dataPath := filepath.Join(root, "data")
 	logPath := filepath.Join(root, "logs")
-	if err := os.MkdirAll(filepath.Join(dataPath, "databases"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dataPath, "versioned"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(dataPath, "users"), 0o755); err != nil {
@@ -80,7 +80,7 @@ func TestDiagnoseFailsClosedForRecoveryCandidate(t *testing.T) {
 	if err := os.MkdirAll(logPath, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dataPath, "databases", "store.gob.tmp"), []byte("candidate"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dataPath, "versioned", "mvcc.db.tmp"), []byte("candidate"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	configPath := filepath.Join(root, "config.yaml")

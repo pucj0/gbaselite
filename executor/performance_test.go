@@ -10,9 +10,9 @@ import (
 	"gbaselite/storage"
 )
 
-func TestConcurrentWritesRemainDurable(t *testing.T) {
+func TestLegacyConcurrentWritesRemainDurable(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "123456")
+	engine, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestConcurrentWritesRemainDurable(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(directory, "root", "123456")
+	reopened, err := openLegacy(directory, "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,8 +70,8 @@ func TestConcurrentWritesRemainDurable(t *testing.T) {
 	}
 }
 
-func TestParsedStatementCacheIsConcurrentAndBounded(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "123456")
+func TestLegacyParsedStatementCacheIsConcurrentAndBounded(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestParsedStatementCacheIsConcurrentAndBounded(t *testing.T) {
 	}
 }
 
-func BenchmarkPersistentUpdate(b *testing.B) {
+func BenchmarkLegacyPersistentUpdate(b *testing.B) {
 	engine := benchmarkWriteEngine(b)
 	session := &Session{CurrentDatabase: "benchmark_writes"}
 	b.ReportAllocs()
@@ -127,7 +127,7 @@ func BenchmarkPersistentUpdate(b *testing.B) {
 	}
 }
 
-func BenchmarkConcurrentPersistentUpdate(b *testing.B) {
+func BenchmarkLegacyConcurrentPersistentUpdate(b *testing.B) {
 	engine := benchmarkWriteEngine(b)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -142,9 +142,9 @@ func BenchmarkConcurrentPersistentUpdate(b *testing.B) {
 	})
 }
 
-func benchmarkWriteEngine(b *testing.B) *Engine {
+func benchmarkWriteEngine(b *testing.B) *legacyEngine {
 	b.Helper()
-	engine, err := Open(b.TempDir(), "root", "123456")
+	engine, err := openLegacy(b.TempDir(), "root", "123456")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func benchmarkWriteEngine(b *testing.B) *Engine {
 	return engine
 }
 
-func BenchmarkStreamTenThousandRows(b *testing.B) {
+func BenchmarkLegacyStreamTenThousandRows(b *testing.B) {
 	table, err := storage.NewTable("records", []storage.Column{{Name: "id", Type: storage.TypeInt}, {Name: "value", Type: storage.TypeVarchar, Length: 32}})
 	if err != nil {
 		b.Fatal(err)
@@ -189,8 +189,8 @@ func BenchmarkStreamTenThousandRows(b *testing.B) {
 	}
 }
 
-func BenchmarkPrimaryKeyLookupTenThousandRows(b *testing.B) {
-	engine, err := Open(b.TempDir(), "root", "123456")
+func BenchmarkLegacyPrimaryKeyLookupTenThousandRows(b *testing.B) {
+	engine, err := openLegacy(b.TempDir(), "root", "123456")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -229,8 +229,8 @@ func BenchmarkPrimaryKeyLookupTenThousandRows(b *testing.B) {
 	}
 }
 
-func BenchmarkRangeQueryTenThousandRows(b *testing.B) {
-	engine, err := Open(b.TempDir(), "root", "123456")
+func BenchmarkLegacyRangeQueryTenThousandRows(b *testing.B) {
+	engine, err := openLegacy(b.TempDir(), "root", "123456")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -266,8 +266,8 @@ func BenchmarkRangeQueryTenThousandRows(b *testing.B) {
 	}
 }
 
-func BenchmarkBulkInsertHundredRows(b *testing.B) {
-	engine, err := Open(b.TempDir(), "root", "123456")
+func BenchmarkLegacyBulkInsertHundredRows(b *testing.B) {
+	engine, err := openLegacy(b.TempDir(), "root", "123456")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -306,8 +306,8 @@ func BenchmarkBulkInsertHundredRows(b *testing.B) {
 	}
 }
 
-func BenchmarkJoinOneThousandRows(b *testing.B) {
-	engine, err := Open(b.TempDir(), "root", "123456")
+func BenchmarkLegacyJoinOneThousandRows(b *testing.B) {
+	engine, err := openLegacy(b.TempDir(), "root", "123456")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -365,8 +365,8 @@ func consumeBenchmarkRows(b *testing.B, result *Result) int {
 	return count
 }
 
-func BenchmarkBeginRollbackTenThousandRows(b *testing.B) {
-	engine, err := Open(b.TempDir(), "root", "123456")
+func BenchmarkLegacyBeginRollbackTenThousandRows(b *testing.B) {
+	engine, err := openLegacy(b.TempDir(), "root", "123456")
 	if err != nil {
 		b.Fatal(err)
 	}

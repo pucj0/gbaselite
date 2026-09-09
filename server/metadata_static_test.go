@@ -8,7 +8,7 @@ import (
 func TestNavicatStaticMetadataAndDescriptions(t *testing.T) {
 	for _, mode := range []string{"", "mvcc"} {
 		t.Run("mode="+mode, func(t *testing.T) {
-			engine, err := executor.OpenWithOptions(t.TempDir(), "root", "secret", executor.OpenOptions{StorageMode: mode})
+			engine, err := openTestEngineWithOptions(t, t.TempDir(), "root", "secret", executor.OpenOptions{StorageMode: mode})
 			if err != nil {
 				t.Fatal(err)
 			}

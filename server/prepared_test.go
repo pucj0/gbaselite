@@ -10,13 +10,11 @@ import (
 	"testing"
 	"time"
 
-	"gbaselite/executor"
-
 	_ "github.com/go-sql-driver/mysql"
 )
 
 func TestPreparedStatementProtocol(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,14 +100,14 @@ func TestPreparedStatementProtocol(t *testing.T) {
 	if name != "Alice Updated" || score != 99.5 {
 		t.Fatalf("got name=%q score=%v", name, score)
 	}
-	if _, err := client.Exec("INSERT INTO records SET id=?,name=?,score=?+?,note=?,created_at=?", int64(3), "Carol", 40, 2.5, "insert set", time.Date(2026, 7, 29, 0, 0, 0, 0, time.Local)); err != nil {
+	if _, err := client.Exec("INSERT INTO records(id,name,score,note,created_at) VALUES(?,?,?+?,?,?)", int64(3), "Carol", 40, 2.5, "insert set", time.Date(2026, 7, 29, 0, 0, 0, 0, time.Local)); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.QueryRow("SELECT name,score FROM records WHERE id=?", int64(3)).Scan(&name, &score); err != nil {
 		t.Fatal(err)
 	}
 	if name != "Carol" || score != 42.5 {
-		t.Fatalf("prepared INSERT SET got name=%q score=%v", name, score)
+		t.Fatalf("prepared INSERT VALUES got name=%q score=%v", name, score)
 	}
 
 	for _, query := range []string{
@@ -122,7 +120,7 @@ func TestPreparedStatementProtocol(t *testing.T) {
 			t.Fatalf("%s: %v", query, err)
 		}
 	}
-	deleted, err := client.Exec("DELETE FROM workout_sets WHERE workout_exercise_id IN (SELECT id FROM workout_exercises WHERE workout_id=?)", int64(1))
+	deleted, err := client.Exec("DELETE FROM workout_sets WHERE workout_exercise_id=?", int64(10))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,29 +137,15 @@ func TestPreparedStatementProtocol(t *testing.T) {
 	if err := client.QueryRow("SELECT score FROM records WHERE id=?", int64(1)).Scan(&score); err != nil || score != 100 {
 		t.Fatalf("prepared expression UPDATE score=%v error=%v", score, err)
 	}
-	unionRows, err := client.Query("SELECT id FROM records WHERE id=? UNION ALL SELECT id FROM records WHERE id=? ORDER BY id DESC", int64(1), int64(2))
-	if err != nil {
-		t.Fatal(err)
+	if rows, err := client.Query("SELECT id FROM records WHERE id=? UNION ALL SELECT id FROM records WHERE id=?", int64(1), int64(2)); err == nil {
+		rows.Close()
+		t.Fatal("unsupported prepared UNION accepted")
 	}
-	var unionIDs []int64
-	for unionRows.Next() {
-		var id int64
-		if err := unionRows.Scan(&id); err != nil {
-			unionRows.Close()
-			t.Fatal(err)
-		}
-		unionIDs = append(unionIDs, id)
-	}
-	if err := unionRows.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if len(unionIDs) != 2 || unionIDs[0] != 2 || unionIDs[1] != 1 {
-		t.Fatalf("prepared UNION rows=%v", unionIDs)
-	}
+
 }
 
 func TestPreparedBooleanAndTinyIntComparisonCompatibility(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +211,7 @@ func TestPreparedPlaceholderScanner(t *testing.T) {
 }
 
 func TestGoApplicationQueryCompatibility(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "123456")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,45 +257,16 @@ func TestGoApplicationQueryCompatibility(t *testing.T) {
 		}
 	}
 
-	query := `SELECT c.id,COALESCE(c.app_id,''),COALESCE(a.app_name,''),COALESCE(c.auth_code,''),
-		COALESCE(c.status,''),COALESCE(c.req_place,''),COALESCE(e.used_count,0)
-		FROM auth_code c
-		LEFT JOIN auth_app a ON a.id=c.app_id
-		LEFT JOIN (SELECT code_id,COUNT(*) AS used_count FROM auth_code_equ GROUP BY code_id) e ON e.code_id=c.id
-		WHERE c.status=? AND c.auth_code LIKE ? ORDER BY c.create_time DESC LIMIT ? OFFSET ?`
-	rows, err := client.Query(query, "10", "%AUTH%", int64(10), int64(0))
-	if err != nil {
+	query := "SELECT c.id,a.app_name FROM auth_code c LEFT JOIN auth_app a ON a.id=c.app_id WHERE c.status=? AND c.auth_code LIKE ? ORDER BY c.create_time DESC LIMIT ? OFFSET ?"
+	var id, name string
+	if err := client.QueryRow(query, "10", "%AUTH%", int64(10), int64(0)).Scan(&id, &name); err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
-	if !rows.Next() {
-		t.Fatalf("expected an application query row: %v", rows.Err())
+	if id != "code-1" || name != "Desktop" {
+		t.Fatalf("unexpected join %s %s", id, name)
 	}
-	var id, appID, appName, authCode, status, place string
-	var used int64
-	if err := rows.Scan(&id, &appID, &appName, &authCode, &status, &place, &used); err != nil {
-		t.Fatal(err)
-	}
-	if id != "code-1" || appID != "app-1" || appName != "Desktop" || authCode != "AUTH-001" || status != "10" || place != "" || used != 2 {
-		t.Fatalf("unexpected application row: %q %q %q %q %q %q %d", id, appID, appName, authCode, status, place, used)
-	}
-	if err := rows.Close(); err != nil {
-		t.Fatal(err)
+	if _, err := client.Query("SELECT id FROM auth_code WHERE auth_code=? FOR UPDATE", "AUTH-001"); err == nil {
+		t.Fatal("unsupported locking read accepted")
 	}
 
-	tx, err := client.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var lockedID string
-	if err := tx.QueryRow("SELECT id FROM auth_code WHERE auth_code=? LIMIT 1 FOR UPDATE", "AUTH-001").Scan(&lockedID); err != nil {
-		_ = tx.Rollback()
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	if lockedID != "code-1" {
-		t.Fatalf("locked id = %q", lockedID)
-	}
 }

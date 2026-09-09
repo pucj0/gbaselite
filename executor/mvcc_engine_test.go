@@ -2,7 +2,7 @@ package executor
 
 import (
 	"errors"
-	"gbaselite/mvcc"
+	"gbaselite/storageengine"
 	"testing"
 )
 
@@ -48,7 +48,7 @@ func TestMVCCSQLTransactionsAndReopen(t *testing.T) {
 	run(a, "UPDATE items SET v=5 WHERE id=10")
 	run(b, "UPDATE items SET v=6 WHERE id=10")
 	run(a, "COMMIT")
-	if _, err = e.Execute(b, "COMMIT"); !errors.Is(err, mvcc.ErrConflict) {
+	if _, err = e.Execute(b, "COMMIT"); !errors.Is(err, storageengine.ErrConflict) {
 		t.Fatalf("conflict: %v", err)
 	}
 	if _, err = e.Execute(s, `INSERT INTO items(v,name) VALUES(7,'c'),(8,'a')`); err == nil {
@@ -93,7 +93,7 @@ func TestMVCCSchemaConflictAndStatementRollback(t *testing.T) {
 	run(a, "BEGIN")
 	run(a, "UPDATE items SET name='c' WHERE id=1")
 	run(s, "TRUNCATE TABLE items")
-	if _, err = e.Execute(a, "COMMIT"); !errors.Is(err, mvcc.ErrConflict) {
+	if _, err = e.Execute(a, "COMMIT"); !errors.Is(err, storageengine.ErrConflict) {
 		t.Fatalf("schema conflict %v", err)
 	}
 	run(a, "BEGIN")
@@ -114,21 +114,31 @@ func TestMVCCSchemaConflictAndStatementRollback(t *testing.T) {
 
 func TestMVCCModeDirectoryGuards(t *testing.T) {
 	dir := t.TempDir()
-	e, err := OpenWithOptions(dir, "root", "pw", OpenOptions{StorageMode: "mvcc"})
+	e, err := Open(dir, "root", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Backend == nil {
+		t.Fatal("default engine is not MVCC")
+	}
+	e.Close()
+	e, err = OpenWithOptions(dir, "root", "pw", OpenOptions{StorageMode: "mvcc"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	e.Close()
-	if _, err = Open(dir, "root", "pw"); err == nil {
-		t.Fatal("legacy opened MVCC directory")
+	for _, mode := range []string{"snapshot", "paged", "legacy", "unknown"} {
+		if _, err = OpenWithOptions(dir, "root", "pw", OpenOptions{StorageMode: mode}); err == nil {
+			t.Fatalf("accepted %s", mode)
+		}
 	}
 	legacy := t.TempDir()
-	e, err = Open(legacy, "root", "pw")
+	old, err := openLegacy(legacy, "root", "pw")
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.Close()
-	if _, err = OpenWithOptions(legacy, "root", "pw", OpenOptions{StorageMode: "mvcc"}); err == nil {
-		t.Fatal("MVCC opened legacy directory")
+	old.Close()
+	if _, err = Open(legacy, "root", "pw"); err == nil {
+		t.Fatal("opened legacy data without migration")
 	}
 }

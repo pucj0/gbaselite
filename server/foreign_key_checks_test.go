@@ -11,7 +11,7 @@ func TestParallelForeignKeyImport(t *testing.T) {
 	for _, mode := range []string{"", "mvcc"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
-			e, err := executor.OpenWithOptions(dir, "root", "secret", executor.OpenOptions{StorageMode: mode})
+			e, err := openTestEngineWithOptions(t, dir, "root", "secret", executor.OpenOptions{StorageMode: mode})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -82,7 +82,7 @@ func TestParallelForeignKeyImport(t *testing.T) {
 			if err := e.Close(); err != nil {
 				t.Fatal(err)
 			}
-			e, err = executor.OpenWithOptions(dir, "root", "secret", executor.OpenOptions{StorageMode: mode})
+			e, err = openTestEngineWithOptions(t, dir, "root", "secret", executor.OpenOptions{StorageMode: mode})
 			if err != nil {
 				t.Fatal(err)
 			}

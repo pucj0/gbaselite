@@ -16,7 +16,7 @@ func TestMVCCBatchBoundsAndOrder(t *testing.T) {
 		values[i] = fmt.Sprintf("(%d,'%s')", i, strings.Repeat("x", 1000))
 	}
 	run("INSERT INTO bat VALUES" + strings.Join(values, ","))
-	tx, err := e.MVCC.Begin(context.Background(), nil)
+	tx, err := e.Backend.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}

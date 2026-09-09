@@ -1,7 +1,6 @@
 package server
 
 import (
-	"gbaselite/storage"
 	"runtime/metrics"
 	"strconv"
 )
@@ -44,29 +43,4 @@ func resourceStatusRows() [][]any {
 		rows = append(rows, []any{"Gbaselite_gc_cpu_seconds", strconv.FormatFloat(samples[7].Value.Float64(), 'f', 6, 64)})
 	}
 	return rows
-}
-
-// Only the persisted-page cache payload is counted here. Decoded rows and the
-// process working set are separate from this explicitly bounded cache.
-func pagedResourceStatusRows(stats storage.PagePersistenceStats, cold bool) [][]any {
-	mode := "snapshot"
-	if stats.Enabled {
-		mode = "paged"
-	}
-	return [][]any{
-		{"Gbaselite_storage_mode", mode},
-		{"Gbaselite_cold_reads", strconv.FormatBool(cold)},
-		{"Gbaselite_page_generation", strconv.FormatUint(stats.Generation, 10)},
-		{"Gbaselite_page_cache_bytes", strconv.FormatInt(stats.CacheBytes, 10)},
-		{"Gbaselite_page_cache_budget_bytes", strconv.FormatInt(stats.CacheBudgetBytes, 10)},
-		{"Gbaselite_page_cache_hits", strconv.FormatUint(stats.CacheHits, 10)},
-		{"Gbaselite_page_cache_misses", strconv.FormatUint(stats.CacheMisses, 10)},
-		{"Gbaselite_pages_written", strconv.FormatUint(stats.PagesWritten, 10)},
-		{"Gbaselite_page_bytes_written", strconv.FormatUint(stats.PageBytesWritten, 10)},
-		{"Gbaselite_wal_bytes_written", strconv.FormatUint(stats.WALBytesWritten, 10)},
-		{"Gbaselite_checkpoints", strconv.FormatUint(stats.Checkpoints, 10)},
-		{"Gbaselite_pages_reclaimed", strconv.FormatUint(stats.PagesReclaimed, 10)},
-		{"Gbaselite_disk_index_builds", strconv.FormatUint(stats.DiskIndexBuilds, 10)},
-		{"Gbaselite_disk_index_bytes_written", strconv.FormatUint(stats.DiskIndexBytesWritten, 10)},
-	}
 }

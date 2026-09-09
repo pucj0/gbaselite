@@ -16,7 +16,7 @@ import (
 	"gbaselite/storage"
 )
 
-func TestExternalSortSpillStableAndCleanup(t *testing.T) {
+func TestLegacyExternalSortSpillStableAndCleanup(t *testing.T) {
 	directory := t.TempDir()
 	q := newQueryControl(context.Background(), QueryOptions{SortMemoryBytes: 64 << 10, TempDirectory: directory, MaxTempBytes: 16 << 20})
 	sorter, err := newExternalRowSorter(q, func(a, b []any) int { return int(a[0].(int64) - b[0].(int64)) })
@@ -71,7 +71,7 @@ func TestExternalSortSpillStableAndCleanup(t *testing.T) {
 	}
 }
 
-func TestExternalSortCodecPreservesSQLValues(t *testing.T) {
+func TestLegacyExternalSortCodecPreservesSQLValues(t *testing.T) {
 	date := time.Date(2026, 9, 8, 12, 34, 56, 123, time.FixedZone("offset", 8*3600))
 	original := externalSortRow{[]any{nil, "你好", jsonDocument(`{"a":null}`), []byte{0, 255}, int(-3), int64(math.MinInt64), uint64(math.MaxUint64), 1.25, true, date, storage.Decimal("12345678901234567890.01"), collatedText{Text: "AbC", Collation: "utf8mb4_general_ci"}}, 123}
 	var buffer bytes.Buffer
@@ -91,7 +91,7 @@ func TestExternalSortCodecPreservesSQLValues(t *testing.T) {
 	}
 }
 
-func TestExternalSortCancellationAndDiskLimitCleanup(t *testing.T) {
+func TestLegacyExternalSortCancellationAndDiskLimitCleanup(t *testing.T) {
 	for _, kind := range []string{"canceled", "disk", "yield"} {
 		t.Run(kind, func(t *testing.T) {
 			directory := t.TempDir()
@@ -142,7 +142,7 @@ func TestExternalSortCancellationAndDiskLimitCleanup(t *testing.T) {
 	}
 }
 
-func TestExternalSortRejectsWideRowsAndCorruptLengths(t *testing.T) {
+func TestLegacyExternalSortRejectsWideRowsAndCorruptLengths(t *testing.T) {
 	sorter, err := newExternalRowSorter(newQueryControl(nil, QueryOptions{SortMemoryBytes: 64 << 10, TempDirectory: t.TempDir()}), func(a, b []any) int { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +172,7 @@ func TestExternalSortRejectsWideRowsAndCorruptLengths(t *testing.T) {
 	}
 }
 
-func TestQueryLockDeadlineDoesNotAcquireLater(t *testing.T) {
+func TestLegacyQueryLockDeadlineDoesNotAcquireLater(t *testing.T) {
 	var mutex sync.RWMutex
 	mutex.Lock()
 	q := newQueryControl(context.Background(), QueryOptions{Timeout: 15 * time.Millisecond})
@@ -196,7 +196,7 @@ func TestQueryLockDeadlineDoesNotAcquireLater(t *testing.T) {
 	}
 }
 
-func TestQueryResultMemoryLimit(t *testing.T) {
+func TestLegacyQueryResultMemoryLimit(t *testing.T) {
 	used, err := checkResultMemory(1024, 0, []any{strings.Repeat("x", 800)})
 	if err != nil {
 		t.Fatal(err)

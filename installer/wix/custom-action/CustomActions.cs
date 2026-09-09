@@ -60,9 +60,9 @@ namespace GBaseLite.CustomActions
                     session["GBASE_ADMIN_USER"] = username;
                 }
                 SetCheckboxFromConfig(session, configPath, "audit", "enabled", "GBASE_AUDIT_ENABLED");
-                SetCheckboxFromConfig(session, configPath, "binlog", "enabled", "GBASE_BINLOG_ENABLED");
+                session["GBASE_BINLOG_ENABLED"] = string.Empty;
                 session["GBASE_AUDIT_RETENTION_DAYS"] = ReadRetentionDaysFromConfig(configPath, "audit", 7).ToString();
-                session["GBASE_BINLOG_RETENTION_DAYS"] = ReadRetentionDaysFromConfig(configPath, "binlog", 7).ToString();
+                session["GBASE_BINLOG_RETENTION_DAYS"] = "7";
                 return ActionResult.Success;
             }
             catch (Exception error)
@@ -457,7 +457,8 @@ namespace GBaseLite.CustomActions
             var auditEnabled = payload.AuditEnabled ? "true" : "false";
             var auditRetentionDays = payload.AuditRetentionDays;
             var auditPath = Path.Combine(payload.LogPath, "audit.jsonl");
-            var binlogEnabled = payload.BinlogEnabled ? "true" : "false";
+            // Legacy logs are preserved on disk, but never enabled for the MVCC runtime.
+            const string binlogEnabled = "false";
             var binlogRetentionDays = payload.BinlogRetentionDays;
             var binlogPath = Path.Combine(payload.DataPath, "binlog.jsonl");
             if (File.Exists(path))
@@ -477,7 +478,6 @@ namespace GBaseLite.CustomActions
                 if (!payload.ConfigureJournals)
                 {
                     auditEnabled = ReadConfigSectionValue(path, "audit", "enabled", auditEnabled);
-                    binlogEnabled = ReadConfigSectionValue(path, "binlog", "enabled", binlogEnabled);
                     auditRetentionDays = ReadRetentionDaysFromConfig(path, "audit", auditRetentionDays);
                     binlogRetentionDays = ReadRetentionDaysFromConfig(path, "binlog", binlogRetentionDays);
                 }

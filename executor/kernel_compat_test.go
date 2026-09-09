@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-func TestConditionalDecimalMetadataAndScalarSubquery(t *testing.T) {
-	engine, err := Open(t.TempDir(), "root", "secret")
+func TestLegacyConditionalDecimalMetadataAndScalarSubquery(t *testing.T) {
+	engine, err := openLegacy(t.TempDir(), "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,9 +41,9 @@ func TestConditionalDecimalMetadataAndScalarSubquery(t *testing.T) {
 	}
 }
 
-func TestExplicitColumnCollationSQLAndPersistence(t *testing.T) {
+func TestLegacyExplicitColumnCollationSQLAndPersistence(t *testing.T) {
 	directory := t.TempDir()
-	engine, err := Open(directory, "root", "secret")
+	engine, err := openLegacy(directory, "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestExplicitColumnCollationSQLAndPersistence(t *testing.T) {
 	if err := engine.Close(); err != nil {
 		t.Fatal(err)
 	}
-	engine, err = Open(directory, "root", "secret")
+	engine, err = openLegacy(directory, "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestExplicitColumnCollationSQLAndPersistence(t *testing.T) {
 	}
 }
 
-func TestCollatedGroupKeyUsesLengthBoundaries(t *testing.T) {
+func TestLegacyCollatedGroupKeyUsesLengthBoundaries(t *testing.T) {
 	value := func(s string) any { return collatedText{s, "utf8mb4_bin"} }
 	left := groupedRowKey([]any{value("a|string:b"), value("c")}, nil)
 	right := groupedRowKey([]any{value("a"), value("b|string:c")}, nil)

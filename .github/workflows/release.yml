@@ -1,5 +1,4 @@
 name: Release
-
 on:
   push:
     tags:
@@ -10,10 +9,8 @@ on:
         description: Numeric version without the v prefix
         required: true
         default: "1.1.1"
-
 permissions:
   contents: write
-
 jobs:
   release:
     runs-on: windows-latest
@@ -60,7 +57,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: GBaseLite ${{ steps.version.outputs.version }}
-          body_path: docs/����˵��/${{ steps.version.outputs.version }}����˵��.md
+          body_path: docs/发布说明/${{ steps.version.outputs.version }}更新说明.md
           generate_release_notes: false
           files: |
             dist/GBaseLite-windows-amd64.msi

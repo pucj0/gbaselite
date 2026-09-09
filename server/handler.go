@@ -26,7 +26,7 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 			result.AutocommitDisabled = session.AutocommitDisabled
 		}
 	}()
-	if engine.MVCC != nil && len(query) > 1<<20 {
+	if len(query) > 1<<20 {
 		return nil, fmt.Errorf("%w: MVCC SQL text exceeds 1 MiB", executor.ErrQueryResourceLimit)
 	}
 	session.InitializeSettings()
@@ -53,40 +53,38 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 			return &executor.Result{Message: "database changed"}, nil
 		}
 	}
-	if engine.MVCC != nil {
-		if strings.HasPrefix(upper, "LOCK TABLES ") || upper == "UNLOCK TABLES" {
-			return nil, fmt.Errorf("MVCC table locking is not supported")
+	if strings.HasPrefix(upper, "LOCK TABLES ") || upper == "UNLOCK TABLES" {
+		return nil, fmt.Errorf("MVCC table locking is not supported")
+	}
+	if strings.HasPrefix(upper, "SET ") {
+		if strings.Contains(upper, "TRANSACTION ISOLATION") || strings.Contains(upper, "TX_ISOLATION") || strings.Contains(upper, "TRANSACTION_ISOLATION") {
+			return nil, fmt.Errorf("MVCC currently provides snapshot isolation; changing isolation level is not supported")
 		}
-		if strings.HasPrefix(upper, "SET ") {
-			if strings.Contains(upper, "TRANSACTION ISOLATION") || strings.Contains(upper, "TX_ISOLATION") || strings.Contains(upper, "TRANSACTION_ISOLATION") {
-				return nil, fmt.Errorf("MVCC currently provides snapshot isolation; changing isolation level is not supported")
+		assignments := splitSetAssignments(trimmed[4:])
+		for _, assignment := range assignments {
+			left, right, ok := strings.Cut(assignment, "=")
+			if !ok {
+				continue
 			}
-			assignments := splitSetAssignments(trimmed[4:])
-			for _, assignment := range assignments {
-				left, right, ok := strings.Cut(assignment, "=")
-				if !ok {
-					continue
+			variable, global := normalizeSetVariable(left)
+			if variable == "autocommit" {
+				if global || len(assignments) != 1 {
+					return nil, fmt.Errorf("MVCC autocommit must be a standalone session SET assignment")
 				}
-				variable, global := normalizeSetVariable(left)
-				if variable == "autocommit" {
-					if global || len(assignments) != 1 {
-						return nil, fmt.Errorf("MVCC autocommit must be a standalone session SET assignment")
-					}
-					value := strings.ToUpper(resolveSessionSettingValue(session, right))
-					var enabled bool
-					switch value {
-					case "1", "ON", "TRUE", "DEFAULT":
-						enabled = true
-					case "0", "OFF", "FALSE":
-						enabled = false
-					default:
-						return nil, fmt.Errorf("invalid autocommit value")
-					}
-					if err := engine.SetMVCCAutocommit(session, enabled); err != nil {
-						return nil, err
-					}
-					return &executor.Result{Message: "autocommit changed"}, nil
+				value := strings.ToUpper(resolveSessionSettingValue(session, right))
+				var enabled bool
+				switch value {
+				case "1", "ON", "TRUE", "DEFAULT":
+					enabled = true
+				case "0", "OFF", "FALSE":
+					enabled = false
+				default:
+					return nil, fmt.Errorf("invalid autocommit value")
 				}
+				if err := engine.SetMVCCAutocommit(session, enabled); err != nil {
+					return nil, err
+				}
+				return &executor.Result{Message: "autocommit changed"}, nil
 			}
 		}
 	}
@@ -213,7 +211,7 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 	case metadataFromMySQLUser(metadataUpper):
 		return mysqlUserInformation(engine, session, trimmed)
 	case strings.HasPrefix(upper, "SELECT @@"):
-		return compatibilityVariables(session, trimmed, engine.MVCC != nil), nil
+		return compatibilityVariables(session, trimmed), nil
 	}
 	return engine.Execute(session, trimmed)
 }
@@ -669,8 +667,6 @@ type runtimeStatus struct {
 	AbortedConnections uint64
 	TLSConnections     uint64
 	StorageState       string
-	Paged              storage.PagePersistenceStats
-	ColdReads          bool
 }
 
 func isShowStatusQuery(upper string) bool {
@@ -702,7 +698,7 @@ func statusRows(session *executor.Session, query string, status runtimeStatus) (
 		{"Uptime", strconv.FormatUint(status.Uptime, 10)},
 	}
 	rows = append(rows, resourceStatusRows()...)
-	rows = append(rows, pagedResourceStatusRows(status.Paged, status.ColdReads)...)
+	rows = append(rows, []any{"Gbaselite_storage_mode", "mvcc"})
 	result := &executor.Result{Columns: []executor.Column{{Name: "Variable_name", Type: storage.TypeVarchar}, {Name: "Value", Type: storage.TypeVarchar}}}
 	for _, row := range rows {
 		if !hasLikePattern || showLikeMatch(row[0].(string), likePattern) {

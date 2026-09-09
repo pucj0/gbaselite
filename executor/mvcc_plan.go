@@ -3,9 +3,9 @@ package executor
 import (
 	"context"
 	"errors"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 )
 
 // Query-local access decisions are shared by execution and EXPLAIN. No row
@@ -16,7 +16,7 @@ type mvccAccessPlan struct {
 	index      string
 	key        []byte
 	space      string
-	bounds     mvcc.KeyRange
+	bounds     storageengine.KeyRange
 	ordered    bool
 	candidates []string
 }
@@ -89,13 +89,13 @@ func planMVCCAccess(s parser.Select, table versionedTable, schema *storage.Table
 	}
 	return p
 }
-func (p mvccAccessPlan) scan(ctx context.Context, tx *mvcc.Tx, table versionedTable, yield func([]byte, []byte) error) error {
+func (p mvccAccessPlan) scan(ctx context.Context, tx storageengine.Txn, table versionedTable, yield func([]byte, []byte) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	switch p.kind {
 	case mvccAccessPoint:
-		value, ok, err := tx.Get("row/"+table.ID, p.key)
+		value, ok, err := tx.Table(table.ID).Get(p.key)
 		if err != nil || !ok {
 			return err
 		}
@@ -105,8 +105,16 @@ func (p mvccAccessPlan) scan(ctx context.Context, tx *mvcc.Tx, table versionedTa
 	case mvccAccessUnique:
 		return scanMVCCUnique(ctx, tx, table, p.space, p.key, yield)
 	case mvccAccessRange, mvccAccessOrdered:
-		return tx.ScanRange(ctx, "row/"+table.ID, p.bounds, yield)
+		iterator, err := tx.Table(table.ID).Scan(ctx, storageengine.ScanRequest{Range: p.bounds})
+		if err != nil {
+			return err
+		}
+		return storageengine.Consume(iterator, yield)
 	default:
-		return tx.Scan(ctx, "row/"+table.ID, yield)
+		iterator, err := tx.Table(table.ID).Scan(ctx, storageengine.ScanRequest{Unordered: true})
+		if err != nil {
+			return err
+		}
+		return storageengine.Consume(iterator, yield)
 	}
 }

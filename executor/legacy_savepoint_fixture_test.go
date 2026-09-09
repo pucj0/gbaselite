@@ -21,51 +21,51 @@ type transactionSavepoint struct {
 	binlogLength int
 }
 
-func savepointIndex(session *Session, name string) int {
-	for i := len(session.savepoints) - 1; i >= 0; i-- {
-		if strings.EqualFold(session.savepoints[i].name, name) {
+func (e *legacyEngine) savepointIndex(session *Session, name string) int {
+	for i := len(e.legacyState(session).savepoints) - 1; i >= 0; i-- {
+		if strings.EqualFold(e.legacyState(session).savepoints[i].name, name) {
 			return i
 		}
 	}
 	return -1
 }
-func (e *Engine) createSavepoint(session *Session, name string) (*Result, error) {
-	if session.transaction == nil {
+func (e *legacyEngine) createSavepoint(session *Session, name string) (*Result, error) {
+	if e.legacyState(session).transaction == nil {
 		return &Result{Message: "no active transaction"}, nil
 	}
-	index := savepointIndex(session, name)
-	if index < 0 && len(session.savepoints) >= maxTransactionSavepoints {
+	index := e.savepointIndex(session, name)
+	if index < 0 && len(e.legacyState(session).savepoints) >= maxTransactionSavepoints {
 		return nil, fmt.Errorf("%w: at most %d savepoints per transaction", ErrResourceLimit, maxTransactionSavepoints)
 	}
-	point := transactionSavepoint{name: name, snapshot: session.transaction.SharedSnapshot(), binlogLength: len(session.binlogStatements)}
+	point := transactionSavepoint{name: name, snapshot: e.legacyState(session).transaction.SharedSnapshot(), binlogLength: len(e.legacyState(session).binlogStatements)}
 	if index >= 0 {
-		copy(session.savepoints[index:], session.savepoints[index+1:])
-		session.savepoints[len(session.savepoints)-1] = transactionSavepoint{}
-		session.savepoints = session.savepoints[:len(session.savepoints)-1]
+		copy(e.legacyState(session).savepoints[index:], e.legacyState(session).savepoints[index+1:])
+		e.legacyState(session).savepoints[len(e.legacyState(session).savepoints)-1] = transactionSavepoint{}
+		e.legacyState(session).savepoints = e.legacyState(session).savepoints[:len(e.legacyState(session).savepoints)-1]
 	}
-	session.savepoints = append(session.savepoints, point)
+	e.legacyState(session).savepoints = append(e.legacyState(session).savepoints, point)
 	return &Result{Message: "savepoint created"}, nil
 }
-func (e *Engine) releaseSavepoint(session *Session, name string) (*Result, error) {
-	index := savepointIndex(session, name)
+func (e *legacyEngine) releaseSavepoint(session *Session, name string) (*Result, error) {
+	index := e.savepointIndex(session, name)
 	if index < 0 {
 		return nil, fmt.Errorf("%w: %s", ErrSavepointNotFound, name)
 	}
-	copy(session.savepoints[index:], session.savepoints[index+1:])
-	session.savepoints[len(session.savepoints)-1] = transactionSavepoint{}
-	session.savepoints = session.savepoints[:len(session.savepoints)-1]
+	copy(e.legacyState(session).savepoints[index:], e.legacyState(session).savepoints[index+1:])
+	e.legacyState(session).savepoints[len(e.legacyState(session).savepoints)-1] = transactionSavepoint{}
+	e.legacyState(session).savepoints = e.legacyState(session).savepoints[:len(e.legacyState(session).savepoints)-1]
 	return &Result{Message: "savepoint released"}, nil
 }
-func (e *Engine) rollbackToSavepoint(session *Session, name string) (*Result, error) {
-	index := savepointIndex(session, name)
-	if index < 0 || session.transaction == nil {
+func (e *legacyEngine) rollbackToSavepoint(session *Session, name string) (*Result, error) {
+	index := e.savepointIndex(session, name)
+	if index < 0 || e.legacyState(session).transaction == nil {
 		return nil, fmt.Errorf("%w: %s", ErrSavepointNotFound, name)
 	}
-	point := &session.savepoints[index]
+	point := &e.legacyState(session).savepoints[index]
 	// Save only the small counter maps, not a second full row-header snapshot.
 	type tableKey struct{ database, table string }
 	current := make(map[tableKey][]journal.AutoIncrementState)
-	for _, state := range collectAutoIncrement(session.transaction) {
+	for _, state := range collectAutoIncrement(e.legacyState(session).transaction) {
 		key := tableKey{strings.ToLower(state.Database), strings.ToLower(state.Table)}
 		current[key] = append(current[key], state)
 	}
@@ -81,19 +81,19 @@ func (e *Engine) rollbackToSavepoint(session *Session, name string) (*Result, er
 			}
 		}
 	}
-	if err := session.transaction.ReplaceShared(point.snapshot); err != nil {
+	if err := e.legacyState(session).transaction.ReplaceShared(point.snapshot); err != nil {
 		return nil, err
 	}
-	clear(session.binlogStatements[point.binlogLength:])
-	session.binlogStatements = session.binlogStatements[:point.binlogLength]
+	clear(e.legacyState(session).binlogStatements[point.binlogLength:])
+	e.legacyState(session).binlogStatements = e.legacyState(session).binlogStatements[:point.binlogLength]
 	if e.binlog != nil {
 		// Do not replay discarded SQL; replay only surviving counter reservations.
-		if counters := collectAutoIncrement(session.transaction); len(counters) > 0 {
-			session.binlogStatements = append(session.binlogStatements, journal.BinlogStatement{AutoIncrement: counters})
+		if counters := collectAutoIncrement(e.legacyState(session).transaction); len(counters) > 0 {
+			e.legacyState(session).binlogStatements = append(e.legacyState(session).binlogStatements, journal.BinlogStatement{AutoIncrement: counters})
 		}
 	}
-	clear(session.savepoints[index+1:])
-	session.savepoints = session.savepoints[:index+1]
+	clear(e.legacyState(session).savepoints[index+1:])
+	e.legacyState(session).savepoints = e.legacyState(session).savepoints[:index+1]
 	return &Result{Message: "rolled back to savepoint"}, nil
 }
 
@@ -119,18 +119,18 @@ func collectAutoIncrement(store *storage.Store) []journal.AutoIncrementState {
 
 // ReplayAutoIncrement applies a v2 binlog control record to an active, isolated
 // replay transaction. It is deliberately not exposed as an SQL command.
-func (e *Engine) ReplayAutoIncrement(session *Session, states []journal.AutoIncrementState) error {
+func (e *legacyEngine) ReplayAutoIncrement(session *Session, states []journal.AutoIncrementState) error {
 	if err := e.AvailabilityError(); err != nil {
 		return err
 	}
-	if session == nil || session.transaction == nil {
+	if session == nil || e.legacyState(session).transaction == nil {
 		return errors.New("auto increment replay requires an active transaction")
 	}
 	for _, state := range states {
 		if state.Next < 1 {
 			return errors.New("invalid auto increment replay counter")
 		}
-		db, err := session.transaction.Database(state.Database)
+		db, err := e.legacyState(session).transaction.Database(state.Database)
 		if err != nil {
 			return err
 		}

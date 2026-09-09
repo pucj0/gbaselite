@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"database/sql"
-	"gbaselite/executor"
 	"io"
 	"log"
 	"net"
@@ -12,7 +11,7 @@ import (
 )
 
 func TestDecimalConditionalPreparedProtocol(t *testing.T) {
-	engine, err := executor.Open(t.TempDir(), "root", "secret")
+	engine, err := openTestEngine(t, t.TempDir(), "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -541,13 +541,14 @@ function Test-ReleaseCandidate {
         if (-not ($uiControlRows | Where-Object { $_[0] -eq 'GBaseConfigDlg' -and $_[1] -eq 'BannerBitmap' -and $_[2] -eq 'Bitmap' -and $_[4] -eq 'GBaseCustomBanner' }) -or
             -not ($uiControlRows | Where-Object { $_[0] -eq 'GBaseJournalDlg' -and $_[1] -eq 'BannerBitmap' -and $_[2] -eq 'Bitmap' -and $_[4] -eq 'GBaseCustomBanner' }) -or
             -not ($uiControlRows | Where-Object { $_[0] -eq 'GBaseJournalDlg' -and $_[1] -eq 'AuditCheck' -and $_[2] -eq 'CheckBox' -and $_[3] -eq 'GBASE_AUDIT_ENABLED' }) -or
-            -not ($uiControlRows | Where-Object { $_[0] -eq 'GBaseJournalDlg' -and $_[1] -eq 'BinlogCheck' -and $_[2] -eq 'CheckBox' -and $_[3] -eq 'GBASE_BINLOG_ENABLED' }) -or
             -not ($uiControlRows | Where-Object { $_[0] -eq 'GBaseJournalDlg' -and $_[1] -eq 'AuditRetentionEdit' -and $_[2] -eq 'Edit' -and $_[3] -eq 'GBASE_AUDIT_RETENTION_DAYS' }) -or
-            -not ($uiControlRows | Where-Object { $_[0] -eq 'GBaseJournalDlg' -and $_[1] -eq 'BinlogRetentionEdit' -and $_[2] -eq 'Edit' -and $_[3] -eq 'GBASE_BINLOG_RETENTION_DAYS' }) -or
             -not ($uiControlRows | Where-Object { $_[0] -eq 'GBaseReinitializeConfirmDlg' -and $_[1] -eq 'BannerBitmap' -and $_[2] -eq 'Bitmap' -and $_[4] -eq 'GBaseCustomBanner' }) -or
             -not ($uiControlRows | Where-Object { $_[0] -eq 'GBaseConfigDlg' -and $_[1] -eq 'DesktopShortcutCheck' -and $_[2] -eq 'CheckBox' -and $_[3] -eq 'GBASE_DESKTOP_SHORTCUT' }) -or
             -not ($uiControlRows | Where-Object { $_[0] -eq 'LicenseAgreementDlg' -and $_[1] -eq 'LicenseText' -and $_[2] -eq 'ScrollableText' -and $_[4] -match 'GBaseLite' -and $_[4] -match '\\u-?[0-9]+\?' })) {
             throw "MSI dialogs do not contain the Chinese license, branded banners, and optional desktop shortcut control"
+        }
+        if ($uiControlRows | Where-Object { $_[0] -eq 'GBaseJournalDlg' -and $_[1] -match '^Binlog(Check|RetentionEdit)$' }) {
+            throw "MSI must not offer removed legacy binlog runtime options"
         }
         $componentRows = Read-MsiRows -Database $database -Query "SELECT ``Component``, ``Attributes`` FROM ``Component`` WHERE ``Component`` = 'InstallDirectoryRegistryComponent' OR ``Component`` = 'DataDirectoryComponent' OR ``Component`` = 'LogDirectoryComponent'" -ColumnCount 2
         $installRegistryComponent = $componentRows | Where-Object { $_[0] -eq "InstallDirectoryRegistryComponent" } | Select-Object -First 1

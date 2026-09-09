@@ -13,9 +13,9 @@ import (
 	"gbaselite/storage"
 )
 
-func queryResourceSQLFixture(t *testing.T) (*Engine, *Session, string) {
+func queryResourceSQLFixture(t *testing.T) (*legacyEngine, *Session, string) {
 	t.Helper()
-	engine, err := Open(t.TempDir(), "root", "secret")
+	engine, err := openLegacy(t.TempDir(), "root", "secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func queryResourceSQLFixture(t *testing.T) (*Engine, *Session, string) {
 	return engine, &Session{CurrentDatabase: "budget"}, t.TempDir()
 }
 
-func TestQueryResourcesSQLSortAndDistinctMatchLegacy(t *testing.T) {
+func TestLegacyQueryResourcesSQLSortAndDistinctMatchLegacy(t *testing.T) {
 	engine, session, directory := queryResourceSQLFixture(t)
 	queries := []string{
 		"SELECT id,label FROM items ORDER BY score DESC,id ASC LIMIT 15 OFFSET 4",
@@ -70,7 +70,7 @@ func TestQueryResourcesSQLSortAndDistinctMatchLegacy(t *testing.T) {
 	}
 }
 
-func TestQueryResourcesSQLBudgetFailuresCleanUp(t *testing.T) {
+func TestLegacyQueryResourcesSQLBudgetFailuresCleanUp(t *testing.T) {
 	engine, session, directory := queryResourceSQLFixture(t)
 	for _, sql := range []string{
 		"SELECT id,label FROM items",
@@ -98,7 +98,7 @@ func TestQueryResourcesSQLBudgetFailuresCleanUp(t *testing.T) {
 	}
 }
 
-func TestQueryResourcesSQLDeferredStreamCancellationCleansRuns(t *testing.T) {
+func TestLegacyQueryResourcesSQLDeferredStreamCancellationCleansRuns(t *testing.T) {
 	engine, session, directory := queryResourceSQLFixture(t)
 	engine.QueryOptions = QueryOptions{SortMemoryBytes: 128 << 10, MaxTempBytes: 32 << 20, TempDirectory: directory}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,7 +136,7 @@ func TestQueryResourcesSQLDeferredStreamCancellationCleansRuns(t *testing.T) {
 	}
 }
 
-func TestQueryResourcesSQLTransactionLockTimeout(t *testing.T) {
+func TestLegacyQueryResourcesSQLTransactionLockTimeout(t *testing.T) {
 	engine, session, _ := queryResourceSQLFixture(t)
 	holder := &Session{CurrentDatabase: "budget"}
 	if _, err := engine.Execute(holder, "BEGIN"); err != nil {

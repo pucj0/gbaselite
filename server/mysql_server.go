@@ -18,11 +18,10 @@ import (
 
 	"gbaselite/executor"
 	"gbaselite/journal"
-	"gbaselite/mvcc"
 	"gbaselite/parser"
 	"gbaselite/protocol"
-	"gbaselite/replication"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 )
 
 type MySQLServer struct {
@@ -158,9 +157,7 @@ func (s *MySQLServer) handleConnection(raw net.Conn) {
 	s.Logger.Printf("client connected id=%d remote=%s", id, remote)
 	defer s.Logger.Printf("client disconnected id=%d remote=%s", id, remote)
 	packet := &protocol.PacketConn{Conn: raw}
-	if s.Engine.MVCC != nil {
-		packet.MaxReadBytes = (1 << 20) + 1
-	}
+	packet.MaxReadBytes = (1 << 20) + 1
 	writeBufferSize := s.WriteBufferSize
 	if writeBufferSize <= 0 {
 		writeBufferSize = 16 << 10
@@ -536,17 +533,7 @@ func (s *MySQLServer) runtimeStatus() runtimeStatus {
 	if s.Engine != nil && s.Engine.AvailabilityError() != nil {
 		storageState = "fail-closed"
 	}
-	var paged storage.PagePersistenceStats
-	coldReads := false
-	if s.Engine != nil {
-		coldReads = s.Engine.ColdRead
-		if s.Engine.Persistence != nil {
-			paged = s.Engine.Persistence.PagedStats()
-		}
-	}
 	return runtimeStatus{
-		Paged:              paged,
-		ColdReads:          coldReads,
 		Uptime:             uptime,
 		Connections:        s.totalConnections.Load(),
 		ActiveConnections:  s.activeConnections.Load(),
@@ -623,18 +610,14 @@ func mysqlExecutionErrorCode(err error) uint16 {
 		return 1264
 	case errors.Is(err, executor.ErrQueryTimeout), errors.Is(err, executor.ErrQueryCanceled):
 		return 1317
-	case errors.Is(err, mvcc.ErrWriteSetLimit), errors.Is(err, executor.ErrQueryResourceLimit), errors.Is(err, storage.ErrColdMaterializationLimit):
+	case errors.Is(err, storageengine.ErrWriteSetLimit), errors.Is(err, executor.ErrQueryResourceLimit):
 		return 1041
-	case errors.Is(err, replication.ErrNotLeader):
+	case errors.Is(err, storageengine.ErrNotLeader):
 		return 1290
-	case errors.Is(err, executor.ErrSerializationConflict), errors.Is(err, mvcc.ErrConflict):
+	case errors.Is(err, storageengine.ErrConflict):
 		return 1213
 	case errors.Is(err, executor.ErrPersistenceUnavailable):
 		return 1030
-	case errors.Is(err, executor.ErrSavepointNotFound):
-		return 1305
-	case errors.Is(err, executor.ErrResourceLimit):
-		return 1041
 	case errors.Is(err, storage.ErrDuplicateKey):
 		return 1062
 	case errors.Is(err, storage.ErrForeignKeyReferenced):

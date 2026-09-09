@@ -1,7 +1,6 @@
 package main
 
 import (
-	"gbaselite/executor"
 	"gbaselite/journal"
 	"os"
 	"path/filepath"
@@ -32,16 +31,11 @@ func TestReplayForeignKeySessionState(t *testing.T) {
 	if err := os.WriteFile(cfg, []byte("storage:\n  path: '"+data+"'\nauth:\n  username: root\n  password: secret\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runReplayBinlog([]string{"--config", cfg, "--input", logPath}); err != nil {
-		t.Fatal(err)
+	if err := runReplayBinlog([]string{"--config", cfg, "--input", logPath}); err == nil {
+		t.Fatal("legacy runtime replay accepted")
 	}
-	e, err := executor.Open(data, "root", "secret")
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(data); !os.IsNotExist(err) {
+		t.Fatal("rejected replay created data")
 	}
-	defer e.Close()
-	s := &executor.Session{CurrentDatabase: "tew"}
-	if _, err := e.Execute(s, "INSERT INTO child VALUES(2,99)"); err == nil {
-		t.Fatal("checks lost after replay")
-	}
+
 }

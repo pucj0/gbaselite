@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"gbaselite/storageengine"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -61,7 +62,7 @@ func TestMVCCSecondaryAfterFlatMigration(t *testing.T) {
 	run("CREATE TABLE sm(id INT PRIMARY KEY,a INT,b INT,KEY ab(a,b))")
 	run("INSERT INTO sm VALUES(1,10,20),(2,10,NULL),(3,11,20)")
 	root := t.TempDir()
-	if err := e.MVCC.ExportLayout(context.Background(), filepath.Join(root, "versioned"), "flat"); err != nil {
+	if err := e.Backend.(storageengine.Maintenance).Compact(context.Background(), filepath.Join(root, "versioned")); err != nil {
 		t.Fatal(err)
 	}
 	migrated, err := OpenWithOptions(root, "root", "pw", OpenOptions{StorageMode: "mvcc", LocalWAL: true})
