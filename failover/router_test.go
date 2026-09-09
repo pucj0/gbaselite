@@ -3,11 +3,13 @@ package failover_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"gbaselite/executor"
 	"gbaselite/failover"
 	"gbaselite/replication"
 	"gbaselite/server"
+	"github.com/go-sql-driver/mysql"
 	"io"
 	"log"
 	"net"
@@ -97,10 +99,33 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 	}
 	db := open()
 	defer db.Close()
-	for _, q := range []string{"CREATE DATABASE test", "USE test", "CREATE TABLE items(id INT PRIMARY KEY,v INT)", "INSERT INTO items VALUES(1,10)"} {
-		if _, err = db.Exec(q); err != nil {
-			t.Fatal(err)
+	// Leader discovery may close a connection while the initial cluster is
+	// converging, especially on a busy CI host. Retry only these idempotent
+	// fixture statements using a fresh connection; the proxy never replays SQL.
+	execFixture := func(query string) {
+		t.Helper()
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			if _, err = db.Exec(query); err == nil {
+				return
+			}
+			// A disconnected INSERT may already have committed. The fixed primary
+			// keys make retry duplicates safe; the final count and sum verify values.
+			var sqlErr *mysql.MySQLError
+			if errors.As(err, &sqlErr) && sqlErr.Number == 1062 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("fixture %s: %v", query, err)
+			}
+			db.Close()
+			time.Sleep(100 * time.Millisecond)
+			db = open()
 		}
+	}
+	defer func() { db.Close() }()
+	for _, q := range []string{"CREATE DATABASE IF NOT EXISTS test", "CREATE TABLE IF NOT EXISTS test.items(id INT PRIMARY KEY,v INT)", "INSERT INTO test.items VALUES(1,10)"} {
+		execFixture(q)
 	}
 	for i, p := range sqlPeers {
 		if p.Address == first {
@@ -114,14 +139,9 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 	db.Close()
 	db = open()
 	defer db.Close()
-	if _, err = db.Exec("USE test"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = db.Exec("INSERT INTO items VALUES(2,20)"); err != nil {
-		t.Fatal(err)
-	}
+	execFixture("INSERT INTO test.items VALUES(2,20)")
 	var count, sum int
-	if err = db.QueryRow("SELECT COUNT(*),SUM(v) FROM items").Scan(&count, &sum); err != nil {
+	if err = db.QueryRow("SELECT COUNT(*),SUM(v) FROM test.items").Scan(&count, &sum); err != nil {
 		t.Fatal(err)
 	}
 	if count != 2 || sum != 30 {
