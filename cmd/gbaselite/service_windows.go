@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/eventlog"
 )
 
 const windowsServiceName = "GBaseLite"
@@ -27,6 +28,20 @@ func runWindowsService(args []string) error {
 }
 
 func (handler *windowsServiceHandler) Execute(_ []string, requests <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
+	return handler.execute(requests, status, runServerControlled, reportWindowsServiceFailure)
+}
+
+// Preserve the startup error: SCM otherwise exposes only service-specific code 1.
+func reportWindowsServiceFailure(err error) {
+	log, openErr := eventlog.Open(windowsServiceName)
+	if openErr != nil {
+		return
+	}
+	defer log.Close()
+	_ = log.Error(1000, "GBaseLite service failed: "+err.Error())
+}
+
+func (handler *windowsServiceHandler) execute(requests <-chan svc.ChangeRequest, status chan<- svc.Status, run func([]string, <-chan struct{}, chan<- struct{}) error, report func(error)) (bool, uint32) {
 	const accepted = svc.AcceptStop | svc.AcceptShutdown
 	status <- svc.Status{State: svc.StartPending}
 
@@ -34,7 +49,7 @@ func (handler *windowsServiceHandler) Execute(_ []string, requests <-chan svc.Ch
 	ready := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {
-		result <- runServerControlled(handler.serverArgs, stop, ready)
+		result <- run(handler.serverArgs, stop, ready)
 	}()
 
 	select {
@@ -42,6 +57,7 @@ func (handler *windowsServiceHandler) Execute(_ []string, requests <-chan svc.Ch
 		status <- svc.Status{State: svc.Running, Accepts: accepted}
 	case err := <-result:
 		if err != nil {
+			report(err)
 			return true, 1
 		}
 		return false, 0
@@ -52,6 +68,7 @@ func (handler *windowsServiceHandler) Execute(_ []string, requests <-chan svc.Ch
 		select {
 		case err := <-result:
 			if err != nil {
+				report(err)
 				return true, 1
 			}
 			return false, 0
@@ -63,6 +80,7 @@ func (handler *windowsServiceHandler) Execute(_ []string, requests <-chan svc.Ch
 				status <- svc.Status{State: svc.StopPending}
 				stopOnce.Do(func() { close(stop) })
 				if err := <-result; err != nil {
+					report(err)
 					return true, 1
 				}
 				return false, 0

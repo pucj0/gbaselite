@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,17 +18,22 @@ import (
 	"gbaselite/catalog"
 	"gbaselite/internal/atomicfile"
 	"gbaselite/journal"
+	"gbaselite/mvcc"
 	"gbaselite/parser"
+	"gbaselite/replication"
 	"gbaselite/storage"
 )
 
-const Version = "1.0.0"
+const Version = "1.1.1"
 
 var ErrPersistenceUnavailable = errors.New("database persistence is unavailable")
 
 type Column struct {
+	Collation     string
+	jsonValue     bool // Internal provenance for materialized JSON columns.
 	Name          string
 	Type          storage.DataType
+	SQLType       string
 	Length        int
 	Schema        string
 	Table         string
@@ -39,45 +45,56 @@ type Column struct {
 	AutoIncrement bool
 }
 type Result struct {
-	Columns         []Column
-	Rows            [][]any
-	StreamRows      func(func([]any) error) error
-	StreamValues    func(func(storage.Row) error) error
-	AffectedRows    uint64
-	LastInsertID    uint64
-	Message         string
-	MetadataChanged bool
+	AutocommitDisabled bool
+	InTransaction      bool
+	Columns            []Column
+	Rows               [][]any
+	StreamRows         func(func([]any) error) error
+	StreamValues       func(func(storage.Row) error) error
+	AffectedRows       uint64
+	LastInsertID       uint64
+	Message            string
+	MetadataChanged    bool
 }
 type Session struct {
-	CurrentDatabase        string
-	StreamResults          bool
-	CharacterSetClient     string
-	CharacterSetConnection string
-	CharacterSetResults    string
-	CollationConnection    string
-	TimeZone               string
-	ServerTimeZone         string
-	Username               string
-	UserVariables          map[string]string
-	Host                   string
-	RemoteIP               string
-	RemotePort             string
-	ConnectionID           uint32
-	SecureTransport        bool
-	TLSVersion             string
-	TLSCipher              string
-	JournalSessionID       string
-	LastInsertID           uint64
-	ReplayTimestamp        time.Time
-	transaction            *storage.Store
-	transactionGate        bool
-	binlogStatements       []journal.BinlogStatement
-	temporaryTables        map[string]*storage.Table
-	viewStack              map[string]bool
-	copySource             *navicatCopySource
-	copyTargets            map[string]string
-	correlationScopes      []map[string]any
-	timeLocation           *time.Location
+	ForeignKeyChecksDisabled bool
+	AutocommitDisabled       bool
+	mvccTransaction          *mvcc.Tx
+	mvccReadCache            *mvccReadTableCache
+	Context                  context.Context
+	query                    *queryControl
+	CurrentDatabase          string
+	StreamResults            bool
+	CharacterSetClient       string
+	CharacterSetConnection   string
+	CharacterSetResults      string
+	CollationConnection      string
+	TimeZone                 string
+	ServerTimeZone           string
+	Username                 string
+	UserVariables            map[string]string
+	Host                     string
+	RemoteIP                 string
+	RemotePort               string
+	ConnectionID             uint32
+	SecureTransport          bool
+	TLSVersion               string
+	TLSCipher                string
+	JournalSessionID         string
+	LastInsertID             uint64
+	ReplayTimestamp          time.Time
+	transaction              *storage.Store
+	transactionGate          bool
+	transactionVersion       uint64
+	transactionDirty         bool
+	savepoints               []transactionSavepoint
+	binlogStatements         []journal.BinlogStatement
+	temporaryTables          map[string]*storage.Table
+	viewStack                map[string]bool
+	copySource               *navicatCopySource
+	copyTargets              map[string]string
+	correlationScopes        []map[string]any
+	timeLocation             *time.Location
 }
 
 type navicatCopySource struct {
@@ -89,46 +106,51 @@ type navicatCopySource struct {
 var errRelationNotFound = errors.New("relation not found")
 
 type Engine struct {
-	Store        *storage.Store
-	Persistence  *storage.Persistence
-	Users        *catalog.Users
-	txGate       sync.RWMutex
-	copyMu       sync.Mutex
-	persistMu    sync.Mutex
-	persistCond  *sync.Cond
-	persistNext  uint64
-	persistDone  uint64
-	persisting   bool
-	persistErr   error
-	persistFatal error
-	persistSave  func(*storage.Store) error
-	parseCache   sync.Map
-	parseCount   int
-	parseMu      sync.Mutex
-	binlog       *journal.Binlog
+	MVCC                   *mvcc.Store
+	Replica                *replication.Node
+	mvccProposer           mvcc.Proposer
+	mvccMetadata           sync.Mutex
+	mvccMetadataVersion    uint64
+	QueryOptions           QueryOptions
+	OptimisticTransactions bool
+	ColdRead               bool
+	ColdMaterializeBytes   int64
+	commitVersion          uint64 // Guarded by txGate.
+	Store                  *storage.Store
+	Persistence            *storage.Persistence
+	Users                  *catalog.Users
+	txGate                 sync.RWMutex
+	copyMu                 sync.Mutex
+	persistMu              sync.Mutex
+	persistCond            *sync.Cond
+	persistNext            uint64
+	persistDone            uint64
+	persisting             bool
+	persistErr             error
+	persistFatal           error
+	persistSave            func(*storage.Store) error
+	parseCache             sync.Map
+	parseOrder             [maxParsedStatements]string
+	parseNext              int
+	parseCount             int
+	parseMu                sync.Mutex
+	binlog                 *journal.Binlog
 }
 
 func Open(dataDir, username, password string) (*Engine, error) {
-	for _, directory := range []string{"databases", "tables", "users", "indexes"} {
-		if err := os.MkdirAll(filepath.Join(dataDir, directory), 0o755); err != nil {
-			return nil, err
-		}
-	}
-	persistence := storage.NewPersistence(dataDir)
-	store, err := persistence.Load()
-	if err != nil {
-		return nil, err
-	}
-	users, err := catalog.OpenUsers(dataDir, username, password)
-	if err != nil {
-		return nil, err
-	}
-	engine := &Engine{Store: store, Persistence: persistence, Users: users, persistSave: persistence.Save}
-	engine.persistCond = sync.NewCond(&engine.persistMu)
-	return engine, nil
+	return OpenWithOptions(dataDir, username, password, OpenOptions{})
 }
 
-func (e *Engine) Close() error { return e.persist() }
+func (e *Engine) Close() error {
+	if e.MVCC != nil {
+		var err error
+		if e.Replica != nil {
+			err = e.Replica.Close()
+		}
+		return errors.Join(err, e.MVCC.Close())
+	}
+	return e.persist()
+}
 
 func (e *Engine) SetBinlog(binlog *journal.Binlog) { e.binlog = binlog }
 
@@ -136,6 +158,11 @@ func (e *Engine) SetBinlog(binlog *journal.Binlog) { e.binlog = binlog }
 // rejects SQL until restart so divergent in-memory state cannot overwrite the
 // last durable snapshot.
 func (e *Engine) AvailabilityError() error {
+	if e.MVCC != nil {
+		if err := e.MVCC.AvailabilityError(); err != nil {
+			return fmt.Errorf("%w: %v", ErrPersistenceUnavailable, err)
+		}
+	}
 	e.persistMu.Lock()
 	defer e.persistMu.Unlock()
 	return e.persistFatal
@@ -201,6 +228,10 @@ func (e *Engine) CloseSession(session *Session) {
 	if session == nil {
 		return
 	}
+	if session.mvccTransaction != nil {
+		session.mvccTransaction.Rollback()
+		session.mvccTransaction = nil
+	}
 	rolledBack := session.transaction != nil
 	e.finishTransaction(session)
 	if rolledBack {
@@ -211,6 +242,9 @@ func (e *Engine) CloseSession(session *Session) {
 func (e *Engine) Execute(session *Session, sql string) (*Result, error) {
 	if session != nil {
 		session.InitializeSettings()
+	}
+	if e.MVCC != nil && len(sql) > 1<<20 {
+		return nil, fmt.Errorf("%w: MVCC SQL text exceeds 1 MiB; send bounded batches", ErrQueryResourceLimit)
 	}
 	expanded, err := parser.ExpandMySQLExecutableComments(sql)
 	if err != nil {
@@ -239,21 +273,20 @@ func (e *Engine) cacheStatement(query string, statement parser.Statement) {
 		return
 	}
 	if e.parseCount >= maxParsedStatements {
-		e.parseCache.Range(func(key, _ any) bool {
-			e.parseCache.Delete(key)
-			return true
-		})
-		e.parseCount = 0
+		e.parseCache.Delete(e.parseOrder[e.parseNext])
+	} else {
+		e.parseCount++
 	}
+	e.parseOrder[e.parseNext] = query
+	e.parseNext = (e.parseNext + 1) % maxParsedStatements
 	e.parseCache.Store(query, statement)
-	e.parseCount++
 }
 
 func (e *Engine) ExecuteStatement(session *Session, statement parser.Statement) (*Result, error) {
 	return e.executeStatement(session, statement, "")
 }
 
-func (e *Engine) executeStatement(session *Session, statement parser.Statement, query string) (*Result, error) {
+func (e *Engine) executeStatement(session *Session, statement parser.Statement, query string) (resultOut *Result, errOut error) {
 	if err := e.AvailabilityError(); err != nil {
 		return nil, err
 	}
@@ -261,16 +294,60 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 		session = &Session{}
 	}
 	session.InitializeSettings()
+	restoreQuery := startQuery(session, e.QueryOptions)
+	defer restoreQuery()
+	defer func() {
+		if resultOut != nil {
+			resultOut.InTransaction = session.mvccTransaction != nil || session.transaction != nil
+			resultOut.AutocommitDisabled = session.AutocommitDisabled
+		}
+		if errOut == nil && resultOut != nil && len(resultOut.Columns) > 0 {
+			resultOut, errOut = bindQueryResult(resultOut, session.query)
+		}
+	}()
+	if err := checkQuery(session); err != nil {
+		return nil, err
+	}
+	if e.MVCC != nil {
+		if session.query.options.SortMemoryBytes == 0 {
+			session.query.options.SortMemoryBytes = 4 << 20
+		}
+		if session.query.options.ResultMemoryBytes == 0 {
+			session.query.options.ResultMemoryBytes = 16 << 20
+		}
+		if session.query.options.MaxTempBytes == 0 {
+			session.query.options.MaxTempBytes = 256 << 20
+		}
+		if err := e.authorizeStatement(session, statement); err != nil {
+			return nil, err
+		}
+		return e.executeMVCCStatement(session, statement)
+	}
 	databaseAtStart := session.CurrentDatabase
 	_, beginning := statement.(parser.Begin)
 	if session.transaction == nil && !beginning {
-		if requiresAtomicStoreMutation(statement) {
-			e.txGate.Lock()
+		if requiresAtomicStoreMutation(statement) || e.OptimisticTransactions && statementChangesData(statement) {
+			if err := acquireQueryMutex(session.query, &e.txGate, true); err != nil {
+				return nil, err
+			}
 			defer e.txGate.Unlock()
 		} else {
-			e.txGate.RLock()
+			if err := acquireQueryMutex(session.query, &e.txGate, false); err != nil {
+				return nil, err
+			}
 			defer e.txGate.RUnlock()
 		}
+		if err := e.AvailabilityError(); err != nil {
+			return nil, err
+		}
+	}
+	// Optimistic writes may reserve IDs on the live store. Keep that store's
+	// tables stable until the reservation and transaction-local mutation finish.
+	if e.OptimisticTransactions && session.transaction != nil && statementChangesData(statement) {
+		if err := acquireQueryMutex(session.query, &e.txGate, false); err != nil {
+			return nil, err
+		}
+		defer e.txGate.RUnlock()
 		if err := e.AvailabilityError(); err != nil {
 			return nil, err
 		}
@@ -282,6 +359,12 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 	if err := e.authorizeStatement(session, statement); err != nil {
 		return nil, err
 	}
+	if coldResult, handled, coldErr := e.prepareColdStatement(store, session, statement); handled || coldErr != nil {
+		return coldResult, coldErr
+	}
+	if len(session.savepoints) > 0 && changesSavepointIdentity(statement) {
+		return nil, errors.New("unsupported schema identity change while savepoints are active; release savepoints first")
+	}
 	mutated := false
 	var result *Result
 	var err error
@@ -289,10 +372,15 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 	case parser.Empty:
 		return &Result{Message: "empty query"}, nil
 	case parser.Begin:
+		if e.OptimisticTransactions {
+			return e.beginOptimistic(session)
+		}
 		if session.transaction != nil {
 			return nil, errors.New("transaction already active")
 		}
-		e.txGate.Lock()
+		if err := acquireQueryMutex(session.query, &e.txGate, true); err != nil {
+			return nil, err
+		}
 		session.transactionGate = true
 		if err := e.AvailabilityError(); err != nil {
 			e.finishTransaction(session)
@@ -306,6 +394,9 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 		result = &Result{Message: "transaction started"}
 		return result, err
 	case parser.Commit:
+		if e.OptimisticTransactions {
+			return e.commitOptimistic(session)
+		}
 		if session.transaction == nil {
 			return &Result{Message: "no active transaction"}, nil
 		}
@@ -318,6 +409,12 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 		}
 		e.finishTransaction(session)
 		return &Result{Message: "transaction committed"}, err
+	case parser.Savepoint:
+		return e.createSavepoint(session, value.Name)
+	case parser.RollbackTo:
+		return e.rollbackToSavepoint(session, value.Name)
+	case parser.ReleaseSavepoint:
+		return e.releaseSavepoint(session, value.Name)
 	case parser.Rollback:
 		if session.transaction == nil {
 			return &Result{Message: "no active transaction"}, nil
@@ -392,7 +489,7 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 							if err != nil {
 								break
 							}
-							err = database.AddForeignKey(tableName, storage.ForeignKey{Name: foreignKey.Name, Columns: append([]string(nil), foreignKey.Columns...), RefTable: foreignKey.RefTable, RefColumns: append([]string(nil), foreignKey.RefColumns...), OnDelete: foreignKey.OnDelete, OnUpdate: foreignKey.OnUpdate})
+							err = database.AddForeignKey(tableName, storage.ForeignKey{Name: foreignKey.Name, Columns: append([]string(nil), foreignKey.Columns...), RefTable: foreignKey.RefTable, RefColumns: append([]string(nil), foreignKey.RefColumns...), OnDelete: foreignKey.OnDelete, OnUpdate: foreignKey.OnUpdate}, !session.ForeignKeyChecksDisabled)
 						}
 						if err != nil {
 							_ = database.DropTable(tableName)
@@ -460,11 +557,11 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 	case parser.RenameTable:
 		result, mutated, err = executeRenameTables(store, session, value)
 	case parser.Insert:
-		if value.Replace {
+		if atomicInsert(value) {
 			var clone *storage.Store
 			clone, err = store.Clone()
 			if err == nil {
-				result, err = executeInsert(clone, e.Store, session, value)
+				result, err = executeInsert(clone, e.Store, session, value, e.OptimisticTransactions)
 			}
 			if err == nil {
 				err = validateStoreCheckConstraints(clone)
@@ -474,7 +571,7 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 			}
 			mutated = err == nil
 		} else {
-			result, err = executeInsert(store, e.Store, session, value)
+			result, err = executeInsert(store, e.Store, session, value, e.OptimisticTransactions)
 			mutated = err == nil
 		}
 	case parser.Select:
@@ -517,7 +614,7 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 		database, table, err = resolveTable(store, session, value.Table)
 		if err == nil {
 			var affected int
-			affected, err = database.Truncate(table.Name())
+			affected, err = database.Truncate(table.Name(), !session.ForeignKeyChecksDisabled)
 			result = &Result{AffectedRows: uint64(affected), Message: "table truncated"}
 			mutated = err == nil
 		}
@@ -614,14 +711,20 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 	if err != nil {
 		return nil, err
 	}
+	if mutated && session.transaction != nil {
+		session.transactionDirty = true
+	}
 	if mutated && session.transaction == nil {
 		err = e.persist()
 		if err != nil {
 			return nil, err
 		}
 	}
-	if query != "" && mutated {
-		change := journal.BinlogStatement{Database: databaseAtStart, SQL: query, AffectedRows: result.AffectedRows}
+	if mutated && session.transaction == nil && e.OptimisticTransactions {
+		e.commitVersion++
+	}
+	if query != "" && mutated && e.binlog != nil {
+		change := journal.BinlogStatement{ForeignKeyChecksDisabled: session.ForeignKeyChecksDisabled, Database: databaseAtStart, SQL: query, AffectedRows: result.AffectedRows}
 		if session.transaction != nil {
 			session.binlogStatements = append(session.binlogStatements, change)
 		} else if err := e.appendBinlog(session, []journal.BinlogStatement{change}); err != nil {
@@ -629,7 +732,7 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 		}
 	}
 	if query != "" && catalogMutation(statement) {
-		change := journal.BinlogStatement{Database: databaseAtStart, SQL: query, AffectedRows: result.AffectedRows}
+		change := journal.BinlogStatement{ForeignKeyChecksDisabled: session.ForeignKeyChecksDisabled, Database: databaseAtStart, SQL: query, AffectedRows: result.AffectedRows}
 		if err := e.appendBinlog(session, []journal.BinlogStatement{change}); err != nil {
 			return nil, fmt.Errorf("account change committed but binlog append failed: %w", err)
 		}
@@ -642,7 +745,7 @@ func requiresAtomicStoreMutation(statement parser.Statement) bool {
 	case parser.AlterTableBatch, parser.CreateTableLike, parser.CreateTableAs:
 		return true
 	case parser.Insert:
-		return value.Replace
+		return atomicInsert(value)
 	case parser.Update, parser.Delete:
 		return true
 	default:
@@ -652,6 +755,9 @@ func requiresAtomicStoreMutation(statement parser.Statement) bool {
 
 func (e *Engine) finishTransaction(session *Session) {
 	session.transaction = nil
+	session.transactionDirty = false
+	session.transactionVersion = 0
+	session.savepoints = nil
 	session.binlogStatements = nil
 	if session.transactionGate {
 		session.transactionGate = false
@@ -737,7 +843,7 @@ func (e *Engine) authorizeStatement(session *Session, statement parser.Statement
 	}
 
 	switch value := statement.(type) {
-	case parser.Empty, parser.Begin, parser.Commit, parser.Rollback:
+	case parser.Empty, parser.Begin, parser.Commit, parser.Rollback, parser.Savepoint, parser.RollbackTo, parser.ReleaseSavepoint:
 		return nil
 	case parser.CreateDatabase:
 		return require("CREATE", value.Name, "*")
@@ -829,6 +935,13 @@ func (e *Engine) authorizeStatement(session *Session, statement parser.Statement
 		if value.Replace {
 			if err := requireTable("DELETE", value.Table); err != nil {
 				return err
+			}
+		}
+		for _, expression := range value.ValueExpressions {
+			for _, name := range expressionRelationNames(expression) {
+				if err := requireTable("SELECT", name); err != nil {
+					return err
+				}
 			}
 		}
 		if value.Select != nil {
@@ -975,6 +1088,13 @@ func (e *Engine) authorizeStatement(session *Session, statement parser.Statement
 			return nil
 		}
 		return requireAccountAdmin()
+	case parser.MVCCMaintenance:
+		for _, privilege := range []string{"FILE", "SELECT", "CREATE", "DROP"} {
+			if err := require(privilege, "*", "*"); err != nil {
+				return err
+			}
+		}
+		return nil
 	case parser.ExportDatabase:
 		return require("SELECT", value.Name, "*")
 	default:
@@ -982,7 +1102,7 @@ func (e *Engine) authorizeStatement(session *Session, statement parser.Statement
 	}
 }
 
-func executeInsert(store, autoIncrementStore *storage.Store, session *Session, statement parser.Insert) (*Result, error) {
+func executeInsert(store, autoIncrementStore *storage.Store, session *Session, statement parser.Insert, globalReservations bool) (*Result, error) {
 	database, table, copyTargetKey, err := resolveInsertTable(store, session, statement.Table)
 	if err != nil {
 		return nil, err
@@ -1023,7 +1143,18 @@ func executeInsert(store, autoIncrementStore *storage.Store, session *Session, s
 					return nil, err
 				}
 				if reservationTable != nil {
-					if reservationErr := reservationTable.AdvanceAutoIncrement(column.Name, next+1); reservationErr != nil {
+					if globalReservations {
+						if reservationErr := reservationTable.AdvanceAutoIncrement(column.Name, next); reservationErr != nil {
+							return nil, reservationErr
+						}
+						next, err = reservationTable.NextAutoIncrement(column.Name)
+						if err != nil {
+							return nil, err
+						}
+						if err := table.AdvanceAutoIncrement(column.Name, next+1); err != nil {
+							return nil, err
+						}
+					} else if reservationErr := reservationTable.AdvanceAutoIncrement(column.Name, next+1); reservationErr != nil {
 						return nil, reservationErr
 					}
 				}
@@ -1077,7 +1208,7 @@ func executeInsert(store, autoIncrementStore *storage.Store, session *Session, s
 			return 0, err
 		}
 		if statement.Replace {
-			replaced, replaceErr := database.ReplaceRow(table.Name(), row)
+			replaced, replaceErr := database.ReplaceRow(table.Name(), row, !session.ForeignKeyChecksDisabled)
 			if replaceErr == nil && generatedAuto && lastInsertID == 0 {
 				for index, column := range columns {
 					if column.AutoIncrement && !row[index].Null {
@@ -1088,7 +1219,7 @@ func executeInsert(store, autoIncrementStore *storage.Store, session *Session, s
 			}
 			return uint64(replaced), replaceErr
 		}
-		insertErr := database.Insert(table.Name(), row)
+		insertErr := database.Insert(table.Name(), row, !session.ForeignKeyChecksDisabled)
 		if errors.Is(insertErr, storage.ErrDuplicateKey) && len(statement.OnDuplicate) > 0 {
 			updated, updateErr := executeInsertDuplicateUpdate(database, table, row, statement.OnDuplicate, session)
 			if updateErr != nil {
@@ -1129,6 +1260,9 @@ func executeInsert(store, autoIncrementStore *storage.Store, session *Session, s
 			if column.AutoIncrement && raw == nil {
 				generatedAuto = true
 				continue
+			}
+			if doc, ok := raw.(jsonDocument); ok {
+				raw = string(doc)
 			}
 			converted, conversionErr := storage.NewValue(column.Type, raw)
 			if conversionErr != nil {
@@ -1192,7 +1326,7 @@ func executeInsert(store, autoIncrementStore *storage.Store, session *Session, s
 			}
 			affected += rowAffected
 		} else {
-			for _, literals := range statement.Values {
+			for rowIndex, literals := range statement.Values {
 				if len(literals) != len(positions) {
 					return nil, fmt.Errorf("%w: expected %d values, got %d", storage.ErrColumnCount, len(positions), len(literals))
 				}
@@ -1202,6 +1336,23 @@ func executeInsert(store, autoIncrementStore *storage.Store, session *Session, s
 				}
 				generatedAuto := autoOmitted
 				for i, literal := range literals {
+					if expression, ok := statement.ValueExpressions[[2]int{rowIndex, i}]; ok {
+						raw, evaluationErr := evaluateExprWithContext(expression, table, row, session, store)
+						if evaluationErr != nil {
+							return nil, evaluationErr
+						}
+						column := columns[positions[i]]
+						if column.AutoIncrement && raw == nil {
+							generatedAuto = true
+							continue
+						}
+						converted, conversionErr := interfaceToColumnValue(raw, column)
+						if conversionErr != nil {
+							return nil, conversionErr
+						}
+						row[positions[i]] = converted
+						continue
+					}
 					if columns[positions[i]].AutoIncrement && literal.Kind == parser.LiteralNull {
 						generatedAuto = true
 						continue
@@ -1276,13 +1427,13 @@ func executeInsertDuplicateUpdate(database *storage.Database, table *storage.Tab
 				if !ok {
 					return nil, fmt.Errorf("%w: %s", storage.ErrColumnNotFound, columnName)
 				}
-				return candidate[position].Interface(), nil
+				return jsonColumnValue(table.ColumnsView()[position], candidate[position]), nil
 			}
 			position, ok := table.ColumnIndex(name)
 			if !ok {
 				return nil, fmt.Errorf("%w: %s", storage.ErrColumnNotFound, name)
 			}
-			return updated[position].Interface(), nil
+			return jsonColumnValue(table.ColumnsView()[position], updated[position]), nil
 		})
 		if err != nil {
 			return false, err
@@ -1332,7 +1483,7 @@ func executeInsertDuplicateUpdate(database *storage.Database, table *storage.Tab
 		}
 		return false
 	}
-	_, err := database.ReplaceRowsLimit(table.Name(), predicate, []storage.Row{updated}, 1)
+	_, err := database.ReplaceRowsLimit(table.Name(), predicate, []storage.Row{updated}, 1, !session.ForeignKeyChecksDisabled)
 	return err == nil, err
 }
 
@@ -1481,7 +1632,7 @@ func executeAlterTableAction(store *storage.Store, session *Session, statement p
 				err = table.DropForeignKey(value.Name)
 			} else {
 				foreignKey := value.ForeignKey
-				err = database.AddForeignKey(table.Name(), storage.ForeignKey{Name: foreignKey.Name, Columns: foreignKey.Columns, RefTable: foreignKey.RefTable, RefColumns: foreignKey.RefColumns, OnDelete: foreignKey.OnDelete, OnUpdate: foreignKey.OnUpdate})
+				err = database.AddForeignKey(table.Name(), storage.ForeignKey{Name: foreignKey.Name, Columns: foreignKey.Columns, RefTable: foreignKey.RefTable, RefColumns: foreignKey.RefColumns, OnDelete: foreignKey.OnDelete, OnUpdate: foreignKey.OnUpdate}, !session.ForeignKeyChecksDisabled)
 			}
 		}
 		return &Result{Message: "foreign key altered"}, err
@@ -1591,6 +1742,31 @@ func executeDropTables(store *storage.Store, session *Session, statement parser.
 			return nil, false, err
 		}
 		targets = append(targets, dropTarget{database: database, table: tableName})
+	}
+	if !session.ForeignKeyChecksDisabled {
+		for _, target := range targets {
+			for _, childName := range target.database.ListTables() {
+				child, childErr := target.database.Table(childName)
+				if childErr != nil {
+					continue
+				}
+				droppingChild := false
+				for _, other := range targets {
+					if other.database == target.database && strings.EqualFold(other.table, childName) {
+						droppingChild = true
+					}
+				}
+				if droppingChild {
+					continue
+				}
+				for _, fk := range child.ForeignKeys() {
+					_, parent := splitTableName(fk.RefTable)
+					if strings.EqualFold(parent, target.table) {
+						return nil, false, fmt.Errorf("%w: table %s is referenced by %s", storage.ErrForeignKeyReferenced, target.table, childName)
+					}
+				}
+			}
+		}
 	}
 	var dropped uint64
 	for _, target := range targets {
@@ -1749,9 +1925,21 @@ func executeCreateTableAs(store *storage.Store, session *Session, statement pars
 		columns[index] = storage.Column{
 			Name:            column.Name,
 			Type:            column.Type,
+			SQLType:         column.SQLType,
+			Collation:       column.Collation,
 			Length:          length,
 			MetadataVersion: 1,
 			Nullable:        nullable,
+		}
+		if column.Type == storage.TypeDecimal {
+			declaration, err := decimalResultDeclaration(column, rows, index)
+			if err != nil {
+				return nil, false, err
+			}
+			columns[index].SQLType = declaration
+		}
+		if column.jsonValue {
+			columns[index].SQLType = "JSON"
 		}
 	}
 	table, err := database.CreateTable(targetTableName, columns)
@@ -1764,7 +1952,7 @@ func executeCreateTableAs(store *storage.Store, session *Session, statement pars
 		}
 		row := make(storage.Row, len(values))
 		for index, value := range values {
-			row[index], err = storage.NewValue(columns[index].Type, value)
+			row[index], err = interfaceToColumnValue(value, columns[index])
 			if err != nil {
 				return nil, false, err
 			}
@@ -1816,6 +2004,19 @@ func executeSelect(store *storage.Store, session *Session, statement parser.Sele
 	query.Distinct = false
 	query.HasLimit = false
 	query.Limit, query.Offset = 0, 0
+	if querySortEnabled(session) {
+		streamSession := *session
+		streamSession.StreamResults = true
+		source, err := executeSelectCore(store, &streamSession, query)
+		if err != nil {
+			return nil, err
+		}
+		limit := -1
+		if statement.HasLimit {
+			limit = statement.Limit
+		}
+		return executeBudgetedDistinct(session, source, statement.Offset, limit)
+	}
 	result, err := executeSelectCore(store, session, query)
 	if err != nil {
 		return nil, err
@@ -1839,7 +2040,7 @@ func executeSelect(store *storage.Store, session *Session, statement parser.Sele
 		start = len(distinct)
 	}
 	end := len(distinct)
-	if statement.HasLimit && start+statement.Limit < end {
+	if statement.HasLimit && statement.Limit < end-start {
 		end = start + statement.Limit
 	}
 	return &Result{Columns: result.Columns, Rows: distinct[start:end]}, nil
@@ -1934,7 +2135,7 @@ func executeUnion(store *storage.Store, session *Session, statement parser.Union
 		start = len(rows)
 	}
 	end := len(rows)
-	if statement.HasLimit && start+statement.Limit < end {
+	if statement.HasLimit && statement.Limit < end-start {
 		end = start + statement.Limit
 	}
 	return &Result{Columns: columns, Rows: rows[start:end]}, nil
@@ -2004,8 +2205,8 @@ func executeExplainSelect(store *storage.Store, session *Session, statement pars
 	if plan != nil {
 		accessType = plan.AccessType
 		selectedKey = plan.Scan.Name
-		if rows, scanErr := table.ScanIndex(plan.Scan, nil, 0, -1); scanErr == nil {
-			estimatedRows = int64(len(rows))
+		if count, scanErr := table.CountIndex(plan.Scan, nil); scanErr == nil {
+			estimatedRows = int64(count)
 		}
 	}
 	var possibleValue any
@@ -2104,6 +2305,11 @@ type indexCondition struct {
 }
 
 func planIndexAccess(statement parser.Select, table *storage.Table, session *Session) *indexAccessPlan {
+	for _, column := range table.ColumnsView() {
+		if column.Collation != "" {
+			return nil
+		}
+	}
 	if selectHasWindow(statement.Items) || len(statement.GroupBy) > 0 || statement.Having != nil || selectHasAggregate(statement.Items) && !(len(statement.Items) == 1 && isCountExpression(statement.Items[0].Expression)) {
 		return nil
 	}
@@ -2137,7 +2343,7 @@ func planIndexAccess(statement parser.Select, table *storage.Table, session *Ses
 		if isTextColumn(table.ColumnsView()[position].Type) && !session.IsBinaryCollation() {
 			return
 		}
-		converted, err := literalToValue(literal.Value, table.ColumnsView()[position])
+		converted, err := decimalPredicateLiteral(literal.Value, table.ColumnsView()[position])
 		if err != nil {
 			return
 		}
@@ -2226,18 +2432,33 @@ func indexSatisfiesOrder(index storage.Index, equalityColumns int, order []parse
 	if len(order) == 0 {
 		return false, false
 	}
-	if equalityColumns+len(order) > len(index.Columns) {
-		return false, false
-	}
-	descending := order[0].Desc
-	for position, item := range order {
-		if item.Desc != descending || !strings.EqualFold(stripQualifier(item.Column), index.Columns[equalityColumns+position]) {
+	next := equalityColumns
+	descending := false
+	directionSet := false
+	for _, item := range order {
+		name := stripQualifier(item.Column)
+		constant := false
+		for i := 0; i < equalityColumns; i++ {
+			if strings.EqualFold(name, index.Columns[i]) {
+				constant = true
+				break
+			}
+		}
+		if constant {
+			continue
+		}
+		if next >= len(index.Columns) || !strings.EqualFold(name, index.Columns[next]) {
 			return false, false
 		}
+		if directionSet && item.Desc != descending {
+			return false, false
+		}
+		descending = item.Desc
+		directionSet = true
+		next++
 	}
 	return true, descending
 }
-
 func executeIndexProjection(table *storage.Table, scan storage.IndexScan, predicate storage.Predicate, selected []int, columns []Column, offset, limit int, stream bool) (*Result, error) {
 	rows, err := table.ScanIndex(scan, predicate, offset, limit)
 	if err != nil {
@@ -2309,6 +2530,20 @@ func collectResultRows(result *Result) ([][]any, error) {
 			return nil, err
 		}
 	}
+	for i, row := range rows {
+		copied := false
+		for j, column := range result.Columns {
+			if value, changed := resultSemanticValue(column, row[j]); changed {
+				if !copied {
+					row = append([]any(nil), row...)
+					rows[i] = row
+					copied = true
+				}
+				row[j] = value
+			}
+		}
+	}
+
 	return rows, nil
 }
 
@@ -2435,7 +2670,7 @@ func appendResultRows(table *storage.Table, rows [][]any) error {
 		}
 		row := make(storage.Row, len(values))
 		for index, value := range values {
-			converted, err := storage.NewValue(columns[index].Type, value)
+			converted, err := interfaceToColumnValue(value, columns[index])
 			if err != nil {
 				return err
 			}
@@ -2488,6 +2723,13 @@ func executeSelectCoreInner(store *storage.Store, session *Session, statement pa
 			if rightQualifier == "" {
 				_, rightQualifier = splitTableName(join.Table)
 			}
+			if indexed, used, indexErr := tryIndexedJoinRelations(store, session, table, right, rightQualifier, join); used {
+				if indexErr != nil {
+					return nil, indexErr
+				}
+				table = indexed
+				continue
+			}
 			right, sourceErr = qualifyRelation(right, rightQualifier)
 			if sourceErr != nil {
 				return nil, sourceErr
@@ -2527,11 +2769,11 @@ func executeSelectCoreInner(store *storage.Store, session *Session, statement pa
 				count = 1
 			}
 		} else if accessPlan != nil {
-			rows, scanErr := accessTable.ScanIndex(accessPlan.Scan, predicate, 0, -1)
+			var scanErr error
+			count, scanErr = accessTable.CountIndex(accessPlan.Scan, predicate)
 			if scanErr != nil {
 				return nil, scanErr
 			}
-			count = len(rows)
 		} else if predicate != nil {
 			count = table.Count(predicate)
 		}
@@ -2567,7 +2809,7 @@ func executeSelectCoreInner(store *storage.Store, session *Session, statement pa
 		}
 	}
 	resultColumn := func(column storage.Column, label string) Column {
-		result := Column{Name: label, Type: column.Type, Length: column.Length, Schema: sourceSchema, Table: sourceTable, OriginalName: stripQualifier(column.Name), Nullable: storage.ColumnNullable(column), AutoIncrement: column.AutoIncrement}
+		result := Column{Name: label, Type: column.Type, SQLType: column.SQLType, Collation: column.Collation, jsonValue: strings.EqualFold(strings.TrimSpace(column.SQLType), "JSON"), Length: column.Length, Schema: sourceSchema, Table: sourceTable, OriginalName: stripQualifier(column.Name), Nullable: storage.ColumnNullable(column), AutoIncrement: column.AutoIncrement}
 		if sourceTable != "" {
 			switch table.ColumnKey(column.Name) {
 			case "PRI":
@@ -2633,6 +2875,9 @@ func executeSelectCoreInner(store *storage.Store, session *Session, statement pa
 		limit = statement.Limit
 	}
 	if len(statement.OrderBy) == 0 {
+		if queryGuardsEnabled(session) {
+			return executeBudgetedProjection(session, table, predicate, selected, resultColumns, statement.Offset, limit)
+		}
 		if accessPlan != nil {
 			return executeIndexProjection(accessTable, accessPlan.Scan, predicate, selected, resultColumns, statement.Offset, limit, session.StreamResults)
 		}
@@ -2693,25 +2938,65 @@ func executeSelectCoreInner(store *storage.Store, session *Session, statement pa
 		orderPositions = append(orderPositions, position)
 		orderDescending = append(orderDescending, order.Desc)
 	}
-	rows := table.Project(predicate, scanColumns, 0, -1)
-	sort.SliceStable(rows, func(i, j int) bool {
+	compare := func(left, right []any) int {
 		for index, position := range orderPositions {
-			comparison := session.Compare(rows[i][position], rows[j][position])
-			if comparison != 0 {
-				if orderDescending[index] {
-					return comparison > 0
+			leftValue, rightValue := left[position], right[position]
+			if c := columns[scanColumns[position]]; c.Collation != "" {
+				if v, ok := leftValue.(string); ok {
+					leftValue = collatedText{v, c.Collation}
 				}
-				return comparison < 0
+				if v, ok := rightValue.(string); ok {
+					rightValue = collatedText{v, c.Collation}
+				}
+			}
+			cmp := session.Compare(leftValue, rightValue)
+			if cmp != 0 {
+				if orderDescending[index] {
+					return -cmp
+				}
+				return cmp
 			}
 		}
-		return false
-	})
+		return 0
+	}
+	if querySortEnabled(session) {
+		q := session.query
+		return executeBudgetedOrder(session, resultColumns, compare, func(yield func([]any) error) error {
+			scratch := make([]any, len(scanColumns))
+			return visitQueryTable(q, table, predicate, func(row storage.Row) error {
+				for i, column := range scanColumns {
+					scratch[i] = jsonColumnValue(columns[column], row[column])
+				}
+				return yield(scratch)
+			})
+		}, statement.Offset, limit)
+	}
+	var rows [][]any
+	k, bounded := boundedSortLimit(statement.Offset, statement.Limit, table.RowCount())
+	if statement.HasLimit && bounded {
+		heap := boundedRows[[]any]{limit: k, compare: compare}
+		scratch := make([]any, len(scanColumns))
+		err := table.Visit(predicate, func(row storage.Row) error {
+			for i, column := range scanColumns {
+				scratch[i] = jsonColumnValue(columns[column], row[column])
+			}
+			heap.offer(scratch, func(value []any) []any { return append([]any(nil), value...) })
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		rows = heap.sorted()
+	} else {
+		rows = table.Project(predicate, scanColumns, 0, -1)
+		sort.SliceStable(rows, func(i, j int) bool { return compare(rows[i], rows[j]) < 0 })
+	}
 	start := statement.Offset
 	if start > len(rows) {
 		start = len(rows)
 	}
 	end := len(rows)
-	if statement.HasLimit && start+statement.Limit < end {
+	if statement.HasLimit && statement.Limit < end-start {
 		end = start + statement.Limit
 	}
 	rows = rows[start:end]
@@ -2828,7 +3113,10 @@ func materializeDerivedTable(alias string, result *Result) (*storage.Table, erro
 		if column.Type == storage.TypeVarchar {
 			length = 65535
 		}
-		columns[index] = storage.Column{Name: column.Name, Type: column.Type, Length: length}
+		columns[index] = storage.Column{Name: column.Name, Type: column.Type, SQLType: column.SQLType, Collation: column.Collation, Length: length}
+		if column.jsonValue {
+			columns[index].SQLType = "JSON"
+		}
 	}
 	table, err := storage.NewTransientTable(alias, columns)
 	if err != nil {
@@ -2840,7 +3128,7 @@ func materializeDerivedTable(alias string, result *Result) (*storage.Table, erro
 		}
 		row := make(storage.Row, len(values))
 		for index, value := range values {
-			converted, conversionErr := storage.NewValue(columns[index].Type, value)
+			converted, conversionErr := interfaceToColumnValue(value, columns[index])
 			if conversionErr != nil {
 				return conversionErr
 			}
@@ -3077,7 +3365,7 @@ func executeExpressionSelect(store *storage.Store, table, accessTable *storage.T
 	for _, item := range statement.Items {
 		if strings.TrimSpace(item.Expression) == "*" {
 			for _, source := range tableColumns {
-				plans = append(plans, projectedExpression{expression: parser.Identifier{Name: source.Name}, column: Column{Name: stripQualifier(source.Name), Type: source.Type}})
+				plans = append(plans, projectedExpression{expression: parser.Identifier{Name: source.Name}, column: Column{Name: stripQualifier(source.Name), Type: source.Type, SQLType: source.SQLType, Collation: source.Collation, jsonValue: strings.EqualFold(strings.TrimSpace(source.SQLType), "JSON")}})
 			}
 			continue
 		}
@@ -3096,7 +3384,9 @@ func executeExpressionSelect(store *storage.Store, table, accessTable *storage.T
 		if err != nil {
 			return nil, err
 		}
-		plans = append(plans, projectedExpression{expression: expression, column: Column{Name: name, Type: dataType}})
+		column := Column{Name: name, Type: dataType, jsonValue: expressionReturnsJSON(expression, table)}
+		inheritExpressionColumn(&column, expression, table)
+		plans = append(plans, projectedExpression{expression: expression, column: column})
 	}
 	result := &Result{Columns: make([]Column, len(plans))}
 	for index := range plans {
@@ -3112,6 +3402,9 @@ func executeExpressionSelect(store *storage.Store, table, accessTable *storage.T
 			values[index] = value
 		}
 		return values, nil
+	}
+	if querySortEnabled(session) && len(statement.OrderBy) > 0 {
+		return executeBudgetedExpressionOrder(store, session, statement, table, predicate, result.Columns, project)
 	}
 	var sourceRows []storage.Row
 	indexOrdered, indexLimited := false, false
@@ -3185,7 +3478,23 @@ func executeExpressionSelect(store *storage.Store, table, accessTable *storage.T
 			orderExpressions[index] = expression
 		}
 	}
+	compare := func(left, right projectedRow) int {
+		for i, order := range statement.OrderBy {
+			cmp := session.Compare(left.keys[i], right.keys[i])
+			if cmp != 0 {
+				if order.Desc {
+					return -cmp
+				}
+				return cmp
+			}
+		}
+		return 0
+	}
+	k, bounded := boundedSortLimit(statement.Offset, statement.Limit, table.RowCount())
+	bounded = bounded && statement.HasLimit && len(statement.OrderBy) > 0 && !indexOrdered
+	heap := boundedRows[projectedRow]{limit: k, compare: compare}
 	rows := make([]projectedRow, 0)
+	account := newQueryMemoryAccount(session, "expression result")
 	appendRow := func(row storage.Row) error {
 		values, err := project(row)
 		if err != nil {
@@ -3202,7 +3511,14 @@ func executeExpressionSelect(store *storage.Store, table, accessTable *storage.T
 				return err
 			}
 		}
-		rows = append(rows, projected)
+		if bounded {
+			heap.offer(projected, func(value projectedRow) projectedRow { return value })
+		} else {
+			if err := account.Reserve(queryRowBytes(projected.values) + queryRowBytes(projected.keys)); err != nil {
+				return err
+			}
+			rows = append(rows, projected)
+		}
 		return nil
 	}
 	var err error
@@ -3213,24 +3529,15 @@ func executeExpressionSelect(store *storage.Store, table, accessTable *storage.T
 			}
 		}
 	} else {
-		err = table.Visit(predicate, appendRow)
+		err = visitQueryTable(session.query, table, predicate, appendRow)
 	}
 	if err != nil {
 		return nil, err
 	}
-	if len(statement.OrderBy) > 0 && !indexOrdered {
-		sort.SliceStable(rows, func(i, j int) bool {
-			for index := range statement.OrderBy {
-				comparison := session.Compare(rows[i].keys[index], rows[j].keys[index])
-				if comparison != 0 {
-					if statement.OrderBy[index].Desc {
-						return comparison > 0
-					}
-					return comparison < 0
-				}
-			}
-			return false
-		})
+	if bounded {
+		rows = heap.sorted()
+	} else if len(statement.OrderBy) > 0 && !indexOrdered {
+		sort.SliceStable(rows, func(i, j int) bool { return compare(rows[i], rows[j]) < 0 })
 	}
 	start := statement.Offset
 	if indexLimited {
@@ -3240,7 +3547,7 @@ func executeExpressionSelect(store *storage.Store, table, accessTable *storage.T
 		start = len(rows)
 	}
 	end := len(rows)
-	if statement.HasLimit && !indexLimited && start+statement.Limit < end {
+	if statement.HasLimit && !indexLimited && statement.Limit < end-start {
 		end = start + statement.Limit
 	}
 	result.Rows = make([][]any, end-start)
@@ -3274,15 +3581,19 @@ func expressionTypeWithSession(expression parser.Expr, table *storage.Table, col
 		if left == storage.TypeDouble || right == storage.TypeDouble || left == storage.TypeFloat || right == storage.TypeFloat {
 			return storage.TypeDouble, nil
 		}
+		if left == storage.TypeDecimal || right == storage.TypeDecimal {
+			return storage.TypeDecimal, nil
+		}
 		return storage.TypeBigInt, nil
 	case parser.CaseExpr:
+		branches := make([]parser.Expr, 0, len(value.Whens)+1)
 		for _, branch := range value.Whens {
-			return expressionTypeWithSession(branch.Then, table, columns, session)
+			branches = append(branches, branch.Then)
 		}
 		if value.Else != nil {
-			return expressionTypeWithSession(value.Else, table, columns, session)
+			branches = append(branches, value.Else)
 		}
-		return storage.TypeVarchar, nil
+		return commonExpressionType(branches, table, columns, session)
 	case parser.ScalarSubquery:
 		return storage.TypeVarchar, nil
 	case parser.ExistsExpr:
@@ -3299,10 +3610,11 @@ func expressionTypeWithSession(expression parser.Expr, table *storage.Table, col
 	case parser.LiteralExpr:
 		switch value.Value.Kind {
 		case parser.LiteralNumber:
-			if strings.Contains(value.Value.Text, ".") {
-				return storage.TypeDouble, nil
+			number, err := decimalLiteral(value.Value.Text)
+			if err != nil {
+				return "", err
 			}
-			return storage.TypeBigInt, nil
+			return scalarValueType(number), nil
 		case parser.LiteralBoolean:
 			return storage.TypeBoolean, nil
 		default:
@@ -3312,12 +3624,24 @@ func expressionTypeWithSession(expression parser.Expr, table *storage.Table, col
 		return storage.TypeVarchar, nil
 	case parser.FunctionExpr:
 		name := strings.ToUpper(value.Name)
+		if typ, ok := jsonFunctionType(name); ok {
+			return typ, nil
+		}
 		switch name {
 		case "COUNT":
 			return storage.TypeBigInt, nil
 		case "LAST_INSERT_ID":
 			return storage.TypeBigInt, nil
 		case "AVG":
+			if len(value.Args) == 1 {
+				typ, err := expressionTypeWithSession(value.Args[0], table, columns, session)
+				if err != nil {
+					return "", err
+				}
+				if typ == storage.TypeDecimal {
+					return typ, nil
+				}
+			}
 			return storage.TypeDouble, nil
 		case "SUM", "MIN", "MAX":
 			if len(value.Args) == 1 {
@@ -3330,26 +3654,33 @@ func expressionTypeWithSession(expression parser.Expr, table *storage.Table, col
 			return storage.TypeBigInt, nil
 		case "ISNULL":
 			return storage.TypeBoolean, nil
-		case "ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "TRUNCATE", "MOD", "POW", "POWER", "SQRT",
+		case "ABS", "CEIL", "CEILING", "FLOOR", "ROUND", "TRUNCATE", "MOD":
+			if len(value.Args) > 0 {
+				typ, err := expressionTypeWithSession(value.Args[0], table, columns, session)
+				if err != nil {
+					return "", err
+				}
+				if typ == storage.TypeDecimal {
+					return typ, nil
+				}
+			}
+			return storage.TypeDouble, nil
+		case "POW", "POWER", "SQRT",
 			"EXP", "LN", "LOG", "LOG2", "LOG10", "PI":
 			return storage.TypeDouble, nil
 		case "CURDATE", "CURRENT_DATE", "DATE", "DATE_SUB", "DATE_ADD", "LAST_DAY":
 			return storage.TypeDate, nil
 		case "NOW", "CURRENT_TIMESTAMP":
 			return storage.TypeDateTime, nil
-		case "COALESCE", "IFNULL", "NULLIF", "GREATEST", "LEAST":
-			for _, argument := range value.Args {
-				if _, isNull := argument.(parser.LiteralExpr); isNull {
-					literal := argument.(parser.LiteralExpr)
-					if literal.Value.Kind == parser.LiteralNull {
-						continue
-					}
-				}
-				return expressionTypeWithSession(argument, table, columns, session)
+		case "COALESCE", "IFNULL", "GREATEST", "LEAST":
+			return commonExpressionType(value.Args, table, columns, session)
+		case "NULLIF":
+			if len(value.Args) > 0 {
+				return expressionTypeWithSession(value.Args[0], table, columns, session)
 			}
 		case "IF":
 			if len(value.Args) == 3 {
-				return expressionTypeWithSession(value.Args[1], table, columns, session)
+				return commonExpressionType(value.Args[1:], table, columns, session)
 			}
 		}
 		return storage.TypeVarchar, nil
@@ -3359,6 +3690,15 @@ func expressionTypeWithSession(expression parser.Expr, table *storage.Table, col
 		case "ROW_NUMBER", "RANK", "DENSE_RANK", "COUNT":
 			return storage.TypeBigInt, nil
 		case "AVG":
+			if len(value.Function.Args) == 1 {
+				typ, err := expressionTypeWithSession(value.Function.Args[0], table, columns, session)
+				if err != nil {
+					return "", err
+				}
+				if typ == storage.TypeDecimal {
+					return typ, nil
+				}
+			}
 			return storage.TypeDouble, nil
 		case "SUM", "MIN", "MAX":
 			if len(value.Function.Args) == 1 {
@@ -3420,7 +3760,7 @@ func executeWindowSelect(table *storage.Table, predicate storage.Predicate, stat
 			for _, source := range columns {
 				plan := windowPlan{
 					expression: parser.Identifier{Name: source.Name},
-					column:     Column{Name: stripQualifier(source.Name), Type: source.Type},
+					column:     Column{Name: stripQualifier(source.Name), Type: source.Type, SQLType: source.SQLType, Collation: source.Collation, jsonValue: strings.EqualFold(strings.TrimSpace(source.SQLType), "JSON")},
 				}
 				plans = append(plans, plan)
 				result.Columns = append(result.Columns, plan.column)
@@ -3442,7 +3782,7 @@ func executeWindowSelect(table *storage.Table, predicate storage.Predicate, stat
 		if err != nil {
 			return nil, err
 		}
-		plan := windowPlan{expression: expression, column: Column{Name: name, Type: dataType}}
+		plan := windowPlan{expression: expression, column: Column{Name: name, Type: dataType, jsonValue: expressionReturnsJSON(expression, table)}}
 		if window, ok := expression.(parser.WindowExpr); ok {
 			plan.window = &window
 		}
@@ -3450,8 +3790,12 @@ func executeWindowSelect(table *storage.Table, predicate storage.Predicate, stat
 		result.Columns = append(result.Columns, plan.column)
 	}
 
-	rows := make([]storage.Row, 0, table.RowCount())
-	if err := table.Visit(predicate, func(row storage.Row) error {
+	account := newQueryMemoryAccount(session, "window query")
+	rows := make([]storage.Row, 0)
+	if err := visitQueryTable(session.query, table, predicate, func(row storage.Row) error {
+		if err := account.Reserve(queryStorageRowBytes(row) + int64(128+len(plans)*128)); err != nil {
+			return err
+		}
 		rows = append(rows, append(storage.Row(nil), row...))
 		return nil
 	}); err != nil {
@@ -3527,7 +3871,7 @@ func executeWindowSelect(table *storage.Table, predicate storage.Predicate, stat
 		start = len(projected)
 	}
 	end := len(projected)
-	if statement.HasLimit && start+statement.Limit < end {
+	if statement.HasLimit && statement.Limit < end-start {
 		end = start + statement.Limit
 	}
 	result.Rows = projected[start:end]
@@ -3618,9 +3962,14 @@ func evaluateWindow(table *storage.Table, rows []storage.Row, output [][]any, ou
 					if err != nil {
 						return err
 					}
-					updateAggregate(&state, windowAggregateKind(name), candidate, star, session)
+					if err := updateAggregate(&state, windowAggregateKind(name), candidate, star, session); err != nil {
+						return err
+					}
 				}
-				value := finishAggregate(state, windowAggregateKind(name), resultType)
+				value, err := finishAggregate(state, windowAggregateKind(name), resultType)
+				if err != nil {
+					return err
+				}
 				for _, rowIndex := range indexes {
 					output[rowIndex][outputIndex] = value
 				}
@@ -3639,9 +3988,14 @@ func evaluateWindow(table *storage.Table, rows []storage.Row, output [][]any, ou
 					if err != nil {
 						return err
 					}
-					updateAggregate(&state, windowAggregateKind(name), candidate, star, session)
+					if err := updateAggregate(&state, windowAggregateKind(name), candidate, star, session); err != nil {
+						return err
+					}
 				}
-				value := finishAggregate(state, windowAggregateKind(name), resultType)
+				value, err := finishAggregate(state, windowAggregateKind(name), resultType)
+				if err != nil {
+					return err
+				}
 				for position := start; position < end; position++ {
 					output[indexes[position]][outputIndex] = value
 				}
@@ -3710,10 +4064,14 @@ const (
 )
 
 type aggregateState struct {
-	count int64
-	sum   float64
-	value any
-	has   bool
+	decimal      decimalAggregate
+	decimalTyped bool
+	integerSum   int64
+	approx       bool
+	count        int64
+	sum          float64
+	value        any
+	has          bool
 }
 
 type groupedBucket struct {
@@ -3777,6 +4135,11 @@ func collectAggregateNodes(expression parser.Expr, nodes map[string]aggregateNod
 }
 
 func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, statement parser.Select, columns []storage.Column, session *Session) (*Result, error) {
+	return executeGroupedSelectWithSource(table, statement, columns, session, func(yield func(storage.Row) error) error {
+		return visitQueryTable(session.query, table, predicate, yield)
+	})
+}
+func executeGroupedSelectWithSource(table *storage.Table, statement parser.Select, columns []storage.Column, session *Session, source func(func(storage.Row) error) error) (*Result, error) {
 	groupExpressions := make([]parser.Expr, len(statement.GroupBy))
 	groupIndexes := make([]int, len(statement.GroupBy))
 	groupPositions := make(map[int]int, len(statement.GroupBy))
@@ -3870,6 +4233,9 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 			case aggregateMin, aggregateMax:
 				resultType = columns[columnIndex].Type
 			}
+			if columnIndex >= 0 && columns[columnIndex].Type == storage.TypeDecimal && (kind == aggregateSum || kind == aggregateAvg) {
+				resultType = storage.TypeDecimal
+			}
 			items[index] = groupedSelectItem{aggregate: kind, aggregateColumn: columnIndex, resultType: resultType}
 			name := item.Alias
 			if name == "" {
@@ -3909,16 +4275,21 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 				name = stripQualifier(identifier.Name)
 			}
 		}
-		resultColumns[index] = Column{Name: name, Type: resultType}
+		resultColumns[index] = Column{Name: name, Type: resultType, jsonValue: expressionReturnsJSON(expression, table)}
+		inheritExpressionColumn(&resultColumns[index], expression, table)
 	}
 
+	account := newQueryMemoryAccount(session, "GROUP BY")
 	groups := make(map[string]int)
 	buckets := make([]groupedBucket, 0)
 	if len(groupIndexes) == 0 {
+		if err := account.Reserve(aggregateBucketBytes(nil, "", len(items), len(aggregateNodes))); err != nil {
+			return nil, err
+		}
 		groups[""] = 0
 		buckets = append(buckets, groupedBucket{states: make([]aggregateState, len(items)), aggregates: make(map[string]aggregateState)})
 	}
-	err := table.Visit(predicate, func(row storage.Row) error {
+	err := source(func(row storage.Row) error {
 		groupValues := make([]any, len(groupIndexes))
 		for index, expression := range groupExpressions {
 			value, evalErr := evaluateExprWithContext(expression, table, row, session, nil)
@@ -3930,6 +4301,9 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 		key := groupedRowKey(groupValues, session)
 		bucketIndex, exists := groups[key]
 		if !exists {
+			if err := account.Reserve(aggregateBucketBytes(groupValues, key, len(items), len(aggregateNodes))); err != nil {
+				return err
+			}
 			bucketIndex = len(buckets)
 			groups[key] = bucketIndex
 			buckets = append(buckets, groupedBucket{groupValues: groupValues, states: make([]aggregateState, len(items)), aggregates: make(map[string]aggregateState)})
@@ -3944,7 +4318,13 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 				candidate = value
 			}
 			state := buckets[bucketIndex].aggregates[key]
-			updateAggregate(&state, node.kind, candidate, node.star, session)
+			previousBytes := queryRowBytes([]any{state.value})
+			if err := updateAggregate(&state, node.kind, candidate, node.star, session); err != nil {
+				return err
+			}
+			if err := account.Resize(previousBytes, queryRowBytes([]any{state.value})); err != nil {
+				return err
+			}
 			buckets[bucketIndex].aggregates[key] = state
 		}
 		for itemIndex, item := range items {
@@ -3953,9 +4333,16 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 			}
 			var candidate any
 			if item.aggregateColumn >= 0 {
-				candidate = row[item.aggregateColumn].Interface()
+				candidate = jsonColumnValue(columns[item.aggregateColumn], row[item.aggregateColumn])
 			}
-			updateAggregate(&buckets[bucketIndex].states[itemIndex], item.aggregate, candidate, item.aggregateColumn < 0, session)
+			state := &buckets[bucketIndex].states[itemIndex]
+			previousBytes := queryRowBytes([]any{state.value})
+			if err := updateAggregate(state, item.aggregate, candidate, item.aggregateColumn < 0, session); err != nil {
+				return err
+			}
+			if err := account.Resize(previousBytes, queryRowBytes([]any{state.value})); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -3973,7 +4360,11 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 				}
 				resultRow[itemIndex] = bucket.groupValues[item.groupPosition]
 			} else {
-				resultRow[itemIndex] = finishAggregate(bucket.states[itemIndex], item.aggregate, item.resultType)
+				value, err := finishAggregate(bucket.states[itemIndex], item.aggregate, item.resultType)
+				if err != nil {
+					return nil, err
+				}
+				resultRow[itemIndex] = value
 			}
 		}
 		for itemIndex := range statement.Items {
@@ -3993,6 +4384,9 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 			if !truthy(value) {
 				continue
 			}
+		}
+		if err := account.Reserve(queryRowBytes(resultRow)); err != nil {
+			return nil, err
 		}
 		resultRows = append(resultRows, resultRow)
 	}
@@ -4023,7 +4417,7 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 		start = len(resultRows)
 	}
 	end := len(resultRows)
-	if statement.HasLimit && start+statement.Limit < end {
+	if statement.HasLimit && statement.Limit < end-start {
 		end = start + statement.Limit
 	}
 	return &Result{Columns: resultColumns, Rows: resultRows[start:end]}, nil
@@ -4057,7 +4451,7 @@ func evaluateGroupedExpression(expression parser.Expr, resultColumns []Column, r
 			return session, nil
 		}
 		if node, ok := nodes[name]; ok {
-			return finishAggregate(bucket.aggregates[name], node.kind, storage.TypeDouble), nil
+			return finishAggregate(bucket.aggregates[name], node.kind, storage.TypeDouble)
 		}
 		for index, column := range resultColumns {
 			if strings.EqualFold(column.Name, name) {
@@ -4112,23 +4506,56 @@ func aggregateName(kind aggregateKind) string {
 }
 
 func isNumericType(dataType storage.DataType) bool {
-	return dataType == storage.TypeInt || dataType == storage.TypeBigInt || dataType == storage.TypeFloat || dataType == storage.TypeDouble
+	return dataType == storage.TypeDecimal || dataType == storage.TypeInt || dataType == storage.TypeBigInt || dataType == storage.TypeFloat || dataType == storage.TypeDouble
 }
 
-func updateAggregate(state *aggregateState, kind aggregateKind, candidate any, countAll bool, session *Session) {
+func updateAggregate(state *aggregateState, kind aggregateKind, candidate any, countAll bool, session *Session) error {
 	if kind == aggregateCount {
 		if countAll || candidate != nil {
 			state.count++
 		}
-		return
+		return nil
 	}
 	if candidate == nil {
-		return
+		return nil
 	}
 	switch kind {
 	case aggregateSum, aggregateAvg:
-		value, _ := numeric(candidate)
-		state.sum += value
+		switch candidate.(type) {
+		case float32, float64:
+			if !state.approx {
+				if state.decimal.has {
+					state.sum, _ = state.decimal.sum.Float64()
+				} else {
+					state.sum = float64(state.integerSum)
+				}
+			}
+			state.approx = true
+		}
+		if state.approx {
+			number, ok := numeric(candidate)
+			if !ok {
+				return fmt.Errorf("aggregate requires a numeric value")
+			}
+			state.sum += number
+		} else if integer, ok := candidate.(int64); ok && !state.decimal.has && !(integer > 0 && state.integerSum > math.MaxInt64-integer) && !(integer < 0 && state.integerSum < math.MinInt64-integer) {
+			state.integerSum += integer
+		} else {
+			if !state.decimal.has && state.has {
+				state.decimal.add(storage.Decimal(strconv.FormatInt(state.integerSum, 10)))
+			}
+			d, err := storage.DecimalFrom(candidate)
+			if err != nil {
+				return err
+			}
+			state.decimal.add(d)
+			if state.decimal.err != nil {
+				return state.decimal.err
+			}
+			if _, ok := candidate.(storage.Decimal); ok {
+				state.decimalTyped = true
+			}
+		}
 		state.count++
 		state.has = true
 	case aggregateMin:
@@ -4142,32 +4569,61 @@ func updateAggregate(state *aggregateState, kind aggregateKind, candidate any, c
 			state.has = true
 		}
 	}
+	return nil
 }
-
-func finishAggregate(state aggregateState, kind aggregateKind, resultType storage.DataType) any {
+func finishAggregate(state aggregateState, kind aggregateKind, resultType storage.DataType) (any, error) {
 	switch kind {
 	case aggregateCount:
-		return state.count
-	case aggregateSum:
+		return state.count, nil
+	case aggregateSum, aggregateAvg:
 		if !state.has {
-			return nil
+			return nil, nil
+		}
+		if !state.approx {
+			if state.decimal.has {
+				if state.decimal.err != nil {
+					return nil, state.decimal.err
+				}
+				if state.decimalTyped || resultType == storage.TypeDecimal {
+					if kind == aggregateAvg {
+						return state.decimal.average(state.count)
+					}
+					return state.decimal.sum, nil
+				}
+				if kind == aggregateSum && resultType == storage.TypeBigInt {
+					return state.decimal.sum.Int64()
+				}
+				number, err := state.decimal.sum.Float64()
+				if err != nil {
+					return nil, err
+				}
+				if kind == aggregateAvg {
+					return number / float64(state.count), nil
+				}
+				return number, nil
+			}
+			if kind == aggregateAvg {
+				return float64(state.integerSum) / float64(state.count), nil
+			}
+			if resultType == storage.TypeBigInt {
+				return state.integerSum, nil
+			}
+			return float64(state.integerSum), nil
+		}
+		if kind == aggregateAvg {
+			return state.sum / float64(state.count), nil
 		}
 		if resultType == storage.TypeBigInt {
-			return int64(state.sum)
+			return int64(state.sum), nil
 		}
-		return state.sum
-	case aggregateAvg:
-		if state.count == 0 {
-			return nil
-		}
-		return state.sum / float64(state.count)
+		return state.sum, nil
 	case aggregateMin, aggregateMax:
 		if !state.has {
-			return nil
+			return nil, nil
 		}
-		return state.value
+		return state.value, nil
 	default:
-		return nil
+		return nil, nil
 	}
 }
 
@@ -4256,6 +4712,18 @@ func evaluateGroupedResult(expr parser.Expr, statement parser.Select, resultColu
 func groupedRowKey(values []any, session *Session) string {
 	var key strings.Builder
 	for _, value := range values {
+		if text, ok := value.(collatedText); ok {
+			v := text.Text
+			if strings.HasSuffix(strings.ToLower(text.Collation), "_ci") {
+				v = strings.ToLower(v)
+			}
+			text := fmt.Sprintf("%T:%v", "", v)
+			fmt.Fprintf(&key, "%d:%s;", len(text), text)
+			continue
+		}
+		if d, ok := value.(storage.Decimal); ok {
+			value = storage.Decimal(storage.DecimalKey(d))
+		}
 		if text, ok := value.(string); ok {
 			if session == nil || !strings.HasSuffix(strings.ToLower(session.CollationConnection), "_bin") && !strings.EqualFold(session.CollationConnection, "binary") {
 				value = strings.ToLower(text)
@@ -4321,6 +4789,7 @@ func executeScalarSelect(session *Session, statement parser.Select) (*Result, er
 					return nil, parseErr
 				}
 				column.Type = scalarExpressionType(parsed, value)
+				_, column.jsonValue = value.(jsonDocument)
 			}
 		}
 		result.Columns = append(result.Columns, column)
@@ -4331,12 +4800,16 @@ func executeScalarSelect(session *Session, statement parser.Select) (*Result, er
 
 func scalarValueType(value any) storage.DataType {
 	switch value.(type) {
+	case storage.Decimal:
+		return storage.TypeDecimal
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
 		return storage.TypeBigInt
 	case float32, float64:
 		return storage.TypeDouble
 	case bool:
 		return storage.TypeBoolean
+	case jsonDocument:
+		return storage.TypeText
 	case time.Time:
 		return storage.TypeDateTime
 	default:
@@ -4346,6 +4819,9 @@ func scalarValueType(value any) storage.DataType {
 
 func scalarExpressionType(expression parser.Expr, value any) storage.DataType {
 	if function, ok := expression.(parser.FunctionExpr); ok {
+		if typ, ok := jsonFunctionType(strings.ToUpper(function.Name)); ok {
+			return typ
+		}
 		switch strings.ToUpper(function.Name) {
 		case "CURDATE", "CURRENT_DATE", "DATE", "LAST_DAY":
 			return storage.TypeDate
@@ -4370,7 +4846,7 @@ func executeUpdate(store *storage.Store, session *Session, statement parser.Upda
 		return nil, err
 	}
 	qualifier := mutationQualifier(statement.Table, statement.TableAlias)
-	evaluationTable, err := qualifyRelation(table, qualifier)
+	evaluationTable, err := qualifySchema(table, qualifier)
 	if err != nil {
 		return nil, err
 	}
@@ -4409,28 +4885,28 @@ func executeUpdate(store *storage.Store, session *Session, statement parser.Upda
 		limit = statement.Limit
 	}
 	replacements := make(map[int]storage.Row)
-	for rowIndex, current := range table.Snapshot().Rows {
+	err = table.VisitMutationRows(mutationIndexScan(table, session, statement.Where, evaluationTable), func(rowIndex int, current storage.Row) (bool, error) {
 		if limit >= 0 && len(replacements) >= limit {
-			break
+			return false, nil
 		}
 		if statement.Where != nil {
 			matched, evaluationErr := evaluateExprWithContext(statement.Where, evaluationTable, current, session, store)
 			if evaluationErr != nil {
-				return nil, evaluationErr
+				return false, evaluationErr
 			}
 			if !truthy(matched) {
-				continue
+				return true, nil
 			}
 		}
 		candidate := append(storage.Row(nil), current...)
 		for _, assignment := range assignments {
 			raw, err := evaluateExprWithContext(assignment.expression, evaluationTable, candidate, session, store)
 			if err != nil {
-				return nil, err
+				return false, err
 			}
 			candidate[assignment.position], err = interfaceToColumnValue(raw, columns[assignment.position])
 			if err != nil {
-				return nil, err
+				return false, err
 			}
 		}
 		for position, column := range columns {
@@ -4440,16 +4916,20 @@ func executeUpdate(store *storage.Store, session *Session, statement parser.Upda
 			if strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP") || strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP()") {
 				candidate[position], err = storage.NewValue(column.Type, session.Now())
 				if err != nil {
-					return nil, err
+					return false, err
 				}
 			}
 		}
 		if err := validateCheckConstraints(table, candidate); err != nil {
-			return nil, err
+			return false, err
 		}
 		replacements[rowIndex] = candidate
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	affected, err := database.ApplyRowMutations([]storage.RowMutation{{Table: table.Name(), Replacements: replacements}})
+	affected, err := database.ApplyRowMutations([]storage.RowMutation{{Table: table.Name(), Replacements: replacements}}, !session.ForeignKeyChecksDisabled)
 	return &Result{AffectedRows: uint64(affected), Message: "rows updated"}, err
 }
 func executeDelete(store *storage.Store, session *Session, statement parser.Delete) (*Result, error) {
@@ -4461,7 +4941,7 @@ func executeDelete(store *storage.Store, session *Session, statement parser.Dele
 		return nil, err
 	}
 	qualifier := mutationQualifier(statement.Table, statement.TableAlias)
-	evaluationTable, err := qualifyRelation(table, qualifier)
+	evaluationTable, err := qualifySchema(table, qualifier)
 	if err != nil {
 		return nil, err
 	}
@@ -4474,22 +4954,26 @@ func executeDelete(store *storage.Store, session *Session, statement parser.Dele
 		limit = statement.Limit
 	}
 	deleteIndexes := make([]int, 0)
-	for rowIndex, row := range table.Snapshot().Rows {
+	err = table.VisitMutationRows(mutationIndexScan(table, session, statement.Where, evaluationTable), func(rowIndex int, row storage.Row) (bool, error) {
 		if limit >= 0 && len(deleteIndexes) >= limit {
-			break
+			return false, nil
 		}
 		if statement.Where != nil {
 			matched, evaluationErr := evaluateExprWithContext(statement.Where, evaluationTable, row, session, store)
 			if evaluationErr != nil {
-				return nil, evaluationErr
+				return false, evaluationErr
 			}
 			if !truthy(matched) {
-				continue
+				return true, nil
 			}
 		}
 		deleteIndexes = append(deleteIndexes, rowIndex)
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	affected, err := database.ApplyRowMutations([]storage.RowMutation{{Table: table.Name(), Delete: deleteIndexes}})
+	affected, err := database.ApplyRowMutations([]storage.RowMutation{{Table: table.Name(), Delete: deleteIndexes}}, !session.ForeignKeyChecksDisabled)
 	return &Result{AffectedRows: uint64(affected), Message: "rows deleted"}, err
 }
 
@@ -4606,7 +5090,7 @@ func executeJoinUpdate(store *storage.Store, session *Session, statement parser.
 		}
 		replacements[rowIndex] = candidate
 	}
-	affected, err := target.database.ApplyRowMutations([]storage.RowMutation{{Table: target.table.Name(), Replacements: replacements}})
+	affected, err := target.database.ApplyRowMutations([]storage.RowMutation{{Table: target.table.Name(), Replacements: replacements}}, !session.ForeignKeyChecksDisabled)
 	return &Result{AffectedRows: uint64(affected), Message: "rows updated"}, err
 }
 
@@ -4676,7 +5160,7 @@ func executeMultiTableDelete(store *storage.Store, session *Session, statement p
 	}
 	var affected uint64
 	for database, mutations := range byDatabase {
-		count, mutationErr := database.ApplyRowMutations(mutations)
+		count, mutationErr := database.ApplyRowMutations(mutations, !session.ForeignKeyChecksDisabled)
 		if mutationErr != nil {
 			return nil, mutationErr
 		}
@@ -4884,6 +5368,9 @@ func executeShow(store *storage.Store, session *Session, statement parser.Show) 
 				var collation any
 				if column.Type == storage.TypeVarchar || column.Type == storage.TypeText {
 					collation = "utf8mb4_general_ci"
+					if column.Collation != "" {
+						collation = column.Collation
+					}
 				}
 				row = []any{column.Name, columnSQLType(column), collation, nullable, table.ColumnKey(column.Name), defaultValue, extra, "select,insert,update,references", column.Comment}
 			}
@@ -5236,6 +5723,9 @@ func materializeInSubqueriesForOuter(store *storage.Store, session *Session, exp
 	if expression == nil {
 		return nil, nil
 	}
+	if !expressionHasSubquery(expression) {
+		return expression, nil
+	}
 	switch value := expression.(type) {
 	case parser.ScalarSubquery:
 		if value.Query == nil {
@@ -5291,6 +5781,7 @@ func materializeInSubqueriesForOuter(store *storage.Store, session *Session, exp
 		value.Value = inner
 		return value, err
 	case parser.InExpr:
+		value.Values = append([]parser.Expr(nil), value.Values...)
 		var err error
 		value.Value, err = materializeInSubqueriesForOuter(store, session, value.Value, outer)
 		if err != nil {
@@ -5346,6 +5837,7 @@ func materializeInSubqueriesForOuter(store *storage.Store, session *Session, exp
 		value.Target, err = materializeInSubqueriesForOuter(store, session, value.Target, outer)
 		return value, err
 	case parser.FunctionExpr:
+		value.Args = append([]parser.Expr(nil), value.Args...)
 		for index := range value.Args {
 			var err error
 			value.Args[index], err = materializeInSubqueriesForOuter(store, session, value.Args[index], outer)
@@ -5355,6 +5847,7 @@ func materializeInSubqueriesForOuter(store *storage.Store, session *Session, exp
 		}
 		return value, nil
 	case parser.RowExpr:
+		value.Values = append([]parser.Expr(nil), value.Values...)
 		for index := range value.Values {
 			var err error
 			value.Values[index], err = materializeInSubqueriesForOuter(store, session, value.Values[index], outer)
@@ -5368,6 +5861,7 @@ func materializeInSubqueriesForOuter(store *storage.Store, session *Session, exp
 		value.Value = inner
 		return value, err
 	case parser.CaseExpr:
+		value.Whens = append([]parser.CaseWhen(nil), value.Whens...)
 		var err error
 		value.Operand, err = materializeInSubqueriesForOuter(store, session, value.Operand, outer)
 		if err != nil {
@@ -5391,12 +5885,21 @@ func materializeInSubqueriesForOuter(store *storage.Store, session *Session, exp
 }
 
 func queryResultLiteral(value any) parser.Expr {
+	if doc, ok := value.(jsonDocument); ok {
+		return parser.FunctionExpr{Name: "JSON_EXTRACT", Args: []parser.Expr{parser.LiteralExpr{Value: parser.Literal{Kind: parser.LiteralString, Text: string(doc)}}, parser.LiteralExpr{Value: parser.Literal{Kind: parser.LiteralString, Text: "$"}}}}
+	}
 	literal := parser.Literal{Kind: parser.LiteralString, Text: fmt.Sprint(value)}
 	switch typed := value.(type) {
 	case nil:
 		literal = parser.Literal{Kind: parser.LiteralNull}
 	case bool:
 		literal = parser.Literal{Kind: parser.LiteralBoolean, Text: strconv.FormatBool(typed)}
+	case storage.Decimal:
+		text := typed.String()
+		if !strings.Contains(text, ".") {
+			text += "."
+		}
+		literal = parser.Literal{Kind: parser.LiteralNumber, Text: text}
 	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
 		literal = parser.Literal{Kind: parser.LiteralNumber, Text: fmt.Sprint(typed)}
 	case time.Time:
@@ -5459,7 +5962,7 @@ func lookupUniquePredicate(expr parser.Expr, table *storage.Table, columns []sto
 	if isTextColumn(columns[position].Type) && !session.IsBinaryCollation() {
 		return nil, false, false
 	}
-	value, err := literalToValue(literal.Value, columns[position])
+	value, err := decimalPredicateLiteral(literal.Value, columns[position])
 	if err != nil {
 		return nil, false, false
 	}
@@ -5471,11 +5974,14 @@ func evaluateExpr(expr parser.Expr, table *storage.Table, row storage.Row) (any,
 		if !ok {
 			return nil, fmt.Errorf("unknown column %s", name)
 		}
-		return row[index].Interface(), nil
+		return jsonColumnValue(table.ColumnsView()[index], row[index]), nil
 	})
 }
 
 func evaluateExprWithContext(expr parser.Expr, table *storage.Table, row storage.Row, session *Session, store *storage.Store) (any, error) {
+	if err := checkQuery(session); err != nil {
+		return nil, err
+	}
 	lookup := func(name string) (any, error) {
 		if name == sessionLookupIdentifier {
 			return session, nil
@@ -5485,19 +5991,19 @@ func evaluateExprWithContext(expr parser.Expr, table *storage.Table, row storage
 		}
 		index, ok := queryColumnIndex(table, name)
 		if ok {
-			return row[index].Interface(), nil
+			return jsonColumnValue(table.ColumnsView()[index], row[index]), nil
 		}
 		if correlated, exists := correlationScopeValue(session, name); exists {
 			return correlated, nil
 		}
 		return nil, fmt.Errorf("unknown column %s", name)
 	}
-	if session == nil || store == nil {
+	if session == nil || store == nil || !expressionHasSubquery(expr) {
 		return evaluateExprWithLookup(expr, lookup)
 	}
 	scope := make(map[string]any)
 	for index, column := range table.ColumnsView() {
-		value := row[index].Interface()
+		value := jsonColumnValue(table.ColumnsView()[index], row[index])
 		scope[column.Name] = value
 		scope[stripQualifier(column.Name)] = value
 	}
@@ -5717,7 +6223,7 @@ func evaluateExprWithLookup(expr parser.Expr, lookup func(string) (any, error)) 
 			if left == nil || right == nil {
 				return nil, nil
 			}
-			matched := likeMatchWithLookup(lookup, fmt.Sprint(left), fmt.Sprint(right))
+			matched := likeCollated(left, right, sessionFromLookup(lookup))
 			if value.Operator == "NOT LIKE" {
 				matched = !matched
 			}
@@ -5744,6 +6250,9 @@ func evaluateExprWithLookup(expr parser.Expr, lookup func(string) (any, error)) 
 					}
 					return addSQLInterval(date, interval)
 				}
+			}
+			if result, handled, err := decimalArithmetic(value.Operator, left, right); handled {
+				return result, err
 			}
 			leftNumber, lok := numeric(left)
 			rightNumber, rok := numeric(right)
@@ -5801,6 +6310,13 @@ func evaluateFunction(function parser.FunctionExpr, lookup func(string) (any, er
 		}
 		arguments[index] = value
 	}
+	if result, handled, err := decimalFunction(name, arguments); handled {
+		return result, err
+	}
+	if _, ok := jsonFunctionType(name); ok {
+		return evaluateJSONFunction(name, arguments)
+	}
+
 	require := func(count int) error {
 		if len(arguments) != count {
 			return fmt.Errorf("%s expects %d arguments", name, count)
@@ -6627,16 +7143,16 @@ func literalInterface(value parser.Literal) (any, error) {
 	case parser.LiteralBoolean:
 		return strings.EqualFold(value.Text, "true"), nil
 	case parser.LiteralNumber:
-		if strings.Contains(value.Text, ".") {
-			return strconv.ParseFloat(value.Text, 64)
-		}
-		return strconv.ParseInt(value.Text, 10, 64)
+		return decimalLiteral(value.Text)
 	}
 	return nil, errors.New("invalid literal")
 }
 func literalToValue(literal parser.Literal, column storage.Column) (storage.Value, error) {
 	if literal.Kind == parser.LiteralNull {
 		return storage.NullValue(column.Type), nil
+	}
+	if column.Type == storage.TypeDecimal {
+		return storage.DecimalColumnValue(column, literal.Text)
 	}
 	raw, err := literalInterface(literal)
 	if err != nil {
@@ -6656,10 +7172,26 @@ func literalToValue(literal parser.Literal, column storage.Column) (storage.Valu
 }
 
 func interfaceToColumnValue(raw any, column storage.Column) (storage.Value, error) {
+	if column.Type == storage.TypeDecimal {
+		if column.SQLType == "" {
+			return storage.NewValue(storage.TypeDecimal, raw)
+		}
+		return storage.DecimalColumnValue(column, raw)
+	}
 	if raw == nil {
 		return storage.NullValue(column.Type), nil
 	}
 	if column.Type == storage.TypeInt || column.Type == storage.TypeBigInt {
+		switch typed := raw.(type) {
+		case storage.Decimal:
+			integer, err := typed.Int64()
+			if err != nil {
+				return storage.Value{}, err
+			}
+			return storage.NewValue(column.Type, integer)
+		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
+			return storage.NewValue(column.Type, raw)
+		}
 		if number, ok := numeric(raw); ok && math.Trunc(number) == number && number >= math.MinInt64 && number <= math.MaxInt64 {
 			raw = int64(number)
 		}
@@ -6703,6 +7235,9 @@ func compareAny(left, right any) int {
 			return 0
 		}
 	}
+	if comparison, ok := decimalCompare(left, right); ok {
+		return comparison
+	}
 	lf, lok := numeric(left)
 	rf, rok := numeric(right)
 	if lok && rok {
@@ -6739,6 +7274,12 @@ func comparableSQLTime(value any) (time.Time, bool) {
 }
 func numeric(value any) (float64, bool) {
 	switch n := value.(type) {
+	case storage.Decimal:
+		number, err := n.Float64()
+		return number, err == nil
+	case jsonDocument:
+		parsed, err := strconv.ParseFloat(string(n), 64)
+		return parsed, err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0)
 	case bool:
 		if n {
 			return 1, true
@@ -6773,6 +7314,8 @@ func numeric(value any) (float64, bool) {
 }
 func truthy(value any) bool {
 	switch v := value.(type) {
+	case storage.Decimal:
+		return !v.IsZero()
 	case bool:
 		return v
 	case nil:
@@ -6833,7 +7376,7 @@ func storageColumnDefinition(column parser.ColumnDef) (storage.Column, error) {
 			sqlType = fmt.Sprintf("%s(%d)", sqlType, length)
 		}
 	}
-	definition := storage.Column{Name: column.Name, Type: dataType, SQLType: sqlType, Length: length, MetadataVersion: 1, Nullable: column.Nullable, HasDefault: column.HasDefault, DefaultExpression: column.DefaultExpression, AutoIncrement: column.AutoIncrement, Comment: column.Comment, OnUpdate: column.OnUpdate}
+	definition := storage.Column{Name: column.Name, Type: dataType, SQLType: sqlType, Collation: column.Collation, Length: length, MetadataVersion: 1, Nullable: column.Nullable, HasDefault: column.HasDefault, DefaultExpression: column.DefaultExpression, AutoIncrement: column.AutoIncrement, Comment: column.Comment, OnUpdate: column.OnUpdate}
 	if column.PrimaryKey || column.AutoIncrement {
 		definition.Nullable = false
 	}
@@ -6861,6 +7404,9 @@ func createTableSQL(table *storage.Table) string {
 	parts := make([]string, 0)
 	for _, column := range table.ColumnsView() {
 		definition := fmt.Sprintf("  `%s` %s", column.Name, columnSQLType(column))
+		if column.Collation != "" {
+			definition += " COLLATE " + column.Collation
+		}
 		if !storage.ColumnNullable(column) {
 			definition += " NOT NULL"
 		} else {
@@ -7094,6 +7640,9 @@ func createTableSnapshotSQL(table storage.TableSnapshot) string {
 	parts := make([]string, 0, len(table.Columns)+len(table.Indexes))
 	for _, column := range table.Columns {
 		definition := fmt.Sprintf("  %s %s", quoteIdentifier(column.Name), columnSQLType(column))
+		if column.Collation != "" {
+			definition += " COLLATE " + column.Collation
+		}
 		if !storage.ColumnNullable(column) {
 			definition += " NOT NULL"
 		}
@@ -7335,7 +7884,7 @@ func sqlLiteral(value storage.Value) string {
 		return "NULL"
 	}
 	switch value.Type {
-	case storage.TypeInt, storage.TypeBigInt, storage.TypeFloat, storage.TypeDouble, storage.TypeBoolean:
+	case storage.TypeDecimal, storage.TypeInt, storage.TypeBigInt, storage.TypeFloat, storage.TypeDouble, storage.TypeBoolean:
 		return value.String()
 	default:
 		text := strings.ReplaceAll(value.String(), "\\", "\\\\")
@@ -7348,3 +7897,7 @@ func quoteIdentifier(value string) string {
 }
 
 var _ = time.Time{}
+
+func (s *Session) InTransaction() bool {
+	return s != nil && (s.mvccTransaction != nil || s.transaction != nil)
+}

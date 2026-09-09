@@ -1,0 +1,66 @@
+{
+  "checked_at": "2026-09-08T22:51:38.541125+08:00",
+  "scope": "Official capability background; timings are local measurements; MySQL 8.4 docs do not change tested 8.2 binary version",
+  "sources": [
+    {
+      "title": "SQLite适用场景",
+      "url": "https://www.sqlite.org/whentouse.html"
+    },
+    {
+      "title": "SQLite在线备份",
+      "url": "https://www.sqlite.org/backup.html"
+    },
+    {
+      "title": "SQLite JSON",
+      "url": "https://www.sqlite.org/json1.html"
+    },
+    {
+      "title": "PostgreSQL限制",
+      "url": "https://www.postgresql.org/docs/17/limits.html"
+    },
+    {
+      "title": "PostgreSQL故障切换",
+      "url": "https://www.postgresql.org/docs/17/warm-standby-failover.html"
+    },
+    {
+      "title": "PostgreSQL备份",
+      "url": "https://www.postgresql.org/docs/17/backup.html"
+    },
+    {
+      "title": "PostgreSQL JSON",
+      "url": "https://www.postgresql.org/docs/17/functions-json.html"
+    },
+    {
+      "title": "MySQL InnoDB限制",
+      "url": "https://dev.mysql.com/doc/refman/8.4/en/innodb-limits.html"
+    },
+    {
+      "title": "MySQL Group Replication",
+      "url": "https://dev.mysql.com/doc/refman/8.4/en/group-replication.html"
+    },
+    {
+      "title": "MySQL JSON",
+      "url": "https://dev.mysql.com/doc/refman/8.4/en/json.html"
+    },
+    {
+      "title": "PostgreSQL索引",
+      "url": "https://www.postgresql.org/docs/17/indexes.html"
+    },
+    {
+      "title": "PostgreSQL MVCC",
+      "url": "https://www.postgresql.org/docs/17/mvcc.html"
+    },
+    {
+      "title": "InnoDB多版本",
+      "url": "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+    },
+    {
+      "title": "SQLite查询规划",
+      "url": "https://www.sqlite.org/queryplanner.html"
+    },
+    {
+      "title": "SQLite WAL",
+      "url": "https://www.sqlite.org/wal.html"
+    }
+  ]
+}

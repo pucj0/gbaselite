@@ -1,0 +1,520 @@
+package executor
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"gbaselite/mvcc"
+	"gbaselite/parser"
+	"gbaselite/storage"
+	"strings"
+)
+
+func (e *Engine) mutateMVCC(ctx context.Context, read, write *mvcc.Tx, session *Session, statement parser.Statement) (*Result, error) {
+	if tableName, ok := mvccAlterTarget(statement); ok {
+		return e.alterMVCC(ctx, read, write, session, tableName, statement)
+	}
+	switch value := statement.(type) {
+	case parser.CreateDatabase:
+		name := strings.ToLower(value.Name)
+		if strings.ContainsAny(name, "/\x00") {
+			return nil, errors.New("invalid database identifier")
+		}
+		k := []byte("db/" + name)
+		_, exists, err := write.Get("catalog", k)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			if value.IfNotExists {
+				return &Result{}, nil
+			}
+			return nil, storage.ErrDatabaseExists
+		}
+		return &Result{AffectedRows: 1}, write.Put("catalog", k, []byte{1})
+	case parser.CreateTable:
+		db, name, err := versionedName(session, value.Name)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok, err := write.Get("catalog", []byte("db/"+db)); err != nil || !ok {
+			if err != nil {
+				return nil, err
+			}
+			return nil, storage.ErrDatabaseNotFound
+		}
+		k := []byte("table/" + db + "/" + name)
+		if _, exists, err := write.Get("catalog", k); err != nil {
+			return nil, err
+		} else if exists {
+			if value.IfNotExists {
+				return &Result{}, nil
+			}
+			return nil, storage.ErrTableExists
+		}
+		var columns []storage.Column
+		primary := append([]string(nil), value.PrimaryKey...)
+		var indexes []storage.Index
+		for _, column := range value.Columns {
+			if column.OnUpdate != "" {
+				return nil, errors.New("MVCC ON UPDATE column expressions are not supported")
+			}
+			definition, err := storageColumnDefinition(column)
+			if err != nil {
+				return nil, err
+			}
+			columns = append(columns, definition)
+			if column.PrimaryKey {
+				found := false
+				for _, name := range primary {
+					if strings.EqualFold(name, column.Name) {
+						found = true
+					}
+				}
+				if !found {
+					primary = append(primary, column.Name)
+				}
+			}
+			if column.Unique {
+				indexes = append(indexes, storage.Index{Name: column.Name, Columns: []string{column.Name}, Unique: true})
+			}
+		}
+		for _, index := range value.Indexes {
+			indexes = append(indexes, storage.Index{Name: index.Name, Columns: index.Columns, Unique: index.Unique})
+		}
+		mirror := storage.NewStore()
+		database, _ := mirror.CreateDatabase(db)
+		table, err := database.CreateTableWithIndexes(name, columns, primary, indexes)
+		if err != nil {
+			return nil, err
+		}
+		checks := make([]storage.CheckConstraint, 0, len(value.Checks))
+		for _, check := range value.Checks {
+			checks = append(checks, storage.CheckConstraint{Name: check.Name, Expression: check.Expression})
+		}
+		for _, column := range value.Columns {
+			if column.Check != "" {
+				checks = append(checks, storage.CheckConstraint{Expression: column.Check})
+			}
+		}
+		for _, check := range checks {
+			if err := validateMVCCCheckDefinition(table, check.Expression); err != nil {
+				return nil, err
+			}
+		}
+		table.SetNamedConstraints(nil, checks)
+		snapshot := table.Snapshot()
+		snapshot.Comment = value.Comment
+		definition := versionedTable{CatalogName: db + "." + name, ID: write.ID + "/" + name, Definition: snapshot, RowEncoding: mvccCompactRowEncoding, SecondaryEncoding: 1}
+		if _, ok := mvccIntegerPrimary(definition); ok {
+			definition.KeyEncoding = mvccIntegerKeyEncoding
+		}
+		for _, fk := range value.ForeignKeys {
+			definition.Definition.ForeignKeys = append(definition.Definition.ForeignKeys, storage.ForeignKey{Name: fk.Name, Columns: fk.Columns, RefTable: fk.RefTable, RefColumns: fk.RefColumns, OnDelete: fk.OnDelete, OnUpdate: fk.OnUpdate})
+		}
+		if err = prepareMVCCForeignKeys(write, &definition, session); err != nil {
+			return nil, err
+		}
+		encoded, err := encodeVersioned(definition)
+		if err != nil {
+			return nil, err
+		}
+		if err = write.Guard("catalog", []byte("db/"+db)); err != nil {
+			return nil, err
+		}
+		return &Result{AffectedRows: 1}, write.Put("catalog", k, encoded)
+	case parser.DropDatabase:
+		name := strings.ToLower(value.Name)
+		k := []byte("db/" + name)
+		_, exists, err := read.Get("catalog", k)
+		if err != nil {
+			return nil, err
+		}
+		if !exists {
+			if value.IfExists {
+				return &Result{}, nil
+			}
+			return nil, storage.ErrDatabaseNotFound
+		}
+		err = read.Scan(ctx, "catalog", func(k, v []byte) error {
+			if strings.HasPrefix(string(k), "table/"+name+"/") {
+				var dropping versionedTable
+				if err := decodeVersioned(v, &dropping); err != nil {
+					return err
+				}
+				if err := rejectMVCCReferencedDrop(write, dropping); err != nil {
+					return err
+				}
+				return write.Delete("catalog", k)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &Result{AffectedRows: 1}, write.Delete("catalog", k)
+	case parser.Truncate:
+		definition, _, k, err := loadVersionedTable(read, session, value.Table)
+		if err != nil {
+			return nil, err
+		}
+		if err = rejectMVCCReferencedDrop(write, definition); err != nil {
+			return nil, err
+		}
+		definition.CounterKeys = nil
+		definition.ID = write.ID + "/truncate"
+		encoded, err := encodeVersioned(definition)
+		if err != nil {
+			return nil, err
+		}
+		return &Result{}, write.Put("catalog", k, encoded)
+	case parser.DropTable:
+		for _, name := range value.Names {
+			dropping, _, k, err := loadVersionedTable(write, session, name)
+			if err != nil {
+				if value.IfExists && errors.Is(err, storage.ErrTableNotFound) {
+					continue
+				}
+				return nil, err
+			}
+			if err = rejectMVCCReferencedDrop(write, dropping); err != nil {
+				return nil, err
+			}
+			if err = write.Delete("catalog", k); err != nil {
+				return nil, err
+			}
+		}
+		return &Result{AffectedRows: uint64(len(value.Names))}, nil
+	case parser.Insert:
+		return e.insertMVCC(ctx, read, write, session, value)
+	case parser.Update:
+		if len(value.Joins) > 0 {
+			return nil, errors.New("MVCC UPDATE JOIN is not supported")
+		}
+		definition, schema, k, err := loadVersionedTable(read, session, value.Table)
+		if err != nil {
+			return nil, err
+		}
+		if err = write.Guard("catalog", k); err != nil {
+			return nil, err
+		}
+		if value.TableAlias != "" {
+			schema, err = qualifySchema(schema, value.TableAlias)
+			if err != nil {
+				return nil, err
+			}
+		}
+		var scratch, updated storage.Row
+		count := 0
+		err = scanMVCCRows(ctx, read, definition, schema, session, value.Where, func(key, encoded []byte) error {
+			if value.HasLimit && count >= value.Limit {
+				return nil
+			}
+			row, err := decodeMVCCRowInto(definition, encoded, nil, scratch)
+			scratch = row
+			if err != nil {
+				return err
+			}
+			if value.Where != nil {
+				match, err := evaluateExprWithContext(value.Where, schema, row, session, nil)
+				if err != nil {
+					return err
+				}
+				if !truthy(match) {
+					return nil
+				}
+			}
+			if cap(updated) < len(row) {
+				updated = make(storage.Row, len(row))
+			} else {
+				updated = updated[:len(row)]
+			}
+			copy(updated, row)
+			for _, assignment := range value.Assignments {
+				position, ok := queryColumnIndex(schema, assignment.Column)
+				if !ok {
+					return storage.ErrColumnNotFound
+				}
+				raw, err := evaluateExprWithContext(assignment.Value, schema, updated, session, nil)
+				if err != nil {
+					return err
+				}
+				updated[position], err = interfaceToColumnValue(raw, definition.Definition.Columns[position])
+				if err != nil {
+					return err
+				}
+			}
+			if err := writeVersionedRow(ctx, write, definition, key, row, updated, ""); err != nil {
+				return err
+			}
+			count++
+			return nil
+		})
+		return &Result{AffectedRows: uint64(count)}, err
+	case parser.Delete:
+		if len(value.Joins) > 0 || len(value.Targets) > 0 {
+			return nil, errors.New("MVCC multi-table DELETE is not supported")
+		}
+		definition, schema, k, err := loadVersionedTable(read, session, value.Table)
+		if err != nil {
+			return nil, err
+		}
+		if err = write.Guard("catalog", k); err != nil {
+			return nil, err
+		}
+		var scratch storage.Row
+		count := 0
+		err = scanMVCCRows(ctx, read, definition, schema, session, value.Where, func(key, encoded []byte) error {
+			if value.HasLimit && count >= value.Limit {
+				return nil
+			}
+			row, err := decodeMVCCRowInto(definition, encoded, nil, scratch)
+			scratch = row
+			if err != nil {
+				return err
+			}
+			if value.Where != nil {
+				matched, err := evaluateExprWithContext(value.Where, schema, row, session, nil)
+				if err != nil {
+					return err
+				}
+				if !truthy(matched) {
+					return nil
+				}
+			}
+			if err := writeVersionedRow(ctx, write, definition, key, row, nil, ""); err != nil {
+				return err
+			}
+			count++
+			return nil
+		})
+		return &Result{AffectedRows: uint64(count)}, err
+	default:
+		return nil, fmt.Errorf("MVCC backend does not support statement %T", statement)
+	}
+}
+func (e *Engine) insertMVCC(ctx context.Context, read, write *mvcc.Tx, session *Session, statement parser.Insert) (*Result, error) {
+	if statement.Replace || statement.Ignore || statement.Select != nil || len(statement.SetValues) > 0 || len(statement.OnDuplicate) > 0 {
+		return nil, errors.New("MVCC insert currently accepts VALUES without IGNORE/REPLACE/ON DUPLICATE")
+	}
+	definition, schema, catalogKey, err := loadVersionedTable(write, session, statement.Table)
+	if err != nil {
+		return nil, err
+	}
+	if err = write.Guard("catalog", catalogKey); err != nil {
+		return nil, err
+	}
+	columns := definition.Definition.Columns
+	positions := make([]int, len(columns))
+	for i := range positions {
+		positions[i] = i
+	}
+	if len(statement.Columns) > 0 {
+		positions = make([]int, len(statement.Columns))
+		seen := map[int]bool{}
+		for i, name := range statement.Columns {
+			position, ok := schema.ColumnIndex(name)
+			if !ok {
+				return nil, storage.ErrColumnNotFound
+			}
+			if seen[position] {
+				return nil, errors.New("duplicate insert column")
+			}
+			seen[position] = true
+			positions[i] = position
+		}
+	}
+	result := &Result{}
+	floors, sent, next, last := make([]uint64, len(columns)), make([]uint64, len(columns)), make([]uint64, len(columns)), make([]uint64, len(columns))
+	advance := func(i int) error {
+		if floors[i] <= sent[i] {
+			return nil
+		}
+		r, err := e.mvccProposer.Propose(ctx, mvcc.Command{Kind: "advance", Counter: definition.counterKey(columns[i].Name), Floor: floors[i]})
+		if err != nil {
+			return err
+		}
+		if err = r.Err(); err != nil {
+			return err
+		}
+		sent[i] = floors[i]
+		return nil
+	}
+	for rowIndex, literals := range statement.Values {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if len(literals) != len(positions) {
+			return nil, errors.New("INSERT value count does not match columns")
+		}
+		row := make(storage.Row, len(columns))
+		for i, column := range columns {
+			row[i] = storage.NullValue(column.Type)
+			if column.HasDefault {
+				row[i], err = columnDefaultValue(column, session)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		for valueIndex, literal := range literals {
+			position := positions[valueIndex]
+			if expression, ok := statement.ValueExpressions[[2]int{rowIndex, valueIndex}]; ok {
+				raw, err := evaluateExprWithContext(expression, schema, row, session, nil)
+				if err != nil {
+					return nil, err
+				}
+				row[position], err = interfaceToColumnValue(raw, columns[position])
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				row[position], err = literalToValue(literal, columns[position])
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		for i, column := range columns {
+			if !column.AutoIncrement {
+				continue
+			}
+			if !row[i].Null && row[i].Int64 > 0 {
+				value := uint64(row[i].Int64)
+				if value > floors[i] {
+					floors[i] = value
+				}
+				if value >= next[i] {
+					next[i] = value + 1
+				}
+			}
+			if row[i].Null {
+				if next[i] == 0 || next[i] > last[i] {
+					if err := advance(i); err != nil {
+						return nil, err
+					}
+					count := uint64(len(statement.Values) - rowIndex)
+					reserved, err := e.mvccProposer.Propose(ctx, mvcc.Command{Kind: "reserve", Counter: definition.counterKey(column.Name), Count: count})
+					if err != nil {
+						return nil, err
+					}
+					if err = reserved.Err(); err != nil {
+						return nil, err
+					}
+					next[i] = reserved.Number
+					last[i] = reserved.Number + count - 1
+				}
+				id := next[i]
+				next[i]++
+				row[i], err = storage.NewValue(column.Type, int64(id))
+				if err != nil {
+					return nil, err
+				}
+				if result.LastInsertID == 0 {
+					result.LastInsertID = id
+					session.LastInsertID = id
+				}
+			}
+		}
+		if err := writeVersionedRow(ctx, write, definition, nil, nil, row, fmt.Sprintf("%s/%020d", write.ID, rowIndex)); err != nil {
+			return nil, err
+		}
+		result.AffectedRows++
+	}
+	for i := range columns {
+		if err := advance(i); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+func writeVersionedRow(ctx context.Context, tx *mvcc.Tx, table versionedTable, oldKey []byte, oldRow, newRow storage.Row, fallback string) error {
+	columns := table.Definition.Columns
+	if err := validateMVCCReferences(ctx, tx, table, oldRow, newRow); err != nil {
+		return err
+	}
+	space := "row/" + table.ID
+	var newKey []byte
+	if newRow != nil {
+		if err := validateVersionedChecks(table, newRow); err != nil {
+			return err
+		}
+		if err := storage.ValidateRowValues(columns, newRow); err != nil {
+			return err
+		}
+		newKey = []byte(fallback)
+		if oldKey != nil {
+			newKey = oldKey
+		}
+		for _, index := range table.Definition.Indexes {
+			if index.Primary {
+				key, ok := mvccPrimaryKey(table, index, newRow)
+				if !ok {
+					return errors.New("NULL primary key")
+				}
+				newKey = key
+			}
+		}
+		if !bytes.Equal(newKey, oldKey) {
+			if _, exists, err := tx.Get(space, newKey); err != nil {
+				return err
+			} else if exists {
+				return storage.ErrDuplicateKey
+			}
+		}
+	}
+	if err := writeSecondaryEntries(tx, table, oldKey, newKey, oldRow, newRow); err != nil {
+		return err
+	}
+	if oldRow != nil {
+		for _, index := range table.Definition.Indexes {
+			if index.Primary && table.KeyEncoding == mvccIntegerKeyEncoding && table.RowEncoding == mvccCompactRowEncoding {
+				continue
+			}
+			if !index.Unique && !index.Primary {
+				continue
+			}
+			k, ok := storage.IndexValueKey(index, columns, oldRow)
+			if ok {
+				if err := tx.Delete("index/"+table.ID+"/"+index.Name, []byte(k)); err != nil {
+					return err
+				}
+			}
+		}
+		if newRow == nil || !bytes.Equal(oldKey, newKey) {
+			if err := tx.Delete(space, oldKey); err != nil {
+				return err
+			}
+		}
+	}
+	if newRow == nil {
+		return nil
+	}
+	for _, index := range table.Definition.Indexes {
+		if index.Primary && table.KeyEncoding == mvccIntegerKeyEncoding && table.RowEncoding == mvccCompactRowEncoding {
+			continue
+		}
+		if !index.Unique && !index.Primary {
+			continue
+		}
+		k, ok := storage.IndexValueKey(index, columns, newRow)
+		if !ok {
+			continue
+		}
+		indexSpace := "index/" + table.ID + "/" + index.Name
+		if owner, exists, err := tx.Get(indexSpace, []byte(k)); err != nil {
+			return err
+		} else if exists && !bytes.Equal(owner, oldKey) {
+			return storage.ErrDuplicateKey
+		}
+		if err := tx.Put(indexSpace, []byte(k), newKey); err != nil {
+			return err
+		}
+	}
+	encoded, err := encodeMVCCRow(table, newRow)
+	if err != nil {
+		return err
+	}
+	return tx.Put(space, newKey, encoded)
+}

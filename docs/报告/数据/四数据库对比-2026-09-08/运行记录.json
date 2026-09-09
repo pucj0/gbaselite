@@ -1,0 +1,311 @@
+{
+  "start": "2026-09-08T22:49:10+0800",
+  "order": [
+    {
+      "repeat": 1,
+      "engine": "mysql",
+      "rows": 1000
+    },
+    {
+      "repeat": 1,
+      "engine": "postgresql",
+      "rows": 10
+    },
+    {
+      "repeat": 1,
+      "engine": "postgresql",
+      "rows": 1000000
+    },
+    {
+      "repeat": 1,
+      "engine": "mysql",
+      "rows": 10000
+    },
+    {
+      "repeat": 1,
+      "engine": "sqlite",
+      "rows": 1000000
+    },
+    {
+      "repeat": 1,
+      "engine": "postgresql",
+      "rows": 10000
+    },
+    {
+      "repeat": 1,
+      "engine": "postgresql",
+      "rows": 100000
+    },
+    {
+      "repeat": 1,
+      "engine": "sqlite",
+      "rows": 100000
+    },
+    {
+      "repeat": 1,
+      "engine": "sqlite",
+      "rows": 10000
+    },
+    {
+      "repeat": 1,
+      "engine": "gbaselite",
+      "rows": 1000
+    },
+    {
+      "repeat": 1,
+      "engine": "gbaselite",
+      "rows": 10
+    },
+    {
+      "repeat": 1,
+      "engine": "gbaselite",
+      "rows": 1000000
+    },
+    {
+      "repeat": 1,
+      "engine": "mysql",
+      "rows": 1000000
+    },
+    {
+      "repeat": 1,
+      "engine": "sqlite",
+      "rows": 1000
+    },
+    {
+      "repeat": 1,
+      "engine": "sqlite",
+      "rows": 10
+    },
+    {
+      "repeat": 1,
+      "engine": "postgresql",
+      "rows": 1000
+    },
+    {
+      "repeat": 1,
+      "engine": "mysql",
+      "rows": 10
+    },
+    {
+      "repeat": 1,
+      "engine": "gbaselite",
+      "rows": 10000
+    },
+    {
+      "repeat": 1,
+      "engine": "mysql",
+      "rows": 100000
+    },
+    {
+      "repeat": 1,
+      "engine": "gbaselite",
+      "rows": 100000
+    },
+    {
+      "repeat": 2,
+      "engine": "postgresql",
+      "rows": 10000
+    },
+    {
+      "repeat": 2,
+      "engine": "gbaselite",
+      "rows": 10
+    },
+    {
+      "repeat": 2,
+      "engine": "gbaselite",
+      "rows": 1000
+    },
+    {
+      "repeat": 2,
+      "engine": "mysql",
+      "rows": 1000000
+    },
+    {
+      "repeat": 2,
+      "engine": "sqlite",
+      "rows": 10000
+    },
+    {
+      "repeat": 2,
+      "engine": "postgresql",
+      "rows": 100000
+    },
+    {
+      "repeat": 2,
+      "engine": "postgresql",
+      "rows": 1000
+    },
+    {
+      "repeat": 2,
+      "engine": "gbaselite",
+      "rows": 10000
+    },
+    {
+      "repeat": 2,
+      "engine": "postgresql",
+      "rows": 10
+    },
+    {
+      "repeat": 2,
+      "engine": "sqlite",
+      "rows": 1000
+    },
+    {
+      "repeat": 2,
+      "engine": "mysql",
+      "rows": 10000
+    },
+    {
+      "repeat": 2,
+      "engine": "postgresql",
+      "rows": 1000000
+    },
+    {
+      "repeat": 2,
+      "engine": "mysql",
+      "rows": 1000
+    },
+    {
+      "repeat": 2,
+      "engine": "mysql",
+      "rows": 10
+    },
+    {
+      "repeat": 2,
+      "engine": "sqlite",
+      "rows": 1000000
+    },
+    {
+      "repeat": 2,
+      "engine": "gbaselite",
+      "rows": 100000
+    },
+    {
+      "repeat": 2,
+      "engine": "sqlite",
+      "rows": 100000
+    },
+    {
+      "repeat": 2,
+      "engine": "gbaselite",
+      "rows": 1000000
+    },
+    {
+      "repeat": 2,
+      "engine": "mysql",
+      "rows": 100000
+    },
+    {
+      "repeat": 2,
+      "engine": "sqlite",
+      "rows": 10
+    },
+    {
+      "repeat": 3,
+      "engine": "gbaselite",
+      "rows": 10
+    },
+    {
+      "repeat": 3,
+      "engine": "mysql",
+      "rows": 1000000
+    },
+    {
+      "repeat": 3,
+      "engine": "postgresql",
+      "rows": 1000000
+    },
+    {
+      "repeat": 3,
+      "engine": "sqlite",
+      "rows": 100000
+    },
+    {
+      "repeat": 3,
+      "engine": "sqlite",
+      "rows": 10
+    },
+    {
+      "repeat": 3,
+      "engine": "postgresql",
+      "rows": 10
+    },
+    {
+      "repeat": 3,
+      "engine": "gbaselite",
+      "rows": 1000000
+    },
+    {
+      "repeat": 3,
+      "engine": "sqlite",
+      "rows": 1000
+    },
+    {
+      "repeat": 3,
+      "engine": "postgresql",
+      "rows": 1000
+    },
+    {
+      "repeat": 3,
+      "engine": "gbaselite",
+      "rows": 100000
+    },
+    {
+      "repeat": 3,
+      "engine": "mysql",
+      "rows": 10
+    },
+    {
+      "repeat": 3,
+      "engine": "sqlite",
+      "rows": 10000
+    },
+    {
+      "repeat": 3,
+      "engine": "sqlite",
+      "rows": 1000000
+    },
+    {
+      "repeat": 3,
+      "engine": "mysql",
+      "rows": 10000
+    },
+    {
+      "repeat": 3,
+      "engine": "gbaselite",
+      "rows": 10000
+    },
+    {
+      "repeat": 3,
+      "engine": "mysql",
+      "rows": 1000
+    },
+    {
+      "repeat": 3,
+      "engine": "postgresql",
+      "rows": 100000
+    },
+    {
+      "repeat": 3,
+      "engine": "mysql",
+      "rows": 100000
+    },
+    {
+      "repeat": 3,
+      "engine": "postgresql",
+      "rows": 10000
+    },
+    {
+      "repeat": 3,
+      "engine": "gbaselite",
+      "rows": 1000
+    }
+  ],
+  "rounds": 3,
+  "binary_sha256": "d4278021cfc9b8988b34f6108d70f63a80c9cf15e2af86a43438e1597f85721c",
+  "harness_sha256": "2c8ddb7f51ce43eeb0c957646eaab1399bc7e4032eebc1e72be3a72a94e5b1af",
+  "design": "60 fresh isolated runs; randomized serial order; durable single client; TCP servers vs embedded SQLite; 250-row inserts; 128-byte payload; one atomic whole-table UPDATE",
+  "end": "2026-09-08T22:59:54+0800",
+  "failed_cases": []
+}

@@ -71,3 +71,13 @@ jobs:
           labels: ${{ steps.ghcr_meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Publish Docker Hub release description
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: pucj/gbaselite
+          short-description: Lightweight database with a MySQL protocol subset and optional MVCC storage.
+          readme-filepath: docker/发布说明.md

@@ -19,7 +19,16 @@ var columnNamePattern = regexp.MustCompile(`(?i)column_name\s*(?:=\s*|like\s+(?:
 var tableTypePattern = regexp.MustCompile(`(?i)table_type\s*=\s*'([^']+)'`)
 var viewFilePattern = regexp.MustCompile(`(?i)concat\s*\(\s*@@datadir\s*,\s*'([^']+)'\s*,\s*'/'\s*,\s*'([^']+)'\s*,\s*'\.frm'\s*\)`)
 
-func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
+func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query string) (result *executor.Result, resultErr error) {
+	defer func() {
+		if result != nil {
+			result.InTransaction = session.InTransaction()
+			result.AutocommitDisabled = session.AutocommitDisabled
+		}
+	}()
+	if engine.MVCC != nil && len(query) > 1<<20 {
+		return nil, fmt.Errorf("%w: MVCC SQL text exceeds 1 MiB", executor.ErrQueryResourceLimit)
+	}
 	session.InitializeSettings()
 	if err := engine.AvailabilityError(); err != nil {
 		return nil, err
@@ -31,7 +40,81 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 	query = trimLeadingCompatibilityComments(expanded)
 	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(query), ";"))
 	upper := strings.ToUpper(trimmed)
+	// SQL USE must select the same virtual schemas as handshake/COM_INIT_DB.
+	// Parse the complete statement so malformed or multiple statements cannot
+	// bypass normal validation. Metadata reads retain their own access filters.
+	if len(trimmed) >= 3 && strings.EqualFold(trimmed[:3], "USE") {
+		statement, err := parser.Parse(trimmed)
+		if err != nil {
+			return nil, err
+		}
+		if use, ok := statement.(parser.Use); ok && virtualDatabase(use.Database) {
+			session.CurrentDatabase = strings.ToLower(use.Database)
+			return &executor.Result{Message: "database changed"}, nil
+		}
+	}
+	if engine.MVCC != nil {
+		if strings.HasPrefix(upper, "LOCK TABLES ") || upper == "UNLOCK TABLES" {
+			return nil, fmt.Errorf("MVCC table locking is not supported")
+		}
+		if strings.HasPrefix(upper, "SET ") {
+			if strings.Contains(upper, "TRANSACTION ISOLATION") || strings.Contains(upper, "TX_ISOLATION") || strings.Contains(upper, "TRANSACTION_ISOLATION") {
+				return nil, fmt.Errorf("MVCC currently provides snapshot isolation; changing isolation level is not supported")
+			}
+			assignments := splitSetAssignments(trimmed[4:])
+			for _, assignment := range assignments {
+				left, right, ok := strings.Cut(assignment, "=")
+				if !ok {
+					continue
+				}
+				variable, global := normalizeSetVariable(left)
+				if variable == "autocommit" {
+					if global || len(assignments) != 1 {
+						return nil, fmt.Errorf("MVCC autocommit must be a standalone session SET assignment")
+					}
+					value := strings.ToUpper(resolveSessionSettingValue(session, right))
+					var enabled bool
+					switch value {
+					case "1", "ON", "TRUE", "DEFAULT":
+						enabled = true
+					case "0", "OFF", "FALSE":
+						enabled = false
+					default:
+						return nil, fmt.Errorf("invalid autocommit value")
+					}
+					if err := engine.SetMVCCAutocommit(session, enabled); err != nil {
+						return nil, err
+					}
+					return &executor.Result{Message: "autocommit changed"}, nil
+				}
+			}
+		}
+	}
+	if upper == "SHOW REPLICATION STATUS" {
+		return engine.ReplicationStatus(), nil
+	}
+	if err := engine.PrepareCompatibilityRead(session.Context); err != nil {
+		return nil, err
+	}
+	if strings.Contains(upper, "INFORMATION_SCHEMA") || strings.EqualFold(session.CurrentDatabase, "information_schema") {
+		if result, handled, err := virtualMetadataStatement(engine, session, trimmed); handled {
+			return result, err
+		}
+	}
 	metadataUpper := strings.ReplaceAll(upper, "`", "")
+	if strings.Contains(upper, "INFORMATION_SCHEMA") || strings.EqualFold(session.CurrentDatabase, "information_schema") {
+		if statement, err := parser.Parse(trimmed); err == nil {
+			if selectStmt, ok := statement.(parser.Select); ok && len(selectStmt.Joins) == 0 && selectStmt.Subquery == nil {
+				table := strings.ToUpper(selectStmt.Table)
+				if strings.HasPrefix(table, "INFORMATION_SCHEMA.") {
+					metadataUpper = "FROM " + table
+				} else if strings.EqualFold(session.CurrentDatabase, "information_schema") && !strings.Contains(table, ".") {
+					metadataUpper = "FROM INFORMATION_SCHEMA." + table
+				}
+			}
+		}
+	}
+
 	switch {
 	case trimmed == "":
 		return &executor.Result{}, nil
@@ -44,7 +127,7 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 	case strings.HasPrefix(upper, "LOCK TABLES ") || upper == "UNLOCK TABLES":
 		return &executor.Result{Message: "table lock compatibility accepted"}, nil
 	case strings.HasPrefix(upper, "SAVEPOINT ") || strings.HasPrefix(upper, "RELEASE SAVEPOINT ") || strings.HasPrefix(upper, "ROLLBACK TO "):
-		return &executor.Result{Message: "savepoint compatibility accepted"}, nil
+		return engine.Execute(session, trimmed)
 	case strings.HasPrefix(upper, "KILL "):
 		return &executor.Result{Message: "connection management accepted"}, nil
 	case strings.HasPrefix(upper, "ALTER TABLE ") && (strings.Contains(upper, " DISABLE KEYS") || strings.Contains(upper, " ENABLE KEYS")):
@@ -130,7 +213,7 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 	case metadataFromMySQLUser(metadataUpper):
 		return mysqlUserInformation(engine, session, trimmed)
 	case strings.HasPrefix(upper, "SELECT @@"):
-		return compatibilityVariables(session, trimmed), nil
+		return compatibilityVariables(session, trimmed, engine.MVCC != nil), nil
 	}
 	return engine.Execute(session, trimmed)
 }
@@ -278,7 +361,7 @@ func showTables(engine *executor.Engine, session *executor.Session, query string
 		}
 		databaseName, remainder = name, strings.TrimSpace(tail)
 	}
-	database, err := engine.Store.Database(databaseName)
+	database, err := metadataBrowseDatabase(engine, databaseName)
 	if err != nil {
 		return nil, err
 	}
@@ -319,7 +402,7 @@ func showTables(engine *executor.Engine, session *executor.Session, query string
 		return matches
 	}
 	appendRelation := func(name, relationType string) {
-		if !engine.Users.HasObjectAccess(session.Username, session.Host, database.Name(), name) {
+		if !strings.EqualFold(databaseName, "information_schema") && !engine.Users.HasObjectAccess(session.Username, session.Host, database.Name(), name) {
 			return
 		}
 		if likePattern != "" && !showLikeMatch(name, likePattern) {
@@ -338,6 +421,9 @@ func showTables(engine *executor.Engine, session *executor.Session, query string
 		relationType := "BASE TABLE"
 		if _, viewErr := database.View(name); viewErr == nil {
 			relationType = "VIEW"
+			if strings.EqualFold(databaseName, "information_schema") {
+				relationType = "SYSTEM VIEW"
+			}
 		}
 		appendRelation(name, relationType)
 	}
@@ -583,6 +669,8 @@ type runtimeStatus struct {
 	AbortedConnections uint64
 	TLSConnections     uint64
 	StorageState       string
+	Paged              storage.PagePersistenceStats
+	ColdReads          bool
 }
 
 func isShowStatusQuery(upper string) bool {
@@ -613,6 +701,8 @@ func statusRows(session *executor.Session, query string, status runtimeStatus) (
 		{"Threads_running", strconv.FormatInt(status.ActiveQueries, 10)},
 		{"Uptime", strconv.FormatUint(status.Uptime, 10)},
 	}
+	rows = append(rows, resourceStatusRows()...)
+	rows = append(rows, pagedResourceStatusRows(status.Paged, status.ColdReads)...)
 	result := &executor.Result{Columns: []executor.Column{{Name: "Variable_name", Type: storage.TypeVarchar}, {Name: "Value", Type: storage.TypeVarchar}}}
 	for _, row := range rows {
 		if !hasLikePattern || showLikeMatch(row[0].(string), likePattern) {
@@ -655,7 +745,49 @@ func schemaInformation(engine *executor.Engine, session *executor.Session) *exec
 	}
 	return result
 }
+
+// TABLES/COLUMNS describe accessible schemas independently of the selected
+// database. Virtual schemas are not persisted in Store.
+func schemaMetadataInformation(engine *executor.Engine, session *executor.Session, query string, columns []executor.Column, read func(*executor.Engine, *executor.Session, string) (*executor.Result, error)) (*executor.Result, error) {
+	result := &executor.Result{Columns: columns}
+	match := tableSchemaPattern.FindStringSubmatch(query)
+	for _, name := range engine.Store.ListDatabases() {
+		if len(match) > 1 && !strings.EqualFold(name, match[1]) {
+			continue
+		}
+		if !engine.Users.HasDatabaseAccess(session.Username, session.Host, name) {
+			continue
+		}
+		if table := tableNamePattern.FindStringSubmatch(query); len(table) > 1 {
+			if !engine.Users.HasObjectAccess(session.Username, session.Host, name, table[1]) {
+				continue
+			}
+			database, err := engine.Store.Database(name)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := database.Table(table[1]); err != nil {
+				if _, err := database.View(table[1]); err != nil {
+					continue
+				}
+			}
+		}
+		metadataSession := *session
+		metadataSession.CurrentDatabase = name
+		part, err := read(engine, &metadataSession, query)
+		if err != nil {
+			return nil, err
+		}
+		result.Rows = append(result.Rows, part.Rows...)
+	}
+	return projectMetadataColumns(query, result), nil
+}
+
 func tableInformation(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
+	return schemaMetadataInformation(engine, session, query, informationSchemaTableColumns(), tableInformationInDatabase)
+}
+
+func tableInformationInDatabase(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
 	databaseName := session.CurrentDatabase
 	if match := tableSchemaPattern.FindStringSubmatch(query); len(match) > 1 {
 		databaseName = match[1]
@@ -696,9 +828,13 @@ func tableInformation(engine *executor.Engine, session *executor.Session, query 
 			result.Rows = append(result.Rows, []any{"def", database.Name(), name, "VIEW", nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "utf8mb4_general_ci", nil, nil, "", "VIEW"})
 		}
 	}
-	return projectMetadataColumns(query, result), nil
+	return result, nil
 }
 func columnInformation(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
+	return schemaMetadataInformation(engine, session, query, informationSchemaColumnColumns(), columnInformationInDatabase)
+}
+
+func columnInformationInDatabase(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
 	databaseName := session.CurrentDatabase
 	if match := tableSchemaPattern.FindStringSubmatch(query); len(match) > 1 {
 		databaseName = match[1]
@@ -730,7 +866,7 @@ func columnInformation(engine *executor.Engine, session *executor.Session, query
 	if tableName != "" {
 		if table, tableErr := database.Table(tableName); tableErr == nil {
 			appendTable(table)
-			return projectMetadataColumns(query, result), nil
+			return result, nil
 		}
 		columns, viewErr := viewColumns(engine, session, database.Name(), tableName)
 		if viewErr != nil {
@@ -743,7 +879,7 @@ func columnInformation(engine *executor.Engine, session *executor.Session, query
 			definition := storage.Column{Name: column.Name, Type: column.Type}
 			result.Rows = append(result.Rows, informationSchemaColumnRow(database.Name(), tableName, position, definition, ""))
 		}
-		return projectMetadataColumns(query, result), nil
+		return result, nil
 	}
 	for _, name := range database.ListTables() {
 		if engine.Users.HasObjectAccess(session.Username, session.Host, database.Name(), name) {
@@ -769,7 +905,7 @@ func columnInformation(engine *executor.Engine, session *executor.Session, query
 			result.Rows = append(result.Rows, informationSchemaColumnRow(database.Name(), name, position, definition, ""))
 		}
 	}
-	return projectMetadataColumns(query, result), nil
+	return result, nil
 }
 
 func informationSchemaColumnColumns() []executor.Column {
@@ -845,6 +981,10 @@ func informationSchemaColumnRow(schema, table string, position int, column stora
 }
 
 func indexInformation(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
+	result := emptyMetadata([]string{"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME", "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT", "IS_VISIBLE", "EXPRESSION"})
+	return schemaMetadataInformation(engine, session, query, result.Columns, indexInformationInDatabase)
+}
+func indexInformationInDatabase(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
 	databaseName := session.CurrentDatabase
 	if match := tableSchemaPattern.FindStringSubmatch(query); len(match) > 1 {
 		databaseName = match[1]
@@ -885,10 +1025,14 @@ func indexInformation(engine *executor.Engine, session *executor.Session, query 
 			}
 		}
 	}
-	return projectMetadataColumns(query, result), nil
+	return result, nil
 }
 
 func tableConstraintInformation(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
+	result := emptyMetadata([]string{"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_SCHEMA", "TABLE_NAME", "CONSTRAINT_TYPE", "ENFORCED"})
+	return schemaMetadataInformation(engine, session, query, result.Columns, tableConstraintInformationInDatabase)
+}
+func tableConstraintInformationInDatabase(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
 	databaseName := session.CurrentDatabase
 	if match := tableSchemaPattern.FindStringSubmatch(query); len(match) > 1 {
 		databaseName = match[1]
@@ -930,10 +1074,14 @@ func tableConstraintInformation(engine *executor.Engine, session *executor.Sessi
 			result.Rows = append(result.Rows, []any{"def", database.Name(), definition.Name, database.Name(), table.Name(), "CHECK", "YES"})
 		}
 	}
-	return projectMetadataColumns(query, result), nil
+	return result, nil
 }
 
 func referentialConstraintInformation(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
+	result := emptyMetadata([]string{"CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "UNIQUE_CONSTRAINT_SCHEMA", "UNIQUE_CONSTRAINT_NAME", "MATCH_OPTION", "UPDATE_RULE", "DELETE_RULE", "TABLE_NAME", "REFERENCED_TABLE_NAME"})
+	return schemaMetadataInformation(engine, session, query, result.Columns, referentialConstraintInformationInDatabase)
+}
+func referentialConstraintInformationInDatabase(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
 	databaseName := session.CurrentDatabase
 	if match := tableSchemaPattern.FindStringSubmatch(query); len(match) > 1 {
 		databaseName = match[1]
@@ -963,10 +1111,14 @@ func referentialConstraintInformation(engine *executor.Engine, session *executor
 			result.Rows = append(result.Rows, []any{database.Name(), definition.Name, database.Name(), "PRIMARY", "NONE", updateRule, deleteRule, table.Name(), referencedTable})
 		}
 	}
-	return projectMetadataColumns(query, result), nil
+	return result, nil
 }
 
 func checkConstraintInformation(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
+	result := emptyMetadata([]string{"CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "CHECK_CLAUSE"})
+	return schemaMetadataInformation(engine, session, query, result.Columns, checkConstraintInformationInDatabase)
+}
+func checkConstraintInformationInDatabase(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
 	databaseName := session.CurrentDatabase
 	if match := tableSchemaPattern.FindStringSubmatch(query); len(match) > 1 {
 		databaseName = match[1]
@@ -985,10 +1137,14 @@ func checkConstraintInformation(engine *executor.Engine, session *executor.Sessi
 			result.Rows = append(result.Rows, []any{database.Name(), definition.Name, definition.Expression})
 		}
 	}
-	return projectMetadataColumns(query, result), nil
+	return result, nil
 }
 
 func keyColumnUsageInformation(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
+	result := emptyMetadata([]string{"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "POSITION_IN_UNIQUE_CONSTRAINT", "REFERENCED_TABLE_SCHEMA", "REFERENCED_TABLE_NAME", "REFERENCED_COLUMN_NAME"})
+	return schemaMetadataInformation(engine, session, query, result.Columns, keyColumnUsageInformationInDatabase)
+}
+func keyColumnUsageInformationInDatabase(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
 	databaseName := session.CurrentDatabase
 	if match := tableSchemaPattern.FindStringSubmatch(query); len(match) > 1 {
 		databaseName = match[1]
@@ -1032,7 +1188,7 @@ func keyColumnUsageInformation(engine *executor.Engine, session *executor.Sessio
 			}
 		}
 	}
-	return projectMetadataColumns(query, result), nil
+	return result, nil
 }
 
 func viewColumns(engine *executor.Engine, session *executor.Session, databaseName, viewName string) ([]executor.Column, error) {
@@ -1045,6 +1201,21 @@ func viewColumns(engine *executor.Engine, session *executor.Session, databaseNam
 }
 
 func viewInformation(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
+	result := &executor.Result{Columns: []executor.Column{
+		{Name: "TABLE_CATALOG", Type: storage.TypeVarchar},
+		{Name: "TABLE_SCHEMA", Type: storage.TypeVarchar},
+		{Name: "TABLE_NAME", Type: storage.TypeVarchar},
+		{Name: "VIEW_DEFINITION", Type: storage.TypeText},
+		{Name: "CHECK_OPTION", Type: storage.TypeVarchar},
+		{Name: "IS_UPDATABLE", Type: storage.TypeVarchar},
+		{Name: "DEFINER", Type: storage.TypeVarchar},
+		{Name: "SECURITY_TYPE", Type: storage.TypeVarchar},
+		{Name: "CHARACTER_SET_CLIENT", Type: storage.TypeVarchar},
+		{Name: "COLLATION_CONNECTION", Type: storage.TypeVarchar},
+	}}
+	return schemaMetadataInformation(engine, session, query, result.Columns, viewInformationInDatabase)
+}
+func viewInformationInDatabase(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
 	databaseName := session.CurrentDatabase
 	if match := tableSchemaPattern.FindStringSubmatch(query); len(match) > 1 {
 		databaseName = match[1]
@@ -1072,7 +1243,7 @@ func viewInformation(engine *executor.Engine, session *executor.Session, query s
 		view, _ := database.View(name)
 		result.Rows = append(result.Rows, []any{"def", database.Name(), view.Name, view.Definition, "NONE", "NO", "root@%", "DEFINER", executor.DefaultCharacterSet, executor.DefaultCollation})
 	}
-	return projectMetadataColumns(query, result), nil
+	return result, nil
 }
 
 func mysqlUserInformation(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
@@ -1159,7 +1330,11 @@ func canInspectAccounts(engine *executor.Engine, session *executor.Session) bool
 }
 
 func projectMetadataColumns(query string, result *executor.Result) *executor.Result {
+	var parsedItems []parser.SelectItem
 	if statement, err := parser.Parse(query); err == nil {
+		if selectStatement, ok := statement.(parser.Select); ok {
+			parsedItems = selectStatement.Items
+		}
 		if selectStatement, ok := statement.(parser.Select); ok && len(selectStatement.Items) == 1 {
 			item := selectStatement.Items[0]
 			if expression, parseErr := parser.ParseExpression(item.Expression); parseErr == nil {
@@ -1176,13 +1351,23 @@ func projectMetadataColumns(query string, result *executor.Result) *executor.Res
 			}
 		}
 	}
-	upper := strings.ToUpper(query)
-	selectPosition := strings.Index(upper, "SELECT ")
-	fromPosition := strings.Index(upper, " FROM ")
-	if selectPosition < 0 || fromPosition <= selectPosition || strings.Contains(upper[selectPosition:fromPosition], "*") {
-		return result
+	var expressions []string
+	if parsedItems != nil {
+		for _, item := range parsedItems {
+			if strings.Contains(item.Expression, "*") {
+				return result
+			}
+			expressions = append(expressions, item.Expression)
+		}
+	} else {
+		upper := strings.ToUpper(query)
+		selectPosition := strings.Index(upper, "SELECT ")
+		fromPosition := strings.Index(upper, " FROM ")
+		if selectPosition < 0 || fromPosition <= selectPosition || strings.Contains(upper[selectPosition:fromPosition], "*") {
+			return result
+		}
+		expressions = strings.Split(query[selectPosition+len("SELECT "):fromPosition], ",")
 	}
-	expressions := strings.Split(query[selectPosition+len("SELECT "):fromPosition], ",")
 	positions := make([]int, 0, len(expressions))
 	columns := make([]executor.Column, 0, len(expressions))
 	for _, expression := range expressions {
@@ -1255,7 +1440,7 @@ func tableStatus(engine *executor.Engine, session *executor.Session, query strin
 	if strings.TrimSpace(remainder) != "" {
 		return nil, fmt.Errorf("unsupported SHOW TABLE STATUS clause: %s", remainder)
 	}
-	database, err := engine.Store.Database(databaseName)
+	database, err := metadataBrowseDatabase(engine, databaseName)
 	if err != nil {
 		return nil, err
 	}
@@ -1274,7 +1459,7 @@ func tableStatus(engine *executor.Engine, session *executor.Session, query strin
 		if hasLikePattern && !showLikeMatch(name, likePattern) {
 			continue
 		}
-		if !engine.Users.HasObjectAccess(session.Username, session.Host, database.Name(), name) {
+		if !strings.EqualFold(databaseName, "information_schema") && !engine.Users.HasObjectAccess(session.Username, session.Host, database.Name(), name) {
 			continue
 		}
 		if _, viewErr := database.View(name); viewErr == nil {

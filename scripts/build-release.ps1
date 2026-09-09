@@ -127,13 +127,8 @@ try {
         if (-not (Test-Path -LiteralPath $gofmt)) {
             $gofmt = "gofmt"
         }
-        $unformatted = & $gofmt -l .
-        if ($LASTEXITCODE -ne 0) {
-            throw "gofmt check failed"
-        }
-        if ($unformatted) {
-            throw "The following Go files require gofmt: $($unformatted -join ', ')"
-        }
+        . (Join-Path $PSScriptRoot 'release-source-files.ps1')
+        Test-ReleaseGoFormat -Root $repositoryRoot -Gofmt $gofmt
         Invoke-GoCommand @("test", "./...", "-count=1")
         Invoke-GoCommand @("vet", "./...")
     }

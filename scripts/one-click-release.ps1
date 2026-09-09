@@ -157,7 +157,7 @@ function Resolve-GoExecutable {
             return [System.IO.Path]::GetFullPath($candidate)
         }
     }
-    throw "Go was not found. Install Go 1.22+ or set GBASELITE_GO."
+    throw "Go was not found. Install Go 1.23+ or set GBASELITE_GO."
 }
 
 function Test-DotnetSDK {
@@ -659,6 +659,7 @@ function Copy-ReleaseToDist {
 }
 
 if ($SelfTest) {
+    & (Join-Path $PSScriptRoot 'test-release-sources.ps1')
     $cases = @{
         "0.9.0" = "1.0.0"
         "1.0.0" = "1.0.1"

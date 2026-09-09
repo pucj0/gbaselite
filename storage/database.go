@@ -292,14 +292,19 @@ func (d *Database) viewSnapshots() []ViewSnapshot {
 	return views
 }
 
-func (d *Database) Insert(tableName string, row Row) error {
+func (d *Database) Insert(tableName string, row Row, checks ...bool) error {
 	d.constraintMu.Lock()
 	defer d.constraintMu.Unlock()
 	table, err := d.Table(tableName)
 	if err != nil {
 		return err
 	}
-	if err := d.validateForeignKeys(tableName, row); err != nil {
+	if err := func() error {
+		if !foreignChecksEnabled(checks) {
+			return nil
+		}
+		return d.validateForeignKeys(tableName, row)
+	}(); err != nil {
 		return err
 	}
 	return table.Insert(row)
@@ -350,20 +355,11 @@ func (d *Database) validateForeignKeys(tableName string, row Row) error {
 		if nullReference {
 			continue
 		}
-		valid := false
-		for _, candidate := range parent.Select(nil) {
-			matched := true
-			for index := range childPositions {
-				if compareValue(candidate[parentPositions[index]], row[childPositions[index]]) != 0 {
-					matched = false
-					break
-				}
-			}
-			if matched {
-				valid = true
-				break
-			}
+		values := make([]Value, len(childPositions))
+		for i, position := range childPositions {
+			values[i] = row[position]
 		}
+		valid := parent.hasReferencedValues(foreignKey.RefColumns, values)
 		if !valid {
 			return fmt.Errorf("%w: %s", ErrForeignKey, tableName)
 		}
@@ -371,7 +367,7 @@ func (d *Database) validateForeignKeys(tableName string, row Row) error {
 	return nil
 }
 
-func (d *Database) AddForeignKey(tableName string, foreignKey ForeignKey) error {
+func (d *Database) AddForeignKey(tableName string, foreignKey ForeignKey, checks ...bool) error {
 	d.constraintMu.Lock()
 	defer d.constraintMu.Unlock()
 	if len(foreignKey.Columns) == 0 || len(foreignKey.Columns) != len(foreignKey.RefColumns) {
@@ -394,7 +390,22 @@ func (d *Database) AddForeignKey(tableName string, foreignKey ForeignKey) error 
 	if referencedDatabase != "" && !strings.EqualFold(referencedDatabase, d.name) {
 		return fmt.Errorf("%w: cross-database reference %s", ErrForeignKey, foreignKey.RefTable)
 	}
+	for _, name := range foreignKey.Columns {
+		if _, ok := child.ColumnIndex(name); !ok {
+			return fmt.Errorf("%w: column %s", ErrForeignKey, name)
+		}
+	}
 	parent, err := d.Table(referencedTable)
+	if err != nil && !foreignChecksEnabled(checks) {
+		for _, name := range foreignKey.Columns {
+			pos, _ := child.ColumnIndex(name)
+			if (normalizeReferentialAction(foreignKey.OnDelete) == "SET NULL" || normalizeReferentialAction(foreignKey.OnUpdate) == "SET NULL") && !ColumnNullable(child.ColumnsView()[pos]) {
+				return ErrForeignKey
+			}
+		}
+		foreignKey.RefTable = referencedTable
+		return child.AddForeignKey(foreignKey)
+	}
 	if err != nil {
 		return fmt.Errorf("%w: referenced table %s", ErrForeignKey, foreignKey.RefTable)
 	}
@@ -426,6 +437,9 @@ func (d *Database) AddForeignKey(tableName string, foreignKey ForeignKey) error 
 		return fmt.Errorf("%w: referenced columns must be PRIMARY or UNIQUE", ErrForeignKey)
 	}
 	foreignKey.RefTable = referencedTable
+	if !foreignChecksEnabled(checks) {
+		return child.AddForeignKey(foreignKey)
+	}
 	for rowIndex, row := range child.Select(nil) {
 		if err := d.validateForeignKey(child, row, foreignKey); err != nil {
 			return fmt.Errorf("%w in existing row %d", err, rowIndex+1)
@@ -526,17 +540,12 @@ func (d *Database) validateForeignKey(child *Table, row Row, foreignKey ForeignK
 		}
 		parentPositions[index], _ = parent.ColumnIndex(foreignKey.RefColumns[index])
 	}
-	for _, candidate := range parent.Select(nil) {
-		matched := true
-		for index := range childPositions {
-			if compareValue(candidate[parentPositions[index]], row[childPositions[index]]) != 0 {
-				matched = false
-				break
-			}
-		}
-		if matched {
-			return nil
-		}
+	values := make([]Value, len(childPositions))
+	for i, position := range childPositions {
+		values[i] = row[position]
+	}
+	if parent.hasReferencedValues(foreignKey.RefColumns, values) {
+		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrForeignKey, child.Name())
 }
@@ -555,6 +564,8 @@ func compareValue(left, right Value) int {
 		return -1
 	}
 	switch left.Type {
+	case TypeDecimal:
+		return CompareDecimal(Decimal(left.Text), Decimal(right.Text))
 	case TypeInt, TypeBigInt:
 		if left.Int64 < right.Int64 {
 			return -1
@@ -632,7 +643,7 @@ func (d *Database) UpdateLimit(tableName string, predicate Predicate, changes ma
 	return d.ApplyRowMutations([]RowMutation{{Table: tableName, Replacements: replacements}})
 }
 
-func (d *Database) ReplaceRowsLimit(tableName string, predicate Predicate, replacements []Row, limit int) (int, error) {
+func (d *Database) ReplaceRowsLimit(tableName string, predicate Predicate, replacements []Row, limit int, checks ...bool) (int, error) {
 	table, err := d.Table(tableName)
 	if err != nil {
 		return 0, err
@@ -656,7 +667,7 @@ func (d *Database) ReplaceRowsLimit(tableName string, predicate Predicate, repla
 	if replacementIndex != len(replacements) {
 		return 0, fmt.Errorf("replacement row count does not match UPDATE predicate")
 	}
-	return d.ApplyRowMutations([]RowMutation{{Table: tableName, Replacements: indexed}})
+	return d.ApplyRowMutations([]RowMutation{{Table: tableName, Replacements: indexed}}, checks...)
 }
 
 func (d *Database) validateParentUpdate(tableName string, parent *Table, current, candidate Row) error {
@@ -726,7 +737,7 @@ func (d *Database) DeleteLimit(tableName string, predicate Predicate, limit int)
 // ReplaceRow applies MySQL REPLACE semantics: every PRIMARY/UNIQUE conflict is
 // deleted, referential actions run for those deletions, and the candidate is
 // inserted as one database mutation.
-func (d *Database) ReplaceRow(tableName string, candidate Row) (int, error) {
+func (d *Database) ReplaceRow(tableName string, candidate Row, checks ...bool) (int, error) {
 	d.constraintMu.Lock()
 	defer d.constraintMu.Unlock()
 	table, err := d.Table(tableName)
@@ -737,13 +748,13 @@ func (d *Database) ReplaceRow(tableName string, candidate Row) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return d.applyRowMutationsLocked([]RowMutation{{Table: tableName, Delete: conflicts, Inserts: []Row{candidate}}})
+	return d.applyRowMutationsLocked([]RowMutation{{Table: tableName, Delete: conflicts, Inserts: []Row{candidate}}}, checks...)
 }
 
-func (d *Database) ApplyRowMutations(mutations []RowMutation) (int, error) {
+func (d *Database) ApplyRowMutations(mutations []RowMutation, checks ...bool) (int, error) {
 	d.constraintMu.Lock()
 	defer d.constraintMu.Unlock()
-	return d.applyRowMutationsLocked(mutations)
+	return d.applyRowMutationsLocked(mutations, checks...)
 }
 
 type stagedTableMutation struct {
@@ -759,7 +770,14 @@ type referentialEvent struct {
 	deleted bool
 }
 
-func (d *Database) applyRowMutationsLocked(mutations []RowMutation) (int, error) {
+func (d *Database) applyRowMutationsLocked(mutations []RowMutation, checks ...bool) (int, error) {
+	if affected, handled, err := d.tryIndependentMutation(mutations); handled {
+		return affected, err
+	}
+	return d.applyRowMutationsGeneralLocked(mutations, checks...)
+}
+
+func (d *Database) applyRowMutationsGeneralLocked(mutations []RowMutation, checks ...bool) (int, error) {
 	staged := make(map[string]*stagedTableMutation)
 	for _, tableName := range d.ListTables() {
 		table, _ := d.Table(tableName)
@@ -771,6 +789,13 @@ func (d *Database) applyRowMutationsLocked(mutations []RowMutation) (int, error)
 		staged[normalizeName(tableName)] = &stagedTableMutation{table: table, rows: snapshot.Rows, active: active}
 	}
 
+	touched := make(map[string]map[int]bool)
+	mark := func(key string, index int) {
+		if touched[key] == nil {
+			touched[key] = map[int]bool{}
+		}
+		touched[key][index] = true
+	}
 	changed := make(map[string]bool)
 	explicit := make(map[string]map[int]string)
 	events := make([]referentialEvent, 0)
@@ -794,6 +819,7 @@ func (d *Database) applyRowMutationsLocked(mutations []RowMutation) (int, error)
 				return 0, fmt.Errorf("row %d of table %s has duplicate %s and UPDATE mutations", rowIndex, tableName, previous)
 			}
 			explicit[key][rowIndex] = "UPDATE"
+			mark(key, rowIndex)
 			oldRow := cloneRow(state.rows[rowIndex])
 			state.rows[rowIndex] = cloneRow(replacement)
 			events = append(events, referentialEvent{table: key, oldRow: oldRow, newRow: cloneRow(replacement)})
@@ -826,7 +852,7 @@ func (d *Database) applyRowMutationsLocked(mutations []RowMutation) (int, error)
 	for _, state := range staged {
 		maxEvents += len(state.rows) * (len(staged) + 1) * 4
 	}
-	for eventIndex := 0; eventIndex < len(events); eventIndex++ {
+	for eventIndex := 0; foreignChecksEnabled(checks) && eventIndex < len(events); eventIndex++ {
 		if eventIndex >= maxEvents {
 			return 0, fmt.Errorf("%w: cascading foreign key actions did not converge", ErrForeignKey)
 		}
@@ -870,6 +896,7 @@ func (d *Database) applyRowMutationsLocked(mutations []RowMutation) (int, error)
 							child.rows[rowIndex][childPosition] = event.newRow[parentPosition]
 						}
 						if !rowsEqual(oldRow, child.rows[rowIndex]) {
+							mark(childKey, rowIndex)
 							events = append(events, referentialEvent{table: childKey, oldRow: oldRow, newRow: cloneRow(child.rows[rowIndex])})
 							changed[childKey] = true
 						}
@@ -884,6 +911,7 @@ func (d *Database) applyRowMutationsLocked(mutations []RowMutation) (int, error)
 							child.rows[rowIndex][position] = NullValue(column.Type)
 						}
 						if !rowsEqual(oldRow, child.rows[rowIndex]) {
+							mark(childKey, rowIndex)
 							events = append(events, referentialEvent{table: childKey, oldRow: oldRow, newRow: cloneRow(child.rows[rowIndex])})
 							changed[childKey] = true
 						}
@@ -895,21 +923,31 @@ func (d *Database) applyRowMutationsLocked(mutations []RowMutation) (int, error)
 		}
 	}
 
+	candidates := make(map[string][]Row)
 	finalRows := make(map[string][]Row, len(staged))
 	for key, state := range staged {
 		rows := make([]Row, 0, len(state.rows)+len(pendingInserts[key]))
 		for rowIndex, row := range state.rows {
 			if state.active[rowIndex] {
 				rows = append(rows, cloneRow(row))
+				if touched[key][rowIndex] {
+					candidates[key] = append(candidates[key], row)
+				}
 			}
 		}
 		rows = append(rows, pendingInserts[key]...)
+		candidates[key] = append(candidates[key], pendingInserts[key]...)
 		finalRows[key] = rows
 		if err := state.table.validateRows(rows); err != nil {
 			return 0, err
 		}
 	}
-	if err := validateStagedForeignKeys(staged, finalRows); err != nil {
+	if err := func() error {
+		if !foreignChecksEnabled(checks) {
+			return nil
+		}
+		return validateStagedForeignKeys(staged, finalRows, candidates)
+	}(); err != nil {
 		return 0, err
 	}
 	keys := make([]string, 0, len(changed))
@@ -962,15 +1000,22 @@ func rowsEqual(left, right Row) bool {
 	return true
 }
 
-func validateStagedForeignKeys(staged map[string]*stagedTableMutation, rows map[string][]Row) error {
+func validateStagedForeignKeys(staged map[string]*stagedTableMutation, rows map[string][]Row, candidates ...map[string][]Row) error {
 	for childKey, child := range staged {
+		childRows := rows[childKey]
+		if len(candidates) > 0 {
+			childRows = candidates[0][childKey]
+		}
+		if len(childRows) == 0 {
+			continue
+		}
 		for _, foreignKey := range child.table.ForeignKeys() {
 			_, reference := splitQualifiedName(foreignKey.RefTable)
 			parent := staged[normalizeName(reference)]
 			if parent == nil {
 				return fmt.Errorf("%w: referenced table %s", ErrForeignKey, foreignKey.RefTable)
 			}
-			for _, childRow := range rows[childKey] {
+			for _, childRow := range childRows {
 				nullReference := false
 				for _, column := range foreignKey.Columns {
 					position, _ := child.table.ColumnIndex(column)
@@ -998,14 +1043,14 @@ func validateStagedForeignKeys(staged map[string]*stagedTableMutation, rows map[
 	return nil
 }
 
-func (d *Database) Truncate(tableName string) (int, error) {
+func (d *Database) Truncate(tableName string, checks ...bool) (int, error) {
 	d.constraintMu.Lock()
 	defer d.constraintMu.Unlock()
 	table, err := d.Table(tableName)
 	if err != nil {
 		return 0, err
 	}
-	if table.RowCount() > 0 {
+	if foreignChecksEnabled(checks) && table.RowCount() > 0 {
 		for _, childName := range d.ListTables() {
 			child, _ := d.Table(childName)
 			for _, foreignKey := range child.ForeignKeys() {
@@ -1118,6 +1163,10 @@ func newStoreFromSnapshot(snapshot StoreSnapshot, shareRows bool) (*Store, error
 			return nil, err
 		}
 		for _, tableSnapshot := range databaseSnapshot.Tables {
+			tableSnapshot, err = NormalizeDecimalSnapshot(tableSnapshot)
+			if err != nil {
+				return nil, err
+			}
 			table, err := database.CreateTable(tableSnapshot.Name, tableSnapshot.Columns)
 			if err != nil {
 				return nil, err
@@ -1153,6 +1202,10 @@ func newStoreFromSnapshot(snapshot StoreSnapshot, shareRows bool) (*Store, error
 			}
 			table.SetNamedConstraints(tableSnapshot.ForeignKeys, checks)
 			table.restoreMetadata(tableSnapshot.Comment, tableSnapshot.CreatedAt, tableSnapshot.UpdatedAt)
+			if tableSnapshot.coldRows != nil {
+				table.cold = tableSnapshot.coldRows
+				table.dataLength = tableSnapshot.coldRows.memoryBytes
+			}
 		}
 		for _, viewSnapshot := range databaseSnapshot.Views {
 			if err := database.CreateView(viewSnapshot.Name, viewSnapshot.Definition, viewSnapshot.Columns, false); err != nil {
@@ -1186,7 +1239,23 @@ func (s *Store) ReplaceShared(snapshot StoreSnapshot) error {
 }
 
 func (s *Store) Clone() (*Store, error) {
-	return newStoreFromSnapshot(s.persistenceSnapshot(), true)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := NewStore()
+	for key, database := range s.databases {
+		database.mu.RLock()
+		copied := &Database{name: database.name, tables: make(map[string]*Table, len(database.tables)), views: make(map[string]View, len(database.views))}
+		for name, table := range database.tables {
+			copied.tables[name] = table.cloneForTransaction()
+		}
+		for name, view := range database.views {
+			view.Columns = append([]string(nil), view.Columns...)
+			copied.views[name] = view
+		}
+		database.mu.RUnlock()
+		result.databases[key] = copied
+	}
+	return result, nil
 }
 
 func validateIdentifier(name string) error {
@@ -1204,3 +1273,5 @@ func validateIdentifier(name string) error {
 	}
 	return nil
 }
+
+func foreignChecksEnabled(checks []bool) bool { return len(checks) == 0 || checks[0] }

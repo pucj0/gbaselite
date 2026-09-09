@@ -25,6 +25,7 @@ namespace GBaseLite.CustomActions
             public string Port { get; set; } = "3307";
             public string Username { get; set; } = "root";
             public string Password { get; set; } = string.Empty;
+            public bool Interactive { get; set; }
             public bool Reinitialize { get; set; }
             public bool ReinitializeConfirmed { get; set; }
             public bool AutoStart { get; set; }
@@ -85,6 +86,7 @@ namespace GBaseLite.CustomActions
                     Port = session["GBASE_PORT"],
                     Username = session["GBASE_ADMIN_USER"],
                     Password = session["GBASE_ADMIN_PASSWORD"],
+                    Interactive = int.TryParse(session["UILevel"], out var uiLevel) && uiLevel >= 3,
                     Reinitialize = session["GBASE_REINITIALIZE"] == "1",
                     ReinitializeConfirmed = session["GBASE_REINITIALIZE_CONFIRMED"] == "1",
                     AutoStart = session["GBASE_AUTO_START"] == "1",
@@ -161,6 +163,8 @@ namespace GBaseLite.CustomActions
         public static ActionResult FinalizeInstallation(Session session)
         {
             string? backupDataPath = null;
+            bool deleteDamagedBackup = false;
+            bool serviceStarted = false;
             byte[]? previousConfig = null;
             string? configPath = null;
             try
@@ -176,6 +180,20 @@ namespace GBaseLite.CustomActions
                     previousConfig = File.ReadAllBytes(configPath);
                 }
 
+                // Stop writers before inspecting or moving any data directory.
+                StopExistingWindowsService(session);
+                StopStandaloneGBaseLiteListener(session, int.Parse(payload.Port));
+                if (!payload.Reinitialize && ConfirmDamagedDataReset(session, payload))
+                {
+                    payload.Reinitialize = true;
+                    payload.ReinitializeConfirmed = true;
+                    payload.StartService = true;
+                    deleteDamagedBackup = true;
+                    if (string.IsNullOrEmpty(payload.Password) && File.Exists(configPath))
+                        payload.Password = ReadConfigValue(configPath, "password");
+                    Validate(payload);
+                }
+
                 if (payload.Reinitialize)
                 {
                     if (!payload.ReinitializeConfirmed)
@@ -183,6 +201,7 @@ namespace GBaseLite.CustomActions
                         throw new InvalidOperationException("Data reinitialization was not confirmed.");
                     }
                     var dataPath = Path.GetFullPath(payload.DataPath);
+                    EnsureResetTreeSafe(dataPath, payload);
                     if (Directory.Exists(dataPath))
                     {
                         backupDataPath = dataPath.TrimEnd(Path.DirectorySeparatorChar) +
@@ -222,6 +241,8 @@ namespace GBaseLite.CustomActions
                                 service.Start();
                                 session.Log("Requested GBaseLite Windows service startup.");
                             }
+                            service.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
+                            serviceStarted = true;
                         }
                     }
                     catch (Exception error)
@@ -232,9 +253,23 @@ namespace GBaseLite.CustomActions
 
                 if (backupDataPath != null)
                 {
-                    // Deleting a large prior data directory can hold the MSI progress UI for minutes.
-                    // Keep the adjacent backup so a successful reinitialization remains recoverable.
-                    session.Log("Retained the previous GBaseLite data directory backup after reinitialization.");
+                    if (deleteDamagedBackup && serviceStarted)
+                    {
+                        // The user explicitly confirmed permanent deletion. Recheck links
+                        // immediately before removing only our uniquely staged old directory.
+                        try
+                        {
+                            EnsureResetTreeSafe(backupDataPath, payload);
+                            Directory.Delete(backupDataPath, true);
+                            backupDataPath = null;
+                            session.Log("Removed confirmed damaged data after successful service initialization.");
+                        }
+                        catch (Exception cleanupError)
+                        {
+                            session.Log("Reinitialization completed; old data retained at {0}: {1}", backupDataPath, cleanupError.Message);
+                        }
+                    }
+                    else session.Log("Retained previous data at {0}; automatic deletion was not confirmed or service startup did not complete.", backupDataPath);
                 }
                 return ActionResult.Success;
             }
@@ -269,6 +304,86 @@ namespace GBaseLite.CustomActions
                     // Avoid logging sensitive paths or masking the original installer failure.
                 }
                 return ActionResult.Failure;
+            }
+        }
+
+        private static bool ConfirmDamagedDataReset(Session session, InstallerData payload)
+        {
+            if (!payload.Interactive || !Directory.Exists(payload.DataPath)) return false;
+            // A preserved config may point somewhere other than the selected directory.
+            // Never offer to delete a directory that this service will not actually use.
+            if (File.Exists(payload.ConfigPath) && !payload.ApplyConfiguration)
+            {
+                var configured = ReadConfigSectionValue(payload.ConfigPath, "storage", "path", string.Empty);
+                if (string.IsNullOrEmpty(configured) || !Path.IsPathRooted(configured) ||
+                    !string.Equals(Path.GetFullPath(configured).TrimEnd('\\', '/'), Path.GetFullPath(payload.DataPath).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+            EnsureResetTreeSafe(payload.DataPath, payload);
+            var executable = Path.Combine(payload.InstallPath, "gbaselite.exe");
+            using (var process = new Process())
+            {
+                process.StartInfo = new ProcessStartInfo(executable,
+                    "check-damaged-data --directory \"" + Path.GetFullPath(payload.DataPath).TrimEnd('\\', '/') + "\"")
+                { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+                process.Start();
+                var output = process.StandardOutput.ReadToEndAsync();
+                var error = process.StandardError.ReadToEndAsync();
+                if (!process.WaitForExit(60000))
+                {
+                    process.Kill(); process.WaitForExit();
+                    session.Log("Data inspection timed out; preserving data.");
+                    return false;
+                }
+                if (process.ExitCode != 0 || output.Result.Trim() != "DAMAGED")
+                {
+                    session.Log("No confirmed snapshot truncation; preserving data. Inspection: {0}", error.Result);
+                    return false;
+                }
+            }
+            var directory = Path.GetFullPath(payload.DataPath);
+            return ConfirmDataDeletion(session, "检测到数据库快照为空或被截断。\r\n\r\n数据目录：" + directory +
+                "\r\n\r\n是否删除该目录中的全部数据库、表、用户和权限，并重新初始化？\r\n选择“否”将保留数据。") &&
+                ConfirmDataDeletion(session, "最后确认：将永久删除以下目录中的全部旧数据：\r\n\r\n" + directory +
+                "\r\n\r\n只有确认不再需要这些数据，才选择“是”。重新初始化失败时保留旧数据备份。");
+        }
+
+        private static bool ConfirmDataDeletion(Session session, string message)
+        {
+            using (var record = new Record(0))
+            {
+                record.FormatString = message;
+                // MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2: default is No.
+                return session.Message(InstallMessage.User | (InstallMessage)0x134, record) == MessageResult.Yes;
+            }
+        }
+
+        private static void EnsureResetTreeSafe(string path, InstallerData payload)
+        {
+            var absolute = Path.GetFullPath(path).TrimEnd('\\', '/');
+            ValidateRuntimeDirectory(absolute, payload.InstallPath, "Data directory");
+            var prefix = absolute + Path.DirectorySeparatorChar;
+            foreach (var protectedPath in new[] { payload.ConfigPath, payload.InstallPath, payload.LogPath })
+            {
+                var full = Path.GetFullPath(protectedPath).TrimEnd('\\', '/');
+                if (full.Equals(absolute, StringComparison.OrdinalIgnoreCase) || full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("Data reset cannot include configuration, program or log paths.");
+            }
+            for (var parent = new DirectoryInfo(absolute); parent != null; parent = parent.Parent)
+                if (parent.Exists && (parent.Attributes & System.IO.FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidOperationException("Data reset refuses junctions and symbolic links.");
+            var pending = new Stack<string>(); pending.Push(absolute);
+            while (pending.Count > 0)
+            {
+                var directory = pending.Pop();
+                if (!Directory.Exists(directory)) continue;
+                foreach (var entry in Directory.EnumerateFileSystemEntries(directory))
+                {
+                    var attributes = File.GetAttributes(entry);
+                    if ((attributes & System.IO.FileAttributes.ReparsePoint) != 0)
+                        throw new InvalidOperationException("Data reset refuses junctions and symbolic links.");
+                    if ((attributes & System.IO.FileAttributes.Directory) != 0) pending.Push(entry);
+                }
             }
         }
 

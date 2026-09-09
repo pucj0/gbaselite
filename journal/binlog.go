@@ -12,12 +12,22 @@ import (
 	"time"
 )
 
-const BinlogVersion = 1
+const BinlogVersion = 2
+
+// AutoIncrementState preserves reservations consumed by rolled-back inserts.
+type AutoIncrementState struct {
+	Database string `json:"database"`
+	Table    string `json:"table"`
+	Column   string `json:"column"`
+	Next     int64  `json:"next"`
+}
 
 type BinlogStatement struct {
-	Database     string `json:"database,omitempty"`
-	SQL          string `json:"sql"`
-	AffectedRows uint64 `json:"affected_rows"`
+	ForeignKeyChecksDisabled bool                 `json:"foreign_key_checks_disabled,omitempty"`
+	AutoIncrement            []AutoIncrementState `json:"auto_increment,omitempty"`
+	Database                 string               `json:"database,omitempty"`
+	SQL                      string               `json:"sql"`
+	AffectedRows             uint64               `json:"affected_rows"`
 }
 
 type BinlogRecord struct {
@@ -72,7 +82,22 @@ func (l *Binlog) Append(record BinlogRecord) error {
 		return err
 	}
 	l.sequence++
-	record.Version = BinlogVersion
+	record.Version = 1
+	for _, statement := range record.Statements {
+		if len(statement.AutoIncrement) > 0 {
+			record.Version = BinlogVersion
+			break
+		}
+	}
+	for _, statement := range record.Statements {
+		if statement.ForeignKeyChecksDisabled {
+			record.Version = 3
+		}
+	}
+	if err := validateBinlogRecord(record); err != nil {
+		l.sequence--
+		return err
+	}
 	record.Sequence = l.sequence
 	if record.Timestamp.IsZero() {
 		record.Timestamp = time.Now().UTC()
@@ -135,8 +160,8 @@ func LastBinlogSequence(path string) (uint64, error) {
 			}
 			return 0, fmt.Errorf("decode binlog: %w", err)
 		}
-		if record.Version != BinlogVersion {
-			return 0, fmt.Errorf("unsupported binlog version %d", record.Version)
+		if err := validateBinlogRecord(record); err != nil {
+			return 0, err
 		}
 		if record.Sequence <= previous {
 			return 0, fmt.Errorf("binlog sequence %d is not greater than %d", record.Sequence, previous)
@@ -171,8 +196,8 @@ func ReadBinlog(path string, options ReplayOptions, apply func(BinlogRecord) err
 			}
 			return count, lastApplied, fmt.Errorf("decode binlog: %w", err)
 		}
-		if record.Version != BinlogVersion {
-			return count, lastApplied, fmt.Errorf("unsupported binlog version %d", record.Version)
+		if err := validateBinlogRecord(record); err != nil {
+			return count, lastApplied, err
 		}
 		if record.Sequence <= lastSeen {
 			return count, lastApplied, fmt.Errorf("binlog sequence %d is not greater than %d", record.Sequence, lastSeen)
@@ -233,4 +258,27 @@ func writeSequenceState(path string, sequence uint64) error {
 		return err
 	}
 	return replaceFile(temporaryPath, path+".sequence")
+}
+
+func validateBinlogRecord(record BinlogRecord) error {
+	if record.Version != 1 && record.Version != BinlogVersion && record.Version != 3 {
+		return fmt.Errorf("unsupported binlog version %d", record.Version)
+	}
+	for _, statement := range record.Statements {
+		if statement.ForeignKeyChecksDisabled && record.Version < 3 {
+			return fmt.Errorf("foreign key session state requires binlog version 3")
+		}
+		if len(statement.AutoIncrement) == 0 {
+			continue
+		}
+		if record.Version < 2 || statement.SQL != "" {
+			return fmt.Errorf("invalid auto increment control record")
+		}
+		for _, state := range statement.AutoIncrement {
+			if state.Next < 1 || strings.TrimSpace(state.Database) == "" || strings.TrimSpace(state.Table) == "" || strings.TrimSpace(state.Column) == "" {
+				return fmt.Errorf("invalid auto increment control state")
+			}
+		}
+	}
+	return nil
 }
