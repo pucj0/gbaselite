@@ -60,7 +60,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: GBaseLite ${{ steps.version.outputs.version }}
-          body_path: docs/·¢²¼ËµÃ÷/${{ steps.version.outputs.version }}¸üÐÂËµÃ÷.md
+          body_path: docs/ï¿½ï¿½ï¿½ï¿½Ëµï¿½ï¿½/${{ steps.version.outputs.version }}ï¿½ï¿½ï¿½ï¿½Ëµï¿½ï¿½.md
           generate_release_notes: false
           files: |
             dist/GBaseLite-windows-amd64.msi
