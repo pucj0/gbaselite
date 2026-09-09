@@ -15,4 +15,4 @@ Dockerfile text eol=lf
 *.bat text eol=crlf
 
 # Preserve exact bytes of checksummed benchmark evidence.
-docs/报告/** -text
+docs/报告/** -text -whitespace

@@ -208,4 +208,3 @@ if __name__=='__main__':
     for n in [10,1000,10000,100000,1000000]:
         completed=subprocess.run([sys.executable,__file__,'--engine',a.engine,'--rows',str(n)],creationflags=FLAGS)
         if completed.returncode: raise SystemExit(completed.returncode)
-
