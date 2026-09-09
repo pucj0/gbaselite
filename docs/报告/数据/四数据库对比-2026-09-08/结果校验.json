@@ -1,0 +1,16 @@
+{
+  "cases": 60,
+  "engines": 4,
+  "scales": [
+    10,
+    1000,
+    10000,
+    100000,
+    1000000
+  ],
+  "rounds": 3,
+  "all_stages_ok": true,
+  "all_update_counts_verified": true,
+  "all_temporary_databases_removed": true,
+  "scope": "COUNT/SUM and affected rows; range result content; no crash/restart/HA or full payload validation"
+}

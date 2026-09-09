@@ -2,9 +2,15 @@ server:
   host: 127.0.0.1
   port: 3307
   max_connections: 512
+  max_prepared_statements: 128
+  max_prepared_memory_kb: 1024
   write_buffer_kb: 8
   slow_query_ms: 100
   time_zone: SYSTEM
+
+resources:
+  memory_limit_mb: 0
+  max_procs: 0
 
 storage:
   path: ./data

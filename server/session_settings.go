@@ -69,6 +69,23 @@ func executeSessionSet(session *executor.Session, query string) (*executor.Resul
 			}
 		}
 		switch variable {
+		case "foreign_key_checks":
+			if global {
+				return nil, fmt.Errorf("SET GLOBAL foreign_key_checks is not supported")
+			}
+			switch strings.ToUpper(strings.TrimSpace(right)) {
+			case "DEFAULT":
+				value = "1"
+			}
+			switch strings.ToUpper(value) {
+			case "0", "OFF":
+				updated.ForeignKeyChecksDisabled = true
+			case "1", "ON":
+				updated.ForeignKeyChecksDisabled = false
+			default:
+				return nil, fmt.Errorf("foreign_key_checks requires 0 or 1")
+			}
+			changed = true
 		case "time_zone":
 			if global {
 				return nil, fmt.Errorf("SET GLOBAL time_zone is not supported; configure each session with SET time_zone")
@@ -274,8 +291,17 @@ func sessionVariableValues(session *executor.Session, global bool) [][]any {
 	if global {
 		timeZone = session.ServerTimeZone
 	}
+	autocommit := "ON"
+	if !global && session.AutocommitDisabled {
+		autocommit = "OFF"
+	}
+	foreignChecks := "1"
+	if !global && session.ForeignKeyChecksDisabled {
+		foreignChecks = "0"
+	}
 	return [][]any{
-		{"autocommit", "ON"},
+		{"foreign_key_checks", foreignChecks},
+		{"autocommit", autocommit},
 		{"character_set_client", session.CharacterSetClient},
 		{"character_set_connection", session.CharacterSetConnection},
 		{"character_set_database", executor.DefaultCharacterSet},
@@ -292,7 +318,7 @@ func sessionVariableValues(session *executor.Session, global bool) [][]any {
 	}
 }
 
-func compatibilityVariables(session *executor.Session, query string) *executor.Result {
+func compatibilityVariables(session *executor.Session, query string, mvccMode bool) *executor.Result {
 	expressions := splitSetAssignments(strings.TrimSpace(query[len("SELECT "):]))
 	values := make(map[string]any)
 	for _, row := range sessionVariableValues(session, false) {
@@ -315,7 +341,16 @@ func compatibilityVariables(session *executor.Session, query string) *executor.R
 			variable = strings.TrimPrefix(variable, prefix)
 		}
 		result.Columns = append(result.Columns, executor.Column{Name: label, Type: storage.TypeVarchar})
-		if global {
+		if mvccMode && (variable == "tx_isolation" || variable == "transaction_isolation") {
+			result.Rows[0][index] = "REPEATABLE-READ"
+		} else if variable == "autocommit" {
+			result.Columns[index].Type = storage.TypeBigInt
+			value := int64(1)
+			if !global && session.AutocommitDisabled {
+				value = 0
+			}
+			result.Rows[0][index] = value
+		} else if global {
 			result.Rows[0][index] = globalValues[variable]
 		} else {
 			result.Rows[0][index] = values[variable]

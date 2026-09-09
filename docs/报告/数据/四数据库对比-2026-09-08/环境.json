@@ -1,0 +1,45 @@
+{
+  "date": "2026-09-08T22:50:30.5144501+08:00",
+  "os": {
+    "Caption": "Microsoft Windows 11 家庭版 中文版",
+    "Version": "10.0.26200",
+    "TotalVisibleMemorySize": 66914252
+  },
+  "cpu": {
+    "Name": "12th Gen Intel(R) Core(TM) i5-12600KF",
+    "NumberOfCores": 10,
+    "NumberOfLogicalProcessors": 16
+  },
+  "disks": [
+    {
+      "FriendlyName": "ZHITAI TiPlus5000 1TB",
+      "MediaType": "SSD",
+      "BusType": "NVMe",
+      "Size": 1024209543168
+    },
+    {
+      "FriendlyName": "WD_BLACK SN7100 2TB",
+      "MediaType": "SSD",
+      "BusType": "NVMe",
+      "Size": 2000398934016
+    }
+  ],
+  "benchmark_drive": {
+    "FriendlyName": "ZHITAI TiPlus5000 1TB",
+    "BusType": "NVMe",
+    "Size": 1024209543168
+  },
+  "go": "go version go1.26.5 windows/amd64",
+  "git_head": "b28a5a070235b463b6fdfa2e13e10fccab4e9a98",
+  "source_dirty": true,
+  "binary_sha256": "D4278021CFC9B8988B34F6108D70F63A80C9CF15E2AF86A43438E1597F85721C",
+  "python": "3.12.14 (main, Aug 25 2026, 14:01:42) [MSC v.1944 64 bit (AMD64)]",
+  "python_executable": "C:\\Users\\18089\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
+  "packages": {
+    "matplotlib": "3.11.1",
+    "psutil": "7.2.2",
+    "PyMySQL": "1.2.0",
+    "psycopg": "3.3.5",
+    "psycopg-binary": "3.3.5"
+  }
+}

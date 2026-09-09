@@ -9,7 +9,7 @@ on:
       version:
         description: Numeric version without the v prefix
         required: true
-        default: "1.1.0"
+        default: "1.1.1"
 
 permissions:
   contents: write
@@ -59,7 +59,9 @@ jobs:
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          name: GBaseLite ${{ steps.version.outputs.version }}
+          body_path: docs/����˵��/${{ steps.version.outputs.version }}����˵��.md
+          generate_release_notes: false
           files: |
             dist/GBaseLite-windows-amd64.msi
             dist/gbaselite-windows-amd64.zip

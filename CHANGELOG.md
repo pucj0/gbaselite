@@ -14,7 +14,72 @@ releases.
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-08-31
+## [1.1.1] - 2026-09-09
+
+### 更新摘要
+
+- 补齐 Navicat 系统元数据与 NDB 探测，实现会话级外键检查及并行乱序导入。
+- 汇总 MVCC、顺序 WAL、磁盘暂存大事务、索引与执行计划、SQL/资源优化、实验性复制和维护能力。
+- 改进 Windows 安装、快照恢复保护、服务诊断及文档/对比验证工具。
+- 外键会话状态使用 binlog v3；旧程序不能重放，升级与 SQL 范围见 [完整更新说明](docs/发布说明/1.1.1更新说明.md)。
+
+## [1.1.0] - 2026-09-09
+
+### Changed
+
+- Automated release build.
+
+## [1.0.9] - 2026-09-09
+
+### Changed
+
+- Automated release build.
+
+## [1.0.8] - 2026-09-09
+
+- 补齐 Navicat information_schema 浏览、单表元数据换行/省略库名路由，以及视图、索引和约束查询的系统库上下文处理。
+
+## [1.0.7] - 2026-09-09
+
+- MSI 对明确为空或截断的旧 snapshot 提供含完整目录的两次删除确认，成功重建后清理已确认删除的旧数据；默认拒绝、静默安装保留，失败留存旁路备份。
+
+- Windows 服务失败时记录应用程序事件日志（GBaseLite / 1000），保留此前只返回 SCM 退出码的具体启动错误。
+
+## [1.0.6] - 2026-09-09
+
+### Changed
+
+- Automated release build.
+
+## [1.0.5] - 2026-09-09
+
+### Changed
+
+- Automated release build.
+
+## [1.0.4] - 2026-09-08
+
+### Changed
+
+- Automated release build.
+
+## [1.0.3] - 2026-09-08
+
+### Changed
+
+- Automated release build.
+
+## [1.0.2] - 2026-09-08
+
+### Changed
+
+- Automated release build.
+
+## [1.0.1] - 2026-09-08
+
+### Fixed
+
+- Windows release formatting checks now exclude tool caches, runtime data and generated output while still checking new/untracked and platform-specific project Go sources. Added a release source-scope regression self-test.
 
 ### Added
 
@@ -754,3 +819,9 @@ releases.
 ### Added
 
 - Initial open-source preview of the MySQL-compatible GBaseLite server.
+
+- 修复 Navicat 查询 information_schema 字符集、排序规则、系统视图字段和索引时错误回落到实体库查找的问题；加入传统/MVCC 及 TCP 回归验证。
+
+- 修复 Navicat 初始化 SELECT COUNT(*) AS support_ndb FROM information_schema.ENGINES WHERE Engine = ? 的 1064 错误；增加传统/MVCC 模式的文本和预处理协议回归测试。
+
+- 实现会话级 FOREIGN_KEY_CHECKS；支持并行乱序导入保留外键定义，补充 MVCC 持久化依赖目录和 binlog v3 逐语句状态；增加并行、重启、回滚、连接重置及重放回归测试。

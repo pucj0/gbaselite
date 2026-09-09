@@ -1,0 +1,241 @@
+package executor
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"gbaselite/mvcc"
+	"gbaselite/storage"
+	"strings"
+)
+
+func mvccFKIndex(parent versionedTable, fk storage.ForeignKey) (storage.Index, error) {
+	for _, idx := range parent.Definition.Indexes {
+		if !idx.Primary && !idx.Unique || len(idx.Columns) != len(fk.RefColumns) {
+			continue
+		}
+		same := true
+		for i, c := range idx.Columns {
+			same = same && strings.EqualFold(c, fk.RefColumns[i])
+		}
+		if same {
+			return idx, nil
+		}
+	}
+	return storage.Index{}, fmt.Errorf("%w: referenced columns need a complete unique index", storage.ErrForeignKey)
+}
+func mvccColumnPosition(table versionedTable, name string) int {
+	for i, c := range table.Definition.Columns {
+		if strings.EqualFold(c.Name, name) {
+			return i
+		}
+	}
+	return -1
+}
+func prepareMVCCForeignKeys(tx *mvcc.Tx, table *versionedTable, session *Session) error {
+	seen := map[string]bool{}
+	for i := range table.Definition.ForeignKeys {
+		fk := &table.Definition.ForeignKeys[i]
+		if fk.Name == "" {
+			fk.Name = fmt.Sprintf("fk_%d", i+1)
+		}
+		if seen[strings.ToLower(fk.Name)] {
+			return fmt.Errorf("duplicate foreign key name")
+		}
+		seen[strings.ToLower(fk.Name)] = true
+		for _, action := range []string{fk.OnDelete, fk.OnUpdate} {
+			if action != "" && !strings.EqualFold(action, "RESTRICT") && !strings.EqualFold(action, "NO ACTION") {
+				return fmt.Errorf("MVCC foreign keys currently support RESTRICT/NO ACTION")
+			}
+		}
+		childDB, _ := splitTableName(table.CatalogName)
+		db, name, err := versionedName(&Session{CurrentDatabase: childDB}, fk.RefTable)
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(db, childDB) {
+			return fmt.Errorf("MVCC cross-database foreign keys are not supported")
+		}
+		fk.RefTable = db + "." + name
+		if strings.EqualFold(fk.RefTable, table.CatalogName) {
+			return fmt.Errorf("MVCC self-referencing foreign keys are not supported")
+		}
+		parent, _, key, err := loadVersionedTable(tx, session, fk.RefTable)
+		if err != nil {
+			return err
+		}
+		if len(fk.Columns) == 0 || len(fk.Columns) != len(fk.RefColumns) {
+			return storage.ErrForeignKey
+		}
+		if _, err = mvccFKIndex(parent, *fk); err != nil {
+			return err
+		}
+		for j, name := range fk.Columns {
+			a, b := mvccColumnPosition(*table, name), mvccColumnPosition(parent, fk.RefColumns[j])
+			if a < 0 || b < 0 {
+				return storage.ErrColumnNotFound
+			}
+			ca, cb := table.Definition.Columns[a], parent.Definition.Columns[b]
+			if ca.Type != cb.Type || !strings.EqualFold(ca.Collation, cb.Collation) {
+				return fmt.Errorf("%w: foreign key type/collation mismatch", storage.ErrForeignKey)
+			}
+		}
+		parent.CatalogName = fk.RefTable
+		found := false
+		for _, ref := range parent.Referrers {
+			found = found || strings.EqualFold(ref, table.CatalogName)
+		}
+		if !found {
+			parent.Referrers = append(parent.Referrers, table.CatalogName)
+		}
+		encoded, err := encodeVersioned(parent)
+		if err != nil {
+			return err
+		}
+		if err = tx.Put("catalog", key, encoded); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func mvccFKParentRow(child, parent versionedTable, fk storage.ForeignKey, row storage.Row) (storage.Row, bool, error) {
+	candidate := make(storage.Row, len(parent.Definition.Columns))
+	for i, c := range parent.Definition.Columns {
+		candidate[i] = storage.NullValue(c.Type)
+	}
+	for i, c := range fk.Columns {
+		a, b := mvccColumnPosition(child, c), mvccColumnPosition(parent, fk.RefColumns[i])
+		if a < 0 || b < 0 {
+			return nil, false, storage.ErrColumnNotFound
+		}
+		if row[a].Null {
+			return nil, false, nil
+		}
+		candidate[b] = row[a]
+	}
+	return candidate, true, nil
+}
+func validateMVCCReferences(ctx context.Context, tx *mvcc.Tx, table versionedTable, oldRow, newRow storage.Row) error {
+	if newRow != nil {
+		for _, fk := range table.Definition.ForeignKeys {
+			parent, _, catalog, err := loadVersionedTable(tx, &Session{}, fk.RefTable)
+			if err != nil {
+				return err
+			}
+			idx, err := mvccFKIndex(parent, fk)
+			if err != nil {
+				return err
+			}
+			candidate, check, err := mvccFKParentRow(table, parent, fk, newRow)
+			if err != nil {
+				return err
+			}
+			if !check {
+				continue
+			}
+			var owner []byte
+			var exists bool
+			if idx.Primary {
+				owner, exists = mvccPrimaryKey(parent, idx, candidate)
+			} else {
+				key, ok := storage.IndexValueKey(idx, parent.Definition.Columns, candidate)
+				if !ok {
+					return storage.ErrForeignKey
+				}
+				owner, exists, err = tx.Get("index/"+parent.ID+"/"+idx.Name, []byte(key))
+				if err != nil {
+					return err
+				}
+			}
+			if !exists {
+				return storage.ErrForeignKey
+			}
+			if _, exists, err = tx.Get("row/"+parent.ID, owner); err != nil {
+				return err
+			}
+			if !exists {
+				return storage.ErrForeignKey
+			}
+			if err = tx.Guard("catalog", catalog); err != nil {
+				return err
+			}
+			if err = tx.Guard("row/"+parent.ID, owner); err != nil {
+				return err
+			}
+		}
+	}
+	if oldRow == nil {
+		return nil
+	}
+	for _, ref := range table.Referrers {
+		child, _, catalog, err := loadVersionedTable(tx, &Session{}, ref)
+		if errors.Is(err, storage.ErrTableNotFound) || errors.Is(err, storage.ErrDatabaseNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for _, fk := range child.Definition.ForeignKeys {
+			if !strings.EqualFold(fk.RefTable, table.CatalogName) {
+				continue
+			}
+			idx, err := mvccFKIndex(table, fk)
+			if err != nil {
+				return err
+			}
+			oldKey, ok := storage.IndexValueKey(idx, table.Definition.Columns, oldRow)
+			if !ok {
+				continue
+			}
+			if newRow != nil {
+				nextKey, _ := storage.IndexValueKey(idx, table.Definition.Columns, newRow)
+				if oldKey == nextKey {
+					continue
+				}
+			}
+			if err = tx.Guard("catalog", catalog); err != nil {
+				return err
+			}
+			if err = tx.GuardRange("row/" + child.ID); err != nil {
+				return err
+			}
+			err = tx.ScanRange(ctx, "row/"+child.ID, mvcc.KeyRange{}, func(_, v []byte) error {
+				row, err := decodeMVCCRow(child, v)
+				if err != nil {
+					return err
+				}
+				candidate, check, err := mvccFKParentRow(child, table, fk, row)
+				if err != nil || !check {
+					return err
+				}
+				key, _ := storage.IndexValueKey(idx, table.Definition.Columns, candidate)
+				if bytes.Equal([]byte(key), []byte(oldKey)) {
+					return storage.ErrForeignKey
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+func rejectMVCCReferencedDrop(tx *mvcc.Tx, table versionedTable) error {
+	for _, ref := range table.Referrers {
+		child, _, _, err := loadVersionedTable(tx, &Session{}, ref)
+		if errors.Is(err, storage.ErrTableNotFound) || errors.Is(err, storage.ErrDatabaseNotFound) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		for _, fk := range child.Definition.ForeignKeys {
+			if strings.EqualFold(fk.RefTable, table.CatalogName) {
+				return fmt.Errorf("%w: table is referenced by %s", storage.ErrForeignKey, ref)
+			}
+		}
+	}
+	return nil
+}

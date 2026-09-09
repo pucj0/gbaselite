@@ -19,6 +19,7 @@ import (
 
 	"gbaselite/config"
 	"gbaselite/executor"
+	"gbaselite/internal/processmemory"
 	"gbaselite/internal/rotatinglog"
 	"gbaselite/journal"
 	gbmysql "gbaselite/mysql"
@@ -42,6 +43,8 @@ func run(args []string) error {
 		args = args[1:]
 	}
 	switch command {
+	case "proxy":
+		return runProxy(args)
 	case "server":
 		return runServer(args)
 	case "service":
@@ -69,6 +72,8 @@ func run(args []string) error {
 			return fmt.Errorf("usage: gbaselite export mysql [options]")
 		}
 		return runExport(args[1:])
+	case "migrate-layout":
+		return runMigrateLayout(args)
 	case "backup":
 		return runBackup(args)
 	case "restore":
@@ -79,6 +84,8 @@ func run(args []string) error {
 		return runHealthcheck(args)
 	case "diagnose":
 		return runDiagnose(args)
+	case "check-damaged-data":
+		return runCheckDamagedData(args)
 	case "inspect-snapshot":
 		return runInspectSnapshot(args)
 	case "inspect-instance":
@@ -108,6 +115,13 @@ func runServerControlled(args []string, externalStop <-chan struct{}, ready chan
 	if err != nil {
 		return err
 	}
+	restoreWorkingSet, err := processmemory.LimitWorkingSet(int64(cfg.Resources.WorkingSetLimitMB) << 20)
+	if err != nil {
+		return err
+	}
+	defer restoreWorkingSet()
+	restoreResources := applyResourceSettings(cfg)
+	defer restoreResources()
 	logger, closeLog, err := newLogger(cfg.Log.Path, cfg.Log.MaxSizeMB, cfg.Log.RetentionDays)
 	if err != nil {
 		return err
@@ -126,10 +140,22 @@ func runServerControlled(args []string, externalStop <-chan struct{}, ready chan
 		return startupFailure(fmt.Errorf("listen on %s: %w", cfg.Address(), err))
 	}
 	defer listener.Close()
-	engine, err := executor.Open(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password)
+	openOptions, err := engineOptions(cfg, true)
+	if err != nil {
+		return err
+	}
+	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
 	if err != nil {
 		return startupFailure(err)
 	}
+	engine.QueryOptions = executor.QueryOptions{
+		Timeout:           cfg.Resources.QueryTimeout,
+		SortMemoryBytes:   int64(cfg.Resources.SortMemoryMB) << 20,
+		ResultMemoryBytes: int64(cfg.Resources.QueryResultMemoryMB) << 20,
+		MaxTempBytes:      int64(cfg.Resources.QueryTempMB) << 20,
+		TempDirectory:     cfg.Resources.QueryTempPath,
+	}
+	engine.OptimisticTransactions = cfg.Resources.OptimisticTransactions
 	var auditLog *journal.AuditLog
 	if cfg.Audit.Enabled {
 		auditLog, err = journal.OpenAudit(cfg.AuditPath(), cfg.Audit.RetentionDays)
@@ -157,6 +183,8 @@ func runServerControlled(args []string, externalStop <-chan struct{}, ready chan
 		Engine:                 engine,
 		Logger:                 logger,
 		MaxConnections:         cfg.Server.MaxConnections,
+		MaxPreparedStatements:  cfg.Server.MaxPreparedStatements,
+		MaxPreparedBytes:       cfg.Server.MaxPreparedMemoryKB << 10,
 		WriteBufferSize:        cfg.Server.WriteBufferSize,
 		SlowQuery:              cfg.Server.SlowQuery,
 		DefaultTimeZone:        cfg.Server.TimeZone,
@@ -374,7 +402,11 @@ func runShell(args []string) error {
 	if err != nil {
 		return err
 	}
-	engine, err := executor.Open(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password)
+	openOptions, err := engineOptions(cfg, false)
+	if err != nil {
+		return err
+	}
+	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
 	if err != nil {
 		return err
 	}
@@ -420,7 +452,11 @@ func runImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	engine, err := executor.Open(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password)
+	openOptions, err := engineOptions(cfg, false)
+	if err != nil {
+		return err
+	}
+	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
 	if err != nil {
 		return err
 	}
@@ -448,7 +484,11 @@ func runExport(args []string) error {
 	if err != nil {
 		return err
 	}
-	engine, err := executor.Open(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password)
+	openOptions, err := engineOptions(cfg, false)
+	if err != nil {
+		return err
+	}
+	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
 	if err != nil {
 		return err
 	}
@@ -480,7 +520,11 @@ func runBackup(args []string) error {
 	if err != nil {
 		return err
 	}
-	engine, err := executor.Open(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password)
+	openOptions, err := engineOptions(cfg, false)
+	if err != nil {
+		return err
+	}
+	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
 	if err != nil {
 		return err
 	}
@@ -513,7 +557,11 @@ func runRestore(args []string) error {
 	if pid, running := readRunningPID(pidPath); running {
 		return fmt.Errorf("stop GBaseLite before restore (currently PID %d)", pid)
 	}
-	engine, err := executor.Open(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password)
+	openOptions, err := engineOptions(cfg, false)
+	if err != nil {
+		return err
+	}
+	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
 	if err != nil {
 		return err
 	}
@@ -573,7 +621,11 @@ func runReplayBinlog(args []string) error {
 	if pid, running := readRunningPID(pidPath); running {
 		return fmt.Errorf("stop GBaseLite before replaying binlog (currently PID %d)", pid)
 	}
-	engine, err := executor.Open(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password)
+	openOptions, err := engineOptions(cfg, false)
+	if err != nil {
+		return err
+	}
+	engine, err := executor.OpenWithOptions(cfg.Storage.Path, cfg.Auth.Username, cfg.Auth.Password, openOptions)
 	if err != nil {
 		return err
 	}
@@ -593,6 +645,16 @@ func runReplayBinlog(args []string) error {
 			return err
 		}
 		for _, statement := range record.Statements {
+			if len(statement.AutoIncrement) > 0 {
+				if err := engine.ReplayAutoIncrement(session, statement.AutoIncrement); err != nil {
+					_, _ = engine.Execute(session, "ROLLBACK")
+					return err
+				}
+				if statement.SQL == "" {
+					continue
+				}
+			}
+			session.ForeignKeyChecksDisabled = statement.ForeignKeyChecksDisabled
 			session.CurrentDatabase = statement.Database
 			if _, err := engine.Execute(session, statement.SQL); err != nil {
 				_, _ = engine.Execute(session, "ROLLBACK")
@@ -656,6 +718,7 @@ func printHelp() {
 	fmt.Print(`GBaseLite commands:
   gbaselite -u USER -p [-h HOST] [-P PORT] [-D DATABASE]
   gbaselite client -u USER -p [-h HOST] [-P PORT] [-D DATABASE]
+  gbaselite proxy --config config.yaml --listen 127.0.0.1:3307 --peers n1=127.0.0.1:3311,n2=127.0.0.1:3312,n3=127.0.0.1:3313 [--tls-ca ca.pem]
   gbaselite server [--config config.yaml]
   gbaselite service [--config config.yaml]  (Windows Service Control Manager only)
   gbaselite start [--config config.yaml]
@@ -671,6 +734,7 @@ func printHelp() {
   gbaselite diagnose [--config config.yaml]
 	  gbaselite inspect-snapshot --file store.gob [--compare store.gob.tmp]
 	  gbaselite inspect-instance --directory copied-data-directory
+  gbaselite migrate-layout --source <stopped-versioned-dir> --target <new-dir> --layout flat|nested
   gbaselite version
 `)
 }
