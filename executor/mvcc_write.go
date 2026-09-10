@@ -306,7 +306,7 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, 
 		if floors[i] <= sent[i] {
 			return nil
 		}
-		if err := e.Backend.AdvanceCounter(ctx, definition.counterKey(columns[i].Name), floors[i]); err != nil {
+		if err := storageengine.AdvanceCounter(ctx, e.Backend, definition.counterKey(columns[i].Name), floors[i]); err != nil {
 			return err
 		}
 		sent[i] = floors[i]
@@ -375,7 +375,7 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, 
 						return struct{}{}, err
 					}
 					count := uint64(len(statement.Values) - rowIndex)
-					reserved, err := e.Backend.ReserveCounter(ctx, definition.counterKey(column.Name), count)
+					reserved, err := storageengine.ReserveCounter(ctx, e.Backend, definition.counterKey(column.Name), count)
 					if err != nil {
 						return struct{}{}, err
 					}

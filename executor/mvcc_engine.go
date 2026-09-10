@@ -52,9 +52,27 @@ func versionedName(session *Session, table string) (string, string, error) {
 func (e *Engine) refreshMVCCMetadata(ctx context.Context) error {
 	e.mvccMetadata.Lock()
 	defer e.mvccMetadata.Unlock()
-	head, err := e.Backend.CatalogHead()
-	if err != nil {
-		return err
+	var head uint64
+	var err error
+	var open func() (storageengine.Iterator, error)
+	if revisions, ok := e.Backend.(storageengine.RevisionReader); ok {
+		head, err = revisions.CatalogHead()
+		if err != nil {
+			return err
+		}
+		open = func() (storageengine.Iterator, error) {
+			return revisions.NewIterator(ctx, head, storageengine.ScanRequest{Space: "catalog"})
+		}
+	} else {
+		tx, beginErr := e.Backend.Begin(ctx)
+		if beginErr != nil {
+			return beginErr
+		}
+		defer tx.Rollback()
+		head = tx.Snapshot()
+		open = func() (storageengine.Iterator, error) {
+			return tx.NewIterator(ctx, storageengine.ScanRequest{Space: "catalog"})
+		}
 	}
 	if head == e.mvccMetadataVersion {
 		return nil
@@ -62,7 +80,11 @@ func (e *Engine) refreshMVCCMetadata(ctx context.Context) error {
 	mirror := storage.NewStore()
 	var tables []versionedTable
 	var names []string
-	err = e.Backend.Scan(ctx, head, "catalog", func(k, v []byte) error {
+	iterator, err := open()
+	if err != nil {
+		return err
+	}
+	err = storageengine.Consume(iterator, func(k, v []byte) error {
 		name := string(k)
 		if strings.HasPrefix(name, "db/") {
 			_, err := mirror.CreateDatabase(strings.TrimPrefix(name, "db/"))
@@ -168,7 +190,7 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 		// Bound quorum discovery, not the entire SQL statement. Large replicated
 		// transactions obey the user's query deadline instead of a hidden 30s cap.
 		barrierCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		err := e.Backend.Barrier(barrierCtx)
+		err := e.Replica.Barrier(barrierCtx)
 		cancel()
 		if err != nil {
 			return nil, err

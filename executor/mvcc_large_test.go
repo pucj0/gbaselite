@@ -63,7 +63,7 @@ func (p *deadlineRecordingBackend) record(ctx context.Context) {
 }
 func (p *deadlineRecordingBackend) Barrier(ctx context.Context) error {
 	p.record(ctx)
-	return p.Engine.Barrier(ctx)
+	return p.Engine.(storageengine.ReplicatedEngine).Barrier(ctx)
 }
 func (p *deadlineRecordingBackend) Begin(ctx context.Context) (storageengine.Txn, error) {
 	p.record(ctx)

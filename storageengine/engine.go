@@ -78,19 +78,53 @@ type Txn interface {
 // Engine owns storage lifetime. Close requires callers to close transactions first.
 // Counter reservations are durable and outside SQL rollback (gaps are allowed).
 // Revision reads are for committed catalog metadata, not a new SQL snapshot.
+// Engine is the minimal transaction/lifetime contract. Optional capabilities
+// must be detected explicitly; Begin and Txn.Snapshot semantics are unchanged.
 type Engine interface {
 	Begin(context.Context) (Txn, error)
+	Close() error
+}
+type RevisionReader interface {
 	Head() (uint64, error)
 	CatalogHead() (uint64, error)
 	NewIterator(context.Context, uint64, ScanRequest) (Iterator, error)
 	Scan(context.Context, uint64, string, func([]byte, []byte) error) error
+}
+type CounterAllocator interface {
 	AdvanceCounter(context.Context, string, uint64) error
 	ReserveCounter(context.Context, string, uint64) (uint64, error)
+}
+type ReplicatedEngine interface {
 	Barrier(context.Context) error
 	Replica() Replica
-	AvailabilityError() error
-	Close() error
 }
+type Availability interface{ AvailabilityError() error }
+
+// FullEngine names the pre-capability contract for existing full-featured users.
+// Implementations of that contract remain valid Engines without adapters.
+type FullEngine interface {
+	Engine
+	RevisionReader
+	CounterAllocator
+	ReplicatedEngine
+	Availability
+}
+
+func AdvanceCounter(ctx context.Context, e Engine, key string, floor uint64) error {
+	c, ok := e.(CounterAllocator)
+	if !ok {
+		return ErrUnsupported
+	}
+	return c.AdvanceCounter(ctx, key, floor)
+}
+func ReserveCounter(ctx context.Context, e Engine, key string, count uint64) (uint64, error) {
+	c, ok := e.(CounterAllocator)
+	if !ok {
+		return 0, ErrUnsupported
+	}
+	return c.ReserveCounter(ctx, key, count)
+}
+
 type Replica interface {
 	Barrier(context.Context) error
 	Status() ReplicationStatus

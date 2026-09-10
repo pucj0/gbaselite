@@ -1,6 +1,7 @@
 package storageengine_test
 
 import (
+	"context"
 	"gbaselite/storageengine"
 	"gbaselite/storageengine/mvccadapter"
 	"gbaselite/storageengine/testkit"
@@ -26,4 +27,12 @@ func TestBackendContract(t *testing.T) {
 			})
 		})
 	}
+}
+
+type coreFixture struct{ inner storageengine.Engine }
+
+func (e coreFixture) Begin(ctx context.Context) (storageengine.Txn, error) { return e.inner.Begin(ctx) }
+func (e coreFixture) Close() error                                         { return e.inner.Close() }
+func TestCoreOnlyContract(t *testing.T) {
+	testkit.Run(t, func(*testing.T) storageengine.Engine { return coreFixture{testkit.NewMemory()} })
 }

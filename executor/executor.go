@@ -122,8 +122,10 @@ func (e *Engine) Close() error { return e.Backend.Close() }
 
 // AvailabilityError reports a fatal MVCC persistence failure.
 func (e *Engine) AvailabilityError() error {
-	if err := e.Backend.AvailabilityError(); err != nil {
-		return fmt.Errorf("%w: %v", ErrPersistenceUnavailable, err)
+	if availability, ok := e.Backend.(storageengine.Availability); ok {
+		if err := availability.AvailabilityError(); err != nil {
+			return fmt.Errorf("%w: %v", ErrPersistenceUnavailable, err)
+		}
 	}
 	return nil
 }

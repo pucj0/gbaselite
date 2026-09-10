@@ -64,7 +64,11 @@ func NewWithStorage(backend storageengine.Engine, users *catalog.Users) (*Engine
 		}
 		return nil, fmt.Errorf("storage engine and user catalog are required")
 	}
-	e := &Engine{Backend: backend, Replica: backend.Replica(), Store: storage.NewStore(), Users: users}
+	var replica storageengine.Replica
+	if replicated, ok := backend.(storageengine.ReplicatedEngine); ok {
+		replica = replicated.Replica()
+	}
+	e := &Engine{Backend: backend, Replica: replica, Store: storage.NewStore(), Users: users}
 	e.QueryOptions = QueryOptions{SortMemoryBytes: 4 << 20, ResultMemoryBytes: 16 << 20, MaxTempBytes: 256 << 20}
 	if err := e.refreshMVCCMetadata(context.Background()); err != nil {
 		e.Close()

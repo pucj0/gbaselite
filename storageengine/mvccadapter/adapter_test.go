@@ -11,14 +11,14 @@ import (
 	"testing"
 )
 
-func openAdapter(t *testing.T, dir string) storageengine.Engine {
+func openAdapter(t *testing.T, dir string) storageengine.FullEngine {
 	t.Helper()
 	e, err := mvccadapter.Open(dir, storageengine.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { e.Close() })
-	return e
+	return e.(storageengine.FullEngine)
 }
 func begin(t *testing.T, e storageengine.Engine) storageengine.Txn {
 	t.Helper()

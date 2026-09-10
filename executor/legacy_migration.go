@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"gbaselite/storage"
+	"gbaselite/storageengine"
 )
 
 // MigrateLegacy converts a stopped snapshot/paged instance to a new standalone
@@ -249,7 +250,7 @@ func (e *Engine) importLegacySnapshot(ctx context.Context, snapshot storage.Stor
 				if next < 1 {
 					return fmt.Errorf("invalid auto increment counter in %s", definition.CatalogName)
 				}
-				if err := e.Backend.AdvanceCounter(ctx, definition.counterKey(col), uint64(next-1)); err != nil {
+				if err := storageengine.AdvanceCounter(ctx, e.Backend, definition.counterKey(col), uint64(next-1)); err != nil {
 					return err
 				}
 			}

@@ -96,13 +96,16 @@ func Run(t *testing.T, factory Factory) {
 		if string(got) != "one" {
 			t.Fatal("snapshot changed")
 		}
-		it, err := e.NewIterator(ctx, revision, storageengine.ScanRequest{Space: "s"})
-		must(t, err)
-		var rows []string
-		must(t, storageengine.Consume(it, func(k, v []byte) error { rows = append(rows, string(k)+"="+string(v)); return nil }))
-		if !reflect.DeepEqual(rows, []string{"a=one"}) {
-			t.Fatal(rows)
+		if revisions, ok := e.(storageengine.RevisionReader); ok {
+			it, err := revisions.NewIterator(ctx, revision, storageengine.ScanRequest{Space: "s"})
+			must(t, err)
+			var rows []string
+			must(t, storageengine.Consume(it, func(k, v []byte) error { rows = append(rows, string(k)+"="+string(v)); return nil }))
+			if !reflect.DeepEqual(rows, []string{"a=one"}) {
+				t.Fatal(rows)
+			}
 		}
+
 		must(t, old.Rollback())
 		if _, _, err := old.Get("s", []byte("a")); !errors.Is(err, storageengine.ErrClosed) {
 			t.Fatal("closed read", err)
@@ -238,18 +241,21 @@ func Run(t *testing.T, factory Factory) {
 	})
 	t.Run("CountersAndCancellation", func(t *testing.T) {
 		e := fresh(t)
-		must(t, e.AdvanceCounter(ctx, "counter", 10))
-		first, err := e.ReserveCounter(ctx, "counter", 2)
-		must(t, err)
-		if first != 11 {
-			t.Fatal(first)
+		if counters, ok := e.(storageengine.CounterAllocator); ok {
+			must(t, counters.AdvanceCounter(ctx, "counter", 10))
+			first, err := counters.ReserveCounter(ctx, "counter", 2)
+			must(t, err)
+			if first != 11 {
+				t.Fatal(first)
+			}
+			must(t, counters.AdvanceCounter(ctx, "counter", 1))
+			first, err = counters.ReserveCounter(ctx, "counter", 1)
+			must(t, err)
+			if first != 13 {
+				t.Fatal(first)
+			}
 		}
-		must(t, e.AdvanceCounter(ctx, "counter", 1))
-		first, err = e.ReserveCounter(ctx, "counter", 1)
-		must(t, err)
-		if first != 13 {
-			t.Fatal(first)
-		}
+
 		c, cancel := context.WithCancel(ctx)
 		cancel()
 		if _, err := e.Begin(c); !errors.Is(err, context.Canceled) {

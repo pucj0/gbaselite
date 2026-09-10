@@ -1236,3 +1236,5 @@ A01–A03 Deep Hardening：SELECT 与 DML 的表/范围扫描直接使用后端 
 Deep Hardening 的输出绑定使用 boundQuery（列描述 + Operator），SELECT/GROUP/Window/UNION 可直接进入 Distinct，只有最终结果边界收集 Result.Rows；最终结果预算、Distinct/Sort 的溢写预算仍生效。事务查询在事务结束前完成消费，暂不让惰性协议流持有已关闭的 Txn；外部已物化输入仍支持 StreamRows 边界。
 
 Physical Join3[L,R,O] 支持不同的左右输入及输出类型；现有 Join[T] 作为同类型兼容外壳委托同一个执行算法。INNER/LEFT、索引探测和表扫描的语义保持不变。
+
+Engine 最小接口为 Begin(ctx)/Close；RevisionReader、CounterAllocator、ReplicatedEngine、Availability、Maintenance、Diagnostics 均独立。缺失 RevisionReader 时通过普通 Txn 快照刷新元数据；自增/维护等显式能力缺失返回 ErrUnsupported。FullEngine 保留原完整方法集合用于嵌入方的兼容迁移。已有完整后端无需修改实现。

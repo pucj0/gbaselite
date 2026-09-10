@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"gbaselite/parser"
+	"gbaselite/storageengine"
 	"strings"
 	"testing"
 )
@@ -57,10 +58,10 @@ func TestMVCCExplainMatchesAccessPlan(t *testing.T) {
 func TestMVCCExplainDoesNotExecuteAndUsesCatalogSnapshot(t *testing.T) {
 	e, s, run := rangeTestEngine(t)
 	run("CREATE TABLE p(id INT PRIMARY KEY)")
-	before, _ := e.Backend.Head()
+	before, _ := e.Backend.(storageengine.RevisionReader).Head()
 	s.LastInsertID = 42
 	run("EXPLAIN SELECT LAST_INSERT_ID(99) FROM p")
-	after, _ := e.Backend.Head()
+	after, _ := e.Backend.(storageengine.RevisionReader).Head()
 	if before != after || s.LastInsertID != 42 {
 		t.Fatal("EXPLAIN changed data/session state")
 	}

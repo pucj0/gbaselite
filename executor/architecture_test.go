@@ -60,6 +60,14 @@ func architectureViolations(path string, src any) []string {
 					}
 				}
 			case *ast.SelectorExpr:
+				if strings.HasPrefix(path, "physical/") {
+					if id, ok := n.X.(*ast.Ident); ok && imports[id.Name] == "gbaselite/storageengine" {
+						switch n.Sel.Name {
+						case "Engine", "RevisionReader", "CounterAllocator", "ReplicatedEngine", "Maintenance", "Diagnostics", "Availability":
+							issues = append(issues, "engine capability leaked into physical operator")
+						}
+					}
+				}
 				if id, ok := n.X.(*ast.Ident); ok && imports[id.Name] == "gbaselite/storage" && strings.Contains(n.Sel.Name, "Persistence") && !loader {
 					issues = append(issues, "legacy persistence outside migration reader")
 				}
@@ -139,6 +147,7 @@ func TestArchitectureChecksRejectRegressionFixtures(t *testing.T) {
 		{"executor/physical_select.go", "package executor; func f(){sourceOperator(rowSource(ctx,op))}"},
 		{"executor/physical_binding.go", "package executor; func f(){sourceOperator(callback)}"},
 		{"executor/physical_select.go", "package executor; func f(){_ = Result{Rows: rows}}"},
+		{"physical/bad.go", "package physical; import s \"gbaselite/storageengine\"; var engine s.Maintenance"},
 	}
 	for _, f := range fixtures {
 		if _, err := parser.ParseFile(token.NewFileSet(), f.path, f.source, 0); err != nil {
