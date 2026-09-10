@@ -328,12 +328,55 @@ func (e *Engine) PrepareCompatibilityRead(ctx context.Context) error {
 	}
 	return e.refreshSQLMetadata(ctx)
 }
-func (e *Engine) ReplicationStatus() *Result {
-	columns := []Column{{Name: "Node_ID", Type: storage.TypeVarchar}, {Name: "State", Type: storage.TypeVarchar}, {Name: "Leader_ID", Type: storage.TypeVarchar}, {Name: "Leader_Raft_Address", Type: storage.TypeVarchar}, {Name: "Applied_Index", Type: storage.TypeBigInt}}
-	if e.Replica == nil {
-		return &Result{Columns: columns, Rows: [][]any{{"", "Standalone", "", "", int64(0)}}}
+
+// VerifiedReplicationStatus preserves the status schema but only advertises a
+// candidate Leader after lightweight quorum verification. It never falls back
+// to Barrier when an optional verifier is absent.
+func (e *Engine) VerifiedReplicationStatus(ctx context.Context) (*Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	s := e.Replica.Status()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if e.Replica == nil {
+		return e.ReplicationStatus(), nil
+	}
+	status := e.Replica.Status()
+	if status.State != "Leader" {
+		return replicationStatusResult(status), nil
+	}
+	if status.ID == "" || status.LeaderID != status.ID {
+		return nil, storageengine.ErrNotLeader
+	}
+	verifier, ok := e.Replica.(storageengine.LeaderVerifier)
+	if !ok {
+		return nil, storageengine.ErrUnsupported
+	}
+	// MySQL does not propagate the client's context. Bound server-side work by
+	// the same 750 ms ceiling as discovery instead of leaving VerifyLeader queued.
+	ctx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+	defer cancel()
+	if err := verifier.VerifyLeader(ctx); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	current := e.Replica.Status()
+	if current.State != "Leader" || current.ID != status.ID || current.LeaderID != current.ID {
+		return nil, storageengine.ErrNotLeader
+	}
+	return replicationStatusResult(current), nil
+}
+func (e *Engine) ReplicationStatus() *Result {
+	if e.Replica == nil {
+		return replicationStatusResult(storageengine.ReplicationStatus{State: "Standalone"})
+	}
+	return replicationStatusResult(e.Replica.Status())
+}
+func replicationStatusResult(s storageengine.ReplicationStatus) *Result {
+	columns := []Column{{Name: "Node_ID", Type: storage.TypeVarchar}, {Name: "State", Type: storage.TypeVarchar}, {Name: "Leader_ID", Type: storage.TypeVarchar}, {Name: "Leader_Raft_Address", Type: storage.TypeVarchar}, {Name: "Applied_Index", Type: storage.TypeBigInt}}
 	return &Result{Columns: columns, Rows: [][]any{{s.ID, s.State, s.LeaderID, s.Leader, int64(s.Applied)}}}
 }
 

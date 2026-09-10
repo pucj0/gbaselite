@@ -171,7 +171,7 @@ func (h *routerHistory) round(e discoveryRound) {
 		return
 	}
 	for _, p := range e.Probes {
-		h.add(fmt.Sprintf("round=%d peer=%s address=%s stage=%s reportedID=%s state=%s leader=%s raft=%s applied=%d acquire=%s status=%s ping=%s remaining=%s total=%s class=%s err=%v", e.ID, p.PeerID, p.Address, p.Stage, p.ReportedID, p.State, p.Leader, p.RaftAddress, p.Applied, p.AcquireDuration, p.StatusDuration, p.PingDuration, p.RemainingBudget, p.TotalDuration, p.ErrClass, p.Err))
+		h.add(fmt.Sprintf("round=%d peer=%s address=%s stage=%s reportedID=%s state=%s leader=%s raft=%s applied=%d acquire=%s status-and-verify=%s remaining=%s total=%s class=%s err=%v", e.ID, p.PeerID, p.Address, p.Stage, p.ReportedID, p.State, p.Leader, p.RaftAddress, p.Applied, p.AcquireDuration, p.StatusDuration, p.RemainingBudget, p.TotalDuration, p.ErrClass, p.Err))
 	}
 	h.add(fmt.Sprintf("round=%d end=%s result=%s duration=%s", e.ID, e.End.Format(time.RFC3339Nano), e.Result, e.End.Sub(e.Start)))
 }

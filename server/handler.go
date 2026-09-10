@@ -89,7 +89,7 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 		}
 	}
 	if upper == "SHOW REPLICATION STATUS" {
-		return engine.ReplicationStatus(), nil
+		return engine.VerifiedReplicationStatus(session.Context)
 	}
 	if err := engine.PrepareCompatibilityRead(session.Context); err != nil {
 		return nil, err

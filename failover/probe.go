@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	sqldriver "database/sql/driver"
 	"errors"
-	"fmt"
 	mysql "github.com/go-sql-driver/mysql"
 	"io"
 	"net"
@@ -13,14 +12,14 @@ import (
 )
 
 type probeResult struct {
-	Confirmed                                                    bool
-	PeerID, Address, Stage                                       string
-	ReportedID, State, Leader, RaftAddress                       string
-	Applied                                                      uint64
-	AcquireDuration, StatusDuration, PingDuration, TotalDuration time.Duration
-	RemainingBudget                                              time.Duration
-	Err                                                          error
-	ErrClass                                                     string
+	Confirmed                                      bool
+	PeerID, Address, Stage                         string
+	ReportedID, State, Leader, RaftAddress         string
+	Applied                                        uint64
+	AcquireDuration, StatusDuration, TotalDuration time.Duration
+	RemainingBudget                                time.Duration
+	Err                                            error
+	ErrClass                                       string
 }
 type discoveryRound struct {
 	ID         uint64
@@ -30,7 +29,8 @@ type discoveryRound struct {
 }
 
 // One confirmation owns one SQL connection. The original shared 750 ms context
-// covers acquisition, role inspection and the quorum-confirmed read unchanged.
+// covers acquisition and the single status request, including server-side
+// lightweight quorum verification. No ordinary SQL or FSM Barrier is probed.
 func probeLeader(ctx context.Context, db *sql.DB, peer Peer) (result probeResult) {
 	started := time.Now()
 	result.PeerID, result.Address, result.Stage = peer.ID, peer.Address, "acquire-conn"
@@ -51,6 +51,9 @@ func probeLeader(ctx context.Context, db *sql.DB, peer Peer) (result probeResult
 	}
 	defer conn.Close()
 	result.Stage = "show-replication-status"
+	if deadline, ok := ctx.Deadline(); ok {
+		result.RemainingBudget = time.Until(deadline)
+	}
 	startedStatus := time.Now()
 	err = conn.QueryRowContext(ctx, "SHOW REPLICATION STATUS").Scan(&result.ReportedID, &result.State, &result.Leader, &result.RaftAddress, &result.Applied)
 	result.StatusDuration = time.Since(startedStatus)
@@ -58,24 +61,8 @@ func probeLeader(ctx context.Context, db *sql.DB, peer Peer) (result probeResult
 		result.Err = err
 		return
 	}
-	if result.State != "Leader" || result.ReportedID != peer.ID {
+	if result.State != "Leader" || result.ReportedID != peer.ID || result.Leader != peer.ID {
 		result.Stage = "role-mismatch"
-		return
-	}
-	result.Stage = "select-1"
-	if deadline, ok := ctx.Deadline(); ok {
-		result.RemainingBudget = time.Until(deadline)
-	}
-	startedPing := time.Now()
-	var one int
-	err = conn.QueryRowContext(ctx, "SELECT 1").Scan(&one)
-	result.PingDuration = time.Since(startedPing)
-	if err != nil {
-		result.Err = err
-		return
-	}
-	if one != 1 {
-		result.Err = fmt.Errorf("leader probe SELECT 1 returned %d", one)
 		return
 	}
 	result.Confirmed, result.Stage = true, "confirmed"

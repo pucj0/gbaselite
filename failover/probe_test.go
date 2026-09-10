@@ -88,7 +88,7 @@ func TestProbeLeaderDiagnostics(t *testing.T) {
 		{"acquire", "acquire-conn", "context-deadline", &probeConnector{acquireErr: context.DeadlineExceeded}},
 		{"status", "show-replication-status", "unexpected-eof", &probeConnector{statusErr: io.ErrUnexpectedEOF}},
 		{"role", "role-mismatch", "", &probeConnector{state: "Follower"}},
-		{"ping", "select-1", "sql-error", &probeConnector{state: "Leader", pingErr: &mysql.MySQLError{Number: 1105, Message: "read unavailable"}}},
+		{"verification", "show-replication-status", "sql-error", &probeConnector{state: "Leader", statusErr: &mysql.MySQLError{Number: 1105, Message: "leadership unavailable"}}},
 		{"success", "confirmed", "", &probeConnector{state: "Leader"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -100,7 +100,7 @@ func TestProbeLeaderDiagnostics(t *testing.T) {
 			if result.Stage != tc.stage || result.ErrClass != tc.class || result.Confirmed != (tc.stage == "confirmed") {
 				t.Fatalf("%+v", result)
 			}
-			if result.PeerID != "0" || result.Address != "sql:1" || result.TotalDuration < result.AcquireDuration+result.StatusDuration+result.PingDuration {
+			if result.PeerID != "0" || result.Address != "sql:1" || result.TotalDuration < result.AcquireDuration+result.StatusDuration {
 				t.Fatalf("invalid diagnostics: %+v", result)
 			}
 			if tc.stage == "role-mismatch" && (result.State != "Follower" || result.Leader != "0" || result.Applied != 7) {
@@ -116,12 +116,12 @@ func TestProbeUsesSingleConnection(t *testing.T) {
 	d := &probeConnector{state: "Leader"}
 	db := sql.OpenDB(d)
 	defer db.Close()
-	// Returning either statement's connection to this pool would close it.
+	// One probe must perform exactly one SQL roundtrip and one checkout.
 	db.SetMaxIdleConns(0)
 	if result := probeLeader(context.Background(), db, Peer{"0", "sql:1"}); !result.Confirmed {
 		t.Fatal(result)
 	}
-	if d.opens != 1 || len(d.connections) != 2 || d.connections[0] != d.connections[1] {
+	if d.opens != 1 || len(d.connections) != 1 {
 		t.Fatalf("opens=%d queries=%v", d.opens, d.connections)
 	}
 }
