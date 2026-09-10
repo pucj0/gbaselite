@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"gbaselite/executor"
 	"gbaselite/server"
+	"gbaselite/storageengine"
 	"io"
 	"log"
 	"net"
@@ -13,12 +14,14 @@ import (
 	"time"
 )
 
-func stateBackend(t *testing.T) string {
+func stateBackend(t *testing.T) string { return stateBackendWithReplica(t, nil) }
+func stateBackendWithReplica(t *testing.T, replica storageengine.Replica) string {
 	t.Helper()
 	e, err := executor.Open(t.TempDir(), "root", "pw")
 	if err != nil {
 		t.Fatal(err)
 	}
+	e.Replica = replica
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		e.Close()
