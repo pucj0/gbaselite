@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"gbaselite/sqllayout"
 	"gbaselite/storageengine"
 )
 
@@ -46,7 +47,7 @@ func (p mvccAccessPlan) scanBatches(ctx context.Context, tx storageengine.Txn, t
 	}
 	var err error
 	if p.kind == mvccAccessAll {
-		err = tx.ScanRange(ctx, "row/"+table.ID, storageengine.KeyRange{}, visit)
+		err = tx.ScanRange(ctx, sqllayout.Rows(table.ID), storageengine.KeyRange{}, visit)
 	} else {
 		err = p.scan(ctx, tx, table, visit)
 	}

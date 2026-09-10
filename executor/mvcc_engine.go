@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"gbaselite/parser"
 	"gbaselite/physical"
+	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
@@ -61,7 +62,7 @@ func (e *Engine) refreshMVCCMetadata(ctx context.Context) error {
 			return err
 		}
 		open = func() (storageengine.Iterator, error) {
-			return revisions.NewIterator(ctx, head, storageengine.ScanRequest{Space: "catalog"})
+			return revisions.NewIterator(ctx, head, storageengine.ScanRequest{Space: sqllayout.Catalog})
 		}
 	} else {
 		tx, beginErr := e.Backend.Begin(ctx)
@@ -71,7 +72,7 @@ func (e *Engine) refreshMVCCMetadata(ctx context.Context) error {
 		defer tx.Rollback()
 		head = tx.Snapshot()
 		open = func() (storageengine.Iterator, error) {
-			return tx.NewIterator(ctx, storageengine.ScanRequest{Space: "catalog"})
+			return tx.NewIterator(ctx, storageengine.ScanRequest{Space: sqllayout.Catalog})
 		}
 	}
 	if head == e.mvccMetadataVersion {
@@ -86,11 +87,11 @@ func (e *Engine) refreshMVCCMetadata(ctx context.Context) error {
 	}
 	err = storageengine.Consume(iterator, func(k, v []byte) error {
 		name := string(k)
-		if strings.HasPrefix(name, "db/") {
-			_, err := mirror.CreateDatabase(strings.TrimPrefix(name, "db/"))
+		if strings.HasPrefix(name, sqllayout.DatabasePrefix) {
+			_, err := mirror.CreateDatabase(strings.TrimPrefix(name, sqllayout.DatabasePrefix))
 			return err
 		}
-		if strings.HasPrefix(name, "table/") {
+		if strings.HasPrefix(name, sqllayout.TablePrefix) {
 			var table versionedTable
 			if err := decodeVersioned(v, &table); err != nil {
 				return err
@@ -144,8 +145,8 @@ func loadVersionedTableInternal(tx storageengine.Txn, session *Session, name str
 	if err != nil {
 		return versionedTable{}, nil, nil, err
 	}
-	catalogKey := []byte("table/" + db + "/" + table)
-	value, ok, err := tx.Get("catalog", catalogKey)
+	catalogKey := sqllayout.TableKey(db, table)
+	value, ok, err := tx.Get(sqllayout.Catalog, catalogKey)
 	if err != nil {
 		return versionedTable{}, nil, nil, err
 	}
@@ -255,7 +256,7 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 	case parser.Empty:
 		return &Result{}, nil
 	case parser.Use:
-		_, ok, err := tx.Get("catalog", []byte("db/"+strings.ToLower(value.Database)))
+		_, ok, err := tx.Get(sqllayout.Catalog, sqllayout.DatabaseKey(strings.ToLower(value.Database)))
 		if err != nil {
 			return nil, err
 		}

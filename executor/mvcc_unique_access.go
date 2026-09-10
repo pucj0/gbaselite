@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"gbaselite/parser"
+	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
@@ -108,7 +109,7 @@ func mvccUniqueCandidates(where parser.Expr, table versionedTable, schema *stora
 		if complete {
 			key, ok := storage.IndexValueKey(idx, table.Definition.Columns, row)
 			if ok {
-				candidates = append(candidates, mvccUniqueCandidate{name: idx.Name, space: "index/" + table.ID + "/" + idx.Name, key: []byte(key)})
+				candidates = append(candidates, mvccUniqueCandidate{name: idx.Name, space: sqllayout.UniqueIndex(table.ID, idx.Name), key: []byte(key)})
 			}
 		}
 	}

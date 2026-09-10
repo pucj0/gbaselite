@@ -88,6 +88,12 @@ func architectureViolations(path string, src any) []string {
 					issues = append(issues, "operator callback roundtrip")
 				}
 			case *ast.BasicLit:
+				if (runtime || strings.HasPrefix(path, "storageengine/")) && n.Kind == token.STRING {
+					v, _ := strconv.Unquote(n.Value)
+					if v == "row/" || v == "index/" || v == "secondary/" {
+						issues = append(issues, "SQL namespace outside sqllayout")
+					}
+				}
 				if runtime && !loader && !migration && n.Kind == token.STRING {
 					v, _ := strconv.Unquote(n.Value)
 					if v == "snapshot" || v == "paged" {
@@ -138,6 +144,7 @@ func TestProductionArchitectureBoundaries(t *testing.T) {
 }
 func TestArchitectureChecksRejectRegressionFixtures(t *testing.T) {
 	fixtures := []struct{ path, source string }{
+		{"executor/bad.go", `package executor; const prefix = "row/"`},
 		{"executor/bad.go", "package executor; import disk \"gbaselite/storage\"; func f(){_ = disk.NewPagedPersistence(\"x\",0)}"},
 		{"executor/bad.go", "package executor; import . \"gbaselite/storage\"; var _ = NewPersistence"},
 		{"executor/legacy_reader.go", "package executor; func runtime(){loadLegacyForMigration(\"x\",\"paged\")}"},

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"gbaselite/sqllayout"
 	"io"
 	"io/fs"
 	"os"
@@ -197,7 +198,7 @@ func (e *Engine) importLegacySnapshot(ctx context.Context, snapshot storage.Stor
 	defer tx.Rollback()
 	// Create all schemas before resolving foreign keys, including forward references.
 	for _, db := range snapshot.Databases {
-		if err = tx.Put("catalog", []byte("db/"+strings.ToLower(db.Name)), []byte{1}); err != nil {
+		if err = tx.Put(sqllayout.Catalog, sqllayout.DatabaseKey(strings.ToLower(db.Name)), []byte{1}); err != nil {
 			return err
 		}
 		for i, table := range db.Tables {
@@ -210,7 +211,7 @@ func (e *Engine) importLegacySnapshot(ctx context.Context, snapshot storage.Stor
 			if err != nil {
 				return err
 			}
-			if err = tx.Put("catalog", []byte("table/"+strings.ToLower(db.Name)+"/"+strings.ToLower(table.Name)), encoded); err != nil {
+			if err = tx.Put(sqllayout.Catalog, sqllayout.TableKey(strings.ToLower(db.Name), strings.ToLower(table.Name)), encoded); err != nil {
 				return err
 			}
 		}
@@ -234,7 +235,7 @@ func (e *Engine) importLegacySnapshot(ctx context.Context, snapshot storage.Stor
 			if err != nil {
 				return err
 			}
-			if err = tx.Put("catalog", key, encoded); err != nil {
+			if err = tx.Put(sqllayout.Catalog, key, encoded); err != nil {
 				return err
 			}
 			disabled := context.WithValue(ctx, foreignChecksContextKey{}, true)
@@ -287,7 +288,7 @@ func (e *Engine) verifyLegacySnapshot(ctx context.Context, snapshot storage.Stor
 				return err
 			}
 			count := 0
-			if err = tx.Scan(ctx, "row/"+definition.ID, func(_, _ []byte) error { count++; return nil }); err != nil {
+			if err = tx.Scan(ctx, sqllayout.Rows(definition.ID), func(_, _ []byte) error { count++; return nil }); err != nil {
 				return err
 			}
 			if count != len(table.Rows) {

@@ -1,9 +1,9 @@
 package executor
 
 import (
-	"encoding/binary"
 	"errors"
 	"gbaselite/parser"
+	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strconv"
@@ -46,9 +46,7 @@ func validateMVCCKeyEncoding(table versionedTable) error {
 	return errors.New("unsupported MVCC primary key encoding/schema; use a compatible database binary")
 }
 func mvccIntegerKey(n int64) []byte {
-	key := make([]byte, 8)
-	binary.BigEndian.PutUint64(key, uint64(n)^(uint64(1)<<63))
-	return key
+	return sqllayout.SignedInteger(n)
 }
 func mvccPrimaryKey(table versionedTable, index storage.Index, row storage.Row) ([]byte, bool) {
 	if table.KeyEncoding == mvccIntegerKeyEncoding {

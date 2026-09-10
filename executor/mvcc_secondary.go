@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"gbaselite/parser"
+	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
@@ -231,7 +232,7 @@ func planMVCCSecondary(s parser.Select, table versionedTable, schema *storage.Ta
 		}
 		if n > bestPrefix || n == bestPrefix && covered && !best.covering {
 			bestPrefix = n
-			best = mvccAccessPlan{kind: "ref", index: idx.Name, space: "secondary/" + table.ID + "/" + idx.Name, bounds: storageengine.KeyRange{Lower: prefix, LowerInclusive: true, Upper: prefixSuccessor(prefix)}, covering: covered}
+			best = mvccAccessPlan{kind: "ref", index: idx.Name, space: sqllayout.SecondaryIndex(table.ID, idx.Name), bounds: storageengine.KeyRange{Lower: prefix, LowerInclusive: true, Upper: prefixSuccessor(prefix)}, covering: covered}
 		}
 	}
 	return best, bestPrefix > 0

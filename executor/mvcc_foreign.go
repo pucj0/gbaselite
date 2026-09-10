@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
@@ -110,7 +111,7 @@ func prepareMVCCForeignKeys(tx storageengine.Txn, table *versionedTable, session
 		if err != nil {
 			return err
 		}
-		if err = tx.Put("catalog", key, encoded); err != nil {
+		if err = tx.Put(sqllayout.Catalog, key, encoded); err != nil {
 			return err
 		}
 	}
@@ -166,7 +167,7 @@ func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table ver
 				if !ok {
 					return storage.ErrForeignKey
 				}
-				owner, exists, err = tx.Get("index/"+parent.ID+"/"+idx.Name, []byte(key))
+				owner, exists, err = tx.Get(sqllayout.UniqueIndex(parent.ID, idx.Name), []byte(key))
 				if err != nil {
 					return err
 				}
@@ -180,7 +181,7 @@ func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table ver
 			if !exists {
 				return storage.ErrForeignKey
 			}
-			if err = tx.Guard("catalog", catalog); err != nil {
+			if err = tx.Guard(sqllayout.Catalog, catalog); err != nil {
 				return err
 			}
 			if err = tx.Table(parent.ID).Guard(owner); err != nil {
@@ -221,13 +222,13 @@ func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table ver
 					continue
 				}
 			}
-			if err = tx.Guard("catalog", catalog); err != nil {
+			if err = tx.Guard(sqllayout.Catalog, catalog); err != nil {
 				return err
 			}
-			if err = tx.GuardRange("row/"+child.ID, storageengine.KeyRange{}); err != nil {
+			if err = tx.GuardRange(sqllayout.Rows(child.ID), storageengine.KeyRange{}); err != nil {
 				return err
 			}
-			err = tx.ScanRange(ctx, "row/"+child.ID, storageengine.KeyRange{}, func(_, v []byte) error {
+			err = tx.ScanRange(ctx, sqllayout.Rows(child.ID), storageengine.KeyRange{}, func(_, v []byte) error {
 				row, err := decodeMVCCRow(child, v)
 				if err != nil {
 					return err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"gbaselite/parser"
+	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
@@ -13,7 +14,7 @@ func (t versionedTable) counterKey(name string) string {
 	if key := t.CounterKeys[strings.ToLower(name)]; key != "" {
 		return key
 	}
-	return t.ID + "/" + name
+	return sqllayout.Counter(t.ID, name)
 }
 func mvccAlterTarget(statement parser.Statement) (string, bool) {
 	switch v := statement.(type) {
@@ -156,11 +157,11 @@ func (e *Engine) alterMVCC(ctx context.Context, read, write storageengine.Txn, s
 	if err = prepareMVCCForeignKeys(write, &definition, session); err != nil {
 		return nil, err
 	}
-	if err = write.GuardRange("row/"+old.ID, storageengine.KeyRange{}); err != nil {
+	if err = write.GuardRange(sqllayout.Rows(old.ID), storageengine.KeyRange{}); err != nil {
 		return nil, err
 	}
 	count := uint64(0)
-	err = read.ScanRange(ctx, "row/"+old.ID, storageengine.KeyRange{}, func(k, v []byte) error {
+	err = read.ScanRange(ctx, sqllayout.Rows(old.ID), storageengine.KeyRange{}, func(k, v []byte) error {
 		row, err := decodeMVCCRow(old, v)
 		if err != nil {
 			return err
@@ -191,7 +192,7 @@ func (e *Engine) alterMVCC(ctx context.Context, read, write storageengine.Txn, s
 	if err != nil {
 		return nil, err
 	}
-	if err = write.Put("catalog", catalog, encoded); err != nil {
+	if err = write.Put(sqllayout.Catalog, catalog, encoded); err != nil {
 		return nil, err
 	}
 	return &Result{AffectedRows: count, Message: "MVCC schema and rebuilt indexes staged atomically", MetadataChanged: true}, nil

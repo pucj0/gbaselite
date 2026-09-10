@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"gbaselite/parser"
 	"gbaselite/physical"
+	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
@@ -22,8 +23,8 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 		if strings.ContainsAny(name, "/\x00") {
 			return nil, errors.New("invalid database identifier")
 		}
-		k := []byte("db/" + name)
-		_, exists, err := write.Get("catalog", k)
+		k := sqllayout.DatabaseKey(name)
+		_, exists, err := write.Get(sqllayout.Catalog, k)
 		if err != nil {
 			return nil, err
 		}
@@ -33,20 +34,20 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 			}
 			return nil, storage.ErrDatabaseExists
 		}
-		return &Result{AffectedRows: 1}, write.Put("catalog", k, []byte{1})
+		return &Result{AffectedRows: 1}, write.Put(sqllayout.Catalog, k, []byte{1})
 	case parser.CreateTable:
 		db, name, err := versionedName(session, value.Name)
 		if err != nil {
 			return nil, err
 		}
-		if _, ok, err := write.Get("catalog", []byte("db/"+db)); err != nil || !ok {
+		if _, ok, err := write.Get(sqllayout.Catalog, sqllayout.DatabaseKey(db)); err != nil || !ok {
 			if err != nil {
 				return nil, err
 			}
 			return nil, storage.ErrDatabaseNotFound
 		}
-		k := []byte("table/" + db + "/" + name)
-		if _, exists, err := write.Get("catalog", k); err != nil {
+		k := sqllayout.TableKey(db, name)
+		if _, exists, err := write.Get(sqllayout.Catalog, k); err != nil {
 			return nil, err
 		} else if exists {
 			if value.IfNotExists {
@@ -121,14 +122,14 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 		if err != nil {
 			return nil, err
 		}
-		if err = write.Guard("catalog", []byte("db/"+db)); err != nil {
+		if err = write.Guard(sqllayout.Catalog, sqllayout.DatabaseKey(db)); err != nil {
 			return nil, err
 		}
-		return &Result{AffectedRows: 1}, write.Put("catalog", k, encoded)
+		return &Result{AffectedRows: 1}, write.Put(sqllayout.Catalog, k, encoded)
 	case parser.DropDatabase:
 		name := strings.ToLower(value.Name)
-		k := []byte("db/" + name)
-		_, exists, err := read.Get("catalog", k)
+		k := sqllayout.DatabaseKey(name)
+		_, exists, err := read.Get(sqllayout.Catalog, k)
 		if err != nil {
 			return nil, err
 		}
@@ -138,8 +139,8 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 			}
 			return nil, storage.ErrDatabaseNotFound
 		}
-		err = read.Scan(ctx, "catalog", func(k, v []byte) error {
-			if strings.HasPrefix(string(k), "table/"+name+"/") {
+		err = read.Scan(ctx, sqllayout.Catalog, func(k, v []byte) error {
+			if strings.HasPrefix(string(k), sqllayout.TablesPrefix(name)) {
 				var dropping versionedTable
 				if err := decodeVersioned(v, &dropping); err != nil {
 					return err
@@ -147,14 +148,14 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 				if err := rejectMVCCReferencedDrop(write, dropping, session.ForeignKeyChecksDisabled); err != nil {
 					return err
 				}
-				return write.Delete("catalog", k)
+				return write.Delete(sqllayout.Catalog, k)
 			}
 			return nil
 		})
 		if err != nil {
 			return nil, err
 		}
-		return &Result{AffectedRows: 1}, write.Delete("catalog", k)
+		return &Result{AffectedRows: 1}, write.Delete(sqllayout.Catalog, k)
 	case parser.Truncate:
 		definition, _, k, err := loadVersionedTable(read, session, value.Table)
 		if err != nil {
@@ -169,7 +170,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 		if err != nil {
 			return nil, err
 		}
-		return &Result{}, write.Put("catalog", k, encoded)
+		return &Result{}, write.Put(sqllayout.Catalog, k, encoded)
 	case parser.DropTable:
 		for _, name := range value.Names {
 			dropping, _, k, err := loadVersionedTable(write, session, name)
@@ -182,7 +183,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 			if err = rejectMVCCReferencedDrop(write, dropping, session.ForeignKeyChecksDisabled); err != nil {
 				return nil, err
 			}
-			if err = write.Delete("catalog", k); err != nil {
+			if err = write.Delete(sqllayout.Catalog, k); err != nil {
 				return nil, err
 			}
 		}
@@ -197,7 +198,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 		if err != nil {
 			return nil, err
 		}
-		if err = write.Guard("catalog", k); err != nil {
+		if err = write.Guard(sqllayout.Catalog, k); err != nil {
 			return nil, err
 		}
 		if value.TableAlias != "" {
@@ -248,7 +249,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 		if err != nil {
 			return nil, err
 		}
-		if err = write.Guard("catalog", k); err != nil {
+		if err = write.Guard(sqllayout.Catalog, k); err != nil {
 			return nil, err
 		}
 
@@ -277,7 +278,7 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, 
 	if err != nil {
 		return nil, err
 	}
-	if err = write.Guard("catalog", catalogKey); err != nil {
+	if err = write.Guard(sqllayout.Catalog, catalogKey); err != nil {
 		return nil, err
 	}
 	columns := definition.Definition.Columns
