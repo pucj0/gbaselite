@@ -1,6 +1,6 @@
-# A01–A03 Deep Hardening delivery
+# A01–A03 Deep Hardening delivery and Finalization-2
 
-Implementation baseline: master dd44f57, fetched and confirmed equal to origin/master before edits. Final local implementation commit before this report update: 4a02136. Existing data/ was not used for write tests; no deployment was performed.
+Original implementation baseline: master dd44f57. Finalization-2 starts from f10e5a2, fetched and confirmed equal to origin/master (0 ahead / 0 behind). Existing data/ was not used for write tests; no deployment was performed.
 
 | Task | Delivered |
 | --- | --- |
@@ -23,11 +23,62 @@ Compatibility review found that removing eager grouped/union results could suppr
 - All tracked Go files pass gofmt; git diff --check passes. Local ignored .tmp probe sources are not part of the clean-checkout formatting gate.
 - Windows amd64 and Linux amd64 static command builds passed. Linux migration test binary compilation and Linux go vet ./... passed.
 - Existing cross-backend SQL matrix and storageengine contract suite pass. New tests cover core-only capability fallback, Distinct input/result budget separation, heterogeneous Join, plan non-execution, Window store failures/cancel/cleanup, grouped LIMIT 0 resource errors, drain-limit late errors, and migration write/before-verify/after-verify/before-rename/after-rename recovery.
-- Remote GitHub Actions run 34442648257 for 974a903939ffeab858fc2dcc172108944dc78857 reported: Linux quality PASS, Windows quality FAIL in the Test step, Linux build PASS, Windows build PASS, MySQL 8 client SKIPPED because it needs quality. The public job annotation is only “Process completed with exit code 1”; GitHub requires authentication to view the raw step log and its API log download returned 403, so the first failing package/test is not observable from this environment. Local Windows Go 1.24.6 reproduction passes, so no speculative Windows-specific fix is claimed. The remote CI acceptance criterion remains open until that job is rerun with accessible logs and passes.
 
-## Remote failure record
+## Finalization-2: historical failure, root cause and fix
 
-The only confirmed remote failure is the Windows quality Test step in run 34442648257 (job 102760726406, step 5). Formatting passed and Vet was skipped because the test step failed. This is a diagnostic limitation rather than evidence that migration, iterator cleanup, or a particular SQL test failed; the runner log must be obtained from an authenticated GitHub Actions view before changing behavior.
+Historical Windows Actions run [34442648257](https://github.com/pucj0/gbaselite/actions/runs/34442648257), commit 974a903939ffeab858fc2dcc172108944dc78857, failed quality job 102760726406. The previous report could only observe the exit-code annotation because raw logs required authentication. The failure excerpt subsequently supplied with Finalization-2 identifies failover/TestProxyRoutesAfterLeaderFailure: fixture CREATE DATABASE IF NOT EXISTS test returned driver: bad connection. Executor, migration/legacy, mvcc, physical, server, storageengine and mvccadapter passed that historical run. A later successful rerun did not establish that the intermittent failure was fixed.
+
+Root cause: Router treated one unsuccessful discovery round as confirmed leader loss, set its address to empty, and closed all current proxy connections. A healthy leader can temporarily fail the combined status/SELECT 1 probe under scheduling or Raft propagation delays. Each peer still has a 750 ms probe deadline; the discovery ticker remains 500 ms (a round can probe three peers sequentially). Windows runner scheduling can expose this window; it is not a Windows-specific SQL or persistence defect. The historical runner timing itself was not captured. The causal disconnect path was reproduced deterministically using an injected probe and a pinned sql.Conn: the pre-fix test failed with 'transient probe failure cleared confirmed leader'. Commit dd9e28c records that reproduction before the production fix.
+
+The state change is deliberately small:
+
+- A successful probe resets the miss count. One or two unsuccessful whole rounds retain the last confirmed leader and its connections; the third consecutive unsuccessful round clears it. Initial discovery still has no leader until a probe succeeds.
+- A newly confirmed B replaces A immediately, without waiting for the miss threshold. Existing A transports close; subsequent connections dial B.
+- Discovery rounds are serialized. A generation check rejects stale probe results and connections dialed across an A → B → A transition.
+- Shutdown forces a transition without grace. Closing a routed connection closes both client and backend exactly once, outside the state mutex, so a copier blocked on a backend write can exit.
+- Router does not replay SQL. No new SQL retry, larger probe deadline, sleep, Windows skip, or ignored bad-connection error was added. Existing fixture retries and duplicate-key tolerance were removed.
+
+Production fix: 8d70628. Changes are confined to failover, its tests, README, the CI race step and this report. Engine/Txn, Physical Operators, Distinct, Join3, PlanNode, sqllayout, migration, SQL behavior, persisted bytes and MySQL wire framing are unchanged in this round. Existing architecture guards remain enabled and unweakened.
+
+Tests added: TestProxyKeepsLeaderAcrossTransientProbeFailure; TestProxyConfirmsLeaderLossAfterConsecutiveMisses (including success resetting misses); TestProxyConfirmedLeaderChangeClosesOldConnection; TestProxyRejectsStaleDiscovery; TestProxyTransitionUnblocksBackendWrite; TestRouterConcurrentDiscoveryAndConnections. The real three-node TestProxyRoutesAfterLeaderFailure still shuts A down, discovers B, opens a new client, writes once, and checks COUNT = 2 and SUM = 30. Test servers join Serve before Shutdown to keep fixture lifecycle synchronization explicit.
+
+## Finalization-2 acceptance
+
+Status: OPEN pending Linux race execution and remote CI. Automatic approval review rejected pushing to the shared origin/master branch without explicit push authorization; authorization has been requested. All local work and required local checks are complete. No architecture freeze is claimed until all required jobs pass.
+
+| Check | Result |
+| --- | --- |
+| go test ./failover -count=20 | PASS, final version: 71.839 s |
+| go test ./failover -count=50 | PASS, final version: 166.355 s |
+| go test -race ./failover -count=10 (Linux) | PENDING remote quality race step |
+| go test ./... -count=1 | PASS, final version |
+| go vet ./... | PASS, final version |
+| quality (ubuntu-latest) | PENDING |
+| quality (windows-latest) | PENDING |
+| build (ubuntu-latest) | PENDING |
+| build (windows-latest) | PENDING |
+| mysql-8-client, including dump/import | PENDING |
+
+Local logs use .tmp/finalization2-count20.log, .tmp/finalization2-count50.log, .tmp/deep-finalization2-test.log and .tmp/deep-finalization2-vet.log. Local validation uses Windows Go 1.24.6. Both stability commands finished with zero failures; all tracked Go sources pass gofmt and git diff --check passes. Linux race is an explicit, non-skipped Ubuntu quality step; Windows has no local C compiler for race. Remote CI must execute the MySQL 8 smoke step rather than accept a skipped job.
+
+A01 = OPEN (final acceptance pending); A02 = OPEN (final acceptance pending); A03 = OPEN (final acceptance pending); Deep Hardening = OPEN. Local tested code baseline: ff1789d5da472324c7c057abd4fd5f50eed6bd47. Final remotely validated baseline: pending.
+
+## Frozen architecture rules for A04+
+
+These existing boundaries remain mandatory while final acceptance is pending and after closure:
+
+1. No direct bbolt dependency from SQL/Executor/Physical.
+2. No direct concrete MVCC backend dependency from SQL/Executor/Physical.
+3. No legacy runtime.
+4. Legacy persistence only exists in offline migration modules.
+5. New SQL features must compose common Physical Operators.
+6. Core SELECT must not introduce Operator → callback → Operator roundtrips.
+7. Core SELECT must not introduce unnecessary Result.Rows materialization.
+8. SQL keyspace encoding belongs to sqllayout.
+9. New storage backend must satisfy storageengine contracts.
+10. Optional Engine features must remain optional capabilities.
+11. A04 SQL capability migration must not bypass storageengine.
+12. Any architecture exception must have an explicit compatibility boundary.
 
 ## Remaining technical debt and API effects
 
@@ -38,4 +89,5 @@ The only confirmed remote failure is the Windows quality Test step in run 344426
 - Plan estimates remain unknown and dynamic join probes are described as dynamic. There is no optimizer, EXPLAIN ANALYZE or new isolation/locking behavior.
 - Residual Executor names and user-facing errors that described the concrete backend were changed to SQL/storage-neutral names; actual MVCC maintenance/parser messages and the deprecated SetMVCCAutocommit compatibility API remain intentionally unchanged.
 - Go callers needing former full Engine capabilities may use FullEngine or assert individual capabilities. Missing explicit optional features return ErrUnsupported. The public autocommit alias remains; offline migration Go callers move to legacy.Migrate with TargetOpener. CLI migration flags, SQL messages and MySQL wire framing remain unchanged; EXPLAIN Extra intentionally gains descriptive text.
-- Failure injection verifies publication/recovery invariants, not a physical power-loss experiment. Linux durability paths are cross-compiled and vetted, but await runtime verification after Docker is repaired. Windows cannot offer Unix directory fsync semantics.
+- Failure injection verifies publication/recovery invariants, not a physical power-loss experiment. Final Linux durability runtime verification is part of the pending Ubuntu full test job. Windows cannot offer Unix directory fsync semantics.
+- Deferred: Txn.Table compatibility bridge removal; transaction read-view redesign; four isolation levels; record/gap/next-key locks; deadlock detector; optimizer; cardinality statistics; EXPLAIN ANALYZE; Pebble backend. No B-stage isolation/locking or new HA architecture is introduced.
