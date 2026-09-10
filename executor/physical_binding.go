@@ -39,25 +39,34 @@ func (i *accessIterator) Close() error {
 	}
 	return nil
 }
+
+// openAccessIterator is the byte-access boundary. Common table/range scans
+// pass the backend iterator directly; multi-step index probes retain one adapter.
+func openAccessIterator(ctx context.Context, tx storageengine.Txn, table versionedTable, access mvccAccessPlan) (storageengine.Iterator, error) {
+	switch access.kind {
+	case mvccAccessAll:
+		return tx.Table(table.ID).Scan(ctx, storageengine.ScanRequest{Unordered: true})
+	case mvccAccessRange, mvccAccessOrdered:
+		return tx.Table(table.ID).Scan(ctx, storageengine.ScanRequest{Range: access.bounds})
+	}
+	i := &accessIterator{}
+	i.next, i.stop = iter.Pull(func(yield func(accessRecord) bool) {
+		i.err = access.scan(ctx, tx, table, func(k, v []byte) error {
+			if !yield(accessRecord{k, v}) {
+				return errBudgetedRowsDone
+			}
+			return nil
+		})
+		if i.err == errBudgetedRowsDone {
+			i.err = nil
+		}
+	})
+	return i, nil
+}
 func bindScan(tx storageengine.Txn, table versionedTable, access mvccAccessPlan, decode func([]byte) (storage.Row, error)) physical.Operator[storage.Row] {
 	return physical.Scan[storage.Row]{Open: func(ctx context.Context) (storageengine.Iterator, error) {
-		i := &accessIterator{}
-		i.next, i.stop = iter.Pull(func(yield func(accessRecord) bool) {
-			i.err = access.scan(ctx, tx, table, func(k, v []byte) error {
-				if !yield(accessRecord{k, v}) {
-					return errBudgetedRowsDone
-				}
-				return nil
-			})
-			if i.err == errBudgetedRowsDone {
-				i.err = nil
-			}
-		})
-		return i, nil
+		return openAccessIterator(ctx, tx, table, access)
 	}, Decode: func(_, v []byte) (storage.Row, error) { return decode(v) }}
-}
-func sourceOperator(source func(func(storage.Row) error) error) physical.Operator[storage.Row] {
-	return physical.Source[storage.Row](func(_ context.Context, y physical.Yield[storage.Row]) error { return source(y) })
 }
 func operatorContext(session *Session) context.Context {
 	if session != nil && session.query != nil {
@@ -83,18 +92,16 @@ type mutationRow struct {
 
 func runRowModification(ctx context.Context, tx storageengine.Txn, table versionedTable, schema *storage.Table, session *Session, where parser.Expr, limit int, apply func([]byte, storage.Row) error) error {
 	access := planMVCCAccess(parser.Select{Where: where}, table, schema, session)
-	input := physical.Source[mutationRow](func(ctx context.Context, y physical.Yield[mutationRow]) error {
-		return access.scan(ctx, tx, table, func(key, value []byte) error {
-			if err := checkQuery(session); err != nil {
-				return err
-			}
-			row, err := decodeMVCCRow(table, value)
-			if err != nil {
-				return err
-			}
-			return y(mutationRow{key, row})
-		})
-	})
+	input := physical.Scan[mutationRow]{Open: func(ctx context.Context) (storageengine.Iterator, error) {
+		return openAccessIterator(ctx, tx, table, access)
+	}, Decode: func(key, value []byte) (mutationRow, error) {
+		if err := checkQuery(session); err != nil {
+			return mutationRow{}, err
+		}
+		row, err := decodeMVCCRow(table, value)
+		return mutationRow{key, row}, err
+	}}
+
 	filter := physical.Filter[mutationRow]{Input: input, Predicate: func(r mutationRow) (bool, error) {
 		if where == nil {
 			return true, nil

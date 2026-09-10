@@ -67,7 +67,7 @@ func architectureViolations(path string, src any) []string {
 				if strings.HasPrefix(n.Name, "openLegacy") || n.Name == "legacyEngine" || n.Name == "legacyTransaction" {
 					issues = append(issues, "legacy runtime symbol")
 				}
-				if (path == "executor/physical_select.go" || path == "executor/physical_join.go") && (n.Name == "sourceOperator" || n.Name == "rowSource") {
+				if (path == "executor/physical_select.go" || path == "executor/physical_join.go" || path == "executor/physical_binding.go") && (n.Name == "sourceOperator" || n.Name == "rowSource") {
 					issues = append(issues, "operator callback roundtrip")
 				}
 			case *ast.BasicLit:
@@ -128,6 +128,7 @@ func TestArchitectureChecksRejectRegressionFixtures(t *testing.T) {
 		{"physical/bad.go", "package physical; import _ \"gbaselite/storageengine/testkit\""},
 		{"server/bad.go", "package server; func f(){switch options.StorageMode{case \"paged\":}}"},
 		{"executor/physical_select.go", "package executor; func f(){sourceOperator(rowSource(ctx,op))}"},
+		{"executor/physical_binding.go", "package executor; func f(){sourceOperator(callback)}"},
 	}
 	for _, f := range fixtures {
 		if _, err := parser.ParseFile(token.NewFileSet(), f.path, f.source, 0); err != nil {

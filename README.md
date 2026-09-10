@@ -1230,3 +1230,5 @@ MVCC SELECT、UPDATE、DELETE 可利用已有单列或复合唯一索引进行�
 ## MVCC 业务兼容与维护
 
 当前状态以本页矩阵为准；详细设计和历史演进见 [MVCC 文档](docs/使用文档/MVCC复制与高可用.md)。
+
+A01–A03 Deep Hardening：SELECT 与 DML 的表/范围扫描直接使用后端 Iterator 接入 Physical Scan；历史 callback 适配单独隔离于 compat_sources，复杂索引访问暂保留一个字节访问适配边界。此清理保持现有 SQL 与事务语义。
