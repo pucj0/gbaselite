@@ -31,9 +31,7 @@ func stateBackend(t *testing.T) string {
 		l.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			t.Error(err)
-		}
+		// Join Serve before Shutdown reads its listener and waits for handlers.
 		select {
 		case err := <-done:
 			if err != nil {
@@ -41,6 +39,10 @@ func stateBackend(t *testing.T) string {
 			}
 		case <-ctx.Done():
 			t.Error("backend did not stop")
+			return
+		}
+		if err := srv.Shutdown(ctx); err != nil {
+			t.Error(err)
 		}
 	})
 	return l.Addr().String()

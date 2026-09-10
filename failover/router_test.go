@@ -33,10 +33,11 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 	defer func() {
 		for i, s := range servers {
 			if s != nil {
+				listeners[i].Close()
+				<-done[i]
 				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 				s.Shutdown(ctx)
 				cancel()
-				<-done[i]
 			}
 		}
 	}()
