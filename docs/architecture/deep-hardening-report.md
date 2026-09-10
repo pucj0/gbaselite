@@ -1,5 +1,7 @@
 # A01–A03 Deep Hardening delivery and Finalization-2
 
+Earlier OPEN statements below are historical acceptance snapshots. The final lightweight-verification section records the current decision and supersedes those snapshots.
+
 Original implementation baseline: master dd44f57. Finalization-2 starts from f10e5a2, fetched and confirmed equal to origin/master (0 ahead / 0 behind). Existing data/ was not used for write tests; no deployment was performed.
 
 | Task | Delivered |
@@ -117,3 +119,59 @@ Timeout changed: NO (750 ms); ticker changed: NO (500 ms); leaderMissThreshold c
 Validation on Windows Go 1.24.13: go test ./failover -count=20 PASS (110.310 s); go test ./failover -count=50 PASS (278.892 s); go test ./failover -run TestProxyRoutesAfterLeaderFailure -count=100 PASS (520.726 s). All completed with zero failures. Full go test ./... -count=1, go vet ./... and formatting checks PASS. Logs are .tmp/finalization22-count20.log, .tmp/finalization22-count50.log, .tmp/finalization22-real100.log, .tmp/deep-finalization22-test.log and .tmp/deep-finalization22-vet.log. The local Docker Linux daemon is unavailable, so no local Linux race pass is claimed. New remote Windows probe-stage evidence, Linux race x10, quality/build/MySQL 8/Docker acceptance remain pending explicit authorization to push to shared origin/master. Previous baseline Linux quality/race, both builds and Docker passed; Windows failed and MySQL 8 was skipped. Previous passes are not final validation of this change.
 
 A01 = OPEN pending final validation; A02 = OPEN pending final validation; A03 = OPEN pending final validation; Deep Hardening = OPEN. All previously listed deferred work and A04+ architecture rules remain unchanged.
+
+## Final lightweight-verification acceptance (2026-09-10)
+
+Code baseline: e1ba8da973badc341319d98300cbe7cb9c05e075. This round started from master 7652ebb1ba0969f8ed90ce5858e655fd7081bc6a, fetched and confirmed equal to origin/master. Only failover leadership verification and its test lifecycle were changed; no B-stage isolation/locking, core Engine/Txn or Physical Operator redesign was performed. Existing data/ was untouched; all write tests used isolated temporary databases.
+
+### Historical evidence and confirmed root cause
+
+The complete Windows raw log from [run 34462470465 (Run #56), job 102823248533](https://github.com/pucj0/gbaselite/actions/runs/34462470465/job/102823248533) resolves the previously unknown per-peer failure stages. Node 0 remained Leader, and both followers kept reporting Leader_ID=0. Successful SELECT 1 probe latency rose through approximately 284, 299, 446 and 657 ms before the following failures:
+
+| Discovery round | Node 0 status | Node 0 SELECT 1 | Node 1 | Node 2 |
+| --- | --- | --- | --- | --- |
+| 6 | Leader/0; 0.359 ms | 750.472 ms; context-deadline | Follower; leader=0 | Follower; leader=0 |
+| 7 | Leader/0; 0.673 ms | 749.418 ms; context-deadline | Follower; leader=0 | Follower; leader=0 |
+| 8 | Leader/0; below timer resolution | 749.928 ms; context-deadline | Follower; leader=0 | Follower; leader=0 |
+
+After round 8, Router changed generation 1 → 2, cleared the leader with confirmed-loss/misses=3, and actively closed the existing connection. CREATE TABLE then returned invalid connection. Stable readiness had already completed; the cause was not initial readiness or an A → B election.
+
+Root cause: Router used ordinary SELECT 1 as a liveness/quorum check. The current replicated SQL path enters Replica.Barrier, which invokes raft.VerifyLeader plus raft.Barrier and waits for FSM ordering. Repeated discovery therefore introduced full read barriers alongside real replicated work. A full SQL consistency barrier is the wrong leadership heartbeat. Probe design bug: YES. Production failover bug: YES. There is no evidence of an election defect or actual leader loss; connection pooling and startup were not this root cause. Increasing the probe timeout or miss threshold would not address the design defect.
+
+### Actual fix and compatibility boundary
+
+- replication.Node.VerifyLeader checks cancellation and local Leader state, then waits for raft.VerifyLeader. It never calls raft.Barrier. The existing Barrier implementation and ordinary SQL pre-barriers remain unchanged.
+- storageengine.LeaderVerifier is an independent optional Replica capability, forwarded by mvccadapter. Engine core, Replica's existing required contract and backend mocks are not expanded. SQL/server/failover do not import concrete replication or Raft packages.
+- SHOW REPLICATION STATUS validates a self-consistent Leader candidate through the optional verifier and rechecks identity/state before returning it. Follower and Standalone reporting retain the same behavior. All five result columns/types and MySQL framing are preserved. Missing optional verification returns ErrUnsupported; it never falls back to the full Barrier.
+- Router makes one status SQL roundtrip, no ordinary SELECT and no FSM Barrier. The original 750 ms overall probe ceiling, 500 ms ticker and three-miss hysteresis remain. Server-side verification is bounded by the same 750 ms ceiling because MySQL does not carry the client's context. Transient failure retains the connection; confirmed loss or a confirmed successor still closes stale transports immediately. Generation and two-sided close protections remain.
+- Diagnostics remain: per-round IDs/timestamps, each attempted peer, status-and-verification duration/budget/errors, transition history and the first connection-close reason. The removed SELECT-stage duration is replaced by the single status-and-verification roundtrip duration; no extra wire columns or production logging are introduced.
+
+A second, distinct failure was found in [run 34469358580, Windows job 102845373754](https://github.com/pucj0/gbaselite/actions/runs/34469358580/job/102845373754) after the production repair. The log shows INSERT hit the integration client's 3-second socket read timeout. Router was still generation 1, with no confirmed-loss; close reason was client-to-backend-copy-ended. Confirmations were mostly below timer resolution to 132 ms, with only two misses before the client timed out. This was not another healthy-leader teardown.
+
+The fixture now bounds each whole statement with a 15-second context, covering its existing two 5-second read-barrier stages plus replicated apply instead of asserting an unrelated 3-second SQL latency SLA. Its pinned sql.Conn prevents database/sql from replaying a fixture statement. No retry, ignored error, duplicate-key tolerance or production timeout change was added. Query duration/error history and COUNT=2, SUM=30, MIN(id)=1, MAX(id)=2 assertions preserve data-loss/duplication detection.
+
+Files modified in this round: replication/node.go and node_test.go; storageengine/engine.go and mvccadapter/adapter.go; executor/transaction_engine.go and leader_verification_test.go; server/handler.go; failover/probe.go, probe_test.go, router_state_test.go, router_test.go and leader_verification_test.go; README.md; this report.
+
+### Deterministic tests and final validation
+
+New protocol test TestProbeDoesNotUseSQLBarrier makes ordinary Barrier fail while VerifyLeader succeeds. More than three discovery rounds still retain the Leader without any Barrier calls. An injected VerifyLeader failure leaves the same generation and pinned client alive; subsequent success recovers, while ordinary SELECT continues to invoke Barrier. Executor tests cover the optional capability, unchanged status schema, failure/cancellation, inconsistent identity and role change during verification. The real replication test verifies that leadership confirmation appends no Raft log entry and rejects follower, canceled context and minority cases. Existing transition, stale generation, blocked writer, concurrent shutdown, contract, migration and architecture tests remain enabled.
+
+| Validation | Result / evidence |
+| --- | --- |
+| Windows Go 1.24.13: go test ./failover -count=20 | PASS; 107.316 s |
+| Windows Go 1.24.13: go test ./failover -count=50 | PASS; 268.831 s |
+| Windows Go 1.24.13: go test ./failover -run TestProxyRoutesAfterLeaderFailure -count=100 | PASS; 511.901 s |
+| go test ./... -count=1 | PASS locally, Ubuntu CI and Windows CI |
+| go vet ./... | PASS locally, Ubuntu CI and Windows CI |
+| gofmt and git diff --check | PASS |
+| Ubuntu: go test -race ./failover -count=10 | PASS; 45.834 s; quality job 102847159542 |
+| quality (ubuntu-latest) | PASS; job 102847159542 |
+| quality (windows-latest) | PASS; job 102847159703; failover package 11.432 s |
+| build (ubuntu-latest) | PASS; job 102847159767 |
+| build (windows-latest) | PASS; job 102847159696 |
+| mysql-8-client | PASS; job 102847882351; dump/import smoke explicitly executed |
+| Docker (linux/amd64 and linux/arm64) | PASS; job 102847159990 |
+
+Remote evidence: [Test run 34469918569](https://github.com/pucj0/gbaselite/actions/runs/34469918569) and [Docker run 34469918674](https://github.com/pucj0/gbaselite/actions/runs/34469918674), both for e1ba8da. No failed run was rerun until green; each subsequent run tested a documented, evidence-driven code or fixture change. Local final-version logs: .tmp/lightweight-final-count20.log, .tmp/lightweight-final-count50.log, .tmp/lightweight-final-real100.log, .tmp/deep-lightweight-final-test.log and .tmp/deep-lightweight-final-vet.log.
+
+Final decision: A01 Single MVCC Runtime = CLOSED; A02 Storage Engine Abstraction = CLOSED; A03 Physical Operator Framework = CLOSED; A01-A03 Deep Hardening = CLOSED. All required checks and the additional 100-run real failover check passed with zero failures. The frozen implementation baseline is e1ba8da973badc341319d98300cbe7cb9c05e075, validated by the runs linked above; this documentation-only closure commit preserves that code baseline. The twelve A04+ rules above remain mandatory. Deferred work also includes optimizing ordinary replicated SQL barrier placement/read consistency; this fix deliberately does not introduce ReadIndex, lease/follower/stale reads, a new consensus protocol or any B-stage transaction/lock design. Existing external aggregate/window spill, Txn.Table bridge removal, read-view/isolation/locks/deadlock, optimizer/statistics/EXPLAIN ANALYZE and Pebble debt remain deferred. After closure, stop A01-A03 changes; A04 Legacy SQL Capability Migration is the next stage.
