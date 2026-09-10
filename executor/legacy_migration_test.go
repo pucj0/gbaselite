@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"crypto/sha256"
+	"gbaselite/migration/legacy"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -186,4 +187,8 @@ func TestDefaultEngineRejectsRetiredRuntimeOptions(t *testing.T) {
 			t.Fatal("invalid options created data")
 		}
 	}
+}
+
+func MigrateLegacy(ctx context.Context, source, target string) error {
+	return legacy.Migrate(ctx, source, target, func(dir string) (legacy.Target, error) { return Open(dir, "", "") })
 }

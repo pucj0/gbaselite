@@ -1,11 +1,9 @@
-package executor
+package legacy
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"gbaselite/sqllayout"
 	"io"
 	"io/fs"
 	"os"
@@ -13,14 +11,16 @@ import (
 	"strings"
 
 	"gbaselite/storage"
-	"gbaselite/storageengine"
 )
 
 // MigrateLegacy converts a stopped snapshot/paged instance to a new standalone
 // MVCC directory. Only an isolated copy is opened by the legacy reader. The
 // target is published after durable reopen and full row verification; the source
 // is never modified. Unsupported schemas fail without publishing a target.
-func MigrateLegacy(ctx context.Context, source, target string) error {
+func Migrate(ctx context.Context, source, target string, open TargetOpener) error {
+	if open == nil {
+		return fmt.Errorf("migration target opener required")
+	}
 	source, err := filepath.Abs(source)
 	if err != nil {
 		return err
@@ -118,21 +118,21 @@ func MigrateLegacy(ctx context.Context, source, target string) error {
 	if err := copyMigrationDirectory(ctx, filepath.Join(copyDir, "users"), filepath.Join(destination, "users")); err != nil {
 		return err
 	}
-	engine, err := Open(destination, "", "")
+	engine, err := open(destination)
 	if err != nil {
 		return err
 	}
-	if err = engine.importLegacySnapshot(ctx, snapshot); err != nil {
+	if err = engine.ImportSnapshot(ctx, snapshot); err != nil {
 		return errors.Join(err, engine.Close())
 	}
 	if err = engine.Close(); err != nil {
 		return err
 	}
-	engine, err = Open(destination, "", "")
+	engine, err = open(destination)
 	if err != nil {
 		return err
 	}
-	err = engine.verifyLegacySnapshot(ctx, snapshot)
+	err = engine.VerifySnapshot(ctx, snapshot)
 	err = errors.Join(err, engine.Close())
 	if err != nil {
 		return err
@@ -190,134 +190,10 @@ func copyMigrationDirectory(ctx context.Context, source, target string) error {
 	})
 }
 
-func (e *Engine) importLegacySnapshot(ctx context.Context, snapshot storage.StoreSnapshot) error {
-	tx, err := e.Backend.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	// Create all schemas before resolving foreign keys, including forward references.
-	for _, db := range snapshot.Databases {
-		if err = tx.Put(sqllayout.Catalog, sqllayout.DatabaseKey(strings.ToLower(db.Name)), []byte{1}); err != nil {
-			return err
-		}
-		for i, table := range db.Tables {
-			table.Rows = nil
-			definition := versionedTable{CatalogName: strings.ToLower(db.Name) + "." + strings.ToLower(table.Name), ID: fmt.Sprintf("%s/%s/%d", tx.ID(), strings.ToLower(db.Name), i), Definition: table, RowEncoding: sqlCompactRowEncoding, SecondaryEncoding: 1}
-			if _, ok := sqlIntegerPrimary(definition); ok {
-				definition.KeyEncoding = sqlIntegerKeyEncoding
-			}
-			encoded, err := encodeVersioned(definition)
-			if err != nil {
-				return err
-			}
-			if err = tx.Put(sqllayout.Catalog, sqllayout.TableKey(strings.ToLower(db.Name), strings.ToLower(table.Name)), encoded); err != nil {
-				return err
-			}
-		}
-	}
-	for _, db := range snapshot.Databases {
-		session := &Session{CurrentDatabase: strings.ToLower(db.Name)}
-		for _, table := range db.Tables {
-			definition, schema, key, err := loadVersionedTable(tx, session, table.Name)
-			if err != nil {
-				return err
-			}
-			for _, check := range table.CheckConstraints {
-				if err = validateSQLCheckDefinition(schema, check.Expression); err != nil {
-					return err
-				}
-			}
-			if err = prepareSQLForeignKeys(tx, &definition, session); err != nil {
-				return fmt.Errorf("migrate %s: %w", definition.CatalogName, err)
-			}
-			encoded, err := encodeVersioned(definition)
-			if err != nil {
-				return err
-			}
-			if err = tx.Put(sqllayout.Catalog, key, encoded); err != nil {
-				return err
-			}
-			disabled := context.WithValue(ctx, foreignChecksContextKey{}, true)
-			for i, row := range table.Rows {
-				if err = ctx.Err(); err != nil {
-					return err
-				}
-				if err = writeVersionedRow(disabled, tx, definition, nil, nil, row, fmt.Sprintf("legacy/%020d", i)); err != nil {
-					return fmt.Errorf("migrate %s row %d: %w", definition.CatalogName, i, err)
-				}
-			}
-			for col, next := range table.AutoIncrementNext {
-				if next < 1 {
-					return fmt.Errorf("invalid auto increment counter in %s", definition.CatalogName)
-				}
-				if err := storageengine.AdvanceCounter(ctx, e.Backend, definition.counterKey(col), uint64(next-1)); err != nil {
-					return err
-				}
-			}
-		}
-	}
-	// Validate every reference against the complete imported transaction.
-	for _, db := range snapshot.Databases {
-		for _, table := range db.Tables {
-			definition, _, _, err := loadVersionedTable(tx, &Session{CurrentDatabase: db.Name}, table.Name)
-			if err != nil {
-				return err
-			}
-			for _, row := range table.Rows {
-				if err = validateSQLReferences(ctx, tx, definition, nil, row); err != nil {
-					return fmt.Errorf("migrate %s: %w", definition.CatalogName, err)
-				}
-			}
-		}
-	}
-	_, err = tx.Commit(ctx)
-	return err
+// Target is a logical snapshot destination. The offline package has no runtime/backend dependency.
+type Target interface {
+	ImportSnapshot(context.Context, storage.StoreSnapshot) error
+	VerifySnapshot(context.Context, storage.StoreSnapshot) error
+	Close() error
 }
-
-func (e *Engine) verifyLegacySnapshot(ctx context.Context, snapshot storage.StoreSnapshot) error {
-	tx, err := e.Backend.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	for _, db := range snapshot.Databases {
-		for _, table := range db.Tables {
-			definition, _, _, err := loadVersionedTable(tx, &Session{CurrentDatabase: db.Name}, table.Name)
-			if err != nil {
-				return err
-			}
-			count := 0
-			if err = tx.Scan(ctx, sqllayout.Rows(definition.ID), func(_, _ []byte) error { count++; return nil }); err != nil {
-				return err
-			}
-			if count != len(table.Rows) {
-				return fmt.Errorf("migration row count mismatch in %s", definition.CatalogName)
-			}
-			for i, row := range table.Rows {
-				key := []byte(fmt.Sprintf("legacy/%020d", i))
-				for _, index := range table.Indexes {
-					if index.Primary {
-						var ok bool
-						key, ok = sqlPrimaryKey(definition, index, row)
-						if !ok {
-							return fmt.Errorf("invalid primary key")
-						}
-					}
-				}
-				got, ok, err := tx.Table(definition.ID).Get(key)
-				if err != nil {
-					return err
-				}
-				want, err := encodeSQLRow(definition, row)
-				if err != nil {
-					return err
-				}
-				if !ok || !bytes.Equal(got, want) {
-					return fmt.Errorf("migration row verification failed in %s at row %d", definition.CatalogName, i)
-				}
-			}
-		}
-	}
-	return nil
-}
+type TargetOpener func(directory string) (Target, error)

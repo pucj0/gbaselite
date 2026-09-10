@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"gbaselite/executor"
+	"gbaselite/migration/legacy"
 )
 
 func runMigrateLegacy(args []string) error {
@@ -17,7 +18,7 @@ func runMigrateLegacy(args []string) error {
 	if *source == "" || *target == "" || flags.NArg() != 0 {
 		return fmt.Errorf("usage: migrate-legacy --source <old-directory> --target <new-directory>")
 	}
-	if err := executor.MigrateLegacy(context.Background(), *source, *target); err != nil {
+	if err := legacy.Migrate(context.Background(), *source, *target, func(dir string) (legacy.Target, error) { return executor.Open(dir, "", "") }); err != nil {
 		return err
 	}
 	fmt.Println("Legacy migration verified:", *target, "; source preserved. Configure storage.path to the new directory before starting.")

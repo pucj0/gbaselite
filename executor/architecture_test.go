@@ -49,8 +49,8 @@ func architectureViolations(path string, src any) []string {
 		if d, ok := decl.(*ast.FuncDecl); ok {
 			fn = d.Name.Name
 		}
-		loader := path == "executor/legacy_reader.go" && fn == "loadLegacyForMigration"
-		migration := path == "executor/legacy_migration.go"
+		loader := path == "migration/legacy/reader.go" && fn == "loadLegacyForMigration"
+		migration := path == "migration/legacy/migrate.go"
 		ast.Inspect(decl, func(node ast.Node) bool {
 			switch n := node.(type) {
 			case *ast.CompositeLit:
@@ -78,7 +78,7 @@ func architectureViolations(path string, src any) []string {
 				if path == "executor/physical_select.go" && (n.Name == "executeBudgetedDistinct" || n.Name == "resultOperator") {
 					issues = append(issues, "materialized DISTINCT in core binding")
 				}
-				if n.Name == "loadLegacyForMigration" && !loader && !(migration && fn == "MigrateLegacy") {
+				if n.Name == "loadLegacyForMigration" && !loader && !(migration && fn == "Migrate") {
 					issues = append(issues, "migration reader reachable from runtime")
 				}
 				if strings.HasPrefix(n.Name, "openLegacy") || n.Name == "legacyEngine" || n.Name == "legacyTransaction" {
@@ -144,6 +144,7 @@ func TestProductionArchitectureBoundaries(t *testing.T) {
 }
 func TestArchitectureChecksRejectRegressionFixtures(t *testing.T) {
 	fixtures := []struct{ path, source string }{
+		{"executor/bad.go", `package executor; import _ "gbaselite/migration/legacy"`},
 		{"executor/bad.go", `package executor; const prefix = "row/"`},
 		{"executor/bad.go", "package executor; import disk \"gbaselite/storage\"; func f(){_ = disk.NewPagedPersistence(\"x\",0)}"},
 		{"executor/bad.go", "package executor; import . \"gbaselite/storage\"; var _ = NewPersistence"},
@@ -164,7 +165,7 @@ func TestArchitectureChecksRejectRegressionFixtures(t *testing.T) {
 			t.Errorf("accepted %s", f.source)
 		}
 	}
-	if got := architectureViolations("executor/legacy_reader.go", "package executor; import s \"gbaselite/storage\"; func loadLegacyForMigration(){_ = s.NewPersistence(\"x\")}"); len(got) > 0 {
+	if got := architectureViolations("migration/legacy/reader.go", "package legacy; import s \"gbaselite/storage\"; func loadLegacyForMigration(){_ = s.NewPersistence(\"x\")}"); len(got) > 0 {
 		t.Fatal(got)
 	}
 }

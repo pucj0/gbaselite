@@ -1246,3 +1246,5 @@ SQL namespace 与有序整数主键基础编码集中到 sqllayout：row/index/s
 EXPLAIN 的 Extra 追加 Pipeline 算子树，由同一次 SQL 绑定生成；索引访问类型与运行计划共享绑定结果。计划不执行 Scan 或 Join 探测，动态内侧扫描明确标注 DynamicScan。PlanNode 为成本、基数和实际行数预留可选字段，当前未实现代价优化器或 EXPLAIN ANALYZE。
 
 Aggregate 的 Accumulator 与 Window 的 PartitionStore/EvaluateStore 为外部聚合和分区落盘预留接口，统一每次运行的资源所有权与 Close。当前 SQL 聚合和窗口仍按原预算保存在内存；窗口表达式保留切片兼容边界，未宣称已实现窗口落盘。设计边界见 docs/architecture/spill-stores.md。
+
+离线迁移编排与 snapshot/paged reader 已移至 migration/legacy，生产 Executor 不再读取旧存储格式。migrate-legacy 命令及源目录只读、目标重开验证语义保持不变。Go 调用入口改为 legacy.Migrate(ctx, source, target, opener)，由命令装配 executor.Open；逻辑 ImportSnapshot/VerifySnapshot 只面向隔离目标，导入失败必须丢弃目标（包含独立计数器变化）。
