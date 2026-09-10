@@ -23,6 +23,7 @@ type Options struct {
 	MaxConnections     int
 }
 type Router struct {
+	probe       func(context.Context, *sql.DB, Peer) bool
 	options     Options
 	mutex       sync.Mutex
 	leader      string
@@ -56,7 +57,7 @@ func New(options Options) (*Router, error) {
 	if options.MaxConnections < 1 || options.MaxConnections > 4096 {
 		return nil, fmt.Errorf("proxy max connections must be 1..4096")
 	}
-	return &Router{options: options, connections: make(map[net.Conn]string)}, nil
+	return &Router{probe: probeLeader, options: options, connections: make(map[net.Conn]string)}, nil
 }
 func (r *Router) Leader() string { r.mutex.Lock(); defer r.mutex.Unlock(); return r.leader }
 func (r *Router) changeLeader(address string) {
@@ -155,17 +156,11 @@ func (r *Router) discover(ctx context.Context, databases []*sql.DB) {
 	}
 	for _, i := range order {
 		probe, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
-		var id, state, leader, raftAddress string
-		var applied uint64
-		err := databases[i].QueryRowContext(probe, "SHOW REPLICATION STATUS").Scan(&id, &state, &leader, &raftAddress, &applied)
-		if err == nil && state == "Leader" && id == r.options.Peers[i].ID {
-			var one int
-			err = databases[i].QueryRowContext(probe, "SELECT 1").Scan(&one)
-			if err == nil && one == 1 {
-				cancel()
-				r.changeLeader(r.options.Peers[i].Address)
-				return
-			}
+		confirmed := r.probe(probe, databases[i], r.options.Peers[i])
+		if confirmed {
+			cancel()
+			r.changeLeader(r.options.Peers[i].Address)
+			return
 		}
 		cancel()
 		if ctx.Err() != nil {
@@ -197,4 +192,15 @@ func (r *Router) route(ctx context.Context, client net.Conn) {
 	io.CopyBuffer(client, backend, make([]byte, 32<<10))
 	client.Close()
 	<-done
+}
+
+// probeLeader requires both role identity and a quorum-confirmed SQL read.
+func probeLeader(ctx context.Context, db *sql.DB, peer Peer) bool {
+	var id, state, leader, raftAddress string
+	var applied uint64
+	if err := db.QueryRowContext(ctx, "SHOW REPLICATION STATUS").Scan(&id, &state, &leader, &raftAddress, &applied); err != nil || state != "Leader" || id != peer.ID {
+		return false
+	}
+	var one int
+	return db.QueryRowContext(ctx, "SELECT 1").Scan(&one) == nil && one == 1
 }
