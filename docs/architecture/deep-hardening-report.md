@@ -1,6 +1,6 @@
 # A01–A03 Deep Hardening delivery
 
-Implementation baseline: master dd44f57, fetched and confirmed equal to origin/master before edits. Local commits implement Tasks 1–10 independently, followed by a compatibility fix. No push or deployment was performed; existing data/ was not used for write tests.
+Implementation baseline: master dd44f57, fetched and confirmed equal to origin/master before edits. Final local implementation commit before this report update: 4a02136. Existing data/ was not used for write tests; no deployment was performed.
 
 | Task | Delivered |
 | --- | --- |
@@ -19,11 +19,15 @@ Compatibility review found that removing eager grouped/union results could suppr
 
 ## Validation on 2026-09-10
 
-- Each task passed Windows go test ./... -count=1 and go vet ./...; final checks passed after the compatibility follow-up (Go 1.26.5). Logs: .tmp/deep-task1-test.log through deep-task10-test.log and .tmp/deep-final2-test.log / deep-final2-vet.log.
+- Windows Go 1.26.5 and Go 1.24.6 both pass go test ./... -count=1; Go 1.24.6 also passes go vet ./.... Logs: .tmp/deep-task1-test.log through deep-task10-test.log, .tmp/deep-final2-test.log, .tmp/deep-final2-vet.log, .tmp/go124-test.log and .tmp/go124-vet.log.
 - All tracked Go files pass gofmt; git diff --check passes. Local ignored .tmp probe sources are not part of the clean-checkout formatting gate.
 - Windows amd64 and Linux amd64 static command builds passed. Linux migration test binary compilation and Linux go vet ./... passed.
 - Existing cross-backend SQL matrix and storageengine contract suite pass. New tests cover core-only capability fallback, Distinct input/result budget separation, heterogeneous Join, plan non-execution, Window store failures/cancel/cleanup, grouped LIMIT 0 resource errors, drain-limit late errors, and migration write/before-verify/after-verify/before-rename/after-rename recovery.
-- Full Linux runtime tests and MySQL 8 dump/import smoke are NOT verified in this round. Docker Desktop fails during startup at its local dockerInference socket before the Linux engine is available. The repository CI workflow was not changed or remotely triggered. This environment blocker means the full CI acceptance criterion remains open.
+- Remote GitHub Actions run 34442648257 for 974a903939ffeab858fc2dcc172108944dc78857 reported: Linux quality PASS, Windows quality FAIL in the Test step, Linux build PASS, Windows build PASS, MySQL 8 client SKIPPED because it needs quality. The public job annotation is only “Process completed with exit code 1”; GitHub requires authentication to view the raw step log and its API log download returned 403, so the first failing package/test is not observable from this environment. Local Windows Go 1.24.6 reproduction passes, so no speculative Windows-specific fix is claimed. The remote CI acceptance criterion remains open until that job is rerun with accessible logs and passes.
+
+## Remote failure record
+
+The only confirmed remote failure is the Windows quality Test step in run 34442648257 (job 102760726406, step 5). Formatting passed and Vet was skipped because the test step failed. This is a diagnostic limitation rather than evidence that migration, iterator cleanup, or a particular SQL test failed; the runner log must be obtained from an authenticated GitHub Actions view before changing behavior.
 
 ## Remaining technical debt and API effects
 
@@ -32,5 +36,6 @@ Compatibility review found that removing eager grouped/union results could suppr
 - Core SQL consumes its Txn before closing it. Lazy protocol streaming that owns a live transaction is not introduced.
 - Table convenience handles still use a compatibility bridge to sqllayout. No logical namespace bytes or persisted table/row metadata fields were renamed.
 - Plan estimates remain unknown and dynamic join probes are described as dynamic. There is no optimizer, EXPLAIN ANALYZE or new isolation/locking behavior.
+- Residual Executor names and user-facing errors that described the concrete backend were changed to SQL/storage-neutral names; actual MVCC maintenance/parser messages and the deprecated SetMVCCAutocommit compatibility API remain intentionally unchanged.
 - Go callers needing former full Engine capabilities may use FullEngine or assert individual capabilities. Missing explicit optional features return ErrUnsupported. The public autocommit alias remains; offline migration Go callers move to legacy.Migrate with TargetOpener. CLI migration flags, SQL messages and MySQL wire framing remain unchanged; EXPLAIN Extra intentionally gains descriptive text.
 - Failure injection verifies publication/recovery invariants, not a physical power-loss experiment. Linux durability paths are cross-compiled and vetted, but await runtime verification after Docker is repaired. Windows cannot offer Unix directory fsync semantics.
