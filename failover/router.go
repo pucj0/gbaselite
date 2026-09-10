@@ -27,15 +27,30 @@ type Options struct {
 // replaces the old one immediately. No timer extends a failed round.
 const leaderMissThreshold = 3
 
+// Test hooks are installed before Serve, must not re-enter Router, and are nil
+// in production. Transition hooks run under mutex to preserve event ordering.
+type leaderTransition struct {
+	From, To, Reason string
+	Misses           int
+	Generation       uint64
+}
+type connectionClose struct {
+	Backend, Reason string
+	Generation      uint64
+	Err             error
+}
+
 type Router struct {
-	discovery   sync.Mutex
-	misses      int
-	generation  uint64
-	probe       func(context.Context, *sql.DB, Peer) bool
-	options     Options
-	mutex       sync.Mutex
-	leader      string
-	connections map[net.Conn]string
+	transitionHook func(leaderTransition)
+	connectionHook func(connectionClose)
+	discovery      sync.Mutex
+	misses         int
+	generation     uint64
+	probe          func(context.Context, *sql.DB, Peer) bool
+	options        Options
+	mutex          sync.Mutex
+	leader         string
+	connections    map[net.Conn]string
 }
 
 func New(options Options) (*Router, error) {
@@ -73,18 +88,23 @@ func (r *Router) Leader() string { r.mutex.Lock(); defer r.mutex.Unlock(); retur
 func (r *Router) changeLeader(address string) {
 	r.mutex.Lock()
 	r.misses = 0
-	stale := r.changeLeaderLocked(address)
-	r.mutex.Unlock()
-	for _, c := range stale {
-		c.Close()
+	reason := "confirmed-new-leader"
+	if address == "" {
+		reason = "shutdown"
 	}
+	stale := r.changeLeaderLocked(address, reason)
+	r.mutex.Unlock()
+	closeTransitionConnections(stale, reason)
 }
-func (r *Router) changeLeaderLocked(address string) []net.Conn {
+func (r *Router) changeLeaderLocked(address, reason string) []net.Conn {
+	from := r.leader
 	if r.leader == address {
+		r.traceTransition(from, address, reason)
 		return nil
 	}
 	r.leader = address
 	r.generation++
+	r.traceTransition(from, address, reason)
 	var stale []net.Conn
 	for c, backend := range r.connections {
 		if backend != address {
@@ -97,6 +117,7 @@ func (r *Router) recordDiscovery(address string, generation uint64) {
 	r.mutex.Lock()
 	// An older probe must not undo a newer transition or shutdown.
 	if r.generation != generation {
+		r.traceTransition(r.leader, address, "stale-result-rejected")
 		r.mutex.Unlock()
 		return
 	}
@@ -105,14 +126,36 @@ func (r *Router) recordDiscovery(address string, generation uint64) {
 	} else if r.leader != "" {
 		r.misses++
 		if r.misses < leaderMissThreshold {
+			r.traceTransition(r.leader, r.leader, "probe-miss")
 			r.mutex.Unlock()
 			return
 		}
 	}
-	stale := r.changeLeaderLocked(address)
+	reason := "confirmed-new-leader"
+	if address == "" {
+		reason = "confirmed-loss"
+	} else if address == r.leader {
+		reason = "confirmed-current-leader"
+	} else if r.leader == "" {
+		reason = "initial-discovery"
+	}
+	stale := r.changeLeaderLocked(address, reason)
 	r.mutex.Unlock()
-	for _, c := range stale {
-		c.Close()
+	closeTransitionConnections(stale, reason)
+}
+
+func (r *Router) traceTransition(from, to, reason string) {
+	if r.transitionHook != nil {
+		r.transitionHook(leaderTransition{from, to, reason, r.misses, r.generation})
+	}
+}
+func closeTransitionConnections(connections []net.Conn, reason string) {
+	for _, c := range connections {
+		if routed, ok := c.(*routedConnection); ok {
+			routed.closeBecause(reason, nil)
+		} else {
+			c.Close()
+		}
 	}
 }
 
@@ -122,11 +165,20 @@ type routedConnection struct {
 	net.Conn
 	backend net.Conn
 	once    sync.Once
+	onClose func(string, error)
 }
 
 func (c *routedConnection) Close() error {
+	return c.closeBecause("route-cleanup", nil)
+}
+func (c *routedConnection) closeBecause(reason string, cause error) error {
 	var err error
-	c.once.Do(func() { err = errors.Join(c.Conn.Close(), c.backend.Close()) })
+	c.once.Do(func() {
+		if c.onClose != nil {
+			c.onClose(reason, cause)
+		}
+		err = errors.Join(c.Conn.Close(), c.backend.Close())
+	})
 	return err
 }
 func (r *Router) Serve(ctx context.Context, listener net.Listener) error {
@@ -245,6 +297,9 @@ func (r *Router) route(ctx context.Context, client net.Conn) {
 		return
 	}
 	connection := &routedConnection{Conn: client, backend: backend}
+	if r.connectionHook != nil {
+		connection.onClose = func(reason string, err error) { r.connectionHook(connectionClose{address, reason, generation, err}) }
+	}
 	defer connection.Close()
 	r.mutex.Lock()
 	if r.leader != address || r.generation != generation || ctx.Err() != nil {
@@ -255,9 +310,21 @@ func (r *Router) route(ctx context.Context, client net.Conn) {
 	r.mutex.Unlock()
 	defer func() { r.mutex.Lock(); delete(r.connections, connection); r.mutex.Unlock() }()
 	done := make(chan struct{})
-	go func() { io.CopyBuffer(backend, client, make([]byte, 32<<10)); connection.Close(); close(done) }()
-	io.CopyBuffer(client, backend, make([]byte, 32<<10))
-	connection.Close()
+	go func() {
+		_, err := io.CopyBuffer(backend, client, make([]byte, 32<<10))
+		reason := "client-to-backend-copy-ended"
+		if ctx.Err() != nil {
+			reason = "context-cancel"
+		}
+		connection.closeBecause(reason, err)
+		close(done)
+	}()
+	_, copyErr := io.CopyBuffer(client, backend, make([]byte, 32<<10))
+	reason := "backend-to-client-copy-ended"
+	if ctx.Err() != nil {
+		reason = "context-cancel"
+	}
+	connection.closeBecause(reason, copyErr)
 	<-done
 }
 

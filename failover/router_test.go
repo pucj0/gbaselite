@@ -1,16 +1,17 @@
-package failover_test
+package failover
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
 	"gbaselite/executor"
-	"gbaselite/failover"
 	"gbaselite/server"
 	"gbaselite/storageengine"
 	"io"
 	"log"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -29,7 +30,7 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 	servers := make([]*server.MySQLServer, 3)
 	listeners := make([]net.Listener, 3)
 	done := make([]chan error, 3)
-	var sqlPeers []failover.Peer
+	var sqlPeers []Peer
 	defer func() {
 		for i, s := range servers {
 			if s != nil {
@@ -56,12 +57,20 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 		servers[i] = srv
 		done[i] = make(chan error, 1)
 		go func(i int) { done[i] <- servers[i].Serve(listeners[i]) }(i)
-		sqlPeers = append(sqlPeers, failover.Peer{ID: peers[i].ID, Address: l.Addr().String()})
+		sqlPeers = append(sqlPeers, Peer{ID: peers[i].ID, Address: l.Addr().String()})
 	}
-	router, err := failover.New(failover.Options{Peers: sqlPeers, Username: "root", Password: "pw", MaxConnections: 8})
+	router, err := New(Options{Peers: sqlPeers, Username: "root", Password: "pw", MaxConnections: 8})
 	if err != nil {
 		t.Fatal(err)
 	}
+	history := &routerHistory{}
+	router.transitionHook = history.transition
+	router.connectionHook = history.connection
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Log("router diagnostics:\n" + history.String())
+		}
+	})
 	front, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -129,4 +138,30 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 	if count != 2 || sum != 30 {
 		t.Fatalf("lost data: %d %d", count, sum)
 	}
+}
+
+// A bounded, synchronized history only used by tests; no production logging.
+type routerHistory struct {
+	mutex  sync.Mutex
+	events []string
+}
+
+func (h *routerHistory) add(s string) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	if len(h.events) == 64 {
+		h.events = h.events[1:]
+	}
+	h.events = append(h.events, s)
+}
+func (h *routerHistory) transition(e leaderTransition) {
+	h.add(fmt.Sprintf("gen=%d %q -> %q reason=%s misses=%d", e.Generation, e.From, e.To, e.Reason, e.Misses))
+}
+func (h *routerHistory) connection(e connectionClose) {
+	h.add(fmt.Sprintf("connection gen=%d backend=%q close=%s err=%v", e.Generation, e.Backend, e.Reason, e.Err))
+}
+func (h *routerHistory) String() string {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	return strings.Join(h.events, "\n")
 }

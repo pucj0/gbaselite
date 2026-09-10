@@ -255,3 +255,43 @@ func TestRouterConcurrentDiscoveryAndConnections(t *testing.T) {
 		t.Fatal("shutdown retained connections or leader")
 	}
 }
+
+func TestRouterTransitionDiagnostics(t *testing.T) {
+	r := stateRouter(t, "127.0.0.1:1", "127.0.0.1:2")
+	var events []leaderTransition
+	r.transitionHook = func(e leaderTransition) { events = append(events, e) }
+	r.recordDiscovery("127.0.0.1:1", 0)
+	r.recordDiscovery("127.0.0.1:1", 1)
+	r.recordDiscovery("127.0.0.1:2", 1)
+	for i := 0; i < leaderMissThreshold; i++ {
+		r.recordDiscovery("", 2)
+	}
+	r.recordDiscovery("127.0.0.1:1", 1)
+	r.changeLeader("")
+	want := []string{"initial-discovery", "confirmed-current-leader", "confirmed-new-leader", "probe-miss", "probe-miss", "confirmed-loss", "stale-result-rejected", "shutdown"}
+	if len(events) != len(want) {
+		t.Fatal(events)
+	}
+	for i, reason := range want {
+		if events[i].Reason != reason {
+			t.Fatalf("event %d: %+v", i, events[i])
+		}
+	}
+	if e := events[5]; e.From != "127.0.0.1:2" || e.To != "" || e.Misses != 3 || e.Generation != 3 {
+		t.Fatal(e)
+	}
+}
+func TestRouterConnectionCloseDiagnosticsOnce(t *testing.T) {
+	client, remote := net.Pipe()
+	backend, server := net.Pipe()
+	defer remote.Close()
+	defer server.Close()
+	var reasons []string
+	c := &routedConnection{Conn: client, backend: backend, onClose: func(reason string, _ error) { reasons = append(reasons, reason) }}
+	c.closeBecause("confirmed-new-leader", nil)
+	c.closeBecause("backend-to-client-copy-ended", net.ErrClosed)
+	c.Close()
+	if len(reasons) != 1 || reasons[0] != "confirmed-new-leader" {
+		t.Fatal(reasons)
+	}
+}
