@@ -76,7 +76,7 @@ func joinedInput(tx storageengine.Txn, session *Session, s parser.Select) (*stor
 	for level := 1; level < len(inputs); level++ {
 		input := inputs[level]
 		leftSchema := inputs[level-1].combined
-		join := physical.Join[storage.Row]{Left: op, Right: func(left storage.Row) (physical.Operator[storage.Row], error) {
+		join := physical.Join3[storage.Row, storage.Row, storage.Row]{Left: op, Right: func(left storage.Row) (physical.Operator[storage.Row], error) {
 			access := mvccAccessPlan{kind: mvccAccessAll}
 			if where, ok := joinLookup(input.join.On, leftSchema, input.schema, left); ok {
 				access = planMVCCAccess(parser.Select{Where: where}, input.definition, input.schema, session)

@@ -91,22 +91,22 @@ func (p Projection[A, B]) Run(ctx context.Context, y Yield[B]) error {
 
 // Join opens a right input per left row. The planner may choose an index probe
 // or a scan without changing the join algorithm. NullRight implements LEFT JOIN.
-type Join[T any] struct {
-	Left      Operator[T]
-	Right     func(T) (Operator[T], error)
-	Combine   func(T, T) T
-	Predicate func(T) (bool, error)
-	NullRight func(T) T
+type Join3[L, R, O any] struct {
+	Left      Operator[L]
+	Right     func(L) (Operator[R], error)
+	Combine   func(L, R) O
+	Predicate func(O) (bool, error)
+	NullRight func(L) O
 }
 
-func (j Join[T]) Run(ctx context.Context, y Yield[T]) error {
-	return j.Left.Run(ctx, func(l T) error {
+func (j Join3[L, R, O]) Run(ctx context.Context, y Yield[O]) error {
+	return j.Left.Run(ctx, func(l L) error {
 		right, e := j.Right(l)
 		if e != nil {
 			return e
 		}
 		matched := false
-		e = right.Run(ctx, func(r T) error {
+		e = right.Run(ctx, func(r R) error {
 			row := j.Combine(l, r)
 			ok := true
 			var e error
@@ -131,6 +131,11 @@ func (j Join[T]) Run(ctx context.Context, y Yield[T]) error {
 		return nil
 	})
 }
+
+// Join preserves the homogeneous API while sharing the sole Join3 algorithm.
+type Join[T any] Join3[T, T, T]
+
+func (j Join[T]) Run(ctx context.Context, y Yield[T]) error { return Join3[T, T, T](j).Run(ctx, y) }
 
 // Aggregate creates fresh query-local state on each run, including empty input.
 type Accumulator[A, B any] interface {

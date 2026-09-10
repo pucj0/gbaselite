@@ -2639,7 +2639,7 @@ func joinRelations(store *storage.Store, session *Session, left, right *storage.
 		leftInput, rightInput = right, left
 	}
 	input := sourceOperator(func(y func(storage.Row) error) error { return visitQueryTable(session.query, leftInput, nil, y) })
-	op := physical.Join[storage.Row]{Left: input, Right: func(storage.Row) (physical.Operator[storage.Row], error) {
+	op := physical.Join3[storage.Row, storage.Row, storage.Row]{Left: input, Right: func(storage.Row) (physical.Operator[storage.Row], error) {
 		return sourceOperator(func(y func(storage.Row) error) error { return visitQueryTable(session.query, rightInput, nil, y) }), nil
 	}, Combine: func(l, r storage.Row) storage.Row {
 		if join.Type == "RIGHT" {

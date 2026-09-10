@@ -45,7 +45,7 @@ func tryIndexedJoinRelations(store *storage.Store, session *Session, left, right
 	if err := q.check(); err != nil {
 		return nil, true, err
 	}
-	op := physical.Join[storage.Row]{Left: sourceOperator(func(y func(storage.Row) error) error { return visitQueryTable(q, left, nil, y) }), Right: func(leftRow storage.Row) (physical.Operator[storage.Row], error) {
+	op := physical.Join3[storage.Row, storage.Row, storage.Row]{Left: sourceOperator(func(y func(storage.Row) error) error { return visitQueryTable(q, left, nil, y) }), Right: func(leftRow storage.Row) (physical.Operator[storage.Row], error) {
 		return sourceOperator(func(y func(storage.Row) error) error {
 			value := leftRow[leftPosition]
 			if value.Null {
