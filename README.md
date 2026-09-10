@@ -1244,3 +1244,5 @@ SQL namespace 与有序整数主键基础编码集中到 sqllayout：row/index/s
 执行层按职责命名：transaction_engine、access_plan、row_layout 等模块只依赖通用存储接口；原 SetMVCCAutocommit Go API 保留为 SetAutocommit 的兼容转发。协议消息与持久化编码不变，审计见 docs/architecture/executor-dependency-audit.md。
 
 EXPLAIN 的 Extra 追加 Pipeline 算子树，由同一次 SQL 绑定生成；索引访问类型与运行计划共享绑定结果。计划不执行 Scan 或 Join 探测，动态内侧扫描明确标注 DynamicScan。PlanNode 为成本、基数和实际行数预留可选字段，当前未实现代价优化器或 EXPLAIN ANALYZE。
+
+Aggregate 的 Accumulator 与 Window 的 PartitionStore/EvaluateStore 为外部聚合和分区落盘预留接口，统一每次运行的资源所有权与 Close。当前 SQL 聚合和窗口仍按原预算保存在内存；窗口表达式保留切片兼容边界，未宣称已实现窗口落盘。设计边界见 docs/architecture/spill-stores.md。

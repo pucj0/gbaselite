@@ -1,0 +1,7 @@
+# Spill state contracts
+
+Aggregate already accepts a fresh Accumulator factory with Add/Finish/Close; it imposes no map or slice representation. GroupStore defines Get/Put/Visit/Close for a future external aggregate accumulator. Window now accepts any Operator input and a fresh PartitionStore factory plus EvaluateStore. Append owns rows; At borrows until the next store call. Stores own temp files and must delete them on Close, including cancellation and partial failures. A failed factory must clean up its own partial state before returning an error.
+
+Current SQL Window uses the charged memory store and the compatibility slice evaluator. Its row and frame overhead charges remain unchanged. SQL aggregate remains charged in-memory state. This change supplies extension points, not external hash aggregation or disk window frames.
+
+TODO for external implementations: bind SQL codecs/collation in executor; reserve memory and temporary bytes before allocation/write; spill complete runs with bounded merge fan-in; preserve first-observed group order or explicitly restore ordinals; add partition offsets and bounded frame reads; release every file on Add, At, Finish, downstream stop and cancellation. Migrate SQL window frame evaluation from Evaluate to EvaluateStore before claiming bounded disk-backed windows. Test null keys, skewed groups, oversized rows, reopened spill runs and joined cleanup errors. Do not bypass query budgets during encoding or merge.

@@ -151,6 +151,9 @@ type Aggregate[A, B any] struct {
 }
 
 func (a Aggregate[A, B]) Run(ctx context.Context, y Yield[B]) (err error) {
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	state, err := a.New()
 	if err != nil {
 		return
@@ -159,7 +162,12 @@ func (a Aggregate[A, B]) Run(ctx context.Context, y Yield[B]) (err error) {
 	if err = a.Input.Run(ctx, state.Add); err != nil {
 		return
 	}
-	return state.Finish(y)
+	return state.Finish(func(b B) error {
+		if e := ctx.Err(); e != nil {
+			return e
+		}
+		return y(b)
+	})
 }
 
 type Sorter[T any] interface {
@@ -270,24 +278,51 @@ func (m Materialize[T]) Run(ctx context.Context, y Yield[T]) error {
 	return nil
 }
 
-// Window receives a bounded materialized partition; expression and frame
-// semantics belong to the SQL binding layer, not the storage implementation.
+// Window delegates retention to a per-run store. EvaluateStore supports bounded
+// random access without requiring a whole partition slice. Evaluate remains a
+// compatibility boundary for existing SQL frame evaluators.
 type Window[A, B any] struct {
-	Input    Materialize[A]
-	Evaluate func([]A, Yield[B]) error
+	Input         Operator[A]
+	NewStore      func() (PartitionStore[A], error)
+	EvaluateStore func(context.Context, PartitionStore[A], Yield[B]) error
+	Evaluate      func([]A, Yield[B]) error
 }
 
-func (w Window[A, B]) Run(ctx context.Context, y Yield[B]) error {
-	var rows []A
-	if err := w.Input.Run(ctx, func(r A) error { rows = append(rows, r); return nil }); err != nil {
+func (w Window[A, B]) Run(ctx context.Context, y Yield[B]) (err error) {
+	if err = ctx.Err(); err != nil {
 		return err
 	}
-	return w.Evaluate(rows, func(r B) error {
-		if err := ctx.Err(); err != nil {
+	var store PartitionStore[A]
+	if w.NewStore != nil {
+		store, err = w.NewStore()
+		if err != nil {
 			return err
 		}
-		return y(r)
-	})
+	} else {
+		// Compatibility inputs already own/charge materialized rows.
+		store = &MemoryPartitionStore[A]{Clone: func(a A) A { return a }, Charge: func(A) error { return nil }}
+	}
+	defer func() { err = errors.Join(err, store.Close()) }()
+	if err = w.Input.Run(ctx, func(a A) error { return store.Append(ctx, a) }); err != nil {
+		return err
+	}
+	emit := func(b B) error {
+		if e := ctx.Err(); e != nil {
+			return e
+		}
+		return y(b)
+	}
+	if w.EvaluateStore != nil {
+		return w.EvaluateStore(ctx, store, emit)
+	}
+	rows := make([]A, store.Len())
+	for i := range rows {
+		rows[i], err = store.At(ctx, i)
+		if err != nil {
+			return err
+		}
+	}
+	return w.Evaluate(rows, emit)
 }
 
 // Modify does not commit. Its caller owns the statement child transaction and

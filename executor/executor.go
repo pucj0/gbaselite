@@ -3202,11 +3202,12 @@ func bindWindow(table *storage.Table, statement parser.Select, columns []storage
 		result.Columns = append(result.Columns, plan.column)
 	}
 
-	account := newQueryMemoryAccount(session, "window query")
-	materialize := physical.Materialize[storage.Row]{Input: source, Clone: func(row storage.Row) storage.Row { return append(storage.Row(nil), row...) }, Charge: func(row storage.Row) error {
-		return account.Reserve(queryStorageRowBytes(row) + int64(128+len(plans)*128))
-	}}
-	window := physical.Window[storage.Row, []any]{Input: materialize, Evaluate: func(rows []storage.Row, y physical.Yield[[]any]) error {
+	window := physical.Window[storage.Row, []any]{Input: source, NewStore: func() (physical.PartitionStore[storage.Row], error) {
+		account := newQueryMemoryAccount(session, "window query")
+		return &physical.MemoryPartitionStore[storage.Row]{Clone: func(row storage.Row) storage.Row { return append(storage.Row(nil), row...) }, Charge: func(row storage.Row) error {
+			return account.Reserve(queryStorageRowBytes(row) + int64(128+len(plans)*128))
+		}}, nil
+	}, Evaluate: func(rows []storage.Row, y physical.Yield[[]any]) error {
 		projected := make([][]any, len(rows))
 		for rowIndex, row := range rows {
 			projected[rowIndex] = make([]any, len(plans))
