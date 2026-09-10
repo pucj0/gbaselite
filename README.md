@@ -1254,3 +1254,5 @@ Aggregate 的 Accumulator 与 Window 的 PartitionStore/EvaluateStore 为外部�
 取消中间物化仍保留已有 GROUP BY/UNION 的求值顺序：最终 LIMIT 只控制输出行数，相关上游继续求值，以保留未输出分组的表达式副作用和错误；普通扫描 LIMIT 继续提前结束。
 
 连接代理的 leader discovery 保留短暂失败宽限：一次未确认 leader 的探测轮次不会关闭现有连接，连续三轮未确认才清空地址；确认到新 leader 时立即切换并关闭旧后端的双向连接。成功确认重置失败计数，关闭代理不等待宽限。探测仍使用原有超时，代理只路由连接，不重放 SQL 或事务。
+
+代理的单次 leader 确认固定在同一条 SQL 连接上执行复制状态查询和 `SELECT 1`，连接获取与两条语句继续共享 750ms deadline。测试使用内部钩子记录逐轮探测阶段、耗时、复制状态与错误分类；这些钩子默认关闭，不增加生产日志或公开 HA API。

@@ -43,10 +43,12 @@ type connectionClose struct {
 type Router struct {
 	transitionHook func(leaderTransition)
 	connectionHook func(connectionClose)
+	discoveryHook  func(discoveryRound)
+	roundID        uint64
 	discovery      sync.Mutex
 	misses         int
 	generation     uint64
-	probe          func(context.Context, *sql.DB, Peer) bool
+	probe          func(context.Context, *sql.DB, Peer) probeResult
 	options        Options
 	mutex          sync.Mutex
 	leader         string
@@ -255,6 +257,13 @@ func (r *Router) discover(ctx context.Context, databases []*sql.DB) {
 	r.mutex.Lock()
 	current, generation := r.leader, r.generation
 	r.mutex.Unlock()
+	var round discoveryRound
+	if r.discoveryHook != nil {
+		r.roundID++
+		round = discoveryRound{ID: r.roundID, Start: time.Now(), Result: "start"}
+		r.discoveryHook(round)
+		defer func() { round.End = time.Now(); r.discoveryHook(round) }()
+	}
 	order := make([]int, 0, 3)
 	for i, p := range r.options.Peers {
 		if p.Address == current {
@@ -268,8 +277,12 @@ func (r *Router) discover(ctx context.Context, databases []*sql.DB) {
 	}
 	for _, i := range order {
 		probe, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
-		confirmed := r.probe(probe, databases[i], r.options.Peers[i])
-		if confirmed {
+		result := r.probe(probe, databases[i], r.options.Peers[i])
+		if r.discoveryHook != nil {
+			round.Probes = append(round.Probes, result)
+		}
+		if result.Confirmed {
+			round.Result = "confirmed"
 			cancel()
 			if ctx.Err() == nil {
 				r.recordDiscovery(r.options.Peers[i].Address, generation)
@@ -281,8 +294,11 @@ func (r *Router) discover(ctx context.Context, databases []*sql.DB) {
 			break
 		}
 	}
+	round.Result = "miss"
 	if ctx.Err() == nil {
 		r.recordDiscovery("", generation)
+	} else {
+		round.Result = "canceled"
 	}
 }
 func (r *Router) route(ctx context.Context, client net.Conn) {
@@ -326,15 +342,4 @@ func (r *Router) route(ctx context.Context, client net.Conn) {
 	}
 	connection.closeBecause(reason, copyErr)
 	<-done
-}
-
-// probeLeader requires both role identity and a quorum-confirmed SQL read.
-func probeLeader(ctx context.Context, db *sql.DB, peer Peer) bool {
-	var id, state, leader, raftAddress string
-	var applied uint64
-	if err := db.QueryRowContext(ctx, "SHOW REPLICATION STATUS").Scan(&id, &state, &leader, &raftAddress, &applied); err != nil || state != "Leader" || id != peer.ID {
-		return false
-	}
-	var one int
-	return db.QueryRowContext(ctx, "SELECT 1").Scan(&one) == nil && one == 1
 }

@@ -64,7 +64,9 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	history := &routerHistory{}
-	router.transitionHook = history.transition
+	stable := newStableLeader()
+	router.transitionHook = func(e leaderTransition) { history.transition(e); stable.observe(e) }
+	router.discoveryHook = history.round
 	router.connectionHook = history.connection
 	t.Cleanup(func() {
 		if t.Failed() {
@@ -84,19 +86,8 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	await := func(previous string) string {
-		deadline := time.Now().Add(12 * time.Second)
-		for time.Now().Before(deadline) {
-			address := router.Leader()
-			if address != "" && address != previous {
-				return address
-			}
-			time.Sleep(25 * time.Millisecond)
-		}
-		t.Fatal("proxy did not find new leader")
-		return ""
-	}
-	first := await("")
+	first, firstGeneration := awaitStableLeader(t, ctx, router, stable, "")
+	history.add(fmt.Sprintf("phase=fixture leader=%q gen=%d", first, firstGeneration))
 	open := func() *sql.DB {
 		db, err := sql.Open("mysql", "root:pw@tcp("+front.Addr().String()+")/?timeout=2s&readTimeout=3s&writeTimeout=3s")
 		if err != nil {
@@ -118,6 +109,13 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 	for _, q := range []string{"CREATE DATABASE IF NOT EXISTS test", "CREATE TABLE IF NOT EXISTS test.items(id INT PRIMARY KEY,v INT)", "INSERT INTO test.items VALUES(1,10)"} {
 		execFixture(q)
 	}
+	router.mutex.Lock()
+	fixtureGeneration := router.generation
+	router.mutex.Unlock()
+	if fixtureGeneration != firstGeneration {
+		t.Fatalf("fixture generation changed: %d -> %d", firstGeneration, fixtureGeneration)
+	}
+	history.add("phase=real-leader-shutdown")
 	for i, p := range sqlPeers {
 		if p.Address == first {
 			listeners[i].Close()
@@ -126,7 +124,8 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 			}
 		}
 	}
-	await(first)
+	awaitStableLeader(t, ctx, router, stable, first)
+	history.add("phase=reconnect-and-verify")
 	db.Close()
 	db = open()
 	defer db.Close()
@@ -149,7 +148,7 @@ type routerHistory struct {
 func (h *routerHistory) add(s string) {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
-	if len(h.events) == 64 {
+	if len(h.events) == 256 {
 		h.events = h.events[1:]
 	}
 	h.events = append(h.events, s)
@@ -164,4 +163,15 @@ func (h *routerHistory) String() string {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 	return strings.Join(h.events, "\n")
+}
+
+func (h *routerHistory) round(e discoveryRound) {
+	if e.Result == "start" {
+		h.add(fmt.Sprintf("round=%d start=%s", e.ID, e.Start.Format(time.RFC3339Nano)))
+		return
+	}
+	for _, p := range e.Probes {
+		h.add(fmt.Sprintf("round=%d peer=%s address=%s stage=%s reportedID=%s state=%s leader=%s raft=%s applied=%d acquire=%s status=%s ping=%s remaining=%s total=%s class=%s err=%v", e.ID, p.PeerID, p.Address, p.Stage, p.ReportedID, p.State, p.Leader, p.RaftAddress, p.Applied, p.AcquireDuration, p.StatusDuration, p.PingDuration, p.RemainingBudget, p.TotalDuration, p.ErrClass, p.Err))
+	}
+	h.add(fmt.Sprintf("round=%d end=%s result=%s duration=%s", e.ID, e.End.Format(time.RFC3339Nano), e.Result, e.End.Sub(e.Start)))
 }

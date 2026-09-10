@@ -107,7 +107,9 @@ func TestProxyKeepsLeaderAcrossTransientProbeFailure(t *testing.T) {
 	a := stateBackend(t)
 	r := stateRouter(t, a, a)
 	available := true
-	r.probe = func(_ context.Context, _ *sql.DB, p Peer) bool { return available && p.ID == "a" }
+	r.probe = func(_ context.Context, _ *sql.DB, p Peer) probeResult {
+		return probeResult{Confirmed: available && p.ID == "a"}
+	}
 	dbs := make([]*sql.DB, 3)
 	r.discover(context.Background(), dbs)
 	c := stateConnection(t, r)
@@ -129,7 +131,9 @@ func TestProxyConfirmsLeaderLossAfterConsecutiveMisses(t *testing.T) {
 	a := stateBackend(t)
 	r := stateRouter(t, a, a)
 	available := true
-	r.probe = func(_ context.Context, _ *sql.DB, p Peer) bool { return available && p.ID == "a" }
+	r.probe = func(_ context.Context, _ *sql.DB, p Peer) probeResult {
+		return probeResult{Confirmed: available && p.ID == "a"}
+	}
 	dbs := make([]*sql.DB, 3)
 	r.discover(context.Background(), dbs)
 	c := stateConnection(t, r)
@@ -159,7 +163,7 @@ func TestProxyConfirmedLeaderChangeClosesOldConnection(t *testing.T) {
 	a, b := stateBackend(t), stateBackend(t)
 	r := stateRouter(t, a, b)
 	leader := "a"
-	r.probe = func(_ context.Context, _ *sql.DB, p Peer) bool { return p.ID == leader }
+	r.probe = func(_ context.Context, _ *sql.DB, p Peer) probeResult { return probeResult{Confirmed: p.ID == leader} }
 	dbs := make([]*sql.DB, 3)
 	r.discover(context.Background(), dbs)
 	old := stateConnection(t, r)
@@ -208,7 +212,7 @@ func TestProxyTransitionUnblocksBackendWrite(t *testing.T) {
 func TestRouterConcurrentDiscoveryAndConnections(t *testing.T) {
 	a := stateBackend(t)
 	r := stateRouter(t, a, a)
-	r.probe = func(_ context.Context, _ *sql.DB, p Peer) bool { return p.ID == "a" }
+	r.probe = func(_ context.Context, _ *sql.DB, p Peer) probeResult { return probeResult{Confirmed: p.ID == "a"} }
 	r.discover(context.Background(), make([]*sql.DB, 3))
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
