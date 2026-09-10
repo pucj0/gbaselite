@@ -88,21 +88,39 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 	}()
 	first, firstGeneration := awaitStableLeader(t, ctx, router, stable, "")
 	history.add(fmt.Sprintf("phase=fixture leader=%q gen=%d", first, firstGeneration))
-	open := func() *sql.DB {
-		db, err := sql.Open("mysql", "root:pw@tcp("+front.Addr().String()+")/?timeout=2s&readTimeout=3s&writeTimeout=3s")
+	open := func() *sql.Conn {
+		db, err := sql.Open("mysql", "root:pw@tcp("+front.Addr().String()+")/?timeout=2s&writeTimeout=3s")
 		if err != nil {
 			t.Fatal(err)
 		}
 		db.SetMaxOpenConns(1)
-		return db
+		db.SetMaxIdleConns(0)
+		t.Cleanup(func() { db.Close() })
+		connectCtx, connectCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer connectCancel()
+		connection, err := db.Conn(connectCtx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return connection
 	}
 	db := open()
 	defer db.Close()
 	// Do not retry fixture SQL or accept duplicate-key errors: every write below
 	// must succeed once, including on a busy Windows runner.
+	// The integration test is not a 3-second SQL latency SLA. A statement can
+	// pass through two existing 5-second read barriers and replicated apply.
+	// Bound each whole statement, separately from the unchanged 750ms probe;
+	// use a pinned connection so database/sql cannot retry a fixture statement.
+	const fixtureSQLTimeout = 15 * time.Second
 	execFixture := func(query string) {
 		t.Helper()
-		if _, err := db.Exec(query); err != nil {
+		queryCtx, queryCancel := context.WithTimeout(ctx, fixtureSQLTimeout)
+		defer queryCancel()
+		started := time.Now()
+		_, err := db.ExecContext(queryCtx, query)
+		history.add(fmt.Sprintf("fixture=%q duration=%s err=%v", query, time.Since(started), err))
+		if err != nil {
 			t.Fatalf("fixture %s: %v", query, err)
 		}
 	}
@@ -130,12 +148,14 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 	db = open()
 	defer db.Close()
 	execFixture("INSERT INTO test.items VALUES(2,20)")
-	var count, sum int
-	if err = db.QueryRow("SELECT COUNT(*),SUM(v) FROM test.items").Scan(&count, &sum); err != nil {
+	var count, sum, minID, maxID int
+	queryCtx, queryCancel := context.WithTimeout(ctx, fixtureSQLTimeout)
+	defer queryCancel()
+	if err = db.QueryRowContext(queryCtx, "SELECT COUNT(*),SUM(v),MIN(id),MAX(id) FROM test.items").Scan(&count, &sum, &minID, &maxID); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 || sum != 30 {
-		t.Fatalf("lost data: %d %d", count, sum)
+	if count != 2 || sum != 30 || minID != 1 || maxID != 2 {
+		t.Fatalf("lost or duplicated data: count=%d sum=%d keys=%d..%d", count, sum, minID, maxID)
 	}
 }
 
