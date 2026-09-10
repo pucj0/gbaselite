@@ -22,7 +22,15 @@ type Options struct {
 	TLS                *tls.Config
 	MaxConnections     int
 }
+
+// Three consecutive unsuccessful rounds confirm loss; a new confirmed leader
+// replaces the old one immediately. No timer extends a failed round.
+const leaderMissThreshold = 3
+
 type Router struct {
+	discovery   sync.Mutex
+	misses      int
+	generation  uint64
 	probe       func(context.Context, *sql.DB, Peer) bool
 	options     Options
 	mutex       sync.Mutex
@@ -60,18 +68,66 @@ func New(options Options) (*Router, error) {
 	return &Router{probe: probeLeader, options: options, connections: make(map[net.Conn]string)}, nil
 }
 func (r *Router) Leader() string { r.mutex.Lock(); defer r.mutex.Unlock(); return r.leader }
+
+// changeLeader forces a transition (including shutdown), bypassing miss grace.
 func (r *Router) changeLeader(address string) {
 	r.mutex.Lock()
-	defer r.mutex.Unlock()
+	r.misses = 0
+	stale := r.changeLeaderLocked(address)
+	r.mutex.Unlock()
+	for _, c := range stale {
+		c.Close()
+	}
+}
+func (r *Router) changeLeaderLocked(address string) []net.Conn {
 	if r.leader == address {
-		return
+		return nil
 	}
 	r.leader = address
+	r.generation++
+	var stale []net.Conn
 	for c, backend := range r.connections {
 		if backend != address {
-			c.Close()
+			stale = append(stale, c)
 		}
 	}
+	return stale
+}
+func (r *Router) recordDiscovery(address string, generation uint64) {
+	r.mutex.Lock()
+	// An older probe must not undo a newer transition or shutdown.
+	if r.generation != generation {
+		r.mutex.Unlock()
+		return
+	}
+	if address != "" {
+		r.misses = 0
+	} else if r.leader != "" {
+		r.misses++
+		if r.misses < leaderMissThreshold {
+			r.mutex.Unlock()
+			return
+		}
+	}
+	stale := r.changeLeaderLocked(address)
+	r.mutex.Unlock()
+	for _, c := range stale {
+		c.Close()
+	}
+}
+
+// Close both transport directions, including a copier blocked writing to the
+// backend. Closing only the client can leave route and Serve waiting forever.
+type routedConnection struct {
+	net.Conn
+	backend net.Conn
+	once    sync.Once
+}
+
+func (c *routedConnection) Close() error {
+	var err error
+	c.once.Do(func() { err = errors.Join(c.Conn.Close(), c.backend.Close()) })
+	return err
 }
 func (r *Router) Serve(ctx context.Context, listener net.Listener) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -142,7 +198,11 @@ func (r *Router) Serve(ctx context.Context, listener net.Listener) error {
 	}
 }
 func (r *Router) discover(ctx context.Context, databases []*sql.DB) {
-	current := r.Leader()
+	r.discovery.Lock()
+	defer r.discovery.Unlock()
+	r.mutex.Lock()
+	current, generation := r.leader, r.generation
+	r.mutex.Unlock()
 	order := make([]int, 0, 3)
 	for i, p := range r.options.Peers {
 		if p.Address == current {
@@ -159,7 +219,9 @@ func (r *Router) discover(ctx context.Context, databases []*sql.DB) {
 		confirmed := r.probe(probe, databases[i], r.options.Peers[i])
 		if confirmed {
 			cancel()
-			r.changeLeader(r.options.Peers[i].Address)
+			if ctx.Err() == nil {
+				r.recordDiscovery(r.options.Peers[i].Address, generation)
+			}
 			return
 		}
 		cancel()
@@ -167,10 +229,14 @@ func (r *Router) discover(ctx context.Context, databases []*sql.DB) {
 			break
 		}
 	}
-	r.changeLeader("")
+	if ctx.Err() == nil {
+		r.recordDiscovery("", generation)
+	}
 }
 func (r *Router) route(ctx context.Context, client net.Conn) {
-	address := r.Leader()
+	r.mutex.Lock()
+	address, generation := r.leader, r.generation
+	r.mutex.Unlock()
 	if address == "" {
 		return
 	}
@@ -178,19 +244,20 @@ func (r *Router) route(ctx context.Context, client net.Conn) {
 	if err != nil {
 		return
 	}
-	defer backend.Close()
+	connection := &routedConnection{Conn: client, backend: backend}
+	defer connection.Close()
 	r.mutex.Lock()
-	if r.leader != address {
+	if r.leader != address || r.generation != generation || ctx.Err() != nil {
 		r.mutex.Unlock()
 		return
 	}
-	r.connections[client] = address
+	r.connections[connection] = address
 	r.mutex.Unlock()
-	defer func() { r.mutex.Lock(); delete(r.connections, client); r.mutex.Unlock() }()
+	defer func() { r.mutex.Lock(); delete(r.connections, connection); r.mutex.Unlock() }()
 	done := make(chan struct{})
-	go func() { io.CopyBuffer(backend, client, make([]byte, 32<<10)); backend.Close(); close(done) }()
+	go func() { io.CopyBuffer(backend, client, make([]byte, 32<<10)); connection.Close(); close(done) }()
 	io.CopyBuffer(client, backend, make([]byte, 32<<10))
-	client.Close()
+	connection.Close()
 	<-done
 }
 
