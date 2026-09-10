@@ -1,8 +1,13 @@
 package executor
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"gbaselite/storageengine"
+	"gbaselite/storageengine/testkit"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -14,7 +19,7 @@ func TestPhysicalPipelineAcrossBackends(t *testing.T) {
 			options := OpenOptions{}
 			if backend == "memory" {
 				options.BackendFactory = func(string, storageengine.Options) (storageengine.Engine, error) {
-					return &memoryBackend{data: map[string]map[string][]byte{}, counters: map[string]uint64{}}, nil
+					return testkit.NewMemory(), nil
 				}
 			}
 			e, err := OpenWithOptions(t.TempDir(), "root", "test-only", options)
@@ -43,6 +48,9 @@ func TestPhysicalPipelineAcrossBackends(t *testing.T) {
 				{"SELECT id,SUM(v) OVER(PARTITION BY g ORDER BY v) AS total FROM a ORDER BY id", "[[1 40] [2 10] [3 20] [4 <nil>]]"},
 				{"SELECT id FROM a WHERE id<=2 UNION ALL SELECT id FROM a WHERE id=1 ORDER BY id DESC LIMIT 2", "[[2] [1]]"},
 				{"SELECT g FROM a UNION SELECT id FROM b ORDER BY g", "[[1] [2] [3]]"},
+				{"SELECT DISTINCT g FROM a ORDER BY g DESC LIMIT 2 OFFSET 1", "[[2] [1]]"},
+				{"SELECT v FROM a WHERE id=4 UNION SELECT v FROM a WHERE id=4", "[[<nil>]]"},
+				{"SELECT id FROM a WHERE id=1 UNION SELECT id FROM a WHERE id=2 UNION ALL SELECT id FROM a WHERE id=1", "[[1] [2] [1]]"},
 				{"SELECT DISTINCT RANK() OVER(ORDER BY g) AS r FROM a ORDER BY r", "[[1] [3] [4]]"},
 			}
 			for _, c := range cases {
@@ -65,6 +73,54 @@ func TestPhysicalPipelineAcrossBackends(t *testing.T) {
 			if got := run("UPDATE a SET v=99 LIMIT 0").AffectedRows; got != 0 {
 				t.Fatal("zero limit", got)
 			}
+
+			// Force Sort and Distinct to spill, then verify resource failures and cleanup.
+			run("CREATE TABLE wide(id INT PRIMARY KEY,label VARCHAR(1000))")
+			var values []string
+			for i := 0; i < 400; i++ {
+				values = append(values, fmt.Sprintf("(%d,'%s-%03d')", i, strings.Repeat("x", 600), i%20))
+			}
+			run("INSERT INTO wide VALUES" + strings.Join(values, ","))
+			temp := t.TempDir()
+			saved := e.QueryOptions
+			e.QueryOptions.SortMemoryBytes = 128 << 10
+			e.QueryOptions.TempDirectory = temp
+			if got := run("SELECT DISTINCT label FROM wide"); len(got.Rows) != 20 {
+				t.Fatal("distinct spill", len(got.Rows))
+			}
+			if got := run("SELECT id FROM wide ORDER BY label DESC,id LIMIT 3"); len(got.Rows) != 3 {
+				t.Fatal("sort spill")
+			}
+			e.QueryOptions.MaxTempBytes = 1
+			if _, err := e.Execute(s, "SELECT DISTINCT label FROM wide"); !errors.Is(err, ErrQueryResourceLimit) {
+				t.Fatal("distinct disk budget", err)
+			}
+			if entries, err := os.ReadDir(temp); err != nil || len(entries) != 0 {
+				t.Fatal("temporary files leaked", entries, err)
+			}
+			e.QueryOptions = saved
+			canceled, cancel := context.WithCancel(context.Background())
+			cancel()
+			s.Context = canceled
+			if _, err := e.Execute(s, "SELECT * FROM a"); !errors.Is(err, ErrQueryCanceled) {
+				t.Fatal("cancel", err)
+			}
+			s.Context = nil
+			// Deterministically cancel during iteration, after one row has been fetched.
+			original := e.Backend
+			probe := &cancelBackend{Engine: original}
+			e.Backend = probe
+			active, cancelActive := context.WithCancel(context.Background())
+			s.Context = active
+			probe.cancel = cancelActive
+			if _, err := e.Execute(s, "SELECT * FROM a"); !errors.Is(err, context.Canceled) && !errors.Is(err, ErrQueryCanceled) {
+				t.Fatal("mid-scan cancellation", err)
+			}
+			if probe.open != 0 {
+				t.Fatal("canceled scan leaked iterator", probe.open)
+			}
+			s.Context = nil
+			e.Backend = original
 			// Materialization rejects input under its budget, without mutating the table.
 			e.QueryOptions.ResultMemoryBytes = 256
 			if _, err := e.Execute(s, "SELECT ROW_NUMBER() OVER(ORDER BY id) FROM a"); err == nil {
@@ -72,4 +128,60 @@ func TestPhysicalPipelineAcrossBackends(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The probe wraps only the public contract; it works unchanged on both backends.
+type cancelBackend struct {
+	storageengine.Engine
+	cancel context.CancelFunc
+	open   int
+}
+
+func (e *cancelBackend) Begin(ctx context.Context) (storageengine.Txn, error) {
+	tx, err := e.Engine.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &cancelTxn{tx, e}, nil
+}
+
+type cancelTxn struct {
+	storageengine.Txn
+	engine *cancelBackend
+}
+
+func (t *cancelTxn) Table(id string) storageengine.Table { return storageengine.BindTable(t, id) }
+func (t *cancelTxn) NewIterator(ctx context.Context, r storageengine.ScanRequest) (storageengine.Iterator, error) {
+	it, err := t.Txn.NewIterator(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(r.Space, "row/") {
+		t.engine.open++
+		return &cancelIterator{Iterator: it, engine: t.engine}, nil
+	}
+	return it, nil
+}
+
+type cancelIterator struct {
+	storageengine.Iterator
+	engine *cancelBackend
+	closed bool
+}
+
+func (i *cancelIterator) Next() bool {
+	ok := i.Iterator.Next()
+	if ok && i.engine.cancel != nil {
+		cancel := i.engine.cancel
+		i.engine.cancel = nil
+		cancel()
+	}
+	return ok
+}
+func (i *cancelIterator) Close() error {
+	if !i.closed {
+		i.closed = true
+		i.engine.open--
+	}
+	return i.Iterator.Close()
 }

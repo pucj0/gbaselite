@@ -16,7 +16,7 @@ func TestRangeGuardDetectsPhantoms(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err = old.GuardRange("rows"); err != nil {
+		if err = old.GuardRange("rows", KeyRange{}); err != nil {
 			t.Fatal(err)
 		}
 		writer, err := s.Begin(context.Background(), nil)

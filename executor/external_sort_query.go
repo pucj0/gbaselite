@@ -33,9 +33,11 @@ func visitQueryTable(q *queryControl, table *storage.Table, predicate storage.Pr
 // executeBudgetedOrder receives projected values followed by any hidden ORDER
 // BY keys. A lazy streaming result owns no run files until it is consumed.
 func executeBudgetedOrder(session *Session, columns []Column, compare func([]any, []any) int, visit func(func([]any) error) error, offset, limit int) (*Result, error) {
+	return executeBudgetedOrderWithInput(session, columns, compare, physical.Source[[]any](func(_ context.Context, y physical.Yield[[]any]) error { return visit(y) }), offset, limit)
+}
+func executeBudgetedOrderWithInput(session *Session, columns []Column, compare func([]any, []any) int, input physical.Operator[[]any], offset, limit int) (*Result, error) {
 	q := session.query
 	run := func(yield func([]any) error) error {
-		input := physical.Source[[]any](func(_ context.Context, y physical.Yield[[]any]) error { return visit(y) })
 		sorter := physical.Sort[[]any]{Input: input, New: func() (physical.Sorter[[]any], error) { return newExternalRowSorter(q, compare) }}
 		var op physical.Operator[[]any] = physical.Limit[[]any]{Input: sorter, Offset: offset, Count: limit}
 		if limit >= 0 {
@@ -124,51 +126,35 @@ func executeBudgetedDistinct(session *Session, source *Result, offset, limit int
 		if split.options.SortMemoryBytes < 64<<10 {
 			return fmt.Errorf("%w: DISTINCT requires at least 131072 bytes of sort memory", ErrQueryResourceLimit)
 		}
-		first, err := newExternalRowSorter(&split, func(a, b []any) int { return strings.Compare(a[0].(string), b[0].(string)) })
-		if err != nil {
-			return err
-		}
-		defer first.Close()
-		second, err := newExternalRowSorter(&split, func(a, b []any) int {
-			left, right := a[0].(uint64), b[0].(uint64)
-			if left < right {
-				return -1
+		op := physical.Distinct[[]any]{Input: resultOperator(q, source), Key: func(row []any) (string, error) { return groupedRowKey(row, session), nil }, NewSort: func(byKey bool) (physical.Sorter[physical.DistinctRow[[]any]], error) {
+			compare := func(a, b []any) int {
+				if byKey {
+					if c := strings.Compare(a[0].(string), b[0].(string)); c != 0 {
+						return c
+					}
+				}
+				index := 0
+				if byKey {
+					index = 1
+				}
+				left, right := a[index].(uint64), b[index].(uint64)
+				if left < right {
+					return -1
+				}
+				if left > right {
+					return 1
+				}
+				return 0
 			}
-			if left > right {
-				return 1
+			sorter, err := newExternalRowSorter(&split, compare)
+			if err != nil {
+				return nil, err
 			}
-			return 0
-		})
-		if err != nil {
-			return err
-		}
-		defer second.Close()
-		ordinal := uint64(0)
-		err = visitQueryResult(q, source, func(row []any) error {
-			values := make([]any, 2, len(row)+2)
-			values[0] = groupedRowKey(row, session)
-			values[1] = ordinal
-			ordinal++
-			return first.Add(append(values, row...))
-		})
-		if err != nil {
-			return err
-		}
-		previous := ""
-		hasPrevious := false
-		err = first.Finish(func(row []any) error {
-			key := row[0].(string)
-			if hasPrevious && previous == key {
-				return nil
-			}
-			previous, hasPrevious = key, true
-			return second.Add(row[1:])
-		})
-		if err != nil {
-			return err
-		}
+			return &distinctSorter{sorter, byKey}, nil
+		}}
+
 		seen, emitted := 0, 0
-		err = second.Finish(func(row []any) error {
+		err := op.Run(operatorContext(session), func(row []any) error {
 			if seen < offset {
 				seen++
 				return nil
@@ -177,7 +163,7 @@ func executeBudgetedDistinct(session *Session, source *Result, offset, limit int
 				return errBudgetedRowsDone
 			}
 			emitted++
-			return yield(row[1:])
+			return yield(row)
 		})
 		if errors.Is(err, errBudgetedRowsDone) {
 			return nil
@@ -250,3 +236,30 @@ func (a *queryMemoryAccount) Resize(previous, next int64) error {
 func aggregateBucketBytes(groupValues []any, key string, itemCount, nodeCount int) int64 {
 	return queryRowBytes(groupValues) + int64(len(key)) + 128 + int64(itemCount+nodeCount)*160
 }
+
+// The Result conversion belongs only at protocol/materialized result boundaries.
+func resultOperator(q *queryControl, result *Result) physical.Operator[[]any] {
+	return physical.Source[[]any](func(_ context.Context, y physical.Yield[[]any]) error { return visitQueryResult(q, result, y) })
+}
+
+type distinctSorter struct {
+	sorter *externalRowSorter
+	byKey  bool
+}
+
+func (s *distinctSorter) Add(r physical.DistinctRow[[]any]) error {
+	prefix := []any{r.Ordinal}
+	if s.byKey {
+		prefix = []any{r.Key, r.Ordinal}
+	}
+	return s.sorter.Add(append(prefix, r.Row...))
+}
+func (s *distinctSorter) Finish(y func(physical.DistinctRow[[]any]) error) error {
+	return s.sorter.Finish(func(r []any) error {
+		if s.byKey {
+			return y(physical.DistinctRow[[]any]{Key: r[0].(string), Ordinal: r[1].(uint64), Row: r[2:]})
+		}
+		return y(physical.DistinctRow[[]any]{Ordinal: r[0].(uint64), Row: r[1:]})
+	})
+}
+func (s *distinctSorter) Close() error { return s.sorter.Close() }

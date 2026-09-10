@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"gbaselite/parser"
+	"gbaselite/physical"
 	"gbaselite/storage"
 	"strconv"
 	"strings"
@@ -16,6 +17,9 @@ func executeBudgetedExpressionOrder(store *storage.Store, session *Session, stat
 }
 
 func executeBudgetedExpressionOrderWithSource(store *storage.Store, session *Session, statement parser.Select, table *storage.Table, columns []Column, project func(storage.Row) ([]any, error), source func(func(storage.Row) error) error) (*Result, error) {
+	return executeBudgetedExpressionOrderWithInput(store, session, statement, table, columns, project, sourceOperator(source))
+}
+func executeBudgetedExpressionOrderWithInput(store *storage.Store, session *Session, statement parser.Select, table *storage.Table, columns []Column, project func(storage.Row) ([]any, error), source physical.Operator[storage.Row]) (*Result, error) {
 	expressions := make([]parser.Expr, len(statement.OrderBy))
 	positions := make([]int, len(expressions))
 	for i, order := range statement.OrderBy {
@@ -53,30 +57,28 @@ func executeBudgetedExpressionOrderWithSource(store *storage.Store, session *Ses
 		}
 		return 0
 	}
-	visit := func(yield func([]any) error) error {
-		return source(func(row storage.Row) error {
-			values, err := project(row)
-			if err != nil {
-				return err
-			}
-			all := make([]any, len(values)+len(expressions))
-			copy(all, values)
-			for i, expr := range expressions {
-				if positions[i] >= 0 {
-					all[len(values)+i] = values[positions[i]]
-				} else {
-					all[len(values)+i], err = evaluateExprWithContext(expr, table, row, session, store)
-					if err != nil {
-						return err
-					}
+	visit := physical.Projection[storage.Row, []any]{Input: source, Project: func(row storage.Row) ([]any, error) {
+		values, err := project(row)
+		if err != nil {
+			return nil, err
+		}
+		all := make([]any, len(values)+len(expressions))
+		copy(all, values)
+		for i, expr := range expressions {
+			if positions[i] >= 0 {
+				all[len(values)+i] = values[positions[i]]
+			} else {
+				all[len(values)+i], err = evaluateExprWithContext(expr, table, row, session, store)
+				if err != nil {
+					return nil, err
 				}
 			}
-			return yield(all)
-		})
-	}
+		}
+		return all, nil
+	}}
 	limit := -1
 	if statement.HasLimit {
 		limit = statement.Limit
 	}
-	return executeBudgetedOrder(session, columns, compare, visit, statement.Offset, limit)
+	return executeBudgetedOrderWithInput(session, columns, compare, visit, statement.Offset, limit)
 }

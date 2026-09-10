@@ -25,7 +25,11 @@ func encodeStagedOp(op Op) []byte {
 // stagedOpHeader validates the existing temporary format without copying payloads.
 func stagedOpHeader(k, value []byte) (int, error) {
 	split := bytes.IndexByte(k, 0)
-	if split < 1 || split > 1024 || len(k)-split-1 > 8192 || len(value) < 2 || value[0] != 1 || value[1] > 3 || len(value)-2 > MaxValueBytes {
+	keyLimit := 8192
+	if bytes.HasPrefix(k, rangeGuardPrefix) && len(value) >= 2 && value[1] == 2 {
+		keyLimit = 32700
+	}
+	if split < 1 || split > 1024 || len(k)-split-1 > keyLimit || len(value) < 2 || value[0] != 1 || value[1] > 3 || len(value)-2 > MaxValueBytes {
 		return 0, errors.New("invalid temporary MVCC write encoding")
 	}
 	return split, nil

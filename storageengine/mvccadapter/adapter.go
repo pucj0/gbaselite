@@ -117,15 +117,15 @@ func (e *engine) CompactHistory(ctx context.Context) error { return e.store.Comp
 func (e *engine) Compact(ctx context.Context, path string) error {
 	return e.store.ExportLayout(ctx, path, "flat")
 }
-func (e *engine) PendingBytes() (int64, error)              { return e.store.PendingBytes() }
-func (t *txn) ID() string                                   { return t.inner.ID }
-func (t *txn) Snapshot() uint64                             { return t.inner.Snapshot }
-func (t *txn) Get(s string, k []byte) ([]byte, bool, error) { return t.inner.Get(s, k) }
-func (t *txn) Put(s string, k, v []byte) error              { return t.inner.Put(s, k, v) }
-func (t *txn) Delete(s string, k []byte) error              { return t.inner.Delete(s, k) }
-func (t *txn) Guard(s string, k []byte) error               { return t.inner.Guard(s, k) }
-func (t *txn) GuardRange(s string) error                    { return t.inner.GuardRange(s) }
-func (t *txn) Table(id string) storageengine.Table          { return storageengine.BindTable(t, id) }
+func (e *engine) PendingBytes() (int64, error)                     { return e.store.PendingBytes() }
+func (t *txn) ID() string                                          { return t.inner.ID }
+func (t *txn) Snapshot() uint64                                    { return t.inner.Snapshot }
+func (t *txn) Get(s string, k []byte) ([]byte, bool, error)        { return t.inner.Get(s, k) }
+func (t *txn) Put(s string, k, v []byte) error                     { return t.inner.Put(s, k, v) }
+func (t *txn) Delete(s string, k []byte) error                     { return t.inner.Delete(s, k) }
+func (t *txn) Guard(s string, k []byte) error                      { return t.inner.Guard(s, k) }
+func (t *txn) GuardRange(s string, r storageengine.KeyRange) error { return t.inner.GuardRange(s, r) }
+func (t *txn) Table(id string) storageengine.Table                 { return storageengine.BindTable(t, id) }
 func (t *txn) Child() (storageengine.Txn, error) {
 	c, err := t.inner.Child()
 	if err != nil {

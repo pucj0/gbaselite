@@ -224,7 +224,7 @@ func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table ver
 			if err = tx.Guard("catalog", catalog); err != nil {
 				return err
 			}
-			if err = tx.GuardRange("row/" + child.ID); err != nil {
+			if err = tx.GuardRange("row/"+child.ID, storageengine.KeyRange{}); err != nil {
 				return err
 			}
 			err = tx.ScanRange(ctx, "row/"+child.ID, storageengine.KeyRange{}, func(_, v []byte) error {

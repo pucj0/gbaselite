@@ -186,7 +186,11 @@ func sequence(n uint64) []byte {
 	return value[:]
 }
 func validateKey(space string, rowKey []byte) error {
-	if space == "" || bytes.IndexByte([]byte(space), 0) >= 0 || len(space) > 1024 || len(rowKey) > 8192 {
+	keyLimit := 8192
+	if space == rangeGuardSpace {
+		keyLimit = 32700
+	} // Encodes two valid endpoints; check-only, never a data row.
+	if space == "" || bytes.IndexByte([]byte(space), 0) >= 0 || len(space) > 1024 || len(rowKey) > keyLimit {
 		return errors.New("invalid MVCC namespace/key")
 	}
 	return nil

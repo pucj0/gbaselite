@@ -56,9 +56,6 @@ func bindScan(tx storageengine.Txn, table versionedTable, access mvccAccessPlan,
 		return i, nil
 	}, Decode: func(_, v []byte) (storage.Row, error) { return decode(v) }}
 }
-func rowSource(ctx context.Context, op physical.Operator[storage.Row]) func(func(storage.Row) error) error {
-	return func(y func(storage.Row) error) error { return op.Run(ctx, y) }
-}
 func sourceOperator(source func(func(storage.Row) error) error) physical.Operator[storage.Row] {
 	return physical.Source[storage.Row](func(_ context.Context, y physical.Yield[storage.Row]) error { return source(y) })
 }

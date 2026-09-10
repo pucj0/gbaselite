@@ -19,7 +19,7 @@ func executePhysicalSelect(ctx context.Context, tx storageengine.Txn, session *S
 		return executeScalarSelect(session, statement)
 	}
 	if len(statement.Joins) > 0 {
-		schema, source, err := joinedSource(ctx, tx, session, statement)
+		schema, source, err := joinedInput(tx, session, statement)
 		if err != nil {
 			return nil, err
 		}
@@ -57,10 +57,9 @@ func executePhysicalSelect(ctx context.Context, tx storageengine.Txn, session *S
 			return truthy(value), err
 		}}
 	}
-	source := rowSource(ctx, op)
-	return finishPhysicalSelect(session, statement, schema, source, ordered)
+	return finishPhysicalSelect(session, statement, schema, op, ordered)
 }
-func finishPhysicalSelect(session *Session, statement parser.Select, schema *storage.Table, source func(func(storage.Row) error) error, ordered bool) (*Result, error) {
+func finishPhysicalSelect(session *Session, statement parser.Select, schema *storage.Table, source physical.Operator[storage.Row], ordered bool) (*Result, error) {
 	if selectHasWindow(statement.Items) {
 		base := statement
 		base.Distinct = false
@@ -68,7 +67,7 @@ func finishPhysicalSelect(session *Session, statement parser.Select, schema *sto
 			base.HasLimit = false
 			base.Offset = 0
 		}
-		result, err := executeWindowWithSource(schema, base, schema.ColumnsView(), session, source)
+		result, err := executeWindowWithInput(schema, base, schema.ColumnsView(), session, source)
 		if err != nil || !statement.Distinct {
 			return result, err
 		}
@@ -87,7 +86,7 @@ func finishPhysicalSelect(session *Session, statement parser.Select, schema *sto
 			base.Distinct = false
 			base.HasLimit = false
 			base.Offset = 0
-			result, err := executeGroupedSelectWithSource(schema, base, schema.ColumnsView(), session, source)
+			result, err := executeGroupedSelectWithInput(schema, base, schema.ColumnsView(), session, source)
 			if err != nil {
 				return nil, err
 			}
@@ -99,7 +98,7 @@ func finishPhysicalSelect(session *Session, statement parser.Select, schema *sto
 			local.StreamResults = false
 			return executeBudgetedDistinct(&local, result, statement.Offset, limit)
 		}
-		return executeGroupedSelectWithSource(schema, statement, schema.ColumnsView(), session, source)
+		return executeGroupedSelectWithInput(schema, statement, schema.ColumnsView(), session, source)
 	}
 	aggregate := selectHasAggregate(statement.Items)
 	if aggregate {
@@ -169,14 +168,14 @@ func finishPhysicalSelect(session *Session, statement parser.Select, schema *sto
 	local := *session
 	local.StreamResults = false
 	if len(statement.OrderBy) > 0 && !ordered {
-		return executeBudgetedExpressionOrderWithSource(nil, &local, statement, schema, result.Columns, project, source)
+		return executeBudgetedExpressionOrderWithInput(nil, &local, statement, schema, result.Columns, project, source)
 	}
 	used := int64(0)
 	count := -1
 	if statement.HasLimit {
 		count = statement.Limit
 	}
-	input := physical.Limit[storage.Row]{Input: sourceOperator(source), Offset: statement.Offset, Count: count}
+	input := physical.Limit[storage.Row]{Input: source, Offset: statement.Offset, Count: count}
 	op := physical.Projection[storage.Row, []any]{Input: input, Project: project}
 	err := op.Run(operatorContext(session), func(values []any) error {
 		var err error
@@ -224,7 +223,7 @@ func mvccPointKey(expression parser.Expr, table versionedTable, schema *storage.
 	}
 	return nil, false
 }
-func executeGlobalAggregate(session *Session, statement parser.Select, schema *storage.Table, source func(func(storage.Row) error) error) (*Result, error) {
+func executeGlobalAggregate(session *Session, statement parser.Select, schema *storage.Table, source physical.Operator[storage.Row]) (*Result, error) {
 	kinds := make([]aggregateKind, len(statement.Items))
 	expressions := make([]parser.Expr, len(kinds))
 	positions := make([]int, len(kinds))
@@ -299,7 +298,7 @@ func executeGlobalAggregate(session *Session, statement parser.Select, schema *s
 		}
 		return nil
 	}
-	op := physical.Aggregate[storage.Row, []any]{Input: sourceOperator(source), New: func() (physical.Accumulator[storage.Row, []any], error) {
+	op := physical.Aggregate[storage.Row, []any]{Input: source, New: func() (physical.Accumulator[storage.Row, []any], error) {
 		return &aggregateBinding[storage.Row, []any]{add: add, finish: func(y physical.Yield[[]any]) error {
 			values := make([]any, len(kinds))
 			for i, kind := range kinds {

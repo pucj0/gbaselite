@@ -54,7 +54,10 @@ type Iterator interface {
 // Child commits merge atomically into their parent; rollback discards only the child.
 // Commit/Rollback end the transaction and require all its iterators to be closed.
 // Get returns owned bytes. Put/Delete do not retain caller-owned slices.
-// Guard/GuardRange add dependencies for foreign keys and schema changes.
+// Guard/GuardRange add optimistic dependencies, validated at commit, including
+// inserts/deletes after Snapshot. GuardRange copies its bounds; zero KeyRange
+// guards the whole space. Reverse/Stats do not affect conflict membership.
+// These are validation dependencies, not blocking gap/next-key locks.
 type Txn interface {
 	ID() string
 	Snapshot() uint64
@@ -62,7 +65,7 @@ type Txn interface {
 	Put(space string, key, value []byte) error
 	Delete(space string, key []byte) error
 	Guard(space string, key []byte) error
-	GuardRange(space string) error
+	GuardRange(space string, bounds KeyRange) error
 	NewIterator(context.Context, ScanRequest) (Iterator, error)
 	Scan(context.Context, string, func([]byte, []byte) error) error
 	ScanRange(context.Context, string, KeyRange, func([]byte, []byte) error) error

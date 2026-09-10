@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"context"
 	"fmt"
 	"gbaselite/parser"
 	"gbaselite/physical"
@@ -64,7 +63,7 @@ func bindJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]joinI
 	}
 	return inputs, nil
 }
-func joinedSource(ctx context.Context, tx storageengine.Txn, session *Session, s parser.Select) (*storage.Table, func(func(storage.Row) error) error, error) {
+func joinedInput(tx storageengine.Txn, session *Session, s parser.Select) (*storage.Table, physical.Operator[storage.Row], error) {
 	inputs, err := bindJoins(tx, session, s)
 	if err != nil {
 		return nil, nil, err
@@ -118,8 +117,7 @@ func joinedSource(ctx context.Context, tx storageengine.Txn, session *Session, s
 			return truthy(v), err
 		}}
 	}
-	source := rowSource(ctx, op)
-	return schema, source, nil
+	return schema, op, nil
 }
 func joinLookup(on parser.Expr, left, right *storage.Table, row storage.Row) (parser.Expr, bool) {
 	expr, ok := on.(parser.BinaryExpr)

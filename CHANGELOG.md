@@ -18,6 +18,8 @@ releases.
 
 ### Changed
 
+- 加固 A01–A03：增加生产 Legacy/后端依赖防回归、共享 storageengine Contract Suite 与键级 memory 夹具；GuardRange 支持精确边界并覆盖 local-WAL 同批冲突；核心 pipeline 直接传 Operator，SELECT/UNION 复用通用 Distinct，保持现有 SQL 行为及数据/迁移格式。
+
 - SQL 改用公共 Physical Operator 管线；统一扫描、过滤、投影、连接、聚合、排序、TopN、Union、Materialize、Window 与行级 Modify，移除独立整数 Executor。UNION 与默认排名/聚合窗口接入唯一事务 API，保留预算、溢写及语句回滚；新增双后端与资源生命周期回归。
 
 - 定义 Storage Engine/Txn/Iterator/Table/Index/ScanRequest 契约，封装现有 MVCC/bbolt adapter，SQL/计划改用接口；支持注入工厂并增加独立后端与导入边界测试。

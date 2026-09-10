@@ -10,7 +10,7 @@ type Keyspace interface {
 	Put([]byte, []byte) error
 	Delete([]byte) error
 	Guard([]byte) error
-	GuardRange() error
+	GuardRange(KeyRange) error
 	Scan(context.Context, ScanRequest) (Iterator, error)
 }
 type Table interface {
@@ -46,7 +46,7 @@ func (s *spaceHandle) Get(k []byte) ([]byte, bool, error) { return s.tx.Get(s.sp
 func (s *spaceHandle) Put(k, v []byte) error              { return s.tx.Put(s.space, k, v) }
 func (s *spaceHandle) Delete(k []byte) error              { return s.tx.Delete(s.space, k) }
 func (s *spaceHandle) Guard(k []byte) error               { return s.tx.Guard(s.space, k) }
-func (s *spaceHandle) GuardRange() error                  { return s.tx.GuardRange(s.space) }
+func (s *spaceHandle) GuardRange(bounds KeyRange) error   { return s.tx.GuardRange(s.space, bounds) }
 func (s *spaceHandle) Scan(ctx context.Context, r ScanRequest) (Iterator, error) {
 	r.Space = s.space
 	return s.tx.NewIterator(ctx, r)

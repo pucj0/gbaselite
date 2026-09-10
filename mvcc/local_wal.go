@@ -15,7 +15,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 const localWALMagic = "GBLWAL01"
@@ -330,9 +329,8 @@ func (s *Store) commitLocalWALGroup(group []*localCommitRequest) {
 				_, v, _ := reader.visible(k)
 				v = max(v, seen[string(k)])
 				if op.Space == rangeGuardSpace {
-					prefix := string(op.Key) + "\x00"
 					for changed, index := range seen {
-						if strings.HasPrefix(changed, prefix) {
+						if rangeDependencyContains(op.Key, []byte(changed)) {
 							v = max(v, index)
 						}
 					}

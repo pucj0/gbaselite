@@ -156,7 +156,7 @@ func (e *Engine) alterMVCC(ctx context.Context, read, write storageengine.Txn, s
 	if err = prepareMVCCForeignKeys(write, &definition, session); err != nil {
 		return nil, err
 	}
-	if err = write.GuardRange("row/" + old.ID); err != nil {
+	if err = write.GuardRange("row/"+old.ID, storageengine.KeyRange{}); err != nil {
 		return nil, err
 	}
 	count := uint64(0)

@@ -927,6 +927,25 @@ GROUP BY 和 Window 保留内存预算，超限报错；窗口物化尚不溢写
 LIMIT 提前结束、消费错误和取消均释放已打开的迭代器/排序临时文件。
 详见[物理算子设计](docs/设计/PhysicalOperator管线.md)。
 
+### A01–A03 架构防回归
+
+生产源码检查禁止 SQL/Physical 导入具体存储实现、测试后端或调用 legacy persistence；
+迁移读取器仅允许在指定迁移函数中使用，snapshot/paged 启动选项持续拒绝。
+检查所有平台源码，并以负例测试验证别名导入、mode 分支和迁移入口绕用会被发现。
+
+storageengine/testkit.Run 是后端通用 Contract Suite，当前覆盖 MVCC、local-WAL 与独立 memory 夹具。
+新后端应运行同一套事务、所有权、扫描、取消、计数器和冲突测试，再运行 SQL regression matrix。
+memory 仅供测试；生产装配仍返回 storageengine.Engine。
+
+Txn.GuardRange(space, KeyRange) 和 Table/Index.GuardRange(KeyRange) 支持明确上下界及开闭区间。
+零 KeyRange 表示整个空间；nil 无界，空但非 nil 是有效端点。守卫复制端点，提交时检测范围内
+插入、更新和删除，子事务回滚会丢弃其守卫。现有 DDL/外键仍传全范围，不改变 SQL 隔离语义。
+这预留了范围依赖表达能力，尚未实现阻塞式 Gap/Next-Key Lock；后续锁管理可复用边界语义。
+
+核心 Scan/Join 到 Filter、Projection、Aggregate、Window、Sort 的输入直接传递 Operator；
+协议 Result 和历史查询辅助入口保留适配边界。SELECT DISTINCT 与 UNION DISTINCT 复用
+physical.Distinct，维持排序规则、NULL、首行代表、输出顺序、分页和溢写预算。
+
 ## 单引擎改造与验证
 
 | 原分支位置 | 当前处理 |

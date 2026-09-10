@@ -62,3 +62,23 @@ Txn.Child 对应 SQL 语句原子写集，不意味着支持 SQL SAVEPOINT。子
 - executor 测试注入完全不依赖 MVCC/bbolt 的内存后端，运行 CRUD、聚合、二级索引、JOIN、外键、快照读取和语句失败回滚。其迭代器故意复用缓冲，验证算子不依赖 adapter 的内存实现。
 - 架构测试检查 executor/server/parser 以及将来出现的 sql/planner 包，禁止直接导入 bbolt、mvcc、replication 或默认 adapter；工厂依赖仅允许出现在装配入口。
 - 内存后端仅为测试夹具，不是可配置生产后端；不声称完成第二种持久化引擎，也不声称性能提升或完整 MySQL 兼容。
+
+## A01–A03 加固契约
+
+GuardRange 的新签名为 GuardRange(space string, bounds KeyRange) error；Table/Index 上为 GuardRange(bounds KeyRange)。
+范围按字节序，LowerInclusive/UpperInclusive 明确开闭，nil 无界，非 nil 空切片有效；反向和 Stats 不影响依赖成员。
+零值继续表达旧的整空间依赖，DDL 与外键调用语义不变。范围包含的插入、更新、删除均在提交时验证；范围外写入不冲突。
+登记时复制边界，子事务提交转移依赖，回滚丢弃。它是乐观验证接口，不宣称已经实现阻塞 gap/next-key 锁或更高隔离级别。
+
+旧整空间守卫编码原样保留。有界守卫使用带版本的 check-only 键，兼容当前嵌套/平铺数据布局和两种本地提交路径。
+普通数据键长度仍为 8192；check-only 编码允许携带两个合法端点。业务行、备份及旧数据迁移格式不变。
+使用有界守卫的后端/复制节点必须理解此守卫语义，不应将新范围依赖发送给不支持它的旧执行代码。
+
+storageengine/testkit.Run(t, factory) 提供统一可复用验收；factory 为每个子测试创建隔离 Engine。
+storageengine/contract_test.go 对 MVCC（默认和 local-WAL）与 testkit.NewMemory() 执行同一套测试。
+内存夹具采用独立键版本、墓碑和范围验证，不依赖 MVCC，也不再用整库版本冲突掩盖语义差异。
+重启持久性、复制、维护能力等后端专属保证继续由 adapter 测试负责，不由易失内存夹具模拟。
+
+executor/architecture_test.go 检查所有生产源文件（包括异平台代码），禁止存储实现泄露和测试后端进入生产；
+legacy persistence 唯一例外限定到 legacy_reader.go 的 loadLegacyForMigration，并限制调用位置。
+测试不依赖文件名中的 MVCC 字样判断合法性，也不会禁止中立 SQL 数据类型 storage.Row/Table。

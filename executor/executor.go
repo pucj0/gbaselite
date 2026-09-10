@@ -3170,6 +3170,9 @@ func executeWindowSelect(table *storage.Table, predicate storage.Predicate, stat
 	return executeWindowWithSource(table, statement, columns, session, func(y func(storage.Row) error) error { return visitQueryTable(session.query, table, predicate, y) })
 }
 func executeWindowWithSource(table *storage.Table, statement parser.Select, columns []storage.Column, session *Session, source func(func(storage.Row) error) error) (*Result, error) {
+	return executeWindowWithInput(table, statement, columns, session, sourceOperator(source))
+}
+func executeWindowWithInput(table *storage.Table, statement parser.Select, columns []storage.Column, session *Session, source physical.Operator[storage.Row]) (*Result, error) {
 	if len(statement.GroupBy) > 0 || statement.Having != nil {
 		return nil, errors.New("window functions with GROUP BY or HAVING require a derived table")
 	}
@@ -3211,7 +3214,7 @@ func executeWindowWithSource(table *storage.Table, statement parser.Select, colu
 	}
 
 	account := newQueryMemoryAccount(session, "window query")
-	materialize := physical.Materialize[storage.Row]{Input: sourceOperator(source), Clone: func(row storage.Row) storage.Row { return append(storage.Row(nil), row...) }, Charge: func(row storage.Row) error {
+	materialize := physical.Materialize[storage.Row]{Input: source, Clone: func(row storage.Row) storage.Row { return append(storage.Row(nil), row...) }, Charge: func(row storage.Row) error {
 		return account.Reserve(queryStorageRowBytes(row) + int64(128+len(plans)*128))
 	}}
 	window := physical.Window[storage.Row, []any]{Input: materialize, Evaluate: func(rows []storage.Row, y physical.Yield[[]any]) error {
@@ -3281,7 +3284,7 @@ func executeWindowWithSource(table *storage.Table, statement parser.Select, colu
 		}
 		local := *session
 		local.StreamResults = false
-		return executeBudgetedOrder(&local, result.Columns, compare, func(y func([]any) error) error { return window.Run(operatorContext(session), y) }, statement.Offset, limit)
+		return executeBudgetedOrderWithInput(&local, result.Columns, compare, window, statement.Offset, limit)
 	}
 	op := physical.Limit[[]any]{Input: window, Offset: statement.Offset, Count: limit}
 	err := op.Run(operatorContext(session), func(row []any) error { result.Rows = append(result.Rows, row); return nil })
@@ -3550,6 +3553,9 @@ func executeGroupedSelect(table *storage.Table, predicate storage.Predicate, sta
 	})
 }
 func executeGroupedSelectWithSource(table *storage.Table, statement parser.Select, columns []storage.Column, session *Session, source func(func(storage.Row) error) error) (*Result, error) {
+	return executeGroupedSelectWithInput(table, statement, columns, session, sourceOperator(source))
+}
+func executeGroupedSelectWithInput(table *storage.Table, statement parser.Select, columns []storage.Column, session *Session, source physical.Operator[storage.Row]) (*Result, error) {
 	groupExpressions := make([]parser.Expr, len(statement.GroupBy))
 	groupIndexes := make([]int, len(statement.GroupBy))
 	groupPositions := make(map[int]int, len(statement.GroupBy))
@@ -3797,7 +3803,7 @@ func executeGroupedSelectWithSource(table *storage.Table, statement parser.Selec
 		resultRows = append(resultRows, resultRow)
 		return nil
 	}
-	op := physical.Aggregate[storage.Row, groupedBucket]{Input: sourceOperator(source), New: func() (physical.Accumulator[storage.Row, groupedBucket], error) {
+	op := physical.Aggregate[storage.Row, groupedBucket]{Input: source, New: func() (physical.Accumulator[storage.Row, groupedBucket], error) {
 		return &aggregateBinding[storage.Row, groupedBucket]{add: add, finish: func(y physical.Yield[groupedBucket]) error {
 			for _, bucket := range buckets {
 				if err := y(bucket); err != nil {
