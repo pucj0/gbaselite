@@ -245,7 +245,12 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 	case parser.Select:
 		return executePhysicalSelect(ctx, tx, session, value)
 	case parser.Union:
-		return executeUnionWithSelect(session, value, func(query parser.Select) (*Result, error) { return executePhysicalSelect(ctx, tx, session, query) })
+		query, err := bindUnionWithSelect(session, value, func(s parser.Select) (*boundQuery, error) { return bindPhysicalSelect(ctx, tx, session, s) })
+		if err != nil {
+			return nil, err
+		}
+		return collectBoundQuery(session, query, false)
+
 	case parser.Explain:
 		return executeMVCCExplain(tx, session, value.Query)
 	case parser.Show:

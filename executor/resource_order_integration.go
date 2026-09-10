@@ -20,6 +20,13 @@ func executeBudgetedExpressionOrderWithSource(store *storage.Store, session *Ses
 	return executeBudgetedExpressionOrderWithInput(store, session, statement, table, columns, project, sourceOperator(source))
 }
 func executeBudgetedExpressionOrderWithInput(store *storage.Store, session *Session, statement parser.Select, table *storage.Table, columns []Column, project func(storage.Row) ([]any, error), source physical.Operator[storage.Row]) (*Result, error) {
+	query, err := bindExpressionOrder(store, session, statement, table, columns, project, source)
+	if err != nil {
+		return nil, err
+	}
+	return collectBoundQuery(session, query, session.StreamResults)
+}
+func bindExpressionOrder(store *storage.Store, session *Session, statement parser.Select, table *storage.Table, columns []Column, project func(storage.Row) ([]any, error), source physical.Operator[storage.Row]) (*boundQuery, error) {
 	expressions := make([]parser.Expr, len(statement.OrderBy))
 	positions := make([]int, len(expressions))
 	for i, order := range statement.OrderBy {
@@ -80,5 +87,5 @@ func executeBudgetedExpressionOrderWithInput(store *storage.Store, session *Sess
 	if statement.HasLimit {
 		limit = statement.Limit
 	}
-	return executeBudgetedOrderWithInput(session, columns, compare, visit, statement.Offset, limit)
+	return bindOrder(session, columns, compare, visit, statement.Offset, limit), nil
 }

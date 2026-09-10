@@ -36,41 +36,22 @@ func executeBudgetedOrder(session *Session, columns []Column, compare func([]any
 	return executeBudgetedOrderWithInput(session, columns, compare, physical.Source[[]any](func(_ context.Context, y physical.Yield[[]any]) error { return visit(y) }), offset, limit)
 }
 func executeBudgetedOrderWithInput(session *Session, columns []Column, compare func([]any, []any) int, input physical.Operator[[]any], offset, limit int) (*Result, error) {
+	return collectBoundQuery(session, bindOrder(session, columns, compare, input, offset, limit), session.StreamResults)
+}
+func bindOrder(session *Session, columns []Column, compare func([]any, []any) int, input physical.Operator[[]any], offset, limit int) *boundQuery {
 	q := session.query
-	run := func(yield func([]any) error) error {
-		sorter := physical.Sort[[]any]{Input: input, New: func() (physical.Sorter[[]any], error) { return newExternalRowSorter(q, compare) }}
-		var op physical.Operator[[]any] = physical.Limit[[]any]{Input: sorter, Offset: offset, Count: limit}
-		if limit >= 0 {
-			op = physical.TopN[[]any]{Sort: sorter, Offset: offset, Count: limit}
+	sorter := physical.Sort[[]any]{Input: input, New: func() (physical.Sorter[[]any], error) { return newExternalRowSorter(q, compare) }}
+	var op physical.Operator[[]any] = physical.Limit[[]any]{Input: sorter, Offset: offset, Count: limit}
+	if limit >= 0 {
+		op = physical.TopN[[]any]{Sort: sorter, Offset: offset, Count: limit}
+	}
+	project := physical.Projection[[]any, []any]{Input: op, Project: func(row []any) ([]any, error) {
+		if len(row) < len(columns) {
+			return nil, errors.New("sort projection has fewer values than result columns")
 		}
-		project := physical.Projection[[]any, []any]{Input: op, Project: func(row []any) ([]any, error) {
-			if len(row) < len(columns) {
-				return nil, errors.New("sort projection has fewer values than result columns")
-			}
-			return row[:len(columns)], nil
-		}}
-		return project.Run(operatorContext(session), yield)
-	}
-	result := &Result{Columns: columns}
-	if session.StreamResults {
-		result.StreamRows = run
-		return result, nil
-	}
-	used := int64(0)
-	err := run(func(row []any) error {
-		var err error
-		used, err = checkResultMemory(q.options.ResultMemoryBytes, used, row)
-		if err != nil {
-			return err
-		}
-		// Dropping hidden keys also prevents them from keeping large payloads alive.
-		result.Rows = append(result.Rows, append([]any(nil), row...))
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
+		return row[:len(columns)], nil
+	}}
+	return &boundQuery{columns, project}
 }
 
 func visitQueryResult(q *queryControl, result *Result, yield func([]any) error) error {
@@ -116,79 +97,50 @@ func visitQueryResult(q *queryControl, result *Result, yield func([]any) error) 
 // row. A second bounded sort restores source ORDER BY/tie order before LIMIT.
 // Both sorters share the query's temporary disk accounting.
 func executeBudgetedDistinct(session *Session, source *Result, offset, limit int) (*Result, error) {
+	return collectBoundQuery(session, bindDistinct(session, source.Columns, resultOperator(session.query, source), offset, limit), session.StreamResults)
+}
+func bindDistinct(session *Session, columns []Column, input physical.Operator[[]any], offset, limit int) *boundQuery {
 	q := session.query
-	run := func(yield func([]any) error) error {
+	op := physical.Distinct[[]any]{Input: semanticInput(columns, input), Key: func(row []any) (string, error) { return groupedRowKey(row, session), nil }, NewSort: func(byKey bool) (physical.Sorter[physical.DistinctRow[[]any]], error) {
 		split := *q
 		split.options.SortMemoryBytes = q.options.SortMemoryBytes / 2
 		if q.options.SortMemoryBytes == 0 {
 			split.options.SortMemoryBytes = 2 << 20
 		}
 		if split.options.SortMemoryBytes < 64<<10 {
-			return fmt.Errorf("%w: DISTINCT requires at least 131072 bytes of sort memory", ErrQueryResourceLimit)
+			return nil, fmt.Errorf("%w: DISTINCT requires at least 131072 bytes of sort memory", ErrQueryResourceLimit)
 		}
-		op := physical.Distinct[[]any]{Input: resultOperator(q, source), Key: func(row []any) (string, error) { return groupedRowKey(row, session), nil }, NewSort: func(byKey bool) (physical.Sorter[physical.DistinctRow[[]any]], error) {
-			compare := func(a, b []any) int {
-				if byKey {
-					if c := strings.Compare(a[0].(string), b[0].(string)); c != 0 {
-						return c
-					}
-				}
-				index := 0
-				if byKey {
-					index = 1
-				}
-				left, right := a[index].(uint64), b[index].(uint64)
-				if left < right {
-					return -1
-				}
-				if left > right {
-					return 1
-				}
-				return 0
-			}
-			sorter, err := newExternalRowSorter(&split, compare)
-			if err != nil {
-				return nil, err
-			}
-			return &distinctSorter{sorter, byKey}, nil
-		}}
 
-		seen, emitted := 0, 0
-		err := op.Run(operatorContext(session), func(row []any) error {
-			if seen < offset {
-				seen++
-				return nil
+		compare := func(a, b []any) int {
+			if byKey {
+				if c := strings.Compare(a[0].(string), b[0].(string)); c != 0 {
+					return c
+				}
 			}
-			if limit >= 0 && emitted >= limit {
-				return errBudgetedRowsDone
+			index := 0
+			if byKey {
+				index = 1
 			}
-			emitted++
-			return yield(row)
-		})
-		if errors.Is(err, errBudgetedRowsDone) {
-			return nil
+			left, right := a[index].(uint64), b[index].(uint64)
+			if left < right {
+				return -1
+			}
+			if left > right {
+				return 1
+			}
+			return 0
 		}
-		return err
-	}
-	result := &Result{Columns: source.Columns}
-	if session.StreamResults {
-		result.StreamRows = run
-		return result, nil
-	}
-	used := int64(0)
-	err := run(func(row []any) error {
-		var err error
-		used, err = checkResultMemory(q.options.ResultMemoryBytes, used, row)
+		sorter, err := newExternalRowSorter(&split, compare)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		result.Rows = append(result.Rows, append([]any(nil), row...))
-		return nil
-	})
-	if err != nil {
-		return nil, err
+		return &distinctSorter{sorter, byKey}, nil
+	}}
+	var output physical.Operator[[]any] = physical.Limit[[]any]{Input: op, Offset: offset, Count: limit}
+	if limit == 0 {
+		output = discardOutput(op)
 	}
-	return result, nil
+	return &boundQuery{columns, output}
 }
 
 // queryMemoryAccount is for materializing operators whose states cannot yet be

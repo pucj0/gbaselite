@@ -53,6 +53,12 @@ func architectureViolations(path string, src any) []string {
 		migration := path == "executor/legacy_migration.go"
 		ast.Inspect(decl, func(node ast.Node) bool {
 			switch n := node.(type) {
+			case *ast.CompositeLit:
+				if path == "executor/physical_select.go" {
+					if id, ok := n.Type.(*ast.Ident); ok && id.Name == "Result" {
+						issues = append(issues, "intermediate Result in core SELECT binding")
+					}
+				}
 			case *ast.SelectorExpr:
 				if id, ok := n.X.(*ast.Ident); ok && imports[id.Name] == "gbaselite/storage" && strings.Contains(n.Sel.Name, "Persistence") && !loader {
 					issues = append(issues, "legacy persistence outside migration reader")
@@ -61,6 +67,9 @@ func architectureViolations(path string, src any) []string {
 					issues = append(issues, "runtime mode dispatch")
 				}
 			case *ast.Ident:
+				if path == "executor/physical_select.go" && (n.Name == "executeBudgetedDistinct" || n.Name == "resultOperator") {
+					issues = append(issues, "materialized DISTINCT in core binding")
+				}
 				if n.Name == "loadLegacyForMigration" && !loader && !(migration && fn == "MigrateLegacy") {
 					issues = append(issues, "migration reader reachable from runtime")
 				}
@@ -129,6 +138,7 @@ func TestArchitectureChecksRejectRegressionFixtures(t *testing.T) {
 		{"server/bad.go", "package server; func f(){switch options.StorageMode{case \"paged\":}}"},
 		{"executor/physical_select.go", "package executor; func f(){sourceOperator(rowSource(ctx,op))}"},
 		{"executor/physical_binding.go", "package executor; func f(){sourceOperator(callback)}"},
+		{"executor/physical_select.go", "package executor; func f(){_ = Result{Rows: rows}}"},
 	}
 	for _, f := range fixtures {
 		if _, err := parser.ParseFile(token.NewFileSet(), f.path, f.source, 0); err != nil {

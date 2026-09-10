@@ -12,18 +12,29 @@ import (
 )
 
 func executePhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Session, statement parser.Select) (*Result, error) {
+	query, err := bindPhysicalSelect(ctx, tx, session, statement)
+	if err != nil {
+		return nil, err
+	}
+	return collectBoundQuery(session, query, false)
+}
+func bindPhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Session, statement parser.Select) (*boundQuery, error) {
 	if err := validateMVCCSelectShape(statement); err != nil {
 		return nil, err
 	}
 	if statement.Table == "" && statement.Subquery == nil {
-		return executeScalarSelect(session, statement)
+		result, err := executeScalarSelect(session, statement)
+		if err != nil {
+			return nil, err
+		}
+		return boundResult(session, result), nil
 	}
 	if len(statement.Joins) > 0 {
 		schema, source, err := joinedInput(tx, session, statement)
 		if err != nil {
 			return nil, err
 		}
-		return finishPhysicalSelect(session, statement, schema, source, false)
+		return bindSelectOutput(session, statement, schema, source, false)
 	}
 	definition, schema, _, err := loadVersionedTableForRead(tx, session, statement.Table)
 	if err != nil {
@@ -57,60 +68,16 @@ func executePhysicalSelect(ctx context.Context, tx storageengine.Txn, session *S
 			return truthy(value), err
 		}}
 	}
-	return finishPhysicalSelect(session, statement, schema, op, ordered)
+	return bindSelectOutput(session, statement, schema, op, ordered)
 }
-func finishPhysicalSelect(session *Session, statement parser.Select, schema *storage.Table, source physical.Operator[storage.Row], ordered bool) (*Result, error) {
-	if selectHasWindow(statement.Items) {
-		base := statement
-		base.Distinct = false
-		if statement.Distinct {
-			base.HasLimit = false
-			base.Offset = 0
-		}
-		result, err := executeWindowWithInput(schema, base, schema.ColumnsView(), session, source)
-		if err != nil || !statement.Distinct {
-			return result, err
-		}
-		limit := -1
-		if statement.HasLimit {
-			limit = statement.Limit
-		}
-		local := *session
-		local.StreamResults = false
-		return executeBudgetedDistinct(&local, result, statement.Offset, limit)
-	}
-
-	if len(statement.GroupBy) > 0 || statement.Having != nil {
-		if statement.Distinct {
-			base := statement
-			base.Distinct = false
-			base.HasLimit = false
-			base.Offset = 0
-			result, err := executeGroupedSelectWithInput(schema, base, schema.ColumnsView(), session, source)
-			if err != nil {
-				return nil, err
-			}
-			limit := -1
-			if statement.HasLimit {
-				limit = statement.Limit
-			}
-			local := *session
-			local.StreamResults = false
-			return executeBudgetedDistinct(&local, result, statement.Offset, limit)
-		}
-		return executeGroupedSelectWithInput(schema, statement, schema.ColumnsView(), session, source)
-	}
-	aggregate := selectHasAggregate(statement.Items)
-	if aggregate {
-		return executeGlobalAggregate(session, statement, schema, source)
-	}
+func bindSelectOutput(session *Session, statement parser.Select, schema *storage.Table, source physical.Operator[storage.Row], ordered bool) (*boundQuery, error) {
 	if statement.Distinct {
 		base := statement
 		base.Distinct = false
 		base.HasLimit = false
 		base.Offset = 0
 		base.Limit = 0
-		result, err := finishPhysicalSelect(session, base, schema, source, ordered)
+		query, err := bindSelectOutput(session, base, schema, source, ordered)
 		if err != nil {
 			return nil, err
 		}
@@ -118,10 +85,18 @@ func finishPhysicalSelect(session *Session, statement parser.Select, schema *sto
 		if statement.HasLimit {
 			limit = statement.Limit
 		}
-		local := *session
-		local.StreamResults = false
-		return executeBudgetedDistinct(&local, result, statement.Offset, limit)
+		return bindDistinct(session, query.Columns, query.Input, statement.Offset, limit), nil
 	}
+	if selectHasWindow(statement.Items) {
+		return bindWindow(schema, statement, schema.ColumnsView(), session, source)
+	}
+	if len(statement.GroupBy) > 0 || statement.Having != nil {
+		return bindGroupedSelect(schema, statement, schema.ColumnsView(), session, source)
+	}
+	if selectHasAggregate(statement.Items) {
+		return bindGlobalAggregate(session, statement, schema, source)
+	}
+
 	var plans []projectedExpression
 	columns := schema.ColumnsView()
 	for _, item := range statement.Items {
@@ -150,7 +125,7 @@ func finishPhysicalSelect(session *Session, statement parser.Select, schema *sto
 		inheritExpressionColumn(&column, expression, schema)
 		plans = append(plans, projectedExpression{expression: expression, column: column})
 	}
-	result := &Result{Columns: make([]Column, len(plans))}
+	result := &boundQuery{Columns: make([]Column, len(plans))}
 	for i, plan := range plans {
 		result.Columns[i] = plan.column
 	}
@@ -165,29 +140,19 @@ func finishPhysicalSelect(session *Session, statement parser.Select, schema *sto
 		}
 		return values, nil
 	}
-	local := *session
-	local.StreamResults = false
+
 	if len(statement.OrderBy) > 0 && !ordered {
-		return executeBudgetedExpressionOrderWithInput(nil, &local, statement, schema, result.Columns, project, source)
+		return bindExpressionOrder(nil, session, statement, schema, result.Columns, project, source)
 	}
-	used := int64(0)
 	count := -1
 	if statement.HasLimit {
 		count = statement.Limit
 	}
 	input := physical.Limit[storage.Row]{Input: source, Offset: statement.Offset, Count: count}
-	op := physical.Projection[storage.Row, []any]{Input: input, Project: project}
-	err := op.Run(operatorContext(session), func(values []any) error {
-		var err error
-		used, err = checkResultMemory(session.query.options.ResultMemoryBytes, used, values)
-		if err != nil {
-			return err
-		}
-		result.Rows = append(result.Rows, values)
-		return nil
-	})
-	return result, err
+	result.Input = physical.Projection[storage.Row, []any]{Input: input, Project: project}
+	return result, nil
 }
+
 func mvccPointKey(expression parser.Expr, table versionedTable, schema *storage.Table, session *Session) ([]byte, bool) {
 	if !safeMutationIndexExpression(expression, schema) {
 		return nil, false
@@ -223,7 +188,7 @@ func mvccPointKey(expression parser.Expr, table versionedTable, schema *storage.
 	}
 	return nil, false
 }
-func executeGlobalAggregate(session *Session, statement parser.Select, schema *storage.Table, source physical.Operator[storage.Row]) (*Result, error) {
+func bindGlobalAggregate(session *Session, statement parser.Select, schema *storage.Table, source physical.Operator[storage.Row]) (*boundQuery, error) {
 	kinds := make([]aggregateKind, len(statement.Items))
 	expressions := make([]parser.Expr, len(kinds))
 	positions := make([]int, len(kinds))
@@ -232,7 +197,7 @@ func executeGlobalAggregate(session *Session, statement parser.Select, schema *s
 		positions[i] = -1
 	}
 	states := make([]aggregateState, len(kinds))
-	result := &Result{Columns: make([]Column, len(kinds))}
+	result := &boundQuery{Columns: make([]Column, len(kinds))}
 	for i, item := range statement.Items {
 		kind, argument, ok := parseAggregateExpression(item.Expression)
 		if !ok {
@@ -311,12 +276,10 @@ func executeGlobalAggregate(session *Session, statement parser.Select, schema *s
 			return y(values)
 		}}, nil
 	}}
-	err := op.Run(operatorContext(session), func(values []any) error {
-		if statement.Offset > 0 || statement.HasLimit && statement.Limit == 0 {
-			return nil
-		}
-		result.Rows = append(result.Rows, values)
-		return nil
-	})
-	return result, err
+
+	result.Input = op
+	if statement.Offset > 0 || statement.HasLimit && statement.Limit == 0 {
+		result.Input = discardOutput(op)
+	}
+	return result, nil
 }

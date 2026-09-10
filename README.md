@@ -1232,3 +1232,5 @@ MVCC SELECT、UPDATE、DELETE 可利用已有单列或复合唯一索引进行�
 当前状态以本页矩阵为准；详细设计和历史演进见 [MVCC 文档](docs/使用文档/MVCC复制与高可用.md)。
 
 A01–A03 Deep Hardening：SELECT 与 DML 的表/范围扫描直接使用后端 Iterator 接入 Physical Scan；历史 callback 适配单独隔离于 compat_sources，复杂索引访问暂保留一个字节访问适配边界。此清理保持现有 SQL 与事务语义。
+
+Deep Hardening 的输出绑定使用 boundQuery（列描述 + Operator），SELECT/GROUP/Window/UNION 可直接进入 Distinct，只有最终结果边界收集 Result.Rows；最终结果预算、Distinct/Sort 的溢写预算仍生效。事务查询在事务结束前完成消费，暂不让惰性协议流持有已关闭的 Txn；外部已物化输入仍支持 StreamRows 边界。
