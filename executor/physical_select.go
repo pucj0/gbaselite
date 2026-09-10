@@ -200,7 +200,7 @@ func bindGlobalAggregate(session *Session, statement parser.Select, schema *stor
 	for i := range positions {
 		positions[i] = -1
 	}
-	states := make([]aggregateState, len(kinds))
+	var states []aggregateState
 	result := &boundQuery{Columns: make([]Column, len(kinds))}
 	for i, item := range statement.Items {
 		kind, argument, ok := parseAggregateExpression(item.Expression)
@@ -268,6 +268,7 @@ func bindGlobalAggregate(session *Session, statement parser.Select, schema *stor
 		return nil
 	}
 	op := physical.Aggregate[storage.Row, []any]{Input: source, New: func() (physical.Accumulator[storage.Row, []any], error) {
+		states = make([]aggregateState, len(kinds))
 		return &aggregateBinding[storage.Row, []any]{add: add, finish: func(y physical.Yield[[]any]) error {
 			values := make([]any, len(kinds))
 			for i, kind := range kinds {

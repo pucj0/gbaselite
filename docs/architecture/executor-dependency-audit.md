@@ -63,3 +63,5 @@ Audited declaration map:
 - validateMVCCKeyEncoding → validateSQLKeyEncoding
 - validateMVCCReferences → validateSQLReferences
 - validateMVCCSelectShape → validateSQLSelectShape
+
+Private session/engine fields were audited separately: mvccTransaction (storageengine.Txn) becomes transaction; mvccReadCache becomes tableReadCache; mvccMetadata (mutex) becomes catalogMutex; mvccMetadataVersion becomes catalogRevision. They carry no backend-specific state.

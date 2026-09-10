@@ -26,9 +26,9 @@ func (e *Engine) executeSQLMaintenance(ctx context.Context, session *Session, s 
 		if err := maintenance.RestoreBackup(ctx, s.Path); err != nil {
 			return nil, err
 		}
-		e.mvccMetadata.Lock()
-		e.mvccMetadataVersion = ^uint64(0)
-		e.mvccMetadata.Unlock()
+		e.catalogMutex.Lock()
+		e.catalogRevision = ^uint64(0)
+		e.catalogMutex.Unlock()
 		if err := e.refreshSQLMetadata(ctx); err != nil {
 			return nil, err
 		}

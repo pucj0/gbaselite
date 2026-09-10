@@ -58,8 +58,8 @@ type Result struct {
 type Session struct {
 	ForeignKeyChecksDisabled bool
 	AutocommitDisabled       bool
-	mvccTransaction          storageengine.Txn
-	mvccReadCache            *sqlReadTableCache
+	transaction              storageengine.Txn
+	tableReadCache           *sqlReadTableCache
 	Context                  context.Context
 	query                    *queryControl
 	CurrentDatabase          string
@@ -100,18 +100,18 @@ type navicatCopySource struct {
 var errRelationNotFound = errors.New("relation not found")
 
 type Engine struct {
-	Backend             storageengine.Engine
-	Replica             storageengine.Replica
-	mvccMetadata        sync.Mutex
-	mvccMetadataVersion uint64
-	QueryOptions        QueryOptions
-	Store               *storage.Store
-	Users               *catalog.Users
-	parseCache          sync.Map
-	parseOrder          [maxParsedStatements]string
-	parseNext           int
-	parseCount          int
-	parseMu             sync.Mutex
+	Backend         storageengine.Engine
+	Replica         storageengine.Replica
+	catalogMutex    sync.Mutex
+	catalogRevision uint64
+	QueryOptions    QueryOptions
+	Store           *storage.Store
+	Users           *catalog.Users
+	parseCache      sync.Map
+	parseOrder      [maxParsedStatements]string
+	parseNext       int
+	parseCount      int
+	parseMu         sync.Mutex
 }
 
 func Open(dataDir, username, password string) (*Engine, error) {
@@ -132,9 +132,9 @@ func (e *Engine) AvailabilityError() error {
 
 // CloseSession rolls back an unfinished MVCC transaction on disconnect.
 func (e *Engine) CloseSession(session *Session) {
-	if session != nil && session.mvccTransaction != nil {
-		session.mvccTransaction.Rollback()
-		session.mvccTransaction = nil
+	if session != nil && session.transaction != nil {
+		session.transaction.Rollback()
+		session.transaction = nil
 	}
 }
 
@@ -197,7 +197,7 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 	defer restoreQuery()
 	defer func() {
 		if resultOut != nil {
-			resultOut.InTransaction = session.mvccTransaction != nil
+			resultOut.InTransaction = session.transaction != nil
 			resultOut.AutocommitDisabled = session.AutocommitDisabled
 		}
 		if errOut == nil && resultOut != nil && len(resultOut.Columns) > 0 {
@@ -1575,9 +1575,13 @@ func bindUnionWithSelect(session *Session, statement parser.Union, selectQuery f
 			}
 			return 0
 		}
+		if limit == 0 {
+			current.Input = discardOutput(current.Input)
+			return current, nil
+		}
 		return bindOrder(session, columns, compare, current.Input, statement.Offset, limit), nil
 	}
-	current.Input = physical.Limit[[]any]{Input: current.Input, Offset: statement.Offset, Count: limit}
+	current.Input = physical.Limit[[]any]{Drain: true, Input: current.Input, Offset: statement.Offset, Count: limit}
 	return current, nil
 }
 
@@ -3202,7 +3206,8 @@ func bindWindow(table *storage.Table, statement parser.Select, columns []storage
 		result.Columns = append(result.Columns, plan.column)
 	}
 
-	window := physical.Window[storage.Row, []any]{Input: source, NewStore: func() (physical.PartitionStore[storage.Row], error) {
+	// The selected memory store keeps each owned row stable until Close.
+	window := physical.Window[storage.Row, []any]{Retain: func(row storage.Row) storage.Row { return row }, Input: source, NewStore: func() (physical.PartitionStore[storage.Row], error) {
 		account := newQueryMemoryAccount(session, "window query")
 		return &physical.MemoryPartitionStore[storage.Row]{Clone: func(row storage.Row) storage.Row { return append(storage.Row(nil), row...) }, Charge: func(row storage.Row) error {
 			return account.Reserve(queryStorageRowBytes(row) + int64(128+len(plans)*128))
@@ -3692,16 +3697,9 @@ func bindGroupedSelect(table *storage.Table, statement parser.Select, columns []
 		inheritExpressionColumn(&resultColumns[index], expression, table)
 	}
 
-	account := newQueryMemoryAccount(session, "GROUP BY")
-	groups := make(map[string]int)
-	buckets := make([]groupedBucket, 0)
-	if len(groupIndexes) == 0 {
-		if err := account.Reserve(aggregateBucketBytes(nil, "", len(items), len(aggregateNodes))); err != nil {
-			return nil, err
-		}
-		groups[""] = 0
-		buckets = append(buckets, groupedBucket{states: make([]aggregateState, len(items)), aggregates: make(map[string]aggregateState)})
-	}
+	var account *queryMemoryAccount
+	var groups map[string]int
+	var buckets []groupedBucket
 	add := func(row storage.Row) error {
 		groupValues := make([]any, len(groupIndexes))
 		for index, expression := range groupExpressions {
@@ -3799,6 +3797,17 @@ func bindGroupedSelect(table *storage.Table, statement parser.Select, columns []
 		return resultRow, nil
 	}
 	op := physical.Aggregate[storage.Row, groupedBucket]{Input: source, New: func() (physical.Accumulator[storage.Row, groupedBucket], error) {
+		account = newQueryMemoryAccount(session, "GROUP BY")
+		groups = make(map[string]int)
+		buckets = make([]groupedBucket, 0)
+		if len(groupIndexes) == 0 {
+			if err := account.Reserve(aggregateBucketBytes(nil, "", len(items), len(aggregateNodes))); err != nil {
+				return nil, err
+			}
+			groups[""] = 0
+			buckets = append(buckets, groupedBucket{states: make([]aggregateState, len(items)), aggregates: make(map[string]aggregateState)})
+		}
+
 		return &aggregateBinding[storage.Row, groupedBucket]{add: add, finish: func(y physical.Yield[groupedBucket]) error {
 			for _, bucket := range buckets {
 				if err := y(bucket); err != nil {
@@ -3838,13 +3847,16 @@ func bindGroupedSelect(table *storage.Table, statement parser.Select, columns []
 		}
 		local := *session
 		local.StreamResults = false
+		if limit == 0 {
+			return &boundQuery{Columns: resultColumns, Input: discardOutput(output)}, nil
+		}
 		return bindOrder(&local, resultColumns, compare, output, statement.Offset, limit), nil
 	}
 	limit := -1
 	if statement.HasLimit {
 		limit = statement.Limit
 	}
-	return &boundQuery{Columns: resultColumns, Input: physical.Limit[[]any]{Input: output, Offset: statement.Offset, Count: limit}}, nil
+	return &boundQuery{Columns: resultColumns, Input: physical.Limit[[]any]{Drain: true, Input: output, Offset: statement.Offset, Count: limit}}, nil
 }
 
 func isCountExpression(expression string) bool {
@@ -7323,5 +7335,5 @@ func quoteIdentifier(value string) string {
 var _ = time.Time{}
 
 func (s *Session) InTransaction() bool {
-	return s != nil && s.mvccTransaction != nil
+	return s != nil && s.transaction != nil
 }

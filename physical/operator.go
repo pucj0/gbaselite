@@ -198,6 +198,8 @@ func (s Sort[T]) Run(ctx context.Context, y Yield[T]) (err error) {
 }
 
 type Limit[T any] struct {
+	// Drain preserves evaluation of upstream blocking results after enough rows emit.
+	Drain         bool
 	Input         Operator[T]
 	Offset, Count int
 } // Count < 0 means unlimited.
@@ -205,12 +207,15 @@ func (l Limit[T]) Run(ctx context.Context, y Yield[T]) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if l.Count == 0 {
+	if l.Count == 0 && !l.Drain {
 		return nil
 	}
 	stop := errors.New("physical limit complete")
 	seen, n := 0, 0
 	err := l.Input.Run(ctx, func(r T) error {
+		if l.Count >= 0 && n >= l.Count {
+			return nil
+		}
 		if seen < l.Offset {
 			seen++
 			return nil
@@ -219,7 +224,7 @@ func (l Limit[T]) Run(ctx context.Context, y Yield[T]) error {
 			return err
 		}
 		n++
-		if l.Count >= 0 && n >= l.Count {
+		if l.Count >= 0 && n >= l.Count && !l.Drain {
 			return stop
 		}
 		return nil
@@ -282,6 +287,9 @@ func (m Materialize[T]) Run(ctx context.Context, y Yield[T]) error {
 // random access without requiring a whole partition slice. Evaluate remains a
 // compatibility boundary for existing SQL frame evaluators.
 type Window[A, B any] struct {
+	// Retain owns an At result for the compatibility slice evaluator. Required
+	// with a custom store unless EvaluateStore is used.
+	Retain        func(A) A
 	Input         Operator[A]
 	NewStore      func() (PartitionStore[A], error)
 	EvaluateStore func(context.Context, PartitionStore[A], Yield[B]) error
@@ -315,11 +323,17 @@ func (w Window[A, B]) Run(ctx context.Context, y Yield[B]) (err error) {
 	if w.EvaluateStore != nil {
 		return w.EvaluateStore(ctx, store, emit)
 	}
+	if w.NewStore != nil && w.Retain == nil {
+		return errors.New("Window slice evaluator requires Retain with custom store")
+	}
 	rows := make([]A, store.Len())
 	for i := range rows {
 		rows[i], err = store.At(ctx, i)
 		if err != nil {
 			return err
+		}
+		if w.Retain != nil {
+			rows[i] = w.Retain(rows[i])
 		}
 	}
 	return w.Evaluate(rows, emit)

@@ -10,12 +10,12 @@ func TestMVCCReadCacheFollowsVisibleCatalog(t *testing.T) {
 	run("CREATE TABLE cached(id INT PRIMARY KEY,v INT)")
 	run("INSERT INTO cached VALUES(1,10)")
 	run("SELECT v FROM cached WHERE id=1")
-	first := s.mvccReadCache
+	first := s.tableReadCache
 	if first == nil {
 		t.Fatal("cache not populated")
 	}
 	run("SELECT v FROM cached WHERE id=1")
-	if first != s.mvccReadCache {
+	if first != s.tableReadCache {
 		t.Fatal("unchanged directory decoded again")
 	}
 	run("BEGIN")
@@ -24,7 +24,7 @@ func TestMVCCReadCacheFollowsVisibleCatalog(t *testing.T) {
 	if _, err := e.Execute(other, "ALTER TABLE cached ADD COLUMN n INT DEFAULT 7"); err != nil {
 		t.Fatal(err)
 	}
-	if r := run("SELECT * FROM cached WHERE id=1"); len(r.Columns) != 2 || s.mvccReadCache != first {
+	if r := run("SELECT * FROM cached WHERE id=1"); len(r.Columns) != 2 || s.tableReadCache != first {
 		t.Fatal("old snapshot lost", r)
 	}
 	run("ROLLBACK")
@@ -49,7 +49,7 @@ func TestMVCCReadCacheFollowsVisibleCatalog(t *testing.T) {
 		t.Fatal("cached row data", r)
 	}
 	e.ResetConnection(s)
-	if s.mvccReadCache != nil {
+	if s.tableReadCache != nil {
 		t.Fatal("connection reset retained cache")
 	}
 }
@@ -72,7 +72,7 @@ func BenchmarkMVCCReadTableMetadata(b *testing.B) {
 		b.Run(fmt.Sprint(cached), func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				if _, _, _, err := loadVersionedTableInternal(s.mvccTransaction, s, "t", cached); err != nil {
+				if _, _, _, err := loadVersionedTableInternal(s.transaction, s, "t", cached); err != nil {
 					b.Fatal(err)
 				}
 			}

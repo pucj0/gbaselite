@@ -51,8 +51,8 @@ func versionedName(session *Session, table string) (string, string, error) {
 	return strings.ToLower(database), strings.ToLower(name), nil
 }
 func (e *Engine) refreshSQLMetadata(ctx context.Context) error {
-	e.mvccMetadata.Lock()
-	defer e.mvccMetadata.Unlock()
+	e.catalogMutex.Lock()
+	defer e.catalogMutex.Unlock()
 	var head uint64
 	var err error
 	var open func() (storageengine.Iterator, error)
@@ -75,7 +75,7 @@ func (e *Engine) refreshSQLMetadata(ctx context.Context) error {
 			return tx.NewIterator(ctx, storageengine.ScanRequest{Space: sqllayout.Catalog})
 		}
 	}
-	if head == e.mvccMetadataVersion {
+	if head == e.catalogRevision {
 		return nil
 	}
 	mirror := storage.NewStore()
@@ -124,7 +124,7 @@ func (e *Engine) refreshSQLMetadata(ctx context.Context) error {
 	if err = e.Store.ReplaceShared(mirror.SharedSnapshot()); err != nil {
 		return err
 	}
-	e.mvccMetadataVersion = head
+	e.catalogRevision = head
 	return nil
 }
 
@@ -156,7 +156,7 @@ func loadVersionedTableInternal(tx storageengine.Txn, session *Session, name str
 	// Always read through the current transaction before using decoded metadata.
 	// A cached definition is immutable and never handed to mutation/DDL paths.
 	if cacheRead {
-		if c := session.mvccReadCache; c != nil && bytes.Equal(c.key, catalogKey) && bytes.Equal(c.encoded, value) {
+		if c := session.tableReadCache; c != nil && bytes.Equal(c.key, catalogKey) && bytes.Equal(c.encoded, value) {
 			return c.definition, c.schema, catalogKey, nil
 		}
 	}
@@ -169,7 +169,7 @@ func loadVersionedTableInternal(tx storageengine.Txn, session *Session, name str
 	}
 	schema, err := storage.NewTransientTable(table, definition.Definition.Columns)
 	if err == nil && cacheRead && len(value) <= 4096 && len(definition.Definition.Columns) <= 32 && len(definition.Definition.Indexes) <= 16 {
-		session.mvccReadCache = &sqlReadTableCache{key: catalogKey, encoded: value, definition: definition, schema: schema}
+		session.tableReadCache = &sqlReadTableCache{key: catalogKey, encoded: value, definition: definition, schema: schema}
 	}
 	return definition, schema, catalogKey, err
 }
@@ -206,38 +206,38 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 	}
 	switch statement.(type) {
 	case parser.Begin:
-		if session.mvccTransaction != nil {
+		if session.transaction != nil {
 			return nil, errors.New("transaction already active")
 		}
 		tx, err := e.Backend.Begin(ctx)
-		session.mvccTransaction = tx
+		session.transaction = tx
 		return &Result{Message: "MVCC transaction started"}, err
 	case parser.Commit:
-		if session.mvccTransaction == nil {
+		if session.transaction == nil {
 			return &Result{Message: "no active transaction"}, nil
 		}
-		tx := session.mvccTransaction
-		session.mvccTransaction = nil
+		tx := session.transaction
+		session.transaction = nil
 		_, err := tx.Commit(ctx)
 		if err != nil {
 			return nil, err
 		}
 		return &Result{Message: "MVCC transaction committed"}, e.refreshSQLMetadata(ctx)
 	case parser.Rollback:
-		if session.mvccTransaction != nil {
-			session.mvccTransaction.Rollback()
-			session.mvccTransaction = nil
+		if session.transaction != nil {
+			session.transaction.Rollback()
+			session.transaction = nil
 		}
 		return &Result{Message: "MVCC transaction rolled back"}, nil
 	}
-	tx := session.mvccTransaction
+	tx := session.transaction
 	if tx == nil && session.AutocommitDisabled && sqlStartsImplicitTransaction(statement) {
 		var err error
 		tx, err = e.Backend.Begin(ctx)
 		if err != nil {
 			return nil, err
 		}
-		session.mvccTransaction = tx
+		session.transaction = tx
 	}
 	automatic := tx == nil
 	if automatic {
@@ -296,9 +296,9 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		return nil, err
 	}
 	if _, err = child.Commit(ctx); err != nil {
-		if session.mvccTransaction != nil {
-			session.mvccTransaction.Rollback()
-			session.mvccTransaction = nil
+		if session.transaction != nil {
+			session.transaction.Rollback()
+			session.transaction = nil
 		}
 		return nil, err
 	}

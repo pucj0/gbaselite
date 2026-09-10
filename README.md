@@ -1250,3 +1250,5 @@ Aggregate 的 Accumulator 与 Window 的 PartitionStore/EvaluateStore 为外部�
 离线迁移编排与 snapshot/paged reader 已移至 migration/legacy，生产 Executor 不再读取旧存储格式。migrate-legacy 命令及源目录只读、目标重开验证语义保持不变。Go 调用入口改为 legacy.Migrate(ctx, source, target, opener)，由命令装配 executor.Open；逻辑 ImportSnapshot/VerifySnapshot 只面向隔离目标，导入失败必须丢弃目标（包含独立计数器变化）。
 
 迁移发布先同步复制文件与验证后的目标文件，再在 Linux 同步各级目录，并使用原子 no-replace rename 发布、同步父目录；Windows 使用文件 Flush 与 write-through、不覆盖重命名（不声称提供 Unix 目录 fsync）。发布前失败清理 staging；发布后同步或恢复阶段报错时保留完整且已验证的目标，重新运行不会覆盖它。当前原子迁移发布支持 Linux/Windows；操作系统或文件系统不支持所需同步/rename 时显式失败。
+
+取消中间物化仍保留已有 GROUP BY/UNION 的求值顺序：最终 LIMIT 只控制输出行数，相关上游继续求值，以保留未输出分组的表达式副作用和错误；普通扫描 LIMIT 继续提前结束。

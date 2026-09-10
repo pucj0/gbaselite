@@ -116,9 +116,9 @@ func (e *legacyEngine) CloseSession(session *Session) {
 	if session == nil {
 		return
 	}
-	if session.mvccTransaction != nil {
-		session.mvccTransaction.Rollback()
-		session.mvccTransaction = nil
+	if session.transaction != nil {
+		session.transaction.Rollback()
+		session.transaction = nil
 	}
 	rolledBack := e.legacyState(session).transaction != nil
 	e.finishTransaction(session)
@@ -165,7 +165,7 @@ func (e *legacyEngine) executeStatement(session *Session, statement parser.State
 	defer restoreQuery()
 	defer func() {
 		if resultOut != nil {
-			resultOut.InTransaction = session.mvccTransaction != nil || e.legacyState(session).transaction != nil
+			resultOut.InTransaction = session.transaction != nil || e.legacyState(session).transaction != nil
 			resultOut.AutocommitDisabled = session.AutocommitDisabled
 		}
 		if errOut == nil && resultOut != nil && len(resultOut.Columns) > 0 {
