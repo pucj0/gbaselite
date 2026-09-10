@@ -125,6 +125,12 @@ func ReserveCounter(ctx context.Context, e Engine, key string, count uint64) (ui
 	return c.ReserveCounter(ctx, key, count)
 }
 
+// LeaderVerifier is an optional capability of a Replica, independent of Engine.
+// It confirms quorum-backed leadership without establishing an FSM read barrier.
+type LeaderVerifier interface {
+	VerifyLeader(context.Context) error
+}
+
 type Replica interface {
 	Barrier(context.Context) error
 	Status() ReplicationStatus

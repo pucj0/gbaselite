@@ -3,6 +3,7 @@ package replication
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"gbaselite/mvcc"
 	"github.com/hashicorp/raft"
@@ -86,6 +87,28 @@ func TestThreeNodeFailoverAndMinority(t *testing.T) {
 		}
 	}
 	first := leader()
+	// A verification must not append a barrier log or wait for FSM apply.
+	beforeVerify := nodes[first].raft.LastIndex()
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), time.Second)
+	if err := nodes[first].VerifyLeader(verifyCtx); err != nil {
+		t.Fatal(err)
+	}
+	verifyCancel()
+	if nodes[first].raft.LastIndex() != beforeVerify {
+		t.Fatal("leader verification appended a Raft log entry")
+	}
+	canceled, cancelVerify := context.WithCancel(context.Background())
+	cancelVerify()
+	if err := nodes[first].VerifyLeader(canceled); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	for i, n := range nodes {
+		if i != first {
+			if err := n.VerifyLeader(context.Background()); err == nil {
+				t.Fatal("follower verified leadership")
+			}
+		}
+	}
 	put(first, "a", "confirmed")
 	if err := nodes[first].raft.Snapshot().Error(); err != nil {
 		t.Fatal(err)
@@ -125,6 +148,9 @@ func TestThreeNodeFailoverAndMinority(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	if err := nodes[second].VerifyLeader(ctx); err == nil {
+		t.Fatal("minority verified leadership")
+	}
 	if err := nodes[second].Barrier(ctx); err == nil {
 		t.Fatal("minority accepted linearizable operation")
 	}

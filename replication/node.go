@@ -208,6 +208,18 @@ func timeout(ctx context.Context) time.Duration {
 	}
 	return 5 * time.Second
 }
+
+// VerifyLeader confirms local leadership with the quorum, without waiting for
+// FSM apply ordering. Linearizable SQL reads must continue to use Barrier.
+func (n *Node) VerifyLeader(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := n.check(); err != nil {
+		return err
+	}
+	return wait(ctx, n.raft.VerifyLeader())
+}
 func (n *Node) Barrier(ctx context.Context) error {
 	if err := n.check(); err != nil {
 		return err
