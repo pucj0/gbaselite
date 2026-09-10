@@ -36,10 +36,10 @@ func rangeTestEngine(t *testing.T) (*Engine, *Session, func(string) *Result) {
 func TestMVCCOrderedIntegerKeys(t *testing.T) {
 	numbers := []int64{math.MinInt64, -9007199254740992, -100000, -10, -1, 0, 1, 9, 10, 99, 100, 9007199254740992, math.MaxInt64}
 	for i, n := range numbers {
-		if len(mvccIntegerKey(n)) != 8 {
+		if len(sqlIntegerKey(n)) != 8 {
 			t.Fatal(n)
 		}
-		if i > 0 && bytes.Compare(mvccIntegerKey(numbers[i-1]), mvccIntegerKey(n)) >= 0 {
+		if i > 0 && bytes.Compare(sqlIntegerKey(numbers[i-1]), sqlIntegerKey(n)) >= 0 {
 			t.Fatal("key order", n)
 		}
 	}
@@ -119,7 +119,7 @@ func TestMVCCRangeSQLMatchesFullScan(t *testing.T) {
 	fast, schema, _, _ := loadVersionedTable(read, s, "fast")
 	slow, _, _, _ := loadVersionedTable(read, s, "slow")
 	expr, _ := parser.ParseExpression("id >= 5009 AND id < 5021")
-	plan, ok := mvccPrimaryRange(expr, fast, schema)
+	plan, ok := sqlPrimaryRange(expr, fast, schema)
 	if !ok {
 		t.Fatal("no range plan")
 	}
@@ -130,7 +130,7 @@ func TestMVCCRangeSQLMatchesFullScan(t *testing.T) {
 	if err != nil || count != 4 || stats.StoredKeys != 4 {
 		t.Fatalf("bounded SQL plan: count %d stats %+v error %v", count, stats, err)
 	}
-	if _, ok = mvccPrimaryRange(expr, slow, schema); ok {
+	if _, ok = sqlPrimaryRange(expr, slow, schema); ok {
 		t.Fatal("legacy text keys treated as ordered")
 	}
 	for _, text := range []string{"id > 9007199254740992", "id>0 OR id<10", "id>0 AND missing=1", "id>1.5", "id IS NULL", "id BETWEEN '1' AND '10'"} {
@@ -138,7 +138,7 @@ func TestMVCCRangeSQLMatchesFullScan(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := mvccPrimaryRange(expr, fast, schema); ok {
+		if _, ok := sqlPrimaryRange(expr, fast, schema); ok {
 			t.Fatalf("unsafe plan for %s", text)
 		}
 	}
@@ -219,7 +219,7 @@ func TestMVCCUnsupportedKeyLayouts(t *testing.T) {
 		}
 	}
 	def := versionedTable{KeyEncoding: 99}
-	if validateMVCCKeyEncoding(def) == nil {
+	if validateSQLKeyEncoding(def) == nil {
 		t.Fatal("unknown layout accepted")
 	}
 }

@@ -43,7 +43,7 @@ func TestMVCCExplainMatchesAccessPlan(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		plan := planMVCCAccess(stmt.(parser.Select), table, schema, s)
+		plan := planSQLAccess(stmt.(parser.Select), table, schema, s)
 		tx.Rollback()
 		if plan.index != c.key {
 			t.Fatal("EXPLAIN/execution selected different keys")

@@ -43,7 +43,7 @@ func secondaryPart(v storage.Value) []byte {
 		return []byte{0}
 	}
 	if v.Type == storage.TypeInt || v.Type == storage.TypeBigInt {
-		return append([]byte{1}, mvccIntegerKey(v.Int64)...)
+		return append([]byte{1}, sqlIntegerKey(v.Int64)...)
 	}
 	p := []byte{1}
 	for _, c := range []byte(v.Text) {
@@ -87,7 +87,7 @@ func secondaryEntry(table versionedTable, positions []int, owner []byte, row sto
 			projected[i] = storage.Value{Type: v.Type, Null: true}
 		}
 	}
-	encoded, err := encodeMVCCRow(table, projected)
+	encoded, err := encodeSQLRow(table, projected)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -144,9 +144,9 @@ func prefixSuccessor(p []byte) []byte {
 	}
 	return nil
 }
-func planMVCCSecondary(s parser.Select, table versionedTable, schema *storage.Table, session *Session) (mvccAccessPlan, bool) {
+func planSQLSecondary(s parser.Select, table versionedTable, schema *storage.Table, session *Session) (sqlAccessPlan, bool) {
 	if table.SecondaryEncoding != 1 || !safeMutationIndexExpression(s.Where, schema) {
-		return mvccAccessPlan{}, false
+		return sqlAccessPlan{}, false
 	}
 	hasIndex := false
 	for _, idx := range table.Definition.Indexes {
@@ -156,7 +156,7 @@ func planMVCCSecondary(s parser.Select, table versionedTable, schema *storage.Ta
 		}
 	}
 	if !hasIndex {
-		return mvccAccessPlan{}, false
+		return sqlAccessPlan{}, false
 	}
 	equal := make(map[int]storage.Value)
 	var visit func(parser.Expr)
@@ -202,9 +202,9 @@ func planMVCCSecondary(s parser.Select, table versionedTable, schema *storage.Ta
 		}
 	}
 	visit(s.Where)
-	needed := mvccProjectionMask(s, schema)
+	needed := sqlProjectionMask(s, schema)
 	bestPrefix := 0
-	var best mvccAccessPlan
+	var best sqlAccessPlan
 	for _, idx := range table.Definition.Indexes {
 		positions, ok := secondaryColumns(table, idx)
 		if !ok {
@@ -232,12 +232,12 @@ func planMVCCSecondary(s parser.Select, table versionedTable, schema *storage.Ta
 		}
 		if n > bestPrefix || n == bestPrefix && covered && !best.covering {
 			bestPrefix = n
-			best = mvccAccessPlan{kind: "ref", index: idx.Name, space: sqllayout.SecondaryIndex(table.ID, idx.Name), bounds: storageengine.KeyRange{Lower: prefix, LowerInclusive: true, Upper: prefixSuccessor(prefix)}, covering: covered}
+			best = sqlAccessPlan{kind: "ref", index: idx.Name, space: sqllayout.SecondaryIndex(table.ID, idx.Name), bounds: storageengine.KeyRange{Lower: prefix, LowerInclusive: true, Upper: prefixSuccessor(prefix)}, covering: covered}
 		}
 	}
 	return best, bestPrefix > 0
 }
-func (p mvccAccessPlan) scanSecondary(ctx context.Context, tx storageengine.Txn, table versionedTable, yield func([]byte, []byte) error) error {
+func (p sqlAccessPlan) scanSecondary(ctx context.Context, tx storageengine.Txn, table versionedTable, yield func([]byte, []byte) error) error {
 	iterator, err := tx.Table(table.ID).Index(p.index, storageengine.SecondaryIndex).Scan(ctx, storageengine.ScanRequest{Range: p.bounds})
 	if err != nil {
 		return err

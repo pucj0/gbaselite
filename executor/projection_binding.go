@@ -8,7 +8,7 @@ import (
 
 // A nil mask means decode all columns. Fall back for expressions whose column
 // dependencies are not known here; never infer dependencies from SQL text.
-func mvccProjectionMask(statement parser.Select, schema *storage.Table) []bool {
+func sqlProjectionMask(statement parser.Select, schema *storage.Table) []bool {
 	needed := make([]bool, len(schema.ColumnsView()))
 	var visit func(parser.Expr) bool
 	visit = func(expr parser.Expr) bool {

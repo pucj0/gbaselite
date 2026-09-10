@@ -7,19 +7,19 @@ import (
 	"gbaselite/storageengine"
 )
 
-const mvccBatchBytes = 64 << 10
-const mvccBatchRows = 128
+const sqlBatchBytes = 64 << 10
+const sqlBatchRows = 128
 
-type mvccBatchEntry struct{ value []byte }
+type sqlBatchEntry struct{ value []byte }
 
 // scanBatches owns its encoded values. Consumers run outside storage read views;
 // the batch is released before more input is fetched. A single wide row is
 // permitted, so the byte target is not a process-memory limit.
-func (p mvccAccessPlan) scanBatches(ctx context.Context, tx storageengine.Txn, table versionedTable, rowLimit int, consume func([]mvccBatchEntry) error) error {
-	if rowLimit <= 0 || rowLimit > mvccBatchRows {
-		rowLimit = mvccBatchRows
+func (p sqlAccessPlan) scanBatches(ctx context.Context, tx storageengine.Txn, table versionedTable, rowLimit int, consume func([]sqlBatchEntry) error) error {
+	if rowLimit <= 0 || rowLimit > sqlBatchRows {
+		rowLimit = sqlBatchRows
 	}
-	batch := make([]mvccBatchEntry, 0, rowLimit)
+	batch := make([]sqlBatchEntry, 0, rowLimit)
 	used := 0
 	flush := func() error {
 		if err := ctx.Err(); err != nil {
@@ -33,12 +33,12 @@ func (p mvccAccessPlan) scanBatches(ctx context.Context, tx storageengine.Txn, t
 	}
 	visit := func(_, value []byte) error {
 		cost := len(value) + 24
-		if len(batch) > 0 && (used+cost > mvccBatchBytes || len(batch) >= rowLimit) {
+		if len(batch) > 0 && (used+cost > sqlBatchBytes || len(batch) >= rowLimit) {
 			if err := flush(); err != nil {
 				return err
 			}
 		}
-		batch = append(batch, mvccBatchEntry{value: bytes.Clone(value)})
+		batch = append(batch, sqlBatchEntry{value: bytes.Clone(value)})
 		used += cost
 		if len(batch) >= rowLimit {
 			return flush()
@@ -46,7 +46,7 @@ func (p mvccAccessPlan) scanBatches(ctx context.Context, tx storageengine.Txn, t
 		return ctx.Err()
 	}
 	var err error
-	if p.kind == mvccAccessAll {
+	if p.kind == sqlAccessAll {
 		err = tx.ScanRange(ctx, sqllayout.Rows(table.ID), storageengine.KeyRange{}, visit)
 	} else {
 		err = p.scan(ctx, tx, table, visit)

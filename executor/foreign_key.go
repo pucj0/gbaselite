@@ -11,7 +11,7 @@ import (
 	"strings"
 )
 
-func mvccFKIndex(parent versionedTable, fk storage.ForeignKey) (storage.Index, error) {
+func sqlFKIndex(parent versionedTable, fk storage.ForeignKey) (storage.Index, error) {
 	for _, idx := range parent.Definition.Indexes {
 		if !idx.Primary && !idx.Unique || len(idx.Columns) != len(fk.RefColumns) {
 			continue
@@ -26,7 +26,7 @@ func mvccFKIndex(parent versionedTable, fk storage.ForeignKey) (storage.Index, e
 	}
 	return storage.Index{}, fmt.Errorf("%w: referenced columns need a complete unique index", storage.ErrForeignKey)
 }
-func mvccColumnPosition(table versionedTable, name string) int {
+func sqlColumnPosition(table versionedTable, name string) int {
 	for i, c := range table.Definition.Columns {
 		if strings.EqualFold(c.Name, name) {
 			return i
@@ -34,7 +34,7 @@ func mvccColumnPosition(table versionedTable, name string) int {
 	}
 	return -1
 }
-func prepareMVCCForeignKeys(tx storageengine.Txn, table *versionedTable, session *Session) error {
+func prepareSQLForeignKeys(tx storageengine.Txn, table *versionedTable, session *Session) error {
 	seen := map[string]bool{}
 	for i := range table.Definition.ForeignKeys {
 		fk := &table.Definition.ForeignKeys[i]
@@ -66,7 +66,7 @@ func prepareMVCCForeignKeys(tx storageengine.Txn, table *versionedTable, session
 			return storage.ErrForeignKey
 		}
 		for _, name := range fk.Columns {
-			if mvccColumnPosition(*table, name) < 0 {
+			if sqlColumnPosition(*table, name) < 0 {
 				return storage.ErrColumnNotFound
 			}
 		}
@@ -83,11 +83,11 @@ func prepareMVCCForeignKeys(tx storageengine.Txn, table *versionedTable, session
 		if len(fk.Columns) == 0 || len(fk.Columns) != len(fk.RefColumns) {
 			return storage.ErrForeignKey
 		}
-		if _, err = mvccFKIndex(parent, *fk); err != nil {
+		if _, err = sqlFKIndex(parent, *fk); err != nil {
 			return err
 		}
 		for j, name := range fk.Columns {
-			a, b := mvccColumnPosition(*table, name), mvccColumnPosition(parent, fk.RefColumns[j])
+			a, b := sqlColumnPosition(*table, name), sqlColumnPosition(parent, fk.RefColumns[j])
 			if a < 0 || b < 0 {
 				return storage.ErrColumnNotFound
 			}
@@ -117,13 +117,13 @@ func prepareMVCCForeignKeys(tx storageengine.Txn, table *versionedTable, session
 	}
 	return nil
 }
-func mvccFKParentRow(child, parent versionedTable, fk storage.ForeignKey, row storage.Row) (storage.Row, bool, error) {
+func sqlFKParentRow(child, parent versionedTable, fk storage.ForeignKey, row storage.Row) (storage.Row, bool, error) {
 	candidate := make(storage.Row, len(parent.Definition.Columns))
 	for i, c := range parent.Definition.Columns {
 		candidate[i] = storage.NullValue(c.Type)
 	}
 	for i, c := range fk.Columns {
-		a, b := mvccColumnPosition(child, c), mvccColumnPosition(parent, fk.RefColumns[i])
+		a, b := sqlColumnPosition(child, c), sqlColumnPosition(parent, fk.RefColumns[i])
 		if a < 0 || b < 0 {
 			return nil, false, storage.ErrColumnNotFound
 		}
@@ -137,7 +137,7 @@ func mvccFKParentRow(child, parent versionedTable, fk storage.ForeignKey, row st
 
 type foreignChecksContextKey struct{}
 
-func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table versionedTable, oldRow, newRow storage.Row) error {
+func validateSQLReferences(ctx context.Context, tx storageengine.Txn, table versionedTable, oldRow, newRow storage.Row) error {
 	if disabled, _ := ctx.Value(foreignChecksContextKey{}).(bool); disabled {
 		return nil
 	}
@@ -147,11 +147,11 @@ func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table ver
 			if err != nil {
 				return err
 			}
-			idx, err := mvccFKIndex(parent, fk)
+			idx, err := sqlFKIndex(parent, fk)
 			if err != nil {
 				return err
 			}
-			candidate, check, err := mvccFKParentRow(table, parent, fk, newRow)
+			candidate, check, err := sqlFKParentRow(table, parent, fk, newRow)
 			if err != nil {
 				return err
 			}
@@ -161,7 +161,7 @@ func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table ver
 			var owner []byte
 			var exists bool
 			if idx.Primary {
-				owner, exists = mvccPrimaryKey(parent, idx, candidate)
+				owner, exists = sqlPrimaryKey(parent, idx, candidate)
 			} else {
 				key, ok := storage.IndexValueKey(idx, parent.Definition.Columns, candidate)
 				if !ok {
@@ -192,7 +192,7 @@ func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table ver
 	if oldRow == nil {
 		return nil
 	}
-	refs, refErr := mvccForeignReferrers(tx, table)
+	refs, refErr := sqlForeignReferrers(tx, table)
 	if refErr != nil {
 		return refErr
 	}
@@ -208,7 +208,7 @@ func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table ver
 			if !strings.EqualFold(fk.RefTable, table.CatalogName) {
 				continue
 			}
-			idx, err := mvccFKIndex(table, fk)
+			idx, err := sqlFKIndex(table, fk)
 			if err != nil {
 				return err
 			}
@@ -229,11 +229,11 @@ func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table ver
 				return err
 			}
 			err = tx.ScanRange(ctx, sqllayout.Rows(child.ID), storageengine.KeyRange{}, func(_, v []byte) error {
-				row, err := decodeMVCCRow(child, v)
+				row, err := decodeSQLRow(child, v)
 				if err != nil {
 					return err
 				}
-				candidate, check, err := mvccFKParentRow(child, table, fk, row)
+				candidate, check, err := sqlFKParentRow(child, table, fk, row)
 				if err != nil || !check {
 					return err
 				}
@@ -250,11 +250,11 @@ func validateMVCCReferences(ctx context.Context, tx storageengine.Txn, table ver
 	}
 	return nil
 }
-func rejectMVCCReferencedDrop(tx storageengine.Txn, table versionedTable, disabled ...bool) error {
+func rejectSQLReferencedDrop(tx storageengine.Txn, table versionedTable, disabled ...bool) error {
 	if len(disabled) > 0 && disabled[0] {
 		return nil
 	}
-	refs, refErr := mvccForeignReferrers(tx, table)
+	refs, refErr := sqlForeignReferrers(tx, table)
 	if refErr != nil {
 		return refErr
 	}
@@ -275,7 +275,7 @@ func rejectMVCCReferencedDrop(tx storageengine.Txn, table versionedTable, disabl
 	return nil
 }
 
-func mvccForeignReferrers(tx storageengine.Txn, table versionedTable) ([]string, error) {
+func sqlForeignReferrers(tx storageengine.Txn, table versionedTable) ([]string, error) {
 	refs := append([]string(nil), table.Referrers...)
 	seen := map[string]bool{}
 	for _, ref := range refs {

@@ -8,11 +8,11 @@ import (
 	"strings"
 )
 
-func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Query) (*Result, error) {
+func executeSQLExplain(tx storageengine.Txn, session *Session, query parser.Query) (*Result, error) {
 	if union, ok := query.(parser.Union); ok {
 		var combined *Result
 		for i, branch := range union.Queries {
-			result, err := executeMVCCExplain(tx, session, branch)
+			result, err := executeSQLExplain(tx, session, branch)
 			if err != nil {
 				return nil, err
 			}
@@ -37,7 +37,7 @@ func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Que
 	if !ok {
 		return nil, fmt.Errorf("MVCC EXPLAIN supports a single SELECT")
 	}
-	if err := validateMVCCSelectShape(s); err != nil {
+	if err := validateSQLSelectShape(s); err != nil {
 		return nil, err
 	}
 	columns := []Column{{Name: "id", Type: storage.TypeBigInt}, {Name: "select_type", Type: storage.TypeVarchar}, {Name: "table", Type: storage.TypeVarchar, Nullable: true}, {Name: "partitions", Type: storage.TypeVarchar, Nullable: true}, {Name: "type", Type: storage.TypeVarchar, Nullable: true}, {Name: "possible_keys", Type: storage.TypeVarchar, Nullable: true}, {Name: "key", Type: storage.TypeVarchar, Nullable: true}, {Name: "key_len", Type: storage.TypeVarchar, Nullable: true}, {Name: "ref", Type: storage.TypeVarchar, Nullable: true}, {Name: "rows", Type: storage.TypeBigInt, Nullable: true}, {Name: "filtered", Type: storage.TypeDouble, Nullable: true}, {Name: "Extra", Type: storage.TypeText}}
@@ -47,7 +47,7 @@ func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Que
 			return nil, err
 		}
 		schema := inputs[len(inputs)-1].combined
-		if err := bindMVCCExplainClauses(s, schema); err != nil {
+		if err := bindSQLExplainClauses(s, schema); err != nil {
 			return nil, err
 		}
 		for _, item := range s.Items {
@@ -58,11 +58,11 @@ func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Que
 			if err != nil {
 				return nil, err
 			}
-			if err = bindMVCCExplainExpr(expr, schema); err != nil {
+			if err = bindSQLExplainExpr(expr, schema); err != nil {
 				return nil, err
 			}
 		}
-		if err = bindMVCCExplainExpr(s.Where, schema); err != nil {
+		if err = bindSQLExplainExpr(s.Where, schema); err != nil {
 			return nil, err
 		}
 		result := &Result{Columns: columns}
@@ -112,11 +112,11 @@ func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Que
 		if err != nil {
 			return nil, err
 		}
-		if err = bindMVCCExplainExpr(expr, schema); err != nil {
+		if err = bindSQLExplainExpr(expr, schema); err != nil {
 			return nil, err
 		}
 	}
-	if err = bindMVCCExplainExpr(s.Where, schema); err != nil {
+	if err = bindSQLExplainExpr(s.Where, schema); err != nil {
 		return nil, err
 	}
 	for _, order := range s.OrderBy {
@@ -127,11 +127,11 @@ func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Que
 		if err != nil {
 			return nil, err
 		}
-		if err = bindMVCCExplainExpr(expr, schema); err != nil {
+		if err = bindSQLExplainExpr(expr, schema); err != nil {
 			return nil, err
 		}
 	}
-	if err := bindMVCCExplainClauses(s, schema); err != nil {
+	if err := bindSQLExplainClauses(s, schema); err != nil {
 		return nil, err
 	}
 	result := &Result{Columns: columns}
@@ -139,7 +139,7 @@ func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Que
 		result.Rows = [][]any{{int64(1), "SIMPLE", nil, nil, nil, nil, nil, nil, nil, int64(1), nil, "No tables used"}}
 		return result, nil
 	}
-	p := planMVCCAccess(s, table, schema, session)
+	p := planSQLAccess(s, table, schema, session)
 	access := p.kind
 	var selected, possible, rows any
 	if p.index != "" {
@@ -169,7 +169,7 @@ func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Que
 	if s.HasLimit && s.Limit == 0 {
 		extra = append(extra, "Zero limit")
 	}
-	if p.kind == mvccAccessPoint || p.kind == mvccAccessUnique {
+	if p.kind == sqlAccessPoint || p.kind == sqlAccessUnique {
 		access = "const"
 		rows = int64(1)
 		extra = append(extra, "rows is an upper bound")
@@ -189,7 +189,7 @@ func executeMVCCExplain(tx storageengine.Txn, session *Session, query parser.Que
 
 // Resolve column references only. EXPLAIN must not evaluate SLEEP, assignments,
 // user functions or row expressions to fabricate cardinality statistics.
-func bindMVCCExplainExpr(expr parser.Expr, schema *storage.Table, aliases ...map[string]bool) error {
+func bindSQLExplainExpr(expr parser.Expr, schema *storage.Table, aliases ...map[string]bool) error {
 	var children []parser.Expr
 	switch v := expr.(type) {
 	case nil, parser.LiteralExpr:
@@ -238,14 +238,14 @@ func bindMVCCExplainExpr(expr parser.Expr, schema *storage.Table, aliases ...map
 		return fmt.Errorf("unsupported MVCC EXPLAIN expression %T", expr)
 	}
 	for _, child := range children {
-		if err := bindMVCCExplainExpr(child, schema, aliases...); err != nil {
+		if err := bindSQLExplainExpr(child, schema, aliases...); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func bindMVCCExplainClauses(s parser.Select, schema *storage.Table) error {
+func bindSQLExplainClauses(s parser.Select, schema *storage.Table) error {
 	aliases := make(map[string]bool)
 	for _, item := range s.Items {
 		if item.Alias != "" {
@@ -261,9 +261,9 @@ func bindMVCCExplainClauses(s parser.Select, schema *storage.Table) error {
 		if err != nil {
 			return err
 		}
-		if err = bindMVCCExplainExpr(expr, schema, aliases); err != nil {
+		if err = bindSQLExplainExpr(expr, schema, aliases); err != nil {
 			return err
 		}
 	}
-	return bindMVCCExplainExpr(s.Having, schema, aliases)
+	return bindSQLExplainExpr(s.Having, schema, aliases)
 }

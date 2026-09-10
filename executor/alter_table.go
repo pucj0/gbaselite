@@ -16,7 +16,7 @@ func (t versionedTable) counterKey(name string) string {
 	}
 	return sqllayout.Counter(t.ID, name)
 }
-func mvccAlterTarget(statement parser.Statement) (string, bool) {
+func sqlAlterTarget(statement parser.Statement) (string, bool) {
 	switch v := statement.(type) {
 	case parser.CreateIndex:
 		return v.Table, true
@@ -45,12 +45,12 @@ func mvccAlterTarget(statement parser.Statement) (string, bool) {
 	}
 	return "", false
 }
-func (e *Engine) alterMVCC(ctx context.Context, read, write storageengine.Txn, session *Session, name string, statement parser.Statement) (*Result, error) {
+func (e *Engine) alterSQL(ctx context.Context, read, write storageengine.Txn, session *Session, name string, statement parser.Statement) (*Result, error) {
 	old, _, catalog, err := loadVersionedTable(read, session, name)
 	if err != nil {
 		return nil, err
 	}
-	if err = rejectMVCCReferencedDrop(write, old, session.ForeignKeyChecksDisabled); err != nil {
+	if err = rejectSQLReferencedDrop(write, old, session.ForeignKeyChecksDisabled); err != nil {
 		return nil, fmt.Errorf("alter referenced table: %w", err)
 	}
 	dbName, tableName, err := versionedName(session, name)
@@ -85,13 +85,13 @@ func (e *Engine) alterMVCC(ctx context.Context, read, write storageengine.Txn, s
 		actions = batch.Actions
 	}
 	for _, action := range actions {
-		if _, ok := mvccAlterTarget(action); !ok {
+		if _, ok := sqlAlterTarget(action); !ok {
 			return nil, fmt.Errorf("unsupported MVCC ALTER action")
 		}
 		switch v := action.(type) {
 		case parser.AlterCheck:
 			if !v.Drop {
-				if err := validateMVCCCheckDefinition(table, v.Check.Expression); err != nil {
+				if err := validateSQLCheckDefinition(table, v.Check.Expression); err != nil {
 					return nil, err
 				}
 			}
@@ -138,9 +138,9 @@ func (e *Engine) alterMVCC(ctx context.Context, read, write storageengine.Txn, s
 			delete(origins, strings.ToLower(v.Name))
 		}
 	}
-	definition := versionedTable{CatalogName: dbName + "." + tableName, ID: write.ID() + "/" + tableName, RowEncoding: mvccCompactRowEncoding, SecondaryEncoding: 1, Definition: table.Snapshot(), CounterKeys: make(map[string]string)}
-	if _, ok := mvccIntegerPrimary(definition); ok {
-		definition.KeyEncoding = mvccIntegerKeyEncoding
+	definition := versionedTable{CatalogName: dbName + "." + tableName, ID: write.ID() + "/" + tableName, RowEncoding: sqlCompactRowEncoding, SecondaryEncoding: 1, Definition: table.Snapshot(), CounterKeys: make(map[string]string)}
+	if _, ok := sqlIntegerPrimary(definition); ok {
+		definition.KeyEncoding = sqlIntegerKeyEncoding
 	}
 	for _, c := range definition.Definition.Columns {
 		if c.AutoIncrement {
@@ -154,7 +154,7 @@ func (e *Engine) alterMVCC(ctx context.Context, read, write storageengine.Txn, s
 			return nil, fmt.Errorf("MVCC ON UPDATE column expressions are not supported")
 		}
 	}
-	if err = prepareMVCCForeignKeys(write, &definition, session); err != nil {
+	if err = prepareSQLForeignKeys(write, &definition, session); err != nil {
 		return nil, err
 	}
 	if err = write.GuardRange(sqllayout.Rows(old.ID), storageengine.KeyRange{}); err != nil {
@@ -162,7 +162,7 @@ func (e *Engine) alterMVCC(ctx context.Context, read, write storageengine.Txn, s
 	}
 	count := uint64(0)
 	err = read.ScanRange(ctx, sqllayout.Rows(old.ID), storageengine.KeyRange{}, func(k, v []byte) error {
-		row, err := decodeMVCCRow(old, v)
+		row, err := decodeSQLRow(old, v)
 		if err != nil {
 			return err
 		}
@@ -197,7 +197,7 @@ func (e *Engine) alterMVCC(ctx context.Context, read, write storageengine.Txn, s
 	}
 	return &Result{AffectedRows: count, Message: "MVCC schema and rebuilt indexes staged atomically", MetadataChanged: true}, nil
 }
-func validateMVCCCheckDefinition(table *storage.Table, definition string) error {
+func validateSQLCheckDefinition(table *storage.Table, definition string) error {
 	expr, err := parser.ParseExpression(definition)
 	if err != nil {
 		return err

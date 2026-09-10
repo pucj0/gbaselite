@@ -32,7 +32,7 @@ func TestMVCCUniqueLookupAndOverlay(t *testing.T) {
 		t.Fatal(err)
 	}
 	expr, _ := parser.ParseExpression("a=10 AND b=20")
-	if _, _, ok := mvccUniqueAccess(expr, table, schema); !ok {
+	if _, _, ok := sqlUniqueAccess(expr, table, schema); !ok {
 		t.Fatal("unique path not selected")
 	}
 	run("BEGIN")

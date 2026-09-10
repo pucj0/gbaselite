@@ -203,9 +203,9 @@ func (e *Engine) importLegacySnapshot(ctx context.Context, snapshot storage.Stor
 		}
 		for i, table := range db.Tables {
 			table.Rows = nil
-			definition := versionedTable{CatalogName: strings.ToLower(db.Name) + "." + strings.ToLower(table.Name), ID: fmt.Sprintf("%s/%s/%d", tx.ID(), strings.ToLower(db.Name), i), Definition: table, RowEncoding: mvccCompactRowEncoding, SecondaryEncoding: 1}
-			if _, ok := mvccIntegerPrimary(definition); ok {
-				definition.KeyEncoding = mvccIntegerKeyEncoding
+			definition := versionedTable{CatalogName: strings.ToLower(db.Name) + "." + strings.ToLower(table.Name), ID: fmt.Sprintf("%s/%s/%d", tx.ID(), strings.ToLower(db.Name), i), Definition: table, RowEncoding: sqlCompactRowEncoding, SecondaryEncoding: 1}
+			if _, ok := sqlIntegerPrimary(definition); ok {
+				definition.KeyEncoding = sqlIntegerKeyEncoding
 			}
 			encoded, err := encodeVersioned(definition)
 			if err != nil {
@@ -224,11 +224,11 @@ func (e *Engine) importLegacySnapshot(ctx context.Context, snapshot storage.Stor
 				return err
 			}
 			for _, check := range table.CheckConstraints {
-				if err = validateMVCCCheckDefinition(schema, check.Expression); err != nil {
+				if err = validateSQLCheckDefinition(schema, check.Expression); err != nil {
 					return err
 				}
 			}
-			if err = prepareMVCCForeignKeys(tx, &definition, session); err != nil {
+			if err = prepareSQLForeignKeys(tx, &definition, session); err != nil {
 				return fmt.Errorf("migrate %s: %w", definition.CatalogName, err)
 			}
 			encoded, err := encodeVersioned(definition)
@@ -265,7 +265,7 @@ func (e *Engine) importLegacySnapshot(ctx context.Context, snapshot storage.Stor
 				return err
 			}
 			for _, row := range table.Rows {
-				if err = validateMVCCReferences(ctx, tx, definition, nil, row); err != nil {
+				if err = validateSQLReferences(ctx, tx, definition, nil, row); err != nil {
 					return fmt.Errorf("migrate %s: %w", definition.CatalogName, err)
 				}
 			}
@@ -299,7 +299,7 @@ func (e *Engine) verifyLegacySnapshot(ctx context.Context, snapshot storage.Stor
 				for _, index := range table.Indexes {
 					if index.Primary {
 						var ok bool
-						key, ok = mvccPrimaryKey(definition, index, row)
+						key, ok = sqlPrimaryKey(definition, index, row)
 						if !ok {
 							return fmt.Errorf("invalid primary key")
 						}
@@ -309,7 +309,7 @@ func (e *Engine) verifyLegacySnapshot(ctx context.Context, snapshot storage.Stor
 				if err != nil {
 					return err
 				}
-				want, err := encodeMVCCRow(definition, row)
+				want, err := encodeSQLRow(definition, row)
 				if err != nil {
 					return err
 				}

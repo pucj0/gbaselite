@@ -19,7 +19,7 @@ func executePhysicalSelect(ctx context.Context, tx storageengine.Txn, session *S
 	return collectBoundQuery(session, query, false)
 }
 func bindPhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Session, statement parser.Select) (*boundQuery, error) {
-	if err := validateMVCCSelectShape(statement); err != nil {
+	if err := validateSQLSelectShape(statement); err != nil {
 		return nil, err
 	}
 	if statement.Table == "" && statement.Subquery == nil {
@@ -46,17 +46,17 @@ func bindPhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Sess
 			return nil, err
 		}
 	}
-	needed := mvccProjectionMask(statement, schema)
-	plan := planMVCCAccess(statement, definition, schema, session)
+	needed := sqlProjectionMask(statement, schema)
+	plan := planSQLAccess(statement, definition, schema, session)
 	ordered := plan.ordered
 	op := bindScan(tx, definition, plan, func(encoded []byte) (storage.Row, error) {
 		if err := checkQuery(session); err != nil {
 			return nil, err
 		}
-		return decodeMVCCRowInto(definition, encoded, needed, nil)
+		return decodeSQLRowInto(definition, encoded, needed, nil)
 	})
 	if statement.Where != nil {
-		evaluate := bindMVCCFilter(statement.Where, schema, session)
+		evaluate := bindSQLFilter(statement.Where, schema, session)
 		op = physical.Filter[storage.Row]{Input: op, Predicate: func(row storage.Row) (bool, error) {
 			var value any
 			var err error
@@ -182,7 +182,7 @@ func mvccPointKey(expression parser.Expr, table versionedTable, schema *storage.
 		if index.Primary && len(index.Columns) == 1 && strings.EqualFold(stripQualifier(identifier.Name), index.Columns[0]) {
 			row := make(storage.Row, len(table.Definition.Columns))
 			row[position] = value
-			k, valid := mvccPrimaryKey(table, index, row)
+			k, valid := sqlPrimaryKey(table, index, row)
 			return k, valid
 		}
 	}

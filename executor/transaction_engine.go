@@ -50,7 +50,7 @@ func versionedName(session *Session, table string) (string, string, error) {
 	}
 	return strings.ToLower(database), strings.ToLower(name), nil
 }
-func (e *Engine) refreshMVCCMetadata(ctx context.Context) error {
+func (e *Engine) refreshSQLMetadata(ctx context.Context) error {
 	e.mvccMetadata.Lock()
 	defer e.mvccMetadata.Unlock()
 	var head uint64
@@ -96,7 +96,7 @@ func (e *Engine) refreshMVCCMetadata(ctx context.Context) error {
 			if err := decodeVersioned(v, &table); err != nil {
 				return err
 			}
-			if err := validateMVCCKeyEncoding(table); err != nil {
+			if err := validateSQLKeyEncoding(table); err != nil {
 				return err
 			}
 			tables = append(tables, table)
@@ -128,7 +128,7 @@ func (e *Engine) refreshMVCCMetadata(ctx context.Context) error {
 	return nil
 }
 
-type mvccReadTableCache struct {
+type sqlReadTableCache struct {
 	key, encoded []byte
 	definition   versionedTable
 	schema       *storage.Table
@@ -164,16 +164,16 @@ func loadVersionedTableInternal(tx storageengine.Txn, session *Session, name str
 	if err = decodeVersioned(value, &definition); err != nil {
 		return definition, nil, nil, err
 	}
-	if err = validateMVCCKeyEncoding(definition); err != nil {
+	if err = validateSQLKeyEncoding(definition); err != nil {
 		return definition, nil, nil, err
 	}
 	schema, err := storage.NewTransientTable(table, definition.Definition.Columns)
 	if err == nil && cacheRead && len(value) <= 4096 && len(definition.Definition.Columns) <= 32 && len(definition.Definition.Indexes) <= 16 {
-		session.mvccReadCache = &mvccReadTableCache{key: catalogKey, encoded: value, definition: definition, schema: schema}
+		session.mvccReadCache = &sqlReadTableCache{key: catalogKey, encoded: value, definition: definition, schema: schema}
 	}
 	return definition, schema, catalogKey, err
 }
-func (e *Engine) executeMVCCStatement(session *Session, statement parser.Statement) (*Result, error) {
+func (e *Engine) executeSQLStatement(session *Session, statement parser.Statement) (*Result, error) {
 	ctx := session.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -185,7 +185,7 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 		defer cancel()
 	}
 	if maintenance, ok := statement.(parser.MVCCMaintenance); ok {
-		return e.executeMVCCMaintenance(ctx, session, maintenance)
+		return e.executeSQLMaintenance(ctx, session, maintenance)
 	}
 	if e.Replica != nil {
 		// Bound quorum discovery, not the entire SQL statement. Large replicated
@@ -222,7 +222,7 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 		if err != nil {
 			return nil, err
 		}
-		return &Result{Message: "MVCC transaction committed"}, e.refreshMVCCMetadata(ctx)
+		return &Result{Message: "MVCC transaction committed"}, e.refreshSQLMetadata(ctx)
 	case parser.Rollback:
 		if session.mvccTransaction != nil {
 			session.mvccTransaction.Rollback()
@@ -231,7 +231,7 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 		return &Result{Message: "MVCC transaction rolled back"}, nil
 	}
 	tx := session.mvccTransaction
-	if tx == nil && session.AutocommitDisabled && mvccStartsImplicitTransaction(statement) {
+	if tx == nil && session.AutocommitDisabled && sqlStartsImplicitTransaction(statement) {
 		var err error
 		tx, err = e.Backend.Begin(ctx)
 		if err != nil {
@@ -275,9 +275,9 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 		return collectBoundQuery(session, query, false)
 
 	case parser.Explain:
-		return executeMVCCExplain(tx, session, value.Query)
+		return executeSQLExplain(tx, session, value.Query)
 	case parser.Show:
-		if err := e.refreshMVCCMetadata(ctx); err != nil {
+		if err := e.refreshSQLMetadata(ctx); err != nil {
 			return nil, err
 		}
 		return executeShow(e.Store, session, value)
@@ -289,7 +289,7 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 	defer child.Rollback()
 	var result *Result
 	modify := physical.Modify[parser.Statement, *Result]{Input: physical.Source[parser.Statement](func(_ context.Context, y physical.Yield[parser.Statement]) error { return y(statement) }), Apply: func(ctx context.Context, s parser.Statement) (*Result, error) {
-		return e.mutateMVCC(ctx, tx, child, session, s)
+		return e.mutateSQL(ctx, tx, child, session, s)
 	}}
 	err = modify.Run(ctx, func(r *Result) error { result = r; return nil })
 	if err != nil {
@@ -306,7 +306,7 @@ func (e *Engine) executeMVCCStatement(session *Session, statement parser.Stateme
 		if _, err = tx.Commit(ctx); err != nil {
 			return nil, err
 		}
-		if err = e.refreshMVCCMetadata(ctx); err != nil {
+		if err = e.refreshSQLMetadata(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -326,7 +326,7 @@ func (e *Engine) PrepareCompatibilityRead(ctx context.Context) error {
 			return err
 		}
 	}
-	return e.refreshMVCCMetadata(ctx)
+	return e.refreshSQLMetadata(ctx)
 }
 func (e *Engine) ReplicationStatus() *Result {
 	columns := []Column{{Name: "Node_ID", Type: storage.TypeVarchar}, {Name: "State", Type: storage.TypeVarchar}, {Name: "Leader_ID", Type: storage.TypeVarchar}, {Name: "Leader_Raft_Address", Type: storage.TypeVarchar}, {Name: "Applied_Index", Type: storage.TypeBigInt}}
@@ -338,7 +338,7 @@ func (e *Engine) ReplicationStatus() *Result {
 }
 
 // Autocommit mode is independent of whether a lazy transaction has started.
-func mvccStartsImplicitTransaction(statement parser.Statement) bool {
+func sqlStartsImplicitTransaction(statement parser.Statement) bool {
 	switch s := statement.(type) {
 	case parser.Empty, parser.Use, parser.Show, parser.Explain:
 		return false
@@ -348,7 +348,7 @@ func mvccStartsImplicitTransaction(statement parser.Statement) bool {
 		return true
 	}
 }
-func (e *Engine) SetMVCCAutocommit(session *Session, enabled bool) error {
+func (e *Engine) SetAutocommit(session *Session, enabled bool) error {
 	if enabled && session.AutocommitDisabled && session.InTransaction() {
 		if _, err := e.Execute(session, "COMMIT"); err != nil {
 			return err

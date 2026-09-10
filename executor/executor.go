@@ -59,7 +59,7 @@ type Session struct {
 	ForeignKeyChecksDisabled bool
 	AutocommitDisabled       bool
 	mvccTransaction          storageengine.Txn
-	mvccReadCache            *mvccReadTableCache
+	mvccReadCache            *sqlReadTableCache
 	Context                  context.Context
 	query                    *queryControl
 	CurrentDatabase          string
@@ -219,7 +219,7 @@ func (e *Engine) executeStatement(session *Session, statement parser.Statement, 
 	if err := e.authorizeStatement(session, statement); err != nil {
 		return nil, err
 	}
-	return e.executeMVCCStatement(session, statement)
+	return e.executeSQLStatement(session, statement)
 }
 
 func (e *Engine) authorizeStatement(session *Session, statement parser.Statement) error {

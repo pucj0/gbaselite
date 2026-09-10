@@ -7,7 +7,7 @@ import (
 	"gbaselite/storageengine"
 )
 
-func (e *Engine) executeMVCCMaintenance(ctx context.Context, session *Session, s parser.MVCCMaintenance) (*Result, error) {
+func (e *Engine) executeSQLMaintenance(ctx context.Context, session *Session, s parser.MVCCMaintenance) (*Result, error) {
 	if e.Replica != nil {
 		return nil, fmt.Errorf("MVCC maintenance currently requires standalone mode")
 	}
@@ -29,7 +29,7 @@ func (e *Engine) executeMVCCMaintenance(ctx context.Context, session *Session, s
 		e.mvccMetadata.Lock()
 		e.mvccMetadataVersion = ^uint64(0)
 		e.mvccMetadata.Unlock()
-		if err := e.refreshMVCCMetadata(ctx); err != nil {
+		if err := e.refreshSQLMetadata(ctx); err != nil {
 			return nil, err
 		}
 		return &Result{Message: "MVCC backup restored; previous transactions invalidated", MetadataChanged: true}, nil

@@ -81,7 +81,7 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 				default:
 					return nil, fmt.Errorf("invalid autocommit value")
 				}
-				if err := engine.SetMVCCAutocommit(session, enabled); err != nil {
+				if err := engine.SetAutocommit(session, enabled); err != nil {
 					return nil, err
 				}
 				return &executor.Result{Message: "autocommit changed"}, nil

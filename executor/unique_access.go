@@ -12,20 +12,20 @@ import (
 // Existing unique entries are complete even for legacy tables. Only exact,
 // non-NULL integer equalities within the SQL comparison precision are eligible.
 // Residual WHERE remains mandatory; unsupported conversions use the scan.
-type mvccUniqueCandidate struct {
+type sqlUniqueCandidate struct {
 	name, space string
 	key         []byte
 }
 
-func mvccUniqueAccess(where parser.Expr, table versionedTable, schema *storage.Table) (string, []byte, bool) {
-	candidates := mvccUniqueCandidates(where, table, schema)
+func sqlUniqueAccess(where parser.Expr, table versionedTable, schema *storage.Table) (string, []byte, bool) {
+	candidates := sqlUniqueCandidates(where, table, schema)
 	if len(candidates) == 0 {
 		return "", nil, false
 	}
 	return candidates[0].space, candidates[0].key, true
 }
-func mvccUniqueCandidates(where parser.Expr, table versionedTable, schema *storage.Table) []mvccUniqueCandidate {
-	var candidates []mvccUniqueCandidate
+func sqlUniqueCandidates(where parser.Expr, table versionedTable, schema *storage.Table) []sqlUniqueCandidate {
+	var candidates []sqlUniqueCandidate
 	hasUnique := false
 	for _, idx := range table.Definition.Indexes {
 		if idx.Unique && !idx.Primary {
@@ -109,14 +109,14 @@ func mvccUniqueCandidates(where parser.Expr, table versionedTable, schema *stora
 		if complete {
 			key, ok := storage.IndexValueKey(idx, table.Definition.Columns, row)
 			if ok {
-				candidates = append(candidates, mvccUniqueCandidate{name: idx.Name, space: sqllayout.UniqueIndex(table.ID, idx.Name), key: []byte(key)})
+				candidates = append(candidates, sqlUniqueCandidate{name: idx.Name, space: sqllayout.UniqueIndex(table.ID, idx.Name), key: []byte(key)})
 			}
 		}
 	}
 	return candidates
 }
 
-func scanMVCCUnique(ctx context.Context, tx storageengine.Txn, table versionedTable, space string, key []byte, yield func([]byte, []byte) error) error {
+func scanSQLUnique(ctx context.Context, tx storageengine.Txn, table versionedTable, space string, key []byte, yield func([]byte, []byte) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}

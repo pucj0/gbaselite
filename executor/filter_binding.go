@@ -8,7 +8,7 @@ import (
 
 // Bind names once, but retain the shared SQL evaluator for NULL, numeric and
 // collation semantics. Plans are query-local and never survive schema changes.
-func bindMVCCFilter(expr parser.Expr, schema *storage.Table, session *Session) func(storage.Row) (any, error) {
+func bindSQLFilter(expr parser.Expr, schema *storage.Table, session *Session) func(storage.Row) (any, error) {
 	fallback := func(row storage.Row) (any, error) { return evaluateExprWithContext(expr, schema, row, session, nil) }
 	if !safeMutationIndexExpression(expr, schema) {
 		return fallback

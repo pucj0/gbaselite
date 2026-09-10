@@ -13,9 +13,9 @@ import (
 	"strings"
 )
 
-func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Statement) (*Result, error) {
-	if tableName, ok := mvccAlterTarget(statement); ok {
-		return e.alterMVCC(ctx, read, write, session, tableName, statement)
+func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Statement) (*Result, error) {
+	if tableName, ok := sqlAlterTarget(statement); ok {
+		return e.alterSQL(ctx, read, write, session, tableName, statement)
 	}
 	switch value := statement.(type) {
 	case parser.CreateDatabase:
@@ -101,21 +101,21 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 			}
 		}
 		for _, check := range checks {
-			if err := validateMVCCCheckDefinition(table, check.Expression); err != nil {
+			if err := validateSQLCheckDefinition(table, check.Expression); err != nil {
 				return nil, err
 			}
 		}
 		table.SetNamedConstraints(nil, checks)
 		snapshot := table.Snapshot()
 		snapshot.Comment = value.Comment
-		definition := versionedTable{CatalogName: db + "." + name, ID: write.ID() + "/" + name, Definition: snapshot, RowEncoding: mvccCompactRowEncoding, SecondaryEncoding: 1}
-		if _, ok := mvccIntegerPrimary(definition); ok {
-			definition.KeyEncoding = mvccIntegerKeyEncoding
+		definition := versionedTable{CatalogName: db + "." + name, ID: write.ID() + "/" + name, Definition: snapshot, RowEncoding: sqlCompactRowEncoding, SecondaryEncoding: 1}
+		if _, ok := sqlIntegerPrimary(definition); ok {
+			definition.KeyEncoding = sqlIntegerKeyEncoding
 		}
 		for _, fk := range value.ForeignKeys {
 			definition.Definition.ForeignKeys = append(definition.Definition.ForeignKeys, storage.ForeignKey{Name: fk.Name, Columns: fk.Columns, RefTable: fk.RefTable, RefColumns: fk.RefColumns, OnDelete: fk.OnDelete, OnUpdate: fk.OnUpdate})
 		}
-		if err = prepareMVCCForeignKeys(write, &definition, session); err != nil {
+		if err = prepareSQLForeignKeys(write, &definition, session); err != nil {
 			return nil, err
 		}
 		encoded, err := encodeVersioned(definition)
@@ -145,7 +145,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 				if err := decodeVersioned(v, &dropping); err != nil {
 					return err
 				}
-				if err := rejectMVCCReferencedDrop(write, dropping, session.ForeignKeyChecksDisabled); err != nil {
+				if err := rejectSQLReferencedDrop(write, dropping, session.ForeignKeyChecksDisabled); err != nil {
 					return err
 				}
 				return write.Delete(sqllayout.Catalog, k)
@@ -161,7 +161,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 		if err != nil {
 			return nil, err
 		}
-		if err = rejectMVCCReferencedDrop(write, definition, session.ForeignKeyChecksDisabled); err != nil {
+		if err = rejectSQLReferencedDrop(write, definition, session.ForeignKeyChecksDisabled); err != nil {
 			return nil, err
 		}
 		definition.CounterKeys = nil
@@ -180,7 +180,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 				}
 				return nil, err
 			}
-			if err = rejectMVCCReferencedDrop(write, dropping, session.ForeignKeyChecksDisabled); err != nil {
+			if err = rejectSQLReferencedDrop(write, dropping, session.ForeignKeyChecksDisabled); err != nil {
 				return nil, err
 			}
 			if err = write.Delete(sqllayout.Catalog, k); err != nil {
@@ -189,7 +189,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 		}
 		return &Result{AffectedRows: uint64(len(value.Names))}, nil
 	case parser.Insert:
-		return e.insertMVCC(ctx, read, write, session, value)
+		return e.insertSQL(ctx, read, write, session, value)
 	case parser.Update:
 		if len(value.Joins) > 0 {
 			return nil, errors.New("MVCC UPDATE JOIN is not supported")
@@ -270,7 +270,7 @@ func (e *Engine) mutateMVCC(ctx context.Context, read, write storageengine.Txn, 
 		return nil, fmt.Errorf("MVCC backend does not support statement %T", statement)
 	}
 }
-func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Insert) (*Result, error) {
+func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Insert) (*Result, error) {
 	if statement.Replace || statement.Ignore || statement.Select != nil || len(statement.SetValues) > 0 || len(statement.OnDuplicate) > 0 {
 		return nil, errors.New("MVCC insert currently accepts VALUES without IGNORE/REPLACE/ON DUPLICATE")
 	}
@@ -414,7 +414,7 @@ func (e *Engine) insertMVCC(ctx context.Context, read, write storageengine.Txn, 
 }
 func writeVersionedRow(ctx context.Context, tx storageengine.Txn, table versionedTable, oldKey []byte, oldRow, newRow storage.Row, fallback string) error {
 	columns := table.Definition.Columns
-	if err := validateMVCCReferences(ctx, tx, table, oldRow, newRow); err != nil {
+	if err := validateSQLReferences(ctx, tx, table, oldRow, newRow); err != nil {
 		return err
 	}
 	rows := tx.Table(table.ID)
@@ -432,7 +432,7 @@ func writeVersionedRow(ctx context.Context, tx storageengine.Txn, table versione
 		}
 		for _, index := range table.Definition.Indexes {
 			if index.Primary {
-				key, ok := mvccPrimaryKey(table, index, newRow)
+				key, ok := sqlPrimaryKey(table, index, newRow)
 				if !ok {
 					return errors.New("NULL primary key")
 				}
@@ -452,7 +452,7 @@ func writeVersionedRow(ctx context.Context, tx storageengine.Txn, table versione
 	}
 	if oldRow != nil {
 		for _, index := range table.Definition.Indexes {
-			if index.Primary && table.KeyEncoding == mvccIntegerKeyEncoding && table.RowEncoding == mvccCompactRowEncoding {
+			if index.Primary && table.KeyEncoding == sqlIntegerKeyEncoding && table.RowEncoding == sqlCompactRowEncoding {
 				continue
 			}
 			if !index.Unique && !index.Primary {
@@ -475,7 +475,7 @@ func writeVersionedRow(ctx context.Context, tx storageengine.Txn, table versione
 		return nil
 	}
 	for _, index := range table.Definition.Indexes {
-		if index.Primary && table.KeyEncoding == mvccIntegerKeyEncoding && table.RowEncoding == mvccCompactRowEncoding {
+		if index.Primary && table.KeyEncoding == sqlIntegerKeyEncoding && table.RowEncoding == sqlCompactRowEncoding {
 			continue
 		}
 		if !index.Unique && !index.Primary {
@@ -495,7 +495,7 @@ func writeVersionedRow(ctx context.Context, tx storageengine.Txn, table versione
 			return err
 		}
 	}
-	encoded, err := encodeMVCCRow(table, newRow)
+	encoded, err := encodeSQLRow(table, newRow)
 	if err != nil {
 		return err
 	}

@@ -13,9 +13,9 @@ import (
 // Only newly created single signed-integer primary keys opt into this layout.
 // Encoding 0 remains the existing IndexValueKey layout; existing tables are
 // never rewritten implicitly. Unique-index keys retain their existing format.
-const mvccIntegerKeyEncoding = 1
+const sqlIntegerKeyEncoding = 1
 
-func mvccIntegerPrimary(table versionedTable) (int, bool) {
+func sqlIntegerPrimary(table versionedTable) (int, bool) {
 	for _, idx := range table.Definition.Indexes {
 		if !idx.Primary || len(idx.Columns) != 1 {
 			continue
@@ -28,46 +28,46 @@ func mvccIntegerPrimary(table versionedTable) (int, bool) {
 	}
 	return 0, false
 }
-func validateMVCCKeyEncoding(table versionedTable) error {
+func validateSQLKeyEncoding(table versionedTable) error {
 	if table.SecondaryEncoding > 1 {
 		return errors.New("unsupported secondary index encoding")
 	}
-	if table.RowEncoding != 0 && table.RowEncoding != mvccCompactRowEncoding {
+	if table.RowEncoding != 0 && table.RowEncoding != sqlCompactRowEncoding {
 		return errors.New("unsupported MVCC row encoding; use a compatible database binary")
 	}
 	if table.KeyEncoding == 0 {
 		return nil
 	}
-	if table.KeyEncoding == mvccIntegerKeyEncoding {
-		if _, ok := mvccIntegerPrimary(table); ok {
+	if table.KeyEncoding == sqlIntegerKeyEncoding {
+		if _, ok := sqlIntegerPrimary(table); ok {
 			return nil
 		}
 	}
 	return errors.New("unsupported MVCC primary key encoding/schema; use a compatible database binary")
 }
-func mvccIntegerKey(n int64) []byte {
+func sqlIntegerKey(n int64) []byte {
 	return sqllayout.SignedInteger(n)
 }
-func mvccPrimaryKey(table versionedTable, index storage.Index, row storage.Row) ([]byte, bool) {
-	if table.KeyEncoding == mvccIntegerKeyEncoding {
-		p, ok := mvccIntegerPrimary(table)
+func sqlPrimaryKey(table versionedTable, index storage.Index, row storage.Row) ([]byte, bool) {
+	if table.KeyEncoding == sqlIntegerKeyEncoding {
+		p, ok := sqlIntegerPrimary(table)
 		if !ok || p >= len(row) || row[p].Null {
 			return nil, false
 		}
-		return mvccIntegerKey(row[p].Int64), true
+		return sqlIntegerKey(row[p].Int64), true
 	}
 	k, ok := storage.IndexValueKey(index, table.Definition.Columns, row)
 	return []byte(k), ok
 }
 
-func mvccSafeRangeExpression(expr parser.Expr, schema *storage.Table) bool {
+func sqlSafeRangeExpression(expr parser.Expr, schema *storage.Table) bool {
 	if expr == nil {
 		return true
 	}
 	switch v := expr.(type) {
 	case parser.BinaryExpr:
 		if v.Operator == "AND" {
-			return mvccSafeRangeExpression(v.Left, schema) && mvccSafeRangeExpression(v.Right, schema)
+			return sqlSafeRangeExpression(v.Left, schema) && sqlSafeRangeExpression(v.Right, schema)
 		}
 	case parser.BetweenExpr:
 		if v.Not {
@@ -80,12 +80,12 @@ func mvccSafeRangeExpression(expr parser.Expr, schema *storage.Table) bool {
 
 // Reject ranges with unsafe conversions/unknown columns. Residual predicates
 // are still evaluated on every candidate; these bounds do not replace WHERE.
-func mvccPrimaryRange(where parser.Expr, table versionedTable, schema *storage.Table) (storageengine.KeyRange, bool) {
+func sqlPrimaryRange(where parser.Expr, table versionedTable, schema *storage.Table) (storageengine.KeyRange, bool) {
 	var r storageengine.KeyRange
-	if table.KeyEncoding != mvccIntegerKeyEncoding || !mvccSafeRangeExpression(where, schema) {
+	if table.KeyEncoding != sqlIntegerKeyEncoding || !sqlSafeRangeExpression(where, schema) {
 		return r, false
 	}
-	position, ok := mvccIntegerPrimary(table)
+	position, ok := sqlIntegerPrimary(table)
 	if !ok {
 		return r, false
 	}
@@ -97,7 +97,7 @@ func mvccPrimaryRange(where parser.Expr, table versionedTable, schema *storage.T
 			inclusive := op != ">"
 			if r.Lower == nil || n > lower {
 				lower = n
-				r.Lower = mvccIntegerKey(n)
+				r.Lower = sqlIntegerKey(n)
 				r.LowerInclusive = inclusive
 			} else if n == lower {
 				r.LowerInclusive = r.LowerInclusive && inclusive
@@ -107,7 +107,7 @@ func mvccPrimaryRange(where parser.Expr, table versionedTable, schema *storage.T
 			inclusive := op != "<"
 			if r.Upper == nil || n < upper {
 				upper = n
-				r.Upper = mvccIntegerKey(n)
+				r.Upper = sqlIntegerKey(n)
 				r.UpperInclusive = inclusive
 			} else if n == upper {
 				r.UpperInclusive = r.UpperInclusive && inclusive
@@ -166,11 +166,11 @@ func mvccPrimaryRange(where parser.Expr, table versionedTable, schema *storage.T
 
 // An ORDER BY projection alias can shadow the input primary key. Only bypass
 // sorting when its meaning is unambiguously the physical integer primary key.
-func mvccPrimaryOrder(statement parser.Select, table versionedTable, schema *storage.Table) bool {
-	if table.KeyEncoding != mvccIntegerKeyEncoding || len(statement.OrderBy) != 1 {
+func sqlPrimaryOrder(statement parser.Select, table versionedTable, schema *storage.Table) bool {
+	if table.KeyEncoding != sqlIntegerKeyEncoding || len(statement.OrderBy) != 1 {
 		return false
 	}
-	p, ok := mvccIntegerPrimary(table)
+	p, ok := sqlIntegerPrimary(table)
 	if !ok {
 		return false
 	}

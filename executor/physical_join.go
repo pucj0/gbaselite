@@ -55,7 +55,7 @@ func bindJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]joinI
 			return nil, err
 		}
 		if i > 0 {
-			if err = bindMVCCExplainExpr(j.On, combined); err != nil {
+			if err = bindSQLExplainExpr(j.On, combined); err != nil {
 				return nil, err
 			}
 		}
@@ -69,23 +69,23 @@ func joinedInput(tx storageengine.Txn, session *Session, s parser.Select) (*stor
 		return nil, nil, err
 	}
 	schema := inputs[len(inputs)-1].combined
-	if err = bindMVCCExplainExpr(s.Where, schema); err != nil {
+	if err = bindSQLExplainExpr(s.Where, schema); err != nil {
 		return nil, nil, err
 	}
-	op := bindScan(tx, inputs[0].definition, mvccAccessPlan{kind: mvccAccessAll}, func(v []byte) (storage.Row, error) { return decodeMVCCRow(inputs[0].definition, v) })
+	op := bindScan(tx, inputs[0].definition, sqlAccessPlan{kind: sqlAccessAll}, func(v []byte) (storage.Row, error) { return decodeSQLRow(inputs[0].definition, v) })
 	for level := 1; level < len(inputs); level++ {
 		input := inputs[level]
 		leftSchema := inputs[level-1].combined
 		join := physical.Join3[storage.Row, storage.Row, storage.Row]{Left: op, Right: func(left storage.Row) (physical.Operator[storage.Row], error) {
-			access := mvccAccessPlan{kind: mvccAccessAll}
+			access := sqlAccessPlan{kind: sqlAccessAll}
 			if where, ok := joinLookup(input.join.On, leftSchema, input.schema, left); ok {
-				access = planMVCCAccess(parser.Select{Where: where}, input.definition, input.schema, session)
+				access = planSQLAccess(parser.Select{Where: where}, input.definition, input.schema, session)
 			}
 			return bindScan(tx, input.definition, access, func(v []byte) (storage.Row, error) {
 				if err := checkQuery(session); err != nil {
 					return nil, err
 				}
-				return decodeMVCCRow(input.definition, v)
+				return decodeSQLRow(input.definition, v)
 			}), nil
 		}, Combine: func(left, right storage.Row) storage.Row {
 			row := make(storage.Row, len(left)+len(right))

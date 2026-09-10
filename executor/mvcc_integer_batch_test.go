@@ -62,7 +62,7 @@ func TestMVCCIntegerBatchMatchesScalar(t *testing.T) {
 	}
 }
 
-func integerBatchFixture(tb testing.TB) (versionedTable, *storage.Table, parser.Select, []mvccBatchEntry) {
+func integerBatchFixture(tb testing.TB) (versionedTable, *storage.Table, parser.Select, []sqlBatchEntry) {
 	tb.Helper()
 	cols := []storage.Column{{Name: "a", Type: storage.TypeBigInt}, {Name: "b", Type: storage.TypeBigInt}, {Name: "note", Type: storage.TypeVarchar, Length: 128}}
 	schema, err := storage.NewTransientTable("bench", cols)
@@ -74,23 +74,23 @@ func integerBatchFixture(tb testing.TB) (versionedTable, *storage.Table, parser.
 	if err != nil {
 		tb.Fatal(err)
 	}
-	batch := make([]mvccBatchEntry, 128)
+	batch := make([]sqlBatchEntry, 128)
 	for i := range batch {
 		row := storage.Row{storage.MustValue(storage.TypeBigInt, i), storage.MustValue(storage.TypeBigInt, i*3), storage.MustValue(storage.TypeVarchar, strings.Repeat("x", 128))}
 		if i%7 == 0 {
 			row[1] = storage.NullValue(storage.TypeBigInt)
 		}
-		v, err := encodeMVCCRow(table, row)
+		v, err := encodeSQLRow(table, row)
 		if err != nil {
 			tb.Fatal(err)
 		}
-		batch[i] = mvccBatchEntry{value: v}
+		batch[i] = sqlBatchEntry{value: v}
 	}
 	return table, schema, stmt.(parser.Select), batch
 }
 func TestIntegerBatchRejectsTruncatedRows(t *testing.T) {
 	table, schema, stmt, batch := integerBatchFixture(t)
-	p := planIntegerBatch(stmt, table, schema, mvccAccessPlan{kind: mvccAccessAll})
+	p := planIntegerBatch(stmt, table, schema, sqlAccessPlan{kind: sqlAccessAll})
 	if p == nil {
 		t.Fatal("no batch plan")
 	}
@@ -111,8 +111,8 @@ func BenchmarkMVCCIntegerBatchKernel(b *testing.B) {
 	table, schema, stmt, batch := integerBatchFixture(b)
 	session := &Session{}
 	b.Run("row", func(b *testing.B) {
-		filter := bindMVCCFilter(stmt.Where, schema, session)
-		needed := mvccProjectionMask(stmt, schema)
+		filter := bindSQLFilter(stmt.Where, schema, session)
+		needed := sqlProjectionMask(stmt, schema)
 		var scratch storage.Row
 		b.ReportAllocs()
 		b.ResetTimer()
@@ -120,7 +120,7 @@ func BenchmarkMVCCIntegerBatchKernel(b *testing.B) {
 			sum := int64(0)
 			for _, entry := range batch {
 				var err error
-				scratch, err = decodeMVCCRowInto(table, entry.value, needed, scratch)
+				scratch, err = decodeSQLRowInto(table, entry.value, needed, scratch)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -136,7 +136,7 @@ func BenchmarkMVCCIntegerBatchKernel(b *testing.B) {
 		}
 	})
 	b.Run("vector", func(b *testing.B) {
-		p := planIntegerBatch(stmt, table, schema, mvccAccessPlan{kind: mvccAccessAll})
+		p := planIntegerBatch(stmt, table, schema, sqlAccessPlan{kind: sqlAccessAll})
 		v := make([]int64, p.width*128)
 		n := make([]bool, len(v))
 		sel := make([]uint16, 128)

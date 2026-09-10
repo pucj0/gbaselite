@@ -29,8 +29,8 @@ type integerBatchPlan struct {
 	aggregate  bool
 }
 
-func planIntegerBatch(s parser.Select, table versionedTable, schema *storage.Table, access mvccAccessPlan) *integerBatchPlan {
-	if len(s.GroupBy) > 0 || s.Having != nil || table.RowEncoding != mvccCompactRowEncoding || s.Distinct || (access.kind == mvccAccessPoint || access.kind == mvccAccessUnique) || len(s.OrderBy) > 0 && !access.ordered || len(schema.ColumnsView()) > 512 {
+func planIntegerBatch(s parser.Select, table versionedTable, schema *storage.Table, access sqlAccessPlan) *integerBatchPlan {
+	if len(s.GroupBy) > 0 || s.Having != nil || table.RowEncoding != sqlCompactRowEncoding || s.Distinct || (access.kind == sqlAccessPoint || access.kind == sqlAccessUnique) || len(s.OrderBy) > 0 && !access.ordered || len(schema.ColumnsView()) > 512 {
 		return nil
 	}
 	p := &integerBatchPlan{positions: make([]int, len(schema.ColumnsView())), aggregate: selectHasAggregate(s.Items)}
@@ -187,23 +187,23 @@ func planIntegerBatch(s parser.Select, table versionedTable, schema *storage.Tab
 
 // Decode directly into packed integer vectors. Other supported fields are
 // structurally validated and skipped without allocating strings or storage.Rows.
-func decodeIntegerBatch(table versionedTable, p *integerBatchPlan, batch []mvccBatchEntry, stride int, values []int64, nulls []bool) error {
+func decodeIntegerBatch(table versionedTable, p *integerBatchPlan, batch []sqlBatchEntry, stride int, values []int64, nulls []bool) error {
 	for row, entry := range batch {
 		encoded := entry.value
-		if !bytes.HasPrefix(encoded, mvccRowMagic) || len(encoded) > storageengine.MaxValueBytes {
-			return errMVCCRowEncoding
+		if !bytes.HasPrefix(encoded, sqlRowMagic) || len(encoded) > storageengine.MaxValueBytes {
+			return errSQLRowEncoding
 		}
 		n, k := binary.Uvarint(encoded[4:])
 		if k <= 0 || n != uint64(len(p.positions)) {
-			return errMVCCRowEncoding
+			return errSQLRowEncoding
 		}
 		offset := 4 + k
 		nb := (len(p.positions) + 7) / 8
 		if len(encoded)-offset < nb {
-			return errMVCCRowEncoding
+			return errSQLRowEncoding
 		}
 		mask := encoded[offset : offset+nb]
-		reader := mvccRowReader{data: encoded, offset: offset + nb}
+		reader := sqlRowReader{data: encoded, offset: offset + nb}
 		for col, c := range table.Definition.Columns {
 			isNull := mask[col/8]&(1<<uint(col%8)) != 0
 			vector := p.positions[col]
@@ -217,7 +217,7 @@ func decodeIntegerBatch(table versionedTable, p *integerBatchPlan, batch []mvccB
 			case storage.TypeInt, storage.TypeBigInt:
 				n, k := binary.Varint(encoded[reader.offset:])
 				if k <= 0 {
-					return errMVCCRowEncoding
+					return errSQLRowEncoding
 				}
 				reader.offset += k
 				if vector >= 0 {
@@ -228,11 +228,11 @@ func decodeIntegerBatch(table versionedTable, p *integerBatchPlan, batch []mvccB
 					return err
 				}
 			default:
-				return errMVCCRowEncoding
+				return errSQLRowEncoding
 			}
 		}
 		if reader.offset != len(encoded) {
-			return errMVCCRowEncoding
+			return errSQLRowEncoding
 		}
 	}
 	return nil

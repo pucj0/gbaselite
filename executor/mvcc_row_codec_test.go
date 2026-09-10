@@ -28,7 +28,7 @@ func compactTestRow() (versionedTable, storage.Row) {
 		storage.MustValue(storage.TypeDateTime, "2026-09-08 12:34:56.123456"),
 		storage.NullValue(storage.TypeText),
 	}
-	table := versionedTable{RowEncoding: mvccCompactRowEncoding}
+	table := versionedTable{RowEncoding: sqlCompactRowEncoding}
 	for i, v := range values {
 		table.Definition.Columns = append(table.Definition.Columns, storage.Column{Name: string(rune('a' + i)), Type: v.Type})
 	}
@@ -36,11 +36,11 @@ func compactTestRow() (versionedTable, storage.Row) {
 }
 func TestCompactMVCCRowRoundTripAndMalformed(t *testing.T) {
 	table, row := compactTestRow()
-	encoded, err := encodeMVCCRow(table, row)
+	encoded, err := encodeSQLRow(table, row)
 	if err != nil {
 		t.Fatal(err)
 	}
-	decoded, err := decodeMVCCRow(table, encoded)
+	decoded, err := decodeSQLRow(table, encoded)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,36 +57,36 @@ func TestCompactMVCCRowRoundTripAndMalformed(t *testing.T) {
 	}
 	legacy := table
 	legacy.RowEncoding = 0
-	old, err := encodeMVCCRow(legacy, row)
+	old, err := encodeSQLRow(legacy, row)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(encoded) >= len(old) {
 		t.Fatalf("compact=%d gob=%d", len(encoded), len(old))
 	}
-	if _, err = decodeMVCCRow(legacy, old); err != nil {
+	if _, err = decodeSQLRow(legacy, old); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = decodeMVCCRow(table, old); err == nil {
+	if _, err = decodeSQLRow(table, old); err == nil {
 		t.Fatal("mixed format accepted")
 	}
 	for i := 0; i < len(encoded); i++ {
-		if _, err = decodeMVCCRow(table, encoded[:i]); err == nil {
+		if _, err = decodeSQLRow(table, encoded[:i]); err == nil {
 			t.Fatalf("truncated length %d accepted", i)
 		}
 	}
-	for _, b := range [][]byte{append(bytes.Clone(encoded), 0), {'G', 'B', 'R', 2, 0}, append(bytes.Clone(mvccRowMagic), 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255)} {
-		if _, err = decodeMVCCRow(table, b); err == nil {
+	for _, b := range [][]byte{append(bytes.Clone(encoded), 0), {'G', 'B', 'R', 2, 0}, append(bytes.Clone(sqlRowMagic), 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255)} {
+		if _, err = decodeSQLRow(table, b); err == nil {
 			t.Fatal("malformed row accepted")
 		}
 	}
 	table.RowEncoding = 99
-	if _, err = decodeMVCCRow(table, encoded); err == nil {
+	if _, err = decodeSQLRow(table, encoded); err == nil {
 		t.Fatal("unknown format")
 	}
 	table, row = compactTestRow()
 	row[5].Text = strings.Repeat("x", storageengine.MaxValueBytes)
-	if _, err = encodeMVCCRow(table, row); !errors.Is(err, ErrQueryResourceLimit) {
+	if _, err = encodeSQLRow(table, row); !errors.Is(err, ErrQueryResourceLimit) {
 		t.Fatal(err)
 	}
 }
@@ -110,10 +110,10 @@ func TestCompactMVCCProjectionKeepsDependencies(t *testing.T) {
 		}
 	}
 	table, row := compactTestRow()
-	encoded, _ := encodeMVCCRow(table, row)
+	encoded, _ := encodeSQLRow(table, row)
 	mask := make([]bool, len(row))
 	mask[5] = true
-	projected, err := decodeMVCCRowProjected(table, encoded, mask)
+	projected, err := decodeSQLRowProjected(table, encoded, mask)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,41 +123,41 @@ func TestCompactMVCCProjectionKeepsDependencies(t *testing.T) {
 	schema, _ := storage.NewTransientTable("items", []storage.Column{{Name: "id", Type: storage.TypeInt}, {Name: "payload", Type: storage.TypeText}})
 	where, _ := parser.ParseExpression("id >= 1")
 	plan := parser.Select{Items: []parser.SelectItem{{Expression: "id"}}, Where: where, OrderBy: []parser.Order{{Column: "id"}}}
-	if mask = mvccProjectionMask(plan, schema); !reflect.DeepEqual(mask, []bool{true, false}) {
+	if mask = sqlProjectionMask(plan, schema); !reflect.DeepEqual(mask, []bool{true, false}) {
 		t.Fatal(mask)
 	}
 	plan.Items = []parser.SelectItem{{Expression: "COUNT(*)"}}
 	plan.OrderBy = nil
-	if mask = mvccProjectionMask(plan, schema); !reflect.DeepEqual(mask, []bool{true, false}) {
+	if mask = sqlProjectionMask(plan, schema); !reflect.DeepEqual(mask, []bool{true, false}) {
 		t.Fatal(mask)
 	}
 	plan.Items = []parser.SelectItem{{Expression: "payload", Alias: "k"}}
 	plan.OrderBy = []parser.Order{{Column: "k"}}
-	if mask = mvccProjectionMask(plan, schema); !reflect.DeepEqual(mask, []bool{true, true}) {
+	if mask = sqlProjectionMask(plan, schema); !reflect.DeepEqual(mask, []bool{true, true}) {
 		t.Fatal(mask)
 	}
 }
 func FuzzCompactMVCCRowDecode(f *testing.F) {
 	table, row := compactTestRow()
-	encoded, _ := encodeMVCCRow(table, row)
+	encoded, _ := encodeSQLRow(table, row)
 	f.Add(encoded)
 	f.Add([]byte{})
-	f.Add(append(bytes.Clone(mvccRowMagic), binary.MaxVarintLen64))
+	f.Add(append(bytes.Clone(sqlRowMagic), binary.MaxVarintLen64))
 	f.Fuzz(func(t *testing.T, b []byte) {
 		if len(b) > storageengine.MaxValueBytes+1 {
 			return
 		}
-		_, _ = decodeMVCCRow(table, b)
+		_, _ = decodeSQLRow(table, b)
 	})
 }
 func TestCompactMVCCDatesUseSameBinarySemanticsAsGob(t *testing.T) {
 	table := versionedTable{RowEncoding: 1, Definition: storage.TableSnapshot{Columns: []storage.Column{{Name: "d", Type: storage.TypeDateTime}}}}
 	row := storage.Row{{Type: storage.TypeDateTime, Date: time.Date(2001, 2, 3, 4, 5, 6, 123456789, time.FixedZone("test", 9*3600))}}
-	b, err := encodeMVCCRow(table, row)
+	b, err := encodeSQLRow(table, row)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := decodeMVCCRow(table, b)
+	got, err := decodeSQLRow(table, b)
 	if err != nil || !got[0].Date.Equal(row[0].Date) {
 		t.Fatal(got, err)
 	}

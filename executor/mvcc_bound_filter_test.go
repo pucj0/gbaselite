@@ -19,7 +19,7 @@ func TestBoundMVCCFilterMatchesEvaluator(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		bound := bindMVCCFilter(expr, schema, session)
+		bound := bindSQLFilter(expr, schema, session)
 		for _, row := range []storage.Row{{{Int64: 1, Type: storage.TypeBigInt}, {Text: "a", Type: storage.TypeVarchar}}, {{Null: true, Type: storage.TypeBigInt}, {Null: true, Type: storage.TypeVarchar}}} {
 			a, ae := bound(row)
 			b, be := evaluateExprWithContext(expr, schema, row, session, nil)

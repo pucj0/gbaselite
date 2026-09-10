@@ -8,11 +8,11 @@ import (
 
 func TestMVCCReusedDecodeClearsNullAndSkippedValues(t *testing.T) {
 	table, row := compactTestRow()
-	encoded, err := encodeMVCCRow(table, row)
+	encoded, err := encodeSQLRow(table, row)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dst, err := decodeMVCCRowInto(table, encoded, nil, nil)
+	dst, err := decodeSQLRowInto(table, encoded, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,11 +20,11 @@ func TestMVCCReusedDecodeClearsNullAndSkippedValues(t *testing.T) {
 	for i := range row {
 		row[i] = storage.NullValue(row[i].Type)
 	}
-	encoded, err = encodeMVCCRow(table, row)
+	encoded, err = encodeSQLRow(table, row)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dst, err = decodeMVCCRowInto(table, encoded, nil, dst)
+	dst, err = decodeSQLRowInto(table, encoded, nil, dst)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,8 +32,8 @@ func TestMVCCReusedDecodeClearsNullAndSkippedValues(t *testing.T) {
 		t.Fatal("stale fields or buffer not reused", dst)
 	}
 	table, row = compactTestRow()
-	encoded, _ = encodeMVCCRow(table, row)
-	dst, err = decodeMVCCRowInto(table, encoded, make([]bool, len(row)), dst)
+	encoded, _ = encodeSQLRow(table, row)
+	dst, err = decodeSQLRowInto(table, encoded, make([]bool, len(row)), dst)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func TestMVCCReusedDecodeClearsNullAndSkippedValues(t *testing.T) {
 		t.Fatal("skipped fields retained text")
 	}
 	for i := 0; i < len(encoded); i++ {
-		if _, err = decodeMVCCRowInto(table, encoded[:i], nil, dst); err == nil {
+		if _, err = decodeSQLRowInto(table, encoded[:i], nil, dst); err == nil {
 			t.Fatalf("accepted truncation %d", i)
 		}
 	}

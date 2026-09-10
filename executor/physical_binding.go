@@ -42,11 +42,11 @@ func (i *accessIterator) Close() error {
 
 // openAccessIterator is the byte-access boundary. Common table/range scans
 // pass the backend iterator directly; multi-step index probes retain one adapter.
-func openAccessIterator(ctx context.Context, tx storageengine.Txn, table versionedTable, access mvccAccessPlan) (storageengine.Iterator, error) {
+func openAccessIterator(ctx context.Context, tx storageengine.Txn, table versionedTable, access sqlAccessPlan) (storageengine.Iterator, error) {
 	switch access.kind {
-	case mvccAccessAll:
+	case sqlAccessAll:
 		return tx.Table(table.ID).Scan(ctx, storageengine.ScanRequest{Unordered: true})
-	case mvccAccessRange, mvccAccessOrdered:
+	case sqlAccessRange, sqlAccessOrdered:
 		return tx.Table(table.ID).Scan(ctx, storageengine.ScanRequest{Range: access.bounds})
 	}
 	i := &accessIterator{}
@@ -63,7 +63,7 @@ func openAccessIterator(ctx context.Context, tx storageengine.Txn, table version
 	})
 	return i, nil
 }
-func bindScan(tx storageengine.Txn, table versionedTable, access mvccAccessPlan, decode func([]byte) (storage.Row, error)) physical.Operator[storage.Row] {
+func bindScan(tx storageengine.Txn, table versionedTable, access sqlAccessPlan, decode func([]byte) (storage.Row, error)) physical.Operator[storage.Row] {
 	return physical.Scan[storage.Row]{Open: func(ctx context.Context) (storageengine.Iterator, error) {
 		return openAccessIterator(ctx, tx, table, access)
 	}, Decode: func(_, v []byte) (storage.Row, error) { return decode(v) }}
@@ -91,14 +91,14 @@ type mutationRow struct {
 }
 
 func runRowModification(ctx context.Context, tx storageengine.Txn, table versionedTable, schema *storage.Table, session *Session, where parser.Expr, limit int, apply func([]byte, storage.Row) error) error {
-	access := planMVCCAccess(parser.Select{Where: where}, table, schema, session)
+	access := planSQLAccess(parser.Select{Where: where}, table, schema, session)
 	input := physical.Scan[mutationRow]{Open: func(ctx context.Context) (storageengine.Iterator, error) {
 		return openAccessIterator(ctx, tx, table, access)
 	}, Decode: func(key, value []byte) (mutationRow, error) {
 		if err := checkQuery(session); err != nil {
 			return mutationRow{}, err
 		}
-		row, err := decodeMVCCRow(table, value)
+		row, err := decodeSQLRow(table, value)
 		return mutationRow{key, row}, err
 	}}
 

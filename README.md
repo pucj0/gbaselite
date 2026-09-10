@@ -1240,3 +1240,5 @@ Physical Join3[L,R,O] 支持不同的左右输入及输出类型；现有 Join[T
 Engine 最小接口为 Begin(ctx)/Close；RevisionReader、CounterAllocator、ReplicatedEngine、Availability、Maintenance、Diagnostics 均独立。缺失 RevisionReader 时通过普通 Txn 快照刷新元数据；自增/维护等显式能力缺失返回 ErrUnsupported。FullEngine 保留原完整方法集合用于嵌入方的兼容迁移。已有完整后端无需修改实现。
 
 SQL namespace 与有序整数主键基础编码集中到 sqllayout：row/index/secondary/catalog 及计数器键只在此定义。storageengine 的 Table/Index 兼容便利句柄委托该布局模块，Txn 的 opaque namespace/bytes 语义保持不变；所有既有编码逐字节兼容。
+
+执行层按职责命名：transaction_engine、access_plan、row_layout 等模块只依赖通用存储接口；原 SetMVCCAutocommit Go API 保留为 SetAutocommit 的兼容转发。协议消息与持久化编码不变，审计见 docs/architecture/executor-dependency-audit.md。

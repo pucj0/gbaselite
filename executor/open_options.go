@@ -70,7 +70,7 @@ func NewWithStorage(backend storageengine.Engine, users *catalog.Users) (*Engine
 	}
 	e := &Engine{Backend: backend, Replica: replica, Store: storage.NewStore(), Users: users}
 	e.QueryOptions = QueryOptions{SortMemoryBytes: 4 << 20, ResultMemoryBytes: 16 << 20, MaxTempBytes: 256 << 20}
-	if err := e.refreshMVCCMetadata(context.Background()); err != nil {
+	if err := e.refreshSQLMetadata(context.Background()); err != nil {
 		e.Close()
 		return nil, err
 	}

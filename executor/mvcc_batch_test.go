@@ -25,14 +25,14 @@ func TestMVCCBatchBoundsAndOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := planMVCCAccess(parser.Select{}, table, schema, s)
+	plan := planSQLAccess(parser.Select{}, table, schema, s)
 	count, batches := 0, 0
-	err = plan.scanBatches(context.Background(), tx, table, 128, func(batch []mvccBatchEntry) error {
+	err = plan.scanBatches(context.Background(), tx, table, 128, func(batch []sqlBatchEntry) error {
 		size := 0
 		for _, v := range batch {
 			size += len(v.value) + 24
 		}
-		if size > mvccBatchBytes || len(batch) > 128 {
+		if size > sqlBatchBytes || len(batch) > 128 {
 			t.Fatal("unbounded batch", size)
 		}
 		count += len(batch)
@@ -52,7 +52,7 @@ func TestMVCCBatchBoundsAndOrder(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err = plan.scanBatches(ctx, tx, table, 128, func([]mvccBatchEntry) error { t.Fatal("consumed canceled batch"); return nil }); err == nil {
+	if err = plan.scanBatches(ctx, tx, table, 128, func([]sqlBatchEntry) error { t.Fatal("consumed canceled batch"); return nil }); err == nil {
 		t.Fatal("missing cancellation")
 	}
 }
