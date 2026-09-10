@@ -47,7 +47,7 @@ func prepareSQLForeignKeys(tx storageengine.Txn, table *versionedTable, session 
 		seen[strings.ToLower(fk.Name)] = true
 		for _, action := range []string{fk.OnDelete, fk.OnUpdate} {
 			if action != "" && !strings.EqualFold(action, "RESTRICT") && !strings.EqualFold(action, "NO ACTION") {
-				return fmt.Errorf("MVCC foreign keys currently support RESTRICT/NO ACTION")
+				return fmt.Errorf("foreign keys currently support RESTRICT/NO ACTION")
 			}
 		}
 		childDB, _ := splitTableName(table.CatalogName)
@@ -56,11 +56,11 @@ func prepareSQLForeignKeys(tx storageengine.Txn, table *versionedTable, session 
 			return err
 		}
 		if !strings.EqualFold(db, childDB) {
-			return fmt.Errorf("MVCC cross-database foreign keys are not supported")
+			return fmt.Errorf("cross-database foreign keys are not supported")
 		}
 		fk.RefTable = db + "." + name
 		if strings.EqualFold(fk.RefTable, table.CatalogName) {
-			return fmt.Errorf("MVCC self-referencing foreign keys are not supported")
+			return fmt.Errorf("self-referencing foreign keys are not supported")
 		}
 		if len(fk.Columns) == 0 || len(fk.Columns) != len(fk.RefColumns) {
 			return storage.ErrForeignKey

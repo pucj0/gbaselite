@@ -33,7 +33,7 @@ func validateSQLKeyEncoding(table versionedTable) error {
 		return errors.New("unsupported secondary index encoding")
 	}
 	if table.RowEncoding != 0 && table.RowEncoding != sqlCompactRowEncoding {
-		return errors.New("unsupported MVCC row encoding; use a compatible database binary")
+		return errors.New("unsupported row encoding; use a compatible database binary")
 	}
 	if table.KeyEncoding == 0 {
 		return nil
@@ -43,7 +43,7 @@ func validateSQLKeyEncoding(table versionedTable) error {
 			return nil
 		}
 	}
-	return errors.New("unsupported MVCC primary key encoding/schema; use a compatible database binary")
+	return errors.New("unsupported primary key encoding/schema; use a compatible database binary")
 }
 func sqlIntegerKey(n int64) []byte {
 	return sqllayout.SignedInteger(n)

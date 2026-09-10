@@ -36,7 +36,7 @@ func executeSQLExplain(tx storageengine.Txn, session *Session, query parser.Quer
 	}
 	s, ok := query.(parser.Select)
 	if !ok {
-		return nil, fmt.Errorf("MVCC EXPLAIN supports a single SELECT")
+		return nil, fmt.Errorf("EXPLAIN supports a single SELECT")
 	}
 	if err := validateSQLSelectShape(s); err != nil {
 		return nil, err
@@ -235,7 +235,7 @@ func bindSQLExplainExpr(expr parser.Expr, schema *storage.Table, aliases ...map[
 		children = []parser.Expr{v.Value}
 	case parser.InExpr:
 		if v.Subquery != nil {
-			return fmt.Errorf("MVCC scalar subqueries are not supported")
+			return fmt.Errorf("scalar subqueries are not supported")
 		}
 		children = append([]parser.Expr{v.Value}, v.Values...)
 	case parser.BetweenExpr:
@@ -248,7 +248,7 @@ func bindSQLExplainExpr(expr parser.Expr, schema *storage.Table, aliases ...map[
 			children = append(children, w.When, w.Then)
 		}
 	default:
-		return fmt.Errorf("unsupported MVCC EXPLAIN expression %T", expr)
+		return fmt.Errorf("unsupported EXPLAIN expression %T", expr)
 	}
 	for _, child := range children {
 		if err := bindSQLExplainExpr(child, schema, aliases...); err != nil {

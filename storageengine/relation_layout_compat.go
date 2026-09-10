@@ -14,6 +14,8 @@ type tableHandle struct {
 	id string
 }
 
+// TODO: remove relational convenience APIs from storageengine after all callers
+// use Txn namespaces directly. Keep this bridge for existing backend contracts.
 // BindTable is the legacy table-handle convenience API; namespace rules are
 // owned by sqllayout, not by the backend transaction implementation.
 func BindTable(tx Txn, id string) Table { return &tableHandle{spaceHandle{tx, sqllayout.Rows(id)}, id} }

@@ -60,7 +60,7 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		var indexes []storage.Index
 		for _, column := range value.Columns {
 			if column.OnUpdate != "" {
-				return nil, errors.New("MVCC ON UPDATE column expressions are not supported")
+				return nil, errors.New("ON UPDATE column expressions are not supported")
 			}
 			definition, err := storageColumnDefinition(column)
 			if err != nil {
@@ -192,7 +192,7 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		return e.insertSQL(ctx, read, write, session, value)
 	case parser.Update:
 		if len(value.Joins) > 0 {
-			return nil, errors.New("MVCC UPDATE JOIN is not supported")
+			return nil, errors.New("UPDATE JOIN is not supported")
 		}
 		definition, schema, k, err := loadVersionedTable(read, session, value.Table)
 		if err != nil {
@@ -243,7 +243,7 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		return &Result{AffectedRows: uint64(count)}, err
 	case parser.Delete:
 		if len(value.Joins) > 0 || len(value.Targets) > 0 {
-			return nil, errors.New("MVCC multi-table DELETE is not supported")
+			return nil, errors.New("multi-table DELETE is not supported")
 		}
 		definition, schema, k, err := loadVersionedTable(read, session, value.Table)
 		if err != nil {
@@ -267,7 +267,7 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		})
 		return &Result{AffectedRows: uint64(count)}, err
 	default:
-		return nil, fmt.Errorf("MVCC backend does not support statement %T", statement)
+		return nil, fmt.Errorf("storage engine does not support statement %T", statement)
 	}
 }
 func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Insert) (*Result, error) {

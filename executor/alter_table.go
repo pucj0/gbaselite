@@ -86,7 +86,7 @@ func (e *Engine) alterSQL(ctx context.Context, read, write storageengine.Txn, se
 	}
 	for _, action := range actions {
 		if _, ok := sqlAlterTarget(action); !ok {
-			return nil, fmt.Errorf("unsupported MVCC ALTER action")
+			return nil, fmt.Errorf("unsupported ALTER action")
 		}
 		switch v := action.(type) {
 		case parser.AlterCheck:
@@ -151,7 +151,7 @@ func (e *Engine) alterSQL(ctx context.Context, read, write storageengine.Txn, se
 			}
 		}
 		if c.OnUpdate != "" {
-			return nil, fmt.Errorf("MVCC ON UPDATE column expressions are not supported")
+			return nil, fmt.Errorf("ON UPDATE column expressions are not supported")
 		}
 	}
 	if err = prepareSQLForeignKeys(write, &definition, session); err != nil {
@@ -195,7 +195,7 @@ func (e *Engine) alterSQL(ctx context.Context, read, write storageengine.Txn, se
 	if err = write.Put(sqllayout.Catalog, catalog, encoded); err != nil {
 		return nil, err
 	}
-	return &Result{AffectedRows: count, Message: "MVCC schema and rebuilt indexes staged atomically", MetadataChanged: true}, nil
+	return &Result{AffectedRows: count, Message: "schema and rebuilt indexes staged atomically", MetadataChanged: true}, nil
 }
 func validateSQLCheckDefinition(table *storage.Table, definition string) error {
 	expr, err := parser.ParseExpression(definition)
@@ -220,7 +220,7 @@ func validateSQLCheckDefinition(table *storage.Table, definition string) error {
 		}
 	}
 	if !pure(expr) {
-		return fmt.Errorf("MVCC CHECK requires deterministic scalar comparisons/arithmetic")
+		return fmt.Errorf("CHECK requires deterministic scalar comparisons/arithmetic")
 	}
 	return validateCheckDefinition(table, definition)
 }

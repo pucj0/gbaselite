@@ -51,7 +51,7 @@ func planSQLAccess(s parser.Select, table versionedTable, schema *storage.Table,
 			break
 		}
 	}
-	if key, ok := mvccPointKey(s.Where, table, schema, session); ok {
+	if key, ok := sqlPointKey(s.Where, table, schema, session); ok {
 		p.kind = sqlAccessPoint
 		p.index = primary
 		p.key = key

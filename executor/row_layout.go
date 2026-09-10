@@ -13,7 +13,7 @@ import (
 const sqlCompactRowEncoding = 1
 
 var sqlRowMagic = []byte{'G', 'B', 'R', 1}
-var errSQLRowEncoding = errors.New("invalid compact MVCC row encoding")
+var errSQLRowEncoding = errors.New("invalid compact row encoding")
 
 // Column types live in the transaction's versioned schema, not in every row.
 // Existing tables retain the gob codec until explicitly migrated to a new table.

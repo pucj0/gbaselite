@@ -115,7 +115,7 @@ func bindSelectOutput(session *Session, statement parser.Select, schema *storage
 			return nil, err
 		}
 		if !scalarExpressionSupported(expression) {
-			return nil, errors.New("MVCC scalar subqueries are not supported")
+			return nil, errors.New("scalar subqueries are not supported")
 		}
 		kind, err := expressionTypeWithSession(expression, schema, columns, session)
 		if err != nil {
@@ -157,7 +157,7 @@ func bindSelectOutput(session *Session, statement parser.Select, schema *storage
 	return result, nil
 }
 
-func mvccPointKey(expression parser.Expr, table versionedTable, schema *storage.Table, session *Session) ([]byte, bool) {
+func sqlPointKey(expression parser.Expr, table versionedTable, schema *storage.Table, session *Session) ([]byte, bool) {
 	if !safeMutationIndexExpression(expression, schema) {
 		return nil, false
 	}
