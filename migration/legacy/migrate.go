@@ -13,11 +13,24 @@ import (
 	"gbaselite/storage"
 )
 
-// MigrateLegacy converts a stopped snapshot/paged instance to a new standalone
+// Migrate converts a stopped snapshot/paged instance to a new standalone
 // MVCC directory. Only an isolated copy is opened by the legacy reader. The
 // target is published after durable reopen and full row verification; the source
 // is never modified. Unsupported schemas fail without publishing a target.
 func Migrate(ctx context.Context, source, target string, open TargetOpener) error {
+	return migrate(ctx, source, target, open, nil)
+}
+
+// checkpoint is private and per invocation: tests cannot change another migration.
+type checkpoint func(string) error
+
+func (c checkpoint) hit(stage string) error {
+	if c != nil {
+		return c(stage)
+	}
+	return nil
+}
+func migrate(ctx context.Context, source, target string, open TargetOpener, check checkpoint) error {
 	if open == nil {
 		return fmt.Errorf("migration target opener required")
 	}
@@ -88,7 +101,7 @@ func Migrate(ctx context.Context, source, target string, open TargetOpener) erro
 	}
 	defer os.RemoveAll(work)
 	copyDir := filepath.Join(work, "source")
-	if err := copyMigrationDirectory(ctx, source, copyDir); err != nil {
+	if err := copyMigrationDirectory(ctx, source, copyDir, check); err != nil {
 		return err
 	}
 	legacy, err := loadLegacyForMigration(copyDir, mode)
@@ -115,7 +128,7 @@ func Migrate(ctx context.Context, source, target string, open TargetOpener) erro
 		}
 	}
 	destination := filepath.Join(work, "target")
-	if err := copyMigrationDirectory(ctx, filepath.Join(copyDir, "users"), filepath.Join(destination, "users")); err != nil {
+	if err := copyMigrationDirectory(ctx, filepath.Join(copyDir, "users"), filepath.Join(destination, "users"), check); err != nil {
 		return err
 	}
 	engine, err := open(destination)
@@ -128,6 +141,9 @@ func Migrate(ctx context.Context, source, target string, open TargetOpener) erro
 	if err = engine.Close(); err != nil {
 		return err
 	}
+	if err = check.hit("before-verify"); err != nil {
+		return err
+	}
 	engine, err = open(destination)
 	if err != nil {
 		return err
@@ -137,16 +153,35 @@ func Migrate(ctx context.Context, source, target string, open TargetOpener) erro
 	if err != nil {
 		return err
 	}
+	if err = check.hit("after-verify"); err != nil {
+		return err
+	}
+	if err = syncTree(ctx, destination); err != nil {
+		return err
+	}
+	if err = check.hit("before-rename"); err != nil {
+		return err
+	}
 	if err = ctx.Err(); err != nil {
 		return err
 	}
 	if _, err = os.Lstat(target); !os.IsNotExist(err) {
 		return fmt.Errorf("migration target appeared during conversion")
 	}
-	return os.Rename(destination, target)
+	if err = publishDirectory(destination, target); err != nil {
+		return err
+	}
+	// Once published, never delete a verified target even if parent sync fails.
+	if err = syncDirectory(parent); err != nil {
+		return fmt.Errorf("target published; parent sync: %w", err)
+	}
+	if err = syncDirectory(work); err != nil {
+		return fmt.Errorf("target published; staging sync: %w", err)
+	}
+	return check.hit("after-rename")
 }
 
-func copyMigrationDirectory(ctx context.Context, source, target string) error {
+func copyMigrationDirectory(ctx context.Context, source, target string, check checkpoint) error {
 	return filepath.WalkDir(source, func(p string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -178,7 +213,10 @@ func copyMigrationDirectory(ctx context.Context, source, target string) error {
 		if err != nil {
 			return err
 		}
-		_, copyErr := io.Copy(dst, in)
+		_, copyErr := io.Copy(&copyWriter{ctx: ctx, file: dst, check: check}, in)
+		if copyErr == nil {
+			copyErr = dst.Sync()
+		}
 		closeErr := dst.Close()
 		if copyErr != nil {
 			return copyErr
@@ -197,3 +235,20 @@ type Target interface {
 	Close() error
 }
 type TargetOpener func(directory string) (Target, error)
+
+type copyWriter struct {
+	ctx   context.Context
+	file  *os.File
+	check checkpoint
+}
+
+func (w *copyWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := w.file.Write(p)
+	if err == nil {
+		err = w.check.hit("write")
+	}
+	return n, err
+}

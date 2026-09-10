@@ -78,7 +78,7 @@ func architectureViolations(path string, src any) []string {
 				if path == "executor/physical_select.go" && (n.Name == "executeBudgetedDistinct" || n.Name == "resultOperator") {
 					issues = append(issues, "materialized DISTINCT in core binding")
 				}
-				if n.Name == "loadLegacyForMigration" && !loader && !(migration && fn == "Migrate") {
+				if n.Name == "loadLegacyForMigration" && !loader && !(migration && fn == "migrate") {
 					issues = append(issues, "migration reader reachable from runtime")
 				}
 				if strings.HasPrefix(n.Name, "openLegacy") || n.Name == "legacyEngine" || n.Name == "legacyTransaction" {
