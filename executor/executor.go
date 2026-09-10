@@ -1530,7 +1530,7 @@ func bindUnionWithSelect(session *Session, statement parser.Union, selectQuery f
 			inputs = append(inputs, semanticInput(current.Columns, current.Input))
 		}
 		inputs = append(inputs, semanticInput(branch.Columns, branch.Input))
-		current = &boundQuery{columns, physical.Union[[]any]{Inputs: inputs}}
+		current = &boundQuery{Columns: columns, Input: physical.Union[[]any]{Inputs: inputs}}
 		if index > 0 && !statement.All[index-1] {
 			current = bindDistinct(session, columns, current.Input, 0, -1)
 		}
@@ -3843,7 +3843,7 @@ func bindGroupedSelect(table *storage.Table, statement parser.Select, columns []
 	if statement.HasLimit {
 		limit = statement.Limit
 	}
-	return &boundQuery{resultColumns, physical.Limit[[]any]{Input: output, Offset: statement.Offset, Count: limit}}, nil
+	return &boundQuery{Columns: resultColumns, Input: physical.Limit[[]any]{Input: output, Offset: statement.Offset, Count: limit}}, nil
 }
 
 func isCountExpression(expression string) bool {

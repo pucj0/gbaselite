@@ -3,12 +3,13 @@ package executor
 import (
 	"fmt"
 	"gbaselite/parser"
+	"gbaselite/physical"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
 )
 
-func executeSQLExplain(tx storageengine.Txn, session *Session, query parser.Query) (*Result, error) {
+func executeSQLExplain(tx storageengine.Txn, session *Session, query parser.Query) (result *Result, err error) {
 	if union, ok := query.(parser.Union); ok {
 		var combined *Result
 		for i, branch := range union.Queries {
@@ -40,6 +41,20 @@ func executeSQLExplain(tx storageengine.Txn, session *Session, query parser.Quer
 	if err := validateSQLSelectShape(s); err != nil {
 		return nil, err
 	}
+	var bound *boundQuery
+	if s.Table != "" {
+		bound, err = bindPhysicalSelect(operatorContext(session), tx, session, s)
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer func() {
+		if err == nil && result != nil && bound != nil {
+			for _, r := range result.Rows {
+				r[11] = fmt.Sprint(r[11]) + "; Pipeline: " + physical.Describe(bound.Input).String()
+			}
+		}
+	}()
 	columns := []Column{{Name: "id", Type: storage.TypeBigInt}, {Name: "select_type", Type: storage.TypeVarchar}, {Name: "table", Type: storage.TypeVarchar, Nullable: true}, {Name: "partitions", Type: storage.TypeVarchar, Nullable: true}, {Name: "type", Type: storage.TypeVarchar, Nullable: true}, {Name: "possible_keys", Type: storage.TypeVarchar, Nullable: true}, {Name: "key", Type: storage.TypeVarchar, Nullable: true}, {Name: "key_len", Type: storage.TypeVarchar, Nullable: true}, {Name: "ref", Type: storage.TypeVarchar, Nullable: true}, {Name: "rows", Type: storage.TypeBigInt, Nullable: true}, {Name: "filtered", Type: storage.TypeDouble, Nullable: true}, {Name: "Extra", Type: storage.TypeText}}
 	if len(s.Joins) > 0 {
 		inputs, err := bindJoins(tx, session, s)
@@ -65,7 +80,7 @@ func executeSQLExplain(tx storageengine.Txn, session *Session, query parser.Quer
 		if err = bindSQLExplainExpr(s.Where, schema); err != nil {
 			return nil, err
 		}
-		result := &Result{Columns: columns}
+		result = &Result{Columns: columns}
 		for i, input := range inputs {
 			name := input.join.TableAlias
 			if name == "" {
@@ -85,11 +100,9 @@ func executeSQLExplain(tx storageengine.Txn, session *Session, query parser.Quer
 		}
 		return result, nil
 	}
-	var table versionedTable
 	var schema *storage.Table
-	var err error
 	if s.Table != "" {
-		table, schema, _, err = loadVersionedTable(tx, session, s.Table)
+		_, schema, _, err = loadVersionedTable(tx, session, s.Table)
 		if err != nil {
 			return nil, err
 		}
@@ -134,12 +147,12 @@ func executeSQLExplain(tx storageengine.Txn, session *Session, query parser.Quer
 	if err := bindSQLExplainClauses(s, schema); err != nil {
 		return nil, err
 	}
-	result := &Result{Columns: columns}
+	result = &Result{Columns: columns}
 	if s.Table == "" {
 		result.Rows = [][]any{{int64(1), "SIMPLE", nil, nil, nil, nil, nil, nil, nil, int64(1), nil, "No tables used"}}
 		return result, nil
 	}
-	p := planSQLAccess(s, table, schema, session)
+	p := *bound.Access
 	access := p.kind
 	var selected, possible, rows any
 	if p.index != "" {

@@ -28,6 +28,7 @@ func (s Source[T]) Run(ctx context.Context, yield Yield[T]) error {
 }
 
 type Scan[T any] struct {
+	Plan   *PlanNode
 	Open   func(context.Context) (storageengine.Iterator, error)
 	Decode func([]byte, []byte) (T, error)
 }
@@ -92,6 +93,7 @@ func (p Projection[A, B]) Run(ctx context.Context, y Yield[B]) error {
 // Join opens a right input per left row. The planner may choose an index probe
 // or a scan without changing the join algorithm. NullRight implements LEFT JOIN.
 type Join3[L, R, O any] struct {
+	RightPlan *PlanNode
 	Left      Operator[L]
 	Right     func(L) (Operator[R], error)
 	Combine   func(L, R) O

@@ -68,7 +68,11 @@ func bindPhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Sess
 			return truthy(value), err
 		}}
 	}
-	return bindSelectOutput(session, statement, schema, op, ordered)
+	query, err := bindSelectOutput(session, statement, schema, op, ordered)
+	if query != nil {
+		query.Access = &plan
+	}
+	return query, err
 }
 func bindSelectOutput(session *Session, statement parser.Select, schema *storage.Table, source physical.Operator[storage.Row], ordered bool) (*boundQuery, error) {
 	if statement.Distinct {

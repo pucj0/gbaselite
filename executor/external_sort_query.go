@@ -51,7 +51,7 @@ func bindOrder(session *Session, columns []Column, compare func([]any, []any) in
 		}
 		return row[:len(columns)], nil
 	}}
-	return &boundQuery{columns, project}
+	return &boundQuery{Columns: columns, Input: project}
 }
 
 func visitQueryResult(q *queryControl, result *Result, yield func([]any) error) error {
@@ -140,7 +140,7 @@ func bindDistinct(session *Session, columns []Column, input physical.Operator[[]
 	if limit == 0 {
 		output = discardOutput(op)
 	}
-	return &boundQuery{columns, output}
+	return &boundQuery{Columns: columns, Input: output}
 }
 
 // queryMemoryAccount is for materializing operators whose states cannot yet be

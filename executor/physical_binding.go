@@ -64,7 +64,7 @@ func openAccessIterator(ctx context.Context, tx storageengine.Txn, table version
 	return i, nil
 }
 func bindScan(tx storageengine.Txn, table versionedTable, access sqlAccessPlan, decode func([]byte) (storage.Row, error)) physical.Operator[storage.Row] {
-	return physical.Scan[storage.Row]{Open: func(ctx context.Context) (storageengine.Iterator, error) {
+	return physical.Scan[storage.Row]{Plan: &physical.PlanNode{Kind: scanKind(access), Attributes: map[string]string{"table": table.CatalogName, "access": access.kind, "index": access.index}}, Open: func(ctx context.Context) (storageengine.Iterator, error) {
 		return openAccessIterator(ctx, tx, table, access)
 	}, Decode: func(_, v []byte) (storage.Row, error) { return decode(v) }}
 }
@@ -111,4 +111,18 @@ func runRowModification(ctx context.Context, tx storageengine.Txn, table version
 	}}
 	op := physical.Modify[mutationRow, struct{}]{Input: physical.Limit[mutationRow]{Input: filter, Count: limit}, Apply: func(_ context.Context, r mutationRow) (struct{}, error) { return struct{}{}, apply(r.key, r.row) }}
 	return op.Run(ctx, func(struct{}) error { return nil })
+}
+
+func scanKind(p sqlAccessPlan) string {
+	switch p.kind {
+	case sqlAccessRange, sqlAccessOrdered:
+		return "IndexRangeScan"
+	case sqlAccessPoint, sqlAccessUnique:
+		return "IndexLookup"
+	default:
+		if p.index != "" {
+			return "IndexScan"
+		}
+		return "Scan"
+	}
 }

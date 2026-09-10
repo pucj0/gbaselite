@@ -7,6 +7,7 @@ import (
 // boundQuery separates binding from execution. Intermediate relational results
 // stay in the pipeline; only the ownership boundary constructs Result rows.
 type boundQuery struct {
+	Access  *sqlAccessPlan
 	Columns []Column
 	Input   physical.Operator[[]any]
 }
@@ -56,5 +57,5 @@ func discardOutput(input physical.Operator[[]any]) physical.Operator[[]any] {
 
 // Used only at scalar and external materialized-result boundaries.
 func boundResult(session *Session, r *Result) *boundQuery {
-	return &boundQuery{r.Columns, resultOperator(session.query, r)}
+	return &boundQuery{Columns: r.Columns, Input: resultOperator(session.query, r)}
 }
