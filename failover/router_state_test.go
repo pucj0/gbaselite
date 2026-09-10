@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -120,4 +121,135 @@ func TestProxyKeepsLeaderAcrossTransientProbeFailure(t *testing.T) {
 		t.Fatal("confirmation did not recover")
 	}
 	stateQuery(t, c)
+}
+
+func TestProxyConfirmsLeaderLossAfterConsecutiveMisses(t *testing.T) {
+	a := stateBackend(t)
+	r := stateRouter(t, a, a)
+	available := true
+	r.probe = func(_ context.Context, _ *sql.DB, p Peer) bool { return available && p.ID == "a" }
+	dbs := make([]*sql.DB, 3)
+	r.discover(context.Background(), dbs)
+	c := stateConnection(t, r)
+	for cycle := 0; cycle < 2; cycle++ {
+		available = false
+		for i := 1; i < leaderMissThreshold; i++ {
+			r.discover(context.Background(), dbs)
+			if r.Leader() != a {
+				t.Fatal("cleared before confirmation")
+			}
+			stateQuery(t, c)
+		}
+		if cycle == 0 {
+			available = true
+			r.discover(context.Background(), dbs)
+		}
+	}
+	r.discover(context.Background(), dbs)
+	if r.Leader() != "" {
+		t.Fatal("unavailable leader retained")
+	}
+	if err := c.PingContext(context.Background()); err == nil {
+		t.Fatal("old connection survived confirmed loss")
+	}
+}
+func TestProxyConfirmedLeaderChangeClosesOldConnection(t *testing.T) {
+	a, b := stateBackend(t), stateBackend(t)
+	r := stateRouter(t, a, b)
+	leader := "a"
+	r.probe = func(_ context.Context, _ *sql.DB, p Peer) bool { return p.ID == leader }
+	dbs := make([]*sql.DB, 3)
+	r.discover(context.Background(), dbs)
+	old := stateConnection(t, r)
+	leader = "b"
+	r.discover(context.Background(), dbs)
+	if r.Leader() != b {
+		t.Fatal("confirmed successor not selected immediately")
+	}
+	if err := old.PingContext(context.Background()); err == nil {
+		t.Fatal("old leader connection still usable")
+	}
+	stateQuery(t, stateConnection(t, r))
+}
+func TestProxyRejectsStaleDiscovery(t *testing.T) {
+	r := stateRouter(t, "127.0.0.1:1", "127.0.0.1:2")
+	r.changeLeader("127.0.0.1:1")
+	old := r.generation
+	r.changeLeader("127.0.0.1:2")
+	r.recordDiscovery("127.0.0.1:1", old)
+	if r.Leader() != "127.0.0.1:2" {
+		t.Fatal("stale probe undid transition")
+	}
+}
+func TestProxyTransitionUnblocksBackendWrite(t *testing.T) {
+	r := stateRouter(t, "127.0.0.1:1", "127.0.0.1:2")
+	r.changeLeader("127.0.0.1:1")
+	client, remote := net.Pipe()
+	backend, server := net.Pipe()
+	defer remote.Close()
+	defer server.Close()
+	c := &routedConnection{Conn: client, backend: backend}
+	defer c.Close()
+	r.connections[c] = "127.0.0.1:1"
+	done := make(chan error, 1)
+	go func() { _, err := backend.Write([]byte("blocked")); done <- err }()
+	r.changeLeader("127.0.0.1:2")
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("write succeeded with no receiver")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("backend writer leaked after leader change")
+	}
+}
+func TestRouterConcurrentDiscoveryAndConnections(t *testing.T) {
+	a := stateBackend(t)
+	r := stateRouter(t, a, a)
+	r.probe = func(_ context.Context, _ *sql.DB, p Peer) bool { return p.ID == "a" }
+	r.discover(context.Background(), make([]*sql.DB, 3))
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.Serve(ctx, l) }()
+	var workers sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for j := 0; j < 8; j++ {
+				c, err := net.DialTimeout("tcp", l.Addr().String(), time.Second)
+				if err == nil {
+					c.Close()
+				}
+				r.Leader()
+			}
+		}()
+	}
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		for i := 0; i < 32; i++ {
+			r.changeLeader("")
+			r.discover(ctx, make([]*sql.DB, 3))
+		}
+	}()
+	workers.Wait()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not close active transports")
+	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	if len(r.connections) != 0 || r.leader != "" {
+		t.Fatal("shutdown retained connections or leader")
+	}
 }

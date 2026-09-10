@@ -36,6 +36,9 @@ jobs:
         run: go test ./... -count=1
       - name: Vet
         run: go vet ./...
+      - name: Failover race regression
+        if: runner.os == 'Linux'
+        run: go test -race ./failover -count=10
 
   mysql-8-client:
     needs: quality

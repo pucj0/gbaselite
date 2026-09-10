@@ -3,13 +3,11 @@ package failover_test
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"gbaselite/executor"
 	"gbaselite/failover"
 	"gbaselite/server"
 	"gbaselite/storageengine"
-	"github.com/go-sql-driver/mysql"
 	"io"
 	"log"
 	"net"
@@ -99,31 +97,14 @@ func TestProxyRoutesAfterLeaderFailure(t *testing.T) {
 	}
 	db := open()
 	defer db.Close()
-	// Leader discovery may close a connection while the initial cluster is
-	// converging, especially on a busy CI host. Retry only these idempotent
-	// fixture statements using a fresh connection; the proxy never replays SQL.
+	// Do not retry fixture SQL or accept duplicate-key errors: every write below
+	// must succeed once, including on a busy Windows runner.
 	execFixture := func(query string) {
 		t.Helper()
-		deadline := time.Now().Add(15 * time.Second)
-		for {
-			if _, err = db.Exec(query); err == nil {
-				return
-			}
-			// A disconnected INSERT may already have committed. The fixed primary
-			// keys make retry duplicates safe; the final count and sum verify values.
-			var sqlErr *mysql.MySQLError
-			if errors.As(err, &sqlErr) && sqlErr.Number == 1062 {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Fatalf("fixture %s: %v", query, err)
-			}
-			db.Close()
-			time.Sleep(100 * time.Millisecond)
-			db = open()
+		if _, err := db.Exec(query); err != nil {
+			t.Fatalf("fixture %s: %v", query, err)
 		}
 	}
-	defer func() { db.Close() }()
 	for _, q := range []string{"CREATE DATABASE IF NOT EXISTS test", "CREATE TABLE IF NOT EXISTS test.items(id INT PRIMARY KEY,v INT)", "INSERT INTO test.items VALUES(1,10)"} {
 		execFixture(q)
 	}
