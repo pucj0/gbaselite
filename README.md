@@ -1256,3 +1256,5 @@ Aggregate 的 Accumulator 与 Window 的 PartitionStore/EvaluateStore 为外部�
 连接代理的 leader discovery 保留短暂失败宽限：一次未确认 leader 的探测轮次不会关闭现有连接，连续三轮未确认才清空地址；确认到新 leader 时立即切换并关闭旧后端的双向连接。成功确认重置失败计数，关闭代理不等待宽限。探测仍使用原有超时，代理只路由连接，不重放 SQL 或事务。
 
 代理的单次 leader 确认只执行一条 `SHOW REPLICATION STATUS`，不再执行普通 `SELECT 1`。服务端只对自报 Leader 且节点身份一致的候选调用 optional `LeaderVerifier.VerifyLeader`，验证 quorum，不等待 FSM Barrier；Follower 和 Standalone 保持原有五列状态结果。候选验证失败返回错误，缺少 verifier 时返回不支持，不回退到完整 Barrier。普通 SQL 的复制 Barrier 语义保持不变。连接获取与状态请求仍共享原有 750ms deadline，服务端验证也以 750ms 为上限；500ms 探测周期及连续三次 miss 阈值不变。内部测试钩子保留逐轮阶段、耗时、状态和错误分类，默认关闭，不增加生产日志。
+
+A04 SQL 能力审计矩阵见 [docs/设计/A04-MVCC-SQL能力矩阵.md](docs/设计/A04-MVCC-SQL能力矩阵.md)。
