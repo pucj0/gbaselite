@@ -55,7 +55,7 @@ func bindJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]joinI
 			return nil, err
 		}
 		if i > 0 {
-			if err = bindSQLExplainExpr(j.On, combined); err != nil {
+			if err = bindSQLExplainExprSession(j.On, combined, session); err != nil {
 				return nil, err
 			}
 		}
@@ -70,7 +70,7 @@ func joinedInput(tx storageengine.Txn, session *Session, s parser.Select) (*stor
 		return nil, nil, err
 	}
 	schema := inputs[len(inputs)-1].combined
-	if err = bindSQLExplainExpr(s.Where, schema); err != nil {
+	if err = bindSQLExplainExprSession(s.Where, schema, session); err != nil {
 		return nil, nil, err
 	}
 	left := bindScan(tx, inputs[0].definition, sqlAccessPlan{kind: sqlAccessAll}, func(v []byte) (storage.Row, error) { return decodeSQLRow(inputs[0].definition, v) })

@@ -49,7 +49,7 @@ func (e *Engine) joinUpdateSQL(ctx context.Context, read, write storageengine.Tx
 		return nil, errors.New("UPDATE JOIN target columns changed while binding")
 	}
 	combined := inputs[len(inputs)-1].combined
-	if err = bindSQLExplainExpr(statement.Where, combined); err != nil {
+	if err = bindSQLExplainExprSession(statement.Where, combined, session); err != nil {
 		return nil, err
 	}
 

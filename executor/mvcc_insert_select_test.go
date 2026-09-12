@@ -9,10 +9,11 @@ import (
 	"gbaselite/storage"
 )
 
-// insertSelectStep is one scripted statement in the legacy/MVCC INSERT SELECT
-// parity run. Fail marks statements that must error on both engines; the error
-// text differs between the runtimes, so only the failure itself is compared.
-type insertSelectStep struct {
+// parityStep is one scripted statement in a legacy/MVCC parity run. Rows compares
+// the full result set, InsertID the reported auto-increment value, Fail requires
+// both engines to reject the statement, and SkipAffect ignores the OK-packet
+// affected-rows difference that DDL statements have between the two runtimes.
+type parityStep struct {
 	Query      string
 	Rows       bool
 	InsertID   bool
@@ -20,29 +21,29 @@ type insertSelectStep struct {
 	SkipAffect bool
 }
 
-type insertSelectOutcome struct {
+type parityOutcome struct {
 	Failed   bool
 	Affected uint64
 	InsertID uint64
 	Rows     string
 }
 
-func runInsertSelectScript(t *testing.T, execute func(string) (*Result, error), steps []insertSelectStep) []insertSelectOutcome {
+func runParityScript(t *testing.T, execute func(string) (*Result, error), steps []parityStep) []parityOutcome {
 	t.Helper()
-	outcomes := make([]insertSelectOutcome, 0, len(steps))
+	outcomes := make([]parityOutcome, 0, len(steps))
 	for _, step := range steps {
 		result, err := execute(step.Query)
 		if err != nil {
 			if !step.Fail {
 				t.Fatalf("%s: %v", step.Query, err)
 			}
-			outcomes = append(outcomes, insertSelectOutcome{Failed: true})
+			outcomes = append(outcomes, parityOutcome{Failed: true})
 			continue
 		}
 		if step.Fail {
 			t.Fatalf("%s: expected an error", step.Query)
 		}
-		outcome := insertSelectOutcome{}
+		outcome := parityOutcome{}
 		if result != nil {
 			if !step.SkipAffect {
 				outcome.Affected = result.AffectedRows
@@ -60,7 +61,7 @@ func runInsertSelectScript(t *testing.T, execute func(string) (*Result, error), 
 }
 
 // insertSelectScript is the shared legacy/MVCC INSERT SELECT fixture.
-var insertSelectScript = []insertSelectStep{
+var insertSelectScript = []parityStep{
 	{Query: "CREATE DATABASE is_parity", SkipAffect: true},
 	{Query: "USE is_parity", SkipAffect: true},
 	{Query: "CREATE TABLE src(id INT PRIMARY KEY,v INT,note VARCHAR(20))", SkipAffect: true},
@@ -119,10 +120,10 @@ func TestMVCCInsertSelectMatchesLegacyEngine(t *testing.T) {
 	}
 	defer legacy.Close()
 	legacySession := &Session{}
-	legacyOutcomes := runInsertSelectScript(t, func(q string) (*Result, error) { return legacy.Execute(legacySession, q) }, insertSelectScript)
+	legacyOutcomes := runParityScript(t, func(q string) (*Result, error) { return legacy.Execute(legacySession, q) }, insertSelectScript)
 
 	e, session, _ := rangeTestEngine(t)
-	mvccOutcomes := runInsertSelectScript(t, func(q string) (*Result, error) { return e.Execute(session, q) }, insertSelectScript)
+	mvccOutcomes := runParityScript(t, func(q string) (*Result, error) { return e.Execute(session, q) }, insertSelectScript)
 
 	if !reflect.DeepEqual(legacyOutcomes, mvccOutcomes) {
 		for i, step := range insertSelectScript {

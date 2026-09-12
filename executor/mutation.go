@@ -201,11 +201,11 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		if err = write.Guard(sqllayout.Catalog, k); err != nil {
 			return nil, err
 		}
-		if value.TableAlias != "" {
-			schema, err = qualifySchema(schema, value.TableAlias)
-			if err != nil {
-				return nil, err
-			}
+		// Always qualify the evaluation schema, like the legacy executor, so a
+		// correlated subquery can bind an explicitly qualified outer column.
+		schema, err = qualifySchema(schema, mutationQualifier(value.Table, value.TableAlias))
+		if err != nil {
+			return nil, err
 		}
 		var updated storage.Row
 		count := 0
@@ -243,13 +243,19 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		return &Result{AffectedRows: uint64(count)}, err
 	case parser.Delete:
 		if len(value.Joins) > 0 || len(value.Targets) > 0 {
-			return nil, errors.New("multi-table DELETE is not supported")
+			return e.multiTableDeleteSQL(ctx, read, write, session, value)
 		}
 		definition, schema, k, err := loadVersionedTable(read, session, value.Table)
 		if err != nil {
 			return nil, err
 		}
 		if err = write.Guard(sqllayout.Catalog, k); err != nil {
+			return nil, err
+		}
+		// Always qualify the evaluation schema so a correlated subquery can bind
+		// an explicitly qualified outer column.
+		schema, err = qualifySchema(schema, mutationQualifier(value.Table, value.TableAlias))
+		if err != nil {
 			return nil, err
 		}
 
@@ -271,8 +277,8 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 	}
 }
 func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Insert) (*Result, error) {
-	if statement.Replace || statement.Ignore || len(statement.SetValues) > 0 || len(statement.OnDuplicate) > 0 {
-		return nil, errors.New("MVCC insert does not support SET, IGNORE, REPLACE, or ON DUPLICATE KEY")
+	if len(statement.SetValues) > 0 {
+		statement = insertSetStatement(statement)
 	}
 	if statement.Select != nil {
 		return e.insertSelectSQL(ctx, read, write, session, statement)
@@ -317,6 +323,10 @@ func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, s
 		sent[i] = floors[i]
 		return nil
 	}
+	// The destination view and duplicate-key policy are shared with the
+	// INSERT SELECT writer so both sources handle conflicts identically.
+	target := &insertTarget{definition: definition, columns: columns, positions: positions, floors: floors, sent: sent, next: next, last: last}
+	mode := insertStatementMode(statement)
 	input := physical.Source[int](func(_ context.Context, y physical.Yield[int]) error {
 		for i := range statement.Values {
 			if err := y(i); err != nil {
@@ -330,6 +340,7 @@ func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, s
 		if err := ctx.Err(); err != nil {
 			return struct{}{}, err
 		}
+		generated := uint64(0)
 		if len(literals) != len(positions) {
 			return struct{}{}, errors.New("INSERT value count does not match columns")
 		}
@@ -393,15 +404,19 @@ func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, s
 				if err != nil {
 					return struct{}{}, err
 				}
-				if lastGenerated == 0 {
-					lastGenerated = id
+				if generated == 0 {
+					generated = id
 				}
 			}
 		}
-		if err := writeVersionedRow(ctx, write, definition, nil, nil, row, fmt.Sprintf("%s/%020d", write.ID(), rowIndex)); err != nil {
-			return struct{}{}, err
+		outcome, writeErr := writeInsertedRow(ctx, write, session, target, mode, row, uint64(rowIndex))
+		if writeErr != nil {
+			return struct{}{}, writeErr
 		}
-		result.AffectedRows++
+		result.AffectedRows += uint64(outcome.affected)
+		if outcome.inserted && generated != 0 && lastGenerated == 0 {
+			lastGenerated = generated
+		}
 		return struct{}{}, nil
 	}}
 	if err := modify.Run(ctx, func(struct{}) error { return nil }); err != nil {
@@ -415,7 +430,6 @@ func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, s
 	}
 	if lastGenerated != 0 {
 		result.LastInsertID = lastGenerated
-		session.LastInsertID = lastGenerated
 	}
 	return result, nil
 }

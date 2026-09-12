@@ -5,55 +5,72 @@ import (
 	"strings"
 )
 
-// scalarExpressionSupported excludes subqueries and aggregates from row evaluation.
+// scalarExpressionSupported excludes subqueries and aggregates from row
+// evaluation. The legacy cold-read guard relies on subqueries being rejected
+// here, so the MVCC projection binder uses rowExpressionSupported instead.
 func scalarExpressionSupported(expression parser.Expr) bool {
+	return expressionSupported(expression, false)
+}
+
+// rowExpressionSupported additionally allows subqueries, which the statement
+// evaluator resolves per row against the statement snapshot transaction.
+func rowExpressionSupported(expression parser.Expr) bool {
+	return expressionSupported(expression, true)
+}
+
+func expressionSupported(expression parser.Expr, subqueries bool) bool {
 	switch value := expression.(type) {
 	case nil, parser.Identifier, parser.LiteralExpr:
 		return true
+	case parser.ScalarSubquery, parser.ExistsExpr:
+		return subqueries
 	case parser.BinaryExpr:
-		return scalarExpressionSupported(value.Left) && scalarExpressionSupported(value.Right)
+		return expressionSupported(value.Left, subqueries) && expressionSupported(value.Right, subqueries)
 	case parser.UnaryExpr:
-		return scalarExpressionSupported(value.Value)
+		return expressionSupported(value.Value, subqueries)
 	case parser.InExpr:
-		if value.Subquery != nil || !scalarExpressionSupported(value.Value) {
+		if value.Subquery != nil && !subqueries {
+			return false
+		}
+		if !expressionSupported(value.Value, subqueries) {
 			return false
 		}
 		for _, item := range value.Values {
-			if !scalarExpressionSupported(item) {
+			if !expressionSupported(item, subqueries) {
 				return false
 			}
 		}
 		return true
 	case parser.BetweenExpr:
-		return scalarExpressionSupported(value.Value) && scalarExpressionSupported(value.Lower) && scalarExpressionSupported(value.Upper)
+		return expressionSupported(value.Value, subqueries) && expressionSupported(value.Lower, subqueries) && expressionSupported(value.Upper, subqueries)
 	case parser.IsExpr:
-		return scalarExpressionSupported(value.Value) && scalarExpressionSupported(value.Target)
+		return expressionSupported(value.Value, subqueries) && expressionSupported(value.Target, subqueries)
 	case parser.FunctionExpr:
 		switch strings.ToUpper(value.Name) {
 		case "COUNT", "SUM", "AVG", "MIN", "MAX":
 			return false
 		}
 		for _, argument := range value.Args {
-			if !scalarExpressionSupported(argument) {
+			if !expressionSupported(argument, subqueries) {
 				return false
 			}
 		}
 		return true
 	case parser.IntervalExpr:
-		return scalarExpressionSupported(value.Value)
+		return expressionSupported(value.Value, subqueries)
 	case parser.RowExpr:
 		for _, item := range value.Values {
-			if !scalarExpressionSupported(item) {
+			if !expressionSupported(item, subqueries) {
 				return false
 			}
 		}
 		return true
 	case parser.CaseExpr:
-		if !scalarExpressionSupported(value.Operand) || !scalarExpressionSupported(value.Else) {
+		if !expressionSupported(value.Operand, subqueries) || !expressionSupported(value.Else, subqueries) {
 			return false
 		}
 		for _, branch := range value.Whens {
-			if !scalarExpressionSupported(branch.When) || !scalarExpressionSupported(branch.Then) {
+			if !expressionSupported(branch.When, subqueries) || !expressionSupported(branch.Then, subqueries) {
 				return false
 			}
 		}

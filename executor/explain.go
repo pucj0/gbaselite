@@ -203,9 +203,17 @@ func executeSQLExplain(tx storageengine.Txn, session *Session, query parser.Quer
 // Resolve column references only. EXPLAIN must not evaluate SLEEP, assignments,
 // user functions or row expressions to fabricate cardinality statistics.
 func bindSQLExplainExpr(expr parser.Expr, schema *storage.Table, aliases ...map[string]bool) error {
+	return bindSQLExplainExprSession(expr, schema, nil, aliases...)
+}
+
+// bindSQLExplainExprSession resolves column references, accepting names that the
+// active correlation scope publishes so a correlated subquery can be bound while
+// its statement evaluates an outer row. Subqueries are not descended into: they
+// are bound and checked when they run.
+func bindSQLExplainExprSession(expr parser.Expr, schema *storage.Table, session *Session, aliases ...map[string]bool) error {
 	var children []parser.Expr
 	switch v := expr.(type) {
-	case nil, parser.LiteralExpr:
+	case nil, parser.LiteralExpr, parser.ScalarSubquery, parser.ExistsExpr:
 		return nil
 	case parser.Identifier:
 		if len(aliases) > 0 && aliases[0][strings.ToLower(v.Name)] {
@@ -215,6 +223,9 @@ func bindSQLExplainExpr(expr parser.Expr, schema *storage.Table, aliases ...map[
 			if _, ok := queryColumnIndex(schema, v.Name); ok {
 				return nil
 			}
+		}
+		if _, ok := correlationScopeValue(session, v.Name); ok {
+			return nil
 		}
 		return fmt.Errorf("unknown column %s", v.Name)
 	case parser.BinaryExpr:
@@ -234,9 +245,6 @@ func bindSQLExplainExpr(expr parser.Expr, schema *storage.Table, aliases ...map[
 	case parser.IntervalExpr:
 		children = []parser.Expr{v.Value}
 	case parser.InExpr:
-		if v.Subquery != nil {
-			return fmt.Errorf("scalar subqueries are not supported")
-		}
 		children = append([]parser.Expr{v.Value}, v.Values...)
 	case parser.BetweenExpr:
 		children = []parser.Expr{v.Value, v.Lower, v.Upper}
@@ -251,7 +259,7 @@ func bindSQLExplainExpr(expr parser.Expr, schema *storage.Table, aliases ...map[
 		return fmt.Errorf("unsupported EXPLAIN expression %T", expr)
 	}
 	for _, child := range children {
-		if err := bindSQLExplainExpr(child, schema, aliases...); err != nil {
+		if err := bindSQLExplainExprSession(child, schema, session, aliases...); err != nil {
 			return err
 		}
 	}

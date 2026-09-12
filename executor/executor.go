@@ -88,6 +88,7 @@ type Session struct {
 	copySource        *navicatCopySource
 	copyTargets       map[string]string
 	correlationScopes []map[string]any
+	subqueries        *subqueryRunner
 	timeLocation      *time.Location
 }
 
@@ -5418,21 +5419,9 @@ func evaluateExprWithContext(expr parser.Expr, table *storage.Table, row storage
 	if err := checkQuery(session); err != nil {
 		return nil, err
 	}
-	lookup := func(name string) (any, error) {
-		if name == sessionLookupIdentifier {
-			return session, nil
-		}
-		if session != nil && strings.EqualFold(name, "LAST_INSERT_ID()") {
-			return int64(session.LastInsertID), nil
-		}
-		index, ok := queryColumnIndex(table, name)
-		if ok {
-			return jsonColumnValue(table.ColumnsView()[index], row[index]), nil
-		}
-		if correlated, exists := correlationScopeValue(session, name); exists {
-			return correlated, nil
-		}
-		return nil, fmt.Errorf("unknown column %s", name)
+	lookup := expressionLookup(session, table, row)
+	if store == nil && session != nil && session.subqueries != nil && expressionHasSubquery(expr) {
+		return session.subqueries.evaluateExprWithSubqueries(expr, table, row, session)
 	}
 	if session == nil || store == nil || !expressionHasSubquery(expr) {
 		return evaluateExprWithLookup(expr, lookup)

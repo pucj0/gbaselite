@@ -70,7 +70,7 @@ func (e *Engine) refreshSQLMetadata(ctx context.Context) error {
 			return beginErr
 		}
 		defer tx.Rollback()
-		head = tx.Snapshot()
+
 		open = func() (storageengine.Iterator, error) {
 			return tx.NewIterator(ctx, storageengine.ScanRequest{Space: sqllayout.Catalog})
 		}
@@ -252,6 +252,10 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 	if automatic {
 		defer tx.Rollback()
 	}
+	// Subqueries run on the statement snapshot transaction: never on the child
+	// write transaction, and never in a transaction of their own.
+	session.subqueries = &subqueryRunner{engine: e, session: session, ctx: ctx, tx: tx}
+	defer func() { session.subqueries = nil }()
 	switch value := statement.(type) {
 	case parser.Empty:
 		return &Result{}, nil
@@ -309,6 +313,12 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		if err = e.refreshSQLMetadata(ctx); err != nil {
 			return nil, err
 		}
+	}
+	// LastInsertID is published only after the statement transaction committed,
+	// so a statement that fails or rolls back cannot leave the session pointing at
+	// an id that was never written.
+	if result != nil && result.LastInsertID != 0 {
+		session.LastInsertID = result.LastInsertID
 	}
 	return result, nil
 }

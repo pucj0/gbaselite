@@ -36,7 +36,7 @@ func (e *Engine) insertSelectSQL(ctx context.Context, read, write storageengine.
 	if err != nil {
 		return nil, err
 	}
-	query, err := bindInsertSource(ctx, read, session, statement.Select)
+	query, err := bindSubqueryQuery(ctx, read, session, statement.Select)
 	if err != nil {
 		return nil, err
 	}
@@ -45,6 +45,7 @@ func (e *Engine) insertSelectSQL(ctx context.Context, read, write storageengine.
 	}
 	result := &Result{}
 	ordinal := uint64(0)
+	mode := insertStatementMode(statement)
 	lastGenerated := uint64(0)
 	modify := physical.Modify[[]any, struct{}]{Input: query.Input, Apply: func(ctx context.Context, values []any) (struct{}, error) {
 		if err := ctx.Err(); err != nil {
@@ -58,14 +59,15 @@ func (e *Engine) insertSelectSQL(ctx context.Context, read, write storageengine.
 		if err != nil {
 			return struct{}{}, err
 		}
-		if ok && lastGenerated == 0 {
-			lastGenerated = generated
-		}
-		if err := writeVersionedRow(ctx, write, target.definition, nil, nil, row, fmt.Sprintf("%s/%020d", write.ID(), ordinal)); err != nil {
-			return struct{}{}, err
+		outcome, writeErr := writeInsertedRow(ctx, write, session, target, mode, row, ordinal)
+		if writeErr != nil {
+			return struct{}{}, writeErr
 		}
 		ordinal++
-		result.AffectedRows++
+		result.AffectedRows += uint64(outcome.affected)
+		if outcome.inserted && ok && lastGenerated == 0 {
+			lastGenerated = generated
+		}
 		return struct{}{}, nil
 	}}
 	if err := modify.Run(ctx, func(struct{}) error { return nil }); err != nil {
@@ -74,12 +76,10 @@ func (e *Engine) insertSelectSQL(ctx context.Context, read, write storageengine.
 	if err := flushInsertCounters(ctx, e, target); err != nil {
 		return nil, err
 	}
-	// LastInsertID is published only after every row and counter reservation
-	// succeeded, so a rolled-back statement cannot leave the session pointing at
-	// an id that was never committed (legacy INSERT SELECT behaviour).
+	// Carry the first generated id in the result; the statement executor
+	// publishes it to the session only after the statement transaction commits.
 	if lastGenerated != 0 {
 		result.LastInsertID = lastGenerated
-		session.LastInsertID = lastGenerated
 	}
 	return result, nil
 }
@@ -125,9 +125,9 @@ func (e *Engine) bindInsertTarget(write storageengine.Txn, session *Session, sta
 	}, nil
 }
 
-// bindInsertSource binds the SELECT/UNION source against the statement read
+// bindSubqueryQuery binds the SELECT/UNION source against the statement read
 // snapshot. No new transaction is created; the caller's transaction is reused.
-func bindInsertSource(ctx context.Context, read storageengine.Txn, session *Session, source parser.Query) (*boundQuery, error) {
+func bindSubqueryQuery(ctx context.Context, read storageengine.Txn, session *Session, source parser.Query) (*boundQuery, error) {
 	switch query := source.(type) {
 	case parser.Select:
 		return bindPhysicalSelect(ctx, read, session, query)

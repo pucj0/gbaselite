@@ -148,7 +148,7 @@ CPU、工作集、私有内存和磁盘。当前报告使用 2026-09-08 19:49—
 
 - MySQL 协议、认证、TLS、Prepared Statement 与常用元数据
 - MVCC 快照隔离、原子提交、断连与语句失败回滚
-- 表/索引 DDL、受支持 CRUD（含 UPDATE JOIN、INSERT SELECT）、聚合、分组、INNER/LEFT JOIN
+- 表/索引 DDL、受支持 CRUD（含 INSERT SET/IGNORE、REPLACE、ON DUPLICATE KEY、UPDATE JOIN、INSERT SELECT、多表 DELETE）、聚合、分组、INNER/LEFT JOIN、标量/IN/EXISTS 子查询
 - 精确 DECIMAL、JSON、约束与单机账号授权
 - 单机 MVCC 备份恢复、历史 GC、实验性复制与代理
 - Windows/Linux 部署、服务管理、Docker 与 MSI
@@ -756,8 +756,8 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 |---|---|---|
 | 连接 | MySQL TCP、认证、TLS、COM_QUERY、Prepared Statement、二进制结果 | 不是完整 MySQL 协议实现 |
 | DDL | 数据库/表创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引 | 不支持视图、CTAS/LIKE、RENAME TABLE；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
-| 写入 | INSERT VALUES/表达式/参数、INSERT SELECT（含 UNION ALL 源）、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT，连接输入须为基表） | 不支持 INSERT SET/IGNORE、REPLACE、ON DUPLICATE KEY、多表 DELETE、派生表/子查询连接输入、写入中的子查询 |
-| 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT JOIN、UNION/UNION ALL、排名与聚合窗口 | 不支持 CTE、派生表、子查询及锁定读；窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
+| 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …，目标表须有主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；不支持派生表/子查询作为连接输入 |
+| 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT JOIN、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询） | 不支持 CTE、派生表、RIGHT/CROSS JOIN 及锁定读；窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
 | 事务 | BEGIN/COMMIT/ROLLBACK、SET autocommit=0/1、断连回滚、语句失败回滚 | 快照隔离；不支持 SAVEPOINT、LOCK TABLES、隔离级别切换或串行化保证 |
 | 约束 | PRIMARY KEY、UNIQUE、CHECK、同库 RESTRICT/NO ACTION 外键 | 不支持级联、自引用、跨库外键；受引用表 ALTER 有限制 |
 | 类型 | INT/BIGINT、文本、日期时间、BOOLEAN、精确 DECIMAL、JSON 列及现有标量函数 | 不支持 ON UPDATE 列表达式；TIMESTAMP 尚无独立 UTC 存储语义 |
@@ -766,16 +766,30 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 | 维护 | 单机 BACKUP/RESTORE/GC/COMPACT MVCC | 必须在事务外且开启 autocommit；复制节点不支持这些在线维护命令 |
 | 复制 | 实验性固定三节点 Raft、选主、连接代理 | 无分片、动态成员、混合版本滚动升级或生产容灾保证 |
 
-UPDATE JOIN 与 INSERT SELECT 是当前支持的复合写入形式。UPDATE JOIN 的目标行被多个连接输入
-命中时只更新一次，并采用首个匹配的连接行；SET 列表从左到右生效，后续表达式可见前面的赋值
-结果；受影响行数按命中的目标行统计。INSERT SELECT（含 UNION ALL 源）在语句快照上读取源数据、
-在 statement child 事务中写入目标表，因此自引用源不会再次读到本次插入的行，任一行 UNIQUE、
-CHECK、外键或类型转换失败都会回滚整条语句。两者都受当前运行时范围限制：连接输入与查询源必须
-是已支持的基表查询，派生表、子查询和多表 DELETE 仍未支持。
+UPDATE JOIN、INSERT SELECT 与多表 DELETE 是当前支持的复合写入形式。UPDATE JOIN 的目标行被多个
+连接输入命中时只更新一次，并采用首个匹配的连接行；SET 列表从左到右生效，后续表达式可见前面的
+赋值结果；受影响行数按命中的目标行统计。INSERT SELECT（含 UNION ALL 源）与多表 DELETE 都在语句
+快照上读取源数据、在 statement child 事务中写入，因此自引用源不会再次读到本次写入的行，任一行
+UNIQUE、CHECK、外键或类型转换失败都会回滚整条语句。多表 DELETE 按主键去重，并按“先删引用方
+（子表）、后删被引用方（父表）”的顺序执行，使同一条语句同时删除父表与子表时仍满足 RESTRICT
+外键；它不支持 LIMIT，目标表必须带主键，目标表之间不允许循环外键，连接输入与查询源也必须是
+已支持的基表查询。
+
+INSERT 的冲突处理与 legacy 一致：IGNORE 只跳过重复键行，其他约束错误仍然失败；REPLACE 先删除主键
+或唯一键上的全部冲突行再插入（受影响行数 = 删除行数 + 1），被引用的行仍受 RESTRICT 保护；
+ON DUPLICATE KEY UPDATE 更新首个冲突行，赋值中普通列名读取被更新的行且可见前面的赋值结果，
+VALUES(列) 读取本次待插入值，受影响行数为 1，不发布 LastInsertID。INSERT SET 等价于单行 VALUES，
+省略列取默认值，表达式按书写顺序求值。
+
+子查询（标量、IN/NOT IN、EXISTS/NOT EXISTS，含相关子查询）在语句的父快照事务上求值，不新开事务，
+因此与所属语句看到同一快照，也不会读到语句自己未提交的写入；相关子查询按外层行逐行求值，
+未限定列优先绑定内层作用域，显式外层限定名按外层行绑定，两层相关也可用。`NOT IN` 子查询包含
+NULL 时遵循三值逻辑；标量子查询返回多行会报错并回滚整条语句（写完的行不会部分保留）。写入语句的
+WHERE、SET、VALUES 表达式与 ON DUPLICATE KEY UPDATE 同样支持子查询；连接输入仍要求是基表。
 
 同一行、唯一键或依赖表结构的并发变更可能导致提交返回 MySQL 1213，应重试整个事务。
 不同行更新可独立提交。自增号持久预留，回滚后允许空洞；会话的 LastInsertID 只在整条写入语句
-成功后更新，回滚的 INSERT 不会发布未提交的 id。SHOW 读取已提交元数据，不能
+提交成功后更新，回滚或提交失败的 INSERT 不会发布未提交的 id。SHOW 读取已提交元数据，不能
 用它判断当前事务内尚未提交的 DDL。单条 SQL 文本限制为 1 MiB。
 
 MVCC 默认查询预算：排序内存 4 MiB、结果内存 16 MiB、查询临时文件 256 MiB。

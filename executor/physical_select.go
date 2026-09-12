@@ -114,7 +114,7 @@ func bindSelectOutput(session *Session, statement parser.Select, schema *storage
 		if err != nil {
 			return nil, err
 		}
-		if !scalarExpressionSupported(expression) {
+		if !rowExpressionSupported(expression) {
 			return nil, errors.New("scalar subqueries are not supported")
 		}
 		kind, err := expressionTypeWithSession(expression, schema, columns, session)
