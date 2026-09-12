@@ -148,7 +148,7 @@ CPU、工作集、私有内存和磁盘。当前报告使用 2026-09-08 19:49—
 
 - MySQL 协议、认证、TLS、Prepared Statement 与常用元数据
 - MVCC 快照隔离、原子提交、断连与语句失败回滚
-- 表/索引 DDL、受支持 CRUD（含 UPDATE JOIN）、聚合、分组、INNER/LEFT JOIN
+- 表/索引 DDL、受支持 CRUD（含 UPDATE JOIN、INSERT SELECT）、聚合、分组、INNER/LEFT JOIN
 - 精确 DECIMAL、JSON、约束与单机账号授权
 - 单机 MVCC 备份恢复、历史 GC、实验性复制与代理
 - Windows/Linux 部署、服务管理、Docker 与 MSI
@@ -756,7 +756,7 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 |---|---|---|
 | 连接 | MySQL TCP、认证、TLS、COM_QUERY、Prepared Statement、二进制结果 | 不是完整 MySQL 协议实现 |
 | DDL | 数据库/表创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引 | 不支持视图、CTAS/LIKE、RENAME TABLE；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
-| 写入 | INSERT VALUES/表达式/参数、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT，连接输入须为基表） | 不支持 INSERT SELECT/SET/IGNORE、REPLACE、ON DUPLICATE KEY、多表 DELETE、派生表/子查询连接输入、写入中的子查询 |
+| 写入 | INSERT VALUES/表达式/参数、INSERT SELECT（含 UNION ALL 源）、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT，连接输入须为基表） | 不支持 INSERT SET/IGNORE、REPLACE、ON DUPLICATE KEY、多表 DELETE、派生表/子查询连接输入、写入中的子查询 |
 | 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT JOIN、UNION/UNION ALL、排名与聚合窗口 | 不支持 CTE、派生表、子查询及锁定读；窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
 | 事务 | BEGIN/COMMIT/ROLLBACK、SET autocommit=0/1、断连回滚、语句失败回滚 | 快照隔离；不支持 SAVEPOINT、LOCK TABLES、隔离级别切换或串行化保证 |
 | 约束 | PRIMARY KEY、UNIQUE、CHECK、同库 RESTRICT/NO ACTION 外键 | 不支持级联、自引用、跨库外键；受引用表 ALTER 有限制 |
@@ -766,9 +766,12 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 | 维护 | 单机 BACKUP/RESTORE/GC/COMPACT MVCC | 必须在事务外且开启 autocommit；复制节点不支持这些在线维护命令 |
 | 复制 | 实验性固定三节点 Raft、选主、连接代理 | 无分片、动态成员、混合版本滚动升级或生产容灾保证 |
 
-UPDATE JOIN 是当前唯一支持的复合写入形式：目标行被多个连接输入命中时只更新一次，并采用首个
-匹配的连接行；SET 列表从左到右生效，后续表达式可见前面的赋值结果；受影响行数按命中的目标行
-统计，任意一行失败会回滚整条语句。连接输入必须是基表，派生表、子查询和多表 DELETE 仍未支持。
+UPDATE JOIN 与 INSERT SELECT 是当前支持的复合写入形式。UPDATE JOIN 的目标行被多个连接输入
+命中时只更新一次，并采用首个匹配的连接行；SET 列表从左到右生效，后续表达式可见前面的赋值
+结果；受影响行数按命中的目标行统计。INSERT SELECT（含 UNION ALL 源）在语句快照上读取源数据、
+在 statement child 事务中写入目标表，因此自引用源不会再次读到本次插入的行，任一行 UNIQUE、
+CHECK、外键或类型转换失败都会回滚整条语句。两者都受当前运行时范围限制：连接输入与查询源必须
+是已支持的基表查询，派生表、子查询和多表 DELETE 仍未支持。
 
 同一行、唯一键或依赖表结构的并发变更可能导致提交返回 MySQL 1213，应重试整个事务。
 不同行更新可独立提交。自增号持久预留，回滚后允许空洞。SHOW 读取已提交元数据，不能

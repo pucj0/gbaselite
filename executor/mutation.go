@@ -271,8 +271,11 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 	}
 }
 func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Insert) (*Result, error) {
-	if statement.Replace || statement.Ignore || statement.Select != nil || len(statement.SetValues) > 0 || len(statement.OnDuplicate) > 0 {
-		return nil, errors.New("MVCC insert currently accepts VALUES without IGNORE/REPLACE/ON DUPLICATE")
+	if statement.Replace || statement.Ignore || len(statement.SetValues) > 0 || len(statement.OnDuplicate) > 0 {
+		return nil, errors.New("MVCC insert does not support SET, IGNORE, REPLACE, or ON DUPLICATE KEY")
+	}
+	if statement.Select != nil {
+		return e.insertSelectSQL(ctx, read, write, session, statement)
 	}
 	definition, schema, catalogKey, err := loadVersionedTable(write, session, statement.Table)
 	if err != nil {
