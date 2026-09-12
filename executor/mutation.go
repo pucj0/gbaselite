@@ -305,6 +305,7 @@ func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, s
 		}
 	}
 	result := &Result{}
+	lastGenerated := uint64(0)
 	floors, sent, next, last := make([]uint64, len(columns)), make([]uint64, len(columns)), make([]uint64, len(columns)), make([]uint64, len(columns))
 	advance := func(i int) error {
 		if floors[i] <= sent[i] {
@@ -392,9 +393,8 @@ func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, s
 				if err != nil {
 					return struct{}{}, err
 				}
-				if result.LastInsertID == 0 {
-					result.LastInsertID = id
-					session.LastInsertID = id
+				if lastGenerated == 0 {
+					lastGenerated = id
 				}
 			}
 		}
@@ -412,6 +412,10 @@ func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, s
 		if err := advance(i); err != nil {
 			return nil, err
 		}
+	}
+	if lastGenerated != 0 {
+		result.LastInsertID = lastGenerated
+		session.LastInsertID = lastGenerated
 	}
 	return result, nil
 }

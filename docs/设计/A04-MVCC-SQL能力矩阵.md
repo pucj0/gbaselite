@@ -27,6 +27,7 @@ INSERT SELECT 两项。
   `executor/mvcc_update_join_test.go` 与 legacy 执行器对拍锁定。
 - INSERT SELECT（含 UNION ALL 源）在语句快照上读取源数据、在 statement child 事务中写入目标表，
   自引用源不会重复读取本次插入的行，任一行 UNIQUE/CHECK/外键/类型转换失败会回滚整条语句。
-  上述语义由 `executor/mvcc_insert_select_test.go` 与 legacy 执行器对拍锁定。
+  生成自增号的语句只在全部行写入成功后才发布 LastInsertID，回滚的语句不会把未提交的 id 写回
+  会话。上述语义由 `executor/mvcc_insert_select_test.go` 与 legacy 执行器对拍锁定。
 - 表中“不支持”的行是 MVCC 运行时的真实缺口，不是 legacy parity 已完成。后续 A04 增量应
   按本表逐项补齐实现和回归，而不是重复审计。

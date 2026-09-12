@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"gbaselite/parser"
+	"gbaselite/physical"
 	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
@@ -44,34 +45,41 @@ func (e *Engine) insertSelectSQL(ctx context.Context, read, write storageengine.
 	}
 	result := &Result{}
 	ordinal := uint64(0)
-	err = query.Input.Run(ctx, func(values []any) error {
+	lastGenerated := uint64(0)
+	modify := physical.Modify[[]any, struct{}]{Input: query.Input, Apply: func(ctx context.Context, values []any) (struct{}, error) {
 		if err := ctx.Err(); err != nil {
-			return err
+			return struct{}{}, err
 		}
 		row, err := target.buildRow(session, values)
 		if err != nil {
-			return err
+			return struct{}{}, err
 		}
 		generated, ok, err := e.resolveInsertAutoIncrement(ctx, target, row)
 		if err != nil {
-			return err
+			return struct{}{}, err
 		}
-		if ok && result.LastInsertID == 0 {
-			result.LastInsertID = generated
-			session.LastInsertID = generated
+		if ok && lastGenerated == 0 {
+			lastGenerated = generated
 		}
 		if err := writeVersionedRow(ctx, write, target.definition, nil, nil, row, fmt.Sprintf("%s/%020d", write.ID(), ordinal)); err != nil {
-			return err
+			return struct{}{}, err
 		}
 		ordinal++
 		result.AffectedRows++
-		return nil
-	})
-	if err != nil {
+		return struct{}{}, nil
+	}}
+	if err := modify.Run(ctx, func(struct{}) error { return nil }); err != nil {
 		return nil, err
 	}
 	if err := flushInsertCounters(ctx, e, target); err != nil {
 		return nil, err
+	}
+	// LastInsertID is published only after every row and counter reservation
+	// succeeded, so a rolled-back statement cannot leave the session pointing at
+	// an id that was never committed (legacy INSERT SELECT behaviour).
+	if lastGenerated != 0 {
+		result.LastInsertID = lastGenerated
+		session.LastInsertID = lastGenerated
 	}
 	return result, nil
 }

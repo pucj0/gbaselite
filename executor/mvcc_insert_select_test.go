@@ -299,3 +299,63 @@ func TestMVCCInsertSelectUsesStatementSnapshot(t *testing.T) {
 		t.Fatalf("committed rows = %s", got)
 	}
 }
+
+func TestMVCCInsertSelectLastInsertIDRollback(t *testing.T) {
+	e, s, run := rangeTestEngine(t)
+	run("CREATE TABLE src(id INT PRIMARY KEY,v INT)")
+	run("CREATE TABLE t(id INT AUTO_INCREMENT PRIMARY KEY,v INT UNIQUE)")
+	run("INSERT INTO src VALUES(1,5),(2,5)")
+	s.LastInsertID = 42
+	// The first row reserves a generated id; the second row fails on the unique
+	// value, so the statement rolls back and must not publish that id.
+	if _, err := e.Execute(s, "INSERT INTO t(v) SELECT v FROM src ORDER BY id"); !errors.Is(err, storage.ErrDuplicateKey) {
+		t.Fatalf("duplicate key error = %v", err)
+	}
+	if s.LastInsertID != 42 {
+		t.Fatalf("rolled-back INSERT SELECT published LastInsertID=%d", s.LastInsertID)
+	}
+	if got := fmt.Sprint(run("SELECT COUNT(*) FROM t").Rows); got != "[[0]]" {
+		t.Fatalf("rolled-back INSERT SELECT kept rows: %s", got)
+	}
+	if got := fmt.Sprint(run("SELECT LAST_INSERT_ID()").Rows); got != "[[42]]" {
+		t.Fatalf("LAST_INSERT_ID() after rollback = %s", got)
+	}
+	// A successful statement publishes its first generated id, and later
+	// failures or explicit-id statements must not move it again.
+	run("DELETE FROM src WHERE id=2")
+	generated := run("INSERT INTO t(v) SELECT v FROM src ORDER BY id")
+	if generated.LastInsertID == 0 || s.LastInsertID != generated.LastInsertID {
+		t.Fatalf("successful INSERT SELECT last id = %d session = %d", generated.LastInsertID, s.LastInsertID)
+	}
+	saved := s.LastInsertID
+	run("INSERT INTO src VALUES(3,5)")
+	if _, err := e.Execute(s, "INSERT INTO t(v) SELECT v FROM src WHERE id=3"); !errors.Is(err, storage.ErrDuplicateKey) {
+		t.Fatalf("duplicate key error = %v", err)
+	}
+	if s.LastInsertID != saved {
+		t.Fatalf("failed INSERT SELECT moved LastInsertID to %d, want %d", s.LastInsertID, saved)
+	}
+	run("INSERT INTO t(id,v) VALUES(50,50)")
+	if s.LastInsertID != saved {
+		t.Fatalf("explicit id INSERT SELECT moved LastInsertID to %d, want %d", s.LastInsertID, saved)
+	}
+}
+
+func TestMVCCInsertValuesLastInsertIDRollback(t *testing.T) {
+	e, s, run := rangeTestEngine(t)
+	run("CREATE TABLE t(id INT AUTO_INCREMENT PRIMARY KEY,v INT UNIQUE)")
+	s.LastInsertID = 42
+	if _, err := e.Execute(s, "INSERT INTO t(v) VALUES(5),(5)"); !errors.Is(err, storage.ErrDuplicateKey) {
+		t.Fatalf("duplicate key error = %v", err)
+	}
+	if s.LastInsertID != 42 {
+		t.Fatalf("rolled-back INSERT VALUES published LastInsertID=%d", s.LastInsertID)
+	}
+	if got := fmt.Sprint(run("SELECT COUNT(*) FROM t").Rows); got != "[[0]]" {
+		t.Fatalf("rolled-back INSERT VALUES kept rows: %s", got)
+	}
+	inserted := run("INSERT INTO t(v) VALUES(7),(8)")
+	if inserted.LastInsertID == 0 || s.LastInsertID != inserted.LastInsertID {
+		t.Fatalf("successful INSERT VALUES last id = %d session = %d", inserted.LastInsertID, s.LastInsertID)
+	}
+}
