@@ -56,7 +56,7 @@ func (e *Engine) multiTableDeleteSQL(ctx context.Context, read, write storageeng
 	driving := bindScan(read, inputs[0].definition, sqlAccessPlan{kind: sqlAccessAll}, func(v []byte) (storage.Row, error) {
 		return decodeSQLRow(inputs[0].definition, v)
 	})
-	op := chainJoinInputs(read, session, inputs, driving)
+	op := chainJoinInputs(read, session, inputs, driving, true)
 	if statement.Where != nil {
 		op = physical.Filter[storage.Row]{Input: op, Predicate: func(row storage.Row) (bool, error) {
 			value, evaluationErr := evaluateExprWithContext(statement.Where, combined, row, session, nil)

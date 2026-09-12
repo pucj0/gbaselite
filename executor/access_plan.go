@@ -36,9 +36,6 @@ func validateSQLSelectShape(s parser.Select) error {
 	if s.Table == "" && s.Subquery == nil {
 		return nil
 	}
-	if s.Subquery != nil {
-		return errors.New("derived tables are not supported")
-	}
 	return nil
 }
 func planSQLAccess(s parser.Select, table versionedTable, schema *storage.Table, session *Session) sqlAccessPlan {

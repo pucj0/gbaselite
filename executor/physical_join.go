@@ -14,33 +14,62 @@ type joinInput struct {
 	schema     *storage.Table
 	combined   *storage.Table
 	join       parser.Join
+	// rows carries a derived table or CTE input. It is nil for base tables, which
+	// are scanned (and probed) per outer row instead.
+	rows []storage.Row
 }
 
 func bindJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]joinInput, error) {
 	if len(s.Joins) > 16 {
 		return nil, fmt.Errorf("join exceeds 16 inputs")
 	}
+	ctx := operatorContext(session)
 	inputs := make([]joinInput, 0, len(s.Joins)+1)
-	joins := append([]parser.Join{{Table: s.Table, TableAlias: s.TableAlias}}, s.Joins...)
+	joins := append([]parser.Join{{Table: s.Table, TableAlias: s.TableAlias, Subquery: s.Subquery}}, s.Joins...)
 	var columns []storage.Column
 	for i, j := range joins {
-		if j.Subquery != nil {
-			return nil, fmt.Errorf("derived join input is not supported")
-		}
-		if i > 0 && j.Type != "INNER" && j.Type != "LEFT" {
-			return nil, fmt.Errorf("supports INNER and LEFT JOIN")
-		}
-		table, schema, _, err := loadVersionedTable(tx, session, j.Table)
-		if err != nil {
-			return nil, err
+		if i > 0 && j.Type != "INNER" && j.Type != "LEFT" && j.Type != "RIGHT" && j.Type != "CROSS" {
+			return nil, fmt.Errorf("supports INNER, LEFT, RIGHT and CROSS JOIN")
 		}
 		alias := j.TableAlias
-		if alias == "" {
+		if alias == "" && j.Subquery == nil {
 			_, alias = splitTableName(j.Table)
 		}
-		schema, err = qualifySchema(schema, alias)
+		var (
+			table  versionedTable
+			schema *storage.Table
+			rows   []storage.Row
+			err    error
+		)
+		relation, isCTE := cteFor(session, j.Table)
+		switch {
+		case j.Subquery != nil:
+			if alias == "" {
+				return nil, fmt.Errorf("every derived table must have its own alias")
+			}
+			schema, rows, err = derivedRelation(ctx, tx, session, j.Subquery, alias, nil)
+		case isCTE:
+			schema = relation.schema
+			rows = relation.rows
+			if alias != "" {
+				schema, err = qualifySchema(schema, alias)
+			} else {
+				_, alias = splitTableName(j.Table)
+			}
+		default:
+			table, schema, _, err = loadVersionedTable(tx, session, j.Table)
+			if err == nil {
+				schema, err = qualifySchema(schema, alias)
+			}
+		}
 		if err != nil {
 			return nil, err
+		}
+		if j.Type == "RIGHT" {
+			for k := range columns {
+				columns[k].Nullable = true
+				columns[k].MetadataVersion = 1
+			}
 		}
 		rightColumns := append([]storage.Column(nil), schema.ColumnsView()...)
 		if j.Type == "LEFT" {
@@ -59,7 +88,7 @@ func bindJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]joinI
 				return nil, err
 			}
 		}
-		inputs = append(inputs, joinInput{table, schema, combined, j})
+		inputs = append(inputs, joinInput{definition: table, schema: schema, combined: combined, join: j, rows: rows})
 	}
 	return inputs, nil
 }
@@ -73,8 +102,11 @@ func joinedInput(tx storageengine.Txn, session *Session, s parser.Select) (*stor
 	if err = bindSQLExplainExprSession(s.Where, schema, session); err != nil {
 		return nil, nil, err
 	}
-	left := bindScan(tx, inputs[0].definition, sqlAccessPlan{kind: sqlAccessAll}, func(v []byte) (storage.Row, error) { return decodeSQLRow(inputs[0].definition, v) })
-	op := chainJoinInputs(tx, session, inputs, left)
+	left := physical.Operator[storage.Row](bindScan(tx, inputs[0].definition, sqlAccessPlan{kind: sqlAccessAll}, func(v []byte) (storage.Row, error) { return decodeSQLRow(inputs[0].definition, v) }))
+	if inputs[0].rows != nil {
+		left = derivedRows(inputs[0].rows)
+	}
+	op := chainJoinInputs(tx, session, inputs, left, false)
 	if s.Where != nil {
 		op = physical.Filter[storage.Row]{Input: op, Predicate: func(row storage.Row) (bool, error) {
 			v, err := evaluateExprWithContext(s.Where, schema, row, session, nil)
@@ -84,37 +116,77 @@ func joinedInput(tx storageengine.Txn, session *Session, s parser.Select) (*stor
 	return schema, op, nil
 }
 
-// chainJoinInputs extends the supplied driving relation with the remaining bound
-// join inputs. Callers own the first input so SELECT can scan the base table
-// directly while UPDATE JOIN pairs the scan with row identity.
-func chainJoinInputs(tx storageengine.Txn, session *Session, inputs []joinInput, driving physical.Operator[storage.Row]) physical.Operator[storage.Row] {
+// chainJoinInputs extends the driving relation with the bound join inputs. When targetDriven is
+// set (UPDATE JOIN and multi-table DELETE) the target must stay the driving side, so a RIGHT
+// JOIN is evaluated as its matched subset: every target row matching at least one right row is
+// still visited once, while null-extended right rows contribute no target identity.
+func chainJoinInputs(tx storageengine.Txn, session *Session, inputs []joinInput, driving physical.Operator[storage.Row], targetDriven bool) physical.Operator[storage.Row] {
 	op := driving
 	for level := 1; level < len(inputs); level++ {
 		input := inputs[level]
 		leftSchema := inputs[level-1].combined
-		join := physical.Join3[storage.Row, storage.Row, storage.Row]{RightPlan: &physical.PlanNode{Kind: "DynamicScan", Attributes: map[string]string{"table": input.definition.CatalogName, "access": "integer equality lookup or scan, chosen per outer row"}}, Left: op, Right: func(left storage.Row) (physical.Operator[storage.Row], error) {
+		leftColumns := leftSchema.ColumnsView()
+		// inputSource opens one source row set for the join input. Base tables can be
+		// probed with an index when the ON clause allows it; derived and CTE inputs
+		// replay their materialized rows.
+		inputSource := func(left storage.Row, probe bool) physical.Operator[storage.Row] {
+			if input.rows != nil {
+				return derivedRows(input.rows)
+			}
 			access := sqlAccessPlan{kind: sqlAccessAll}
-			if where, ok := joinLookup(input.join.On, leftSchema, input.schema, left); ok {
-				access = planSQLAccess(parser.Select{Where: where}, input.definition, input.schema, session)
+			if probe {
+				if where, ok := joinLookup(input.join.On, leftSchema, input.schema, left); ok {
+					access = planSQLAccess(parser.Select{Where: where}, input.definition, input.schema, session)
+				}
 			}
 			return bindScan(tx, input.definition, access, func(v []byte) (storage.Row, error) {
 				if err := checkQuery(session); err != nil {
 					return nil, err
 				}
 				return decodeSQLRow(input.definition, v)
-			}), nil
-		}, Combine: func(left, right storage.Row) storage.Row {
+			})
+		}
+		combine := func(left, right storage.Row) storage.Row {
 			row := make(storage.Row, len(left)+len(right))
 			copy(row, left)
 			copy(row[len(left):], right)
 			return row
-		}, Predicate: func(row storage.Row) (bool, error) {
-			if input.join.On == nil {
+		}
+		predicate := func(row storage.Row) (bool, error) {
+			if input.join.On == nil || input.join.Type == "CROSS" {
 				return true, checkQuery(session)
 			}
 			value, err := evaluateExprWithContext(input.join.On, input.combined, row, session, nil)
 			return truthy(value), err
-		}}
+		}
+		rightPlan := &physical.PlanNode{Kind: "DynamicScan", Attributes: map[string]string{"table": input.definition.CatalogName, "access": "integer equality lookup or scan, chosen per outer row"}}
+		if input.rows != nil {
+			rightPlan = &physical.PlanNode{Kind: "MaterializedDerived", Attributes: map[string]string{"rows": strconv.Itoa(len(input.rows))}}
+		}
+		if input.join.Type == "RIGHT" && !targetDriven {
+			// RIGHT JOIN swaps the driving side: the right input drives and the already
+			// bound left relation is replayed per driving row, keeping the combined row in
+			// [left..., right...] order like the legacy join does.
+			drivingSource := inputSource(nil, false)
+			leftInput := op
+			join := physical.Join3[storage.Row, storage.Row, storage.Row]{RightPlan: rightPlan, Left: drivingSource, Right: func(storage.Row) (physical.Operator[storage.Row], error) {
+				return bufferedRows(session, leftInput), nil
+			}, Combine: func(rightRow, leftRow storage.Row) storage.Row {
+				return combine(leftRow, rightRow)
+			}, Predicate: predicate, NullRight: func(rightRow storage.Row) storage.Row {
+				row := make(storage.Row, len(leftColumns)+len(rightRow))
+				for index, column := range leftColumns {
+					row[index] = storage.NullValue(column.Type)
+				}
+				copy(row[len(leftColumns):], rightRow)
+				return row
+			}}
+			op = join
+			continue
+		}
+		join := physical.Join3[storage.Row, storage.Row, storage.Row]{RightPlan: rightPlan, Left: op, Right: func(left storage.Row) (physical.Operator[storage.Row], error) {
+			return inputSource(left, true), nil
+		}, Combine: combine, Predicate: predicate}
 		if input.join.Type == "LEFT" {
 			join.NullRight = func(left storage.Row) storage.Row {
 				row := make(storage.Row, len(left)+len(input.schema.ColumnsView()))

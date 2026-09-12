@@ -148,7 +148,7 @@ CPU、工作集、私有内存和磁盘。当前报告使用 2026-09-08 19:49—
 
 - MySQL 协议、认证、TLS、Prepared Statement 与常用元数据
 - MVCC 快照隔离、原子提交、断连与语句失败回滚
-- 表/索引 DDL、受支持 CRUD（含 INSERT SET/IGNORE、REPLACE、ON DUPLICATE KEY、UPDATE JOIN、INSERT SELECT、多表 DELETE）、聚合、分组、INNER/LEFT JOIN、标量/IN/EXISTS 子查询
+- 表/索引 DDL、受支持 CRUD（含 INSERT SET/IGNORE、REPLACE、ON DUPLICATE KEY、UPDATE JOIN、INSERT SELECT、多表 DELETE）、聚合、分组、INNER/LEFT/RIGHT/CROSS JOIN、派生表、非递归 CTE、标量/IN/EXISTS 子查询
 - 精确 DECIMAL、JSON、约束与单机账号授权
 - 单机 MVCC 备份恢复、历史 GC、实验性复制与代理
 - Windows/Linux 部署、服务管理、Docker 与 MSI
@@ -756,8 +756,8 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 |---|---|---|
 | 连接 | MySQL TCP、认证、TLS、COM_QUERY、Prepared Statement、二进制结果 | 不是完整 MySQL 协议实现 |
 | DDL | 数据库/表创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引 | 不支持视图、CTAS/LIKE、RENAME TABLE；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
-| 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …，目标表须有主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；不支持派生表/子查询作为连接输入 |
-| 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT JOIN、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询） | 不支持 CTE、派生表、RIGHT/CROSS JOIN 及锁定读；窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
+| 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT/RIGHT/CROSS，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …，目标表须有主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；不支持子查询作为连接输入 |
+| 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT/RIGHT/CROSS JOIN、派生表、非递归 CTE、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询） | 不支持视图、递归 CTE 及锁定读；窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
 | 事务 | BEGIN/COMMIT/ROLLBACK、SET autocommit=0/1、断连回滚、语句失败回滚 | 快照隔离；不支持 SAVEPOINT、LOCK TABLES、隔离级别切换或串行化保证 |
 | 约束 | PRIMARY KEY、UNIQUE、CHECK、同库 RESTRICT/NO ACTION 外键 | 不支持级联、自引用、跨库外键；受引用表 ALTER 有限制 |
 | 类型 | INT/BIGINT、文本、日期时间、BOOLEAN、精确 DECIMAL、JSON 列及现有标量函数 | 不支持 ON UPDATE 列表达式；TIMESTAMP 尚无独立 UTC 存储语义 |
@@ -786,6 +786,13 @@ VALUES(列) 读取本次待插入值，受影响行数为 1，不发布 LastInse
 未限定列优先绑定内层作用域，显式外层限定名按外层行绑定，两层相关也可用。`NOT IN` 子查询包含
 NULL 时遵循三值逻辑；标量子查询返回多行会报错并回滚整条语句（写完的行不会部分保留）。写入语句的
 WHERE、SET、VALUES 表达式与 ON DUPLICATE KEY UPDATE 同样支持子查询；连接输入仍要求是基表。
+
+派生表（`FROM (SELECT …) x`、`JOIN (SELECT …) x ON …`）与非递归 CTE（`WITH x AS (…)`）作为只读关系
+进入统一 physical pipeline：先按语句快照求值、经 `physical.Materialize` 受结果内存预算约束，再以
+transient schema 参与后续 JOIN/过滤/聚合，不经过旧 Result 物化管线；CTE 只在当前语句可见（支持列
+清单、多 CTE、遮蔽同名表），派生表必须带别名。RIGHT JOIN 交换驱动侧并空扩展左表列，CROSS JOIN 为
+无 ON 的笛卡尔积；UPDATE JOIN / 多表 DELETE 仍以目标表为驱动，RIGHT JOIN 只取其匹配子集，从而与
+legacy 的目标行集合一致。
 
 同一行、唯一键或依赖表结构的并发变更可能导致提交返回 MySQL 1213，应重试整个事务。
 不同行更新可独立提交。自增号持久预留，回滚后允许空洞；会话的 LastInsertID 只在整条写入语句

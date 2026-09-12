@@ -87,7 +87,7 @@ func (e *Engine) joinUpdateSQL(ctx context.Context, read, write storageengine.Tx
 		left := append(storage.Row(nil), row...)
 		op := chainJoinInputs(read, session, inputs, physical.Source[storage.Row](func(_ context.Context, yield physical.Yield[storage.Row]) error {
 			return yield(left)
-		}))
+		}), true)
 		if statement.Where != nil {
 			op = physical.Filter[storage.Row]{Input: op, Predicate: func(joined storage.Row) (bool, error) {
 				value, evaluationErr := evaluateExprWithContext(statement.Where, combined, joined, session, nil)

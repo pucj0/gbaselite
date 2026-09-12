@@ -61,6 +61,7 @@ func (e *Engine) refreshSQLMetadata(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+
 		open = func() (storageengine.Iterator, error) {
 			return revisions.NewIterator(ctx, head, storageengine.ScanRequest{Space: sqllayout.Catalog})
 		}
@@ -70,6 +71,8 @@ func (e *Engine) refreshSQLMetadata(ctx context.Context) error {
 			return beginErr
 		}
 		defer tx.Rollback()
+
+		head = tx.Snapshot()
 
 		open = func() (storageengine.Iterator, error) {
 			return tx.NewIterator(ctx, storageengine.ScanRequest{Space: sqllayout.Catalog})
@@ -271,6 +274,11 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		return &Result{Message: "database changed"}, nil
 	case parser.Select:
 		return executePhysicalSelect(ctx, tx, session, value)
+	case parser.With:
+		return e.executeWithSQL(ctx, tx, session, value)
+	case parser.WithRecursive:
+		return nil, errors.New("recursive WITH is not supported")
+
 	case parser.Union:
 		query, err := bindUnionWithSelect(session, value, func(s parser.Select) (*boundQuery, error) { return bindPhysicalSelect(ctx, tx, session, s) })
 		if err != nil {

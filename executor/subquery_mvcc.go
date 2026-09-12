@@ -20,6 +20,8 @@ type subqueryRunner struct {
 	session *Session
 	ctx     context.Context
 	tx      storageengine.Txn
+	// ctes holds the statement-local WITH relations currently in scope.
+	ctes map[string]cteRelation
 }
 
 func (r *subqueryRunner) resultMemoryLimit() int64 {

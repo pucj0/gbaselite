@@ -36,6 +36,42 @@ func bindPhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Sess
 		}
 		return bindSelectOutput(session, statement, schema, source, false)
 	}
+	if statement.Subquery != nil {
+		alias := statement.TableAlias
+		if alias == "" {
+			return nil, errors.New("every derived table must have its own alias")
+		}
+		schema, rows, err := derivedRelation(ctx, tx, session, statement.Subquery, alias, nil)
+		if err != nil {
+			return nil, err
+		}
+		source := derivedRows(rows)
+		if statement.Where != nil {
+			source = physical.Filter[storage.Row]{Input: source, Predicate: func(row storage.Row) (bool, error) {
+				value, err := evaluateExprWithContext(statement.Where, schema, row, session, nil)
+				return truthy(value), err
+			}}
+		}
+		return bindSelectOutput(session, statement, schema, source, false)
+	}
+	if relation, ok := cteFor(session, statement.Table); ok {
+		schema := relation.schema
+		var err error
+		if statement.TableAlias != "" {
+			schema, err = qualifySchema(schema, statement.TableAlias)
+			if err != nil {
+				return nil, err
+			}
+		}
+		source := derivedRows(relation.rows)
+		if statement.Where != nil {
+			source = physical.Filter[storage.Row]{Input: source, Predicate: func(row storage.Row) (bool, error) {
+				value, err := evaluateExprWithContext(statement.Where, schema, row, session, nil)
+				return truthy(value), err
+			}}
+		}
+		return bindSelectOutput(session, statement, schema, source, false)
+	}
 	definition, schema, _, err := loadVersionedTableForRead(tx, session, statement.Table)
 	if err != nil {
 		return nil, err

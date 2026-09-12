@@ -1,48 +1,40 @@
 # A04 MVCC SQL 能力矩阵
 
-本表以 Repository HEAD 的实测行为为准（针对 HEAD 编写的 SQL probe 加现有回归），不是历史
-legacy 执行器的能力承诺。MVCC 是唯一运行事务引擎。写入面已实现 INSERT SET/IGNORE、REPLACE、
-ON DUPLICATE KEY UPDATE、子查询（标量/IN/EXISTS，含相关子查询），以及复合写入 UPDATE JOIN、
-INSERT SELECT 与多表 DELETE。
+本表以 Repository HEAD 的实测行为为准（针对 HEAD 编写的 legacy↔MVCC 对拍脚本加回归），一项一行，
+不合并独立能力。MVCC 是唯一运行事务引擎；“范围限制”记录当前实现的真实边界。
 
-| 能力 | Legacy 执行器 | Parser | MVCC 运行时 | 回归覆盖 |
-|---|---|---|---|---|
-| UNION / UNION ALL / DISTINCT | 支持 | 支持 | 支持 | 有 |
-| 窗口函数 | 支持 | 支持 | 支持 | 有 |
-| INNER/LEFT JOIN、聚合、分组、排序分页 | 支持 | 支持 | 支持 | 有 |
-| UPDATE JOIN（连接输入为基表） | 支持 | 支持 | 支持（A04 增量） | 有（legacy 对拍） |
-| INSERT SELECT（含 UNION ALL 源） | 支持 | 支持 | 支持（A04 增量） | 有（legacy 对拍） |
-| 多表 DELETE（目标表须有主键） | 支持 | 支持 | 支持（A04 增量） | 有（legacy 对拍） |
-| INSERT SET / IGNORE / REPLACE / ON DUPLICATE KEY | 支持 | 支持 | 支持（A04 增量） | 有（legacy 对拍） |
-| 子查询（标量/IN/EXISTS，含相关子查询，SELECT 与写入） | 支持 | 支持 | 支持（A04 增量） | 有（legacy 对拍） |
-| 派生表、CTE、视图 | 支持 | 支持 | 不支持 | 无 |
-| RIGHT / CROSS JOIN | 支持 | 支持 | 不支持（仅 INNER/LEFT） | 无 |
-| SAVEPOINT、外键级联/置空动作 | 支持 | 支持 | 不支持（外键仅 RESTRICT/NO ACTION） | 无 |
-| 事务快照、语句原子性、断连回滚 | 支持 | - | 支持 | 有 |
+| 能力 | Legacy | Parser | MVCC runtime | 回归 | 范围限制 |
+|---|---|---|---|---|---|
+| UNION / UNION ALL / DISTINCT | 支持 | 支持 | 支持 | 有 | 未实现完整 MySQL 类型合并 |
+| 窗口函数 | 支持 | 支持 | 支持 | 有 | 不支持 named window / 显式 frame |
+| INNER / LEFT JOIN | 支持 | 支持 | 支持 | 有 | 16 路输入上限 |
+| RIGHT JOIN | 支持 | 支持 | 支持 | 有（对拍） | SELECT 交换驱动侧；DML 取目标匹配子集 |
+| CROSS JOIN | 支持 | 支持 | 支持 | 有（对拍） | 无 ON 时笛卡尔积 |
+| Derived table in FROM | 支持 | 支持 | 支持 | 有（对拍） | 必须带别名；别名列在相关作用域可见（legacy 不发布） |
+| Derived table in JOIN | 支持 | 支持 | 支持 | 有（对拍） | 同上；受结果内存预算约束 |
+| 非递归 CTE | 支持 | 支持 | 支持 | 有（对拍） | 语句级作用域，支持列清单/多 CTE/遮蔽同名表 |
+| 递归 CTE（WITH RECURSIVE） | 支持 | 支持 | 不支持 | 无 | `executor/transaction_engine.go` 显式拒绝 |
+| 标量/IN/NOT IN/EXISTS 子查询（含相关、写入中） | 支持 | 支持 | 支持 | 有（对拍） | 无 FROM 的 `SELECT (SELECT …)` 两引擎均不支持 |
+| UPDATE JOIN（连接输入为基表） | 支持 | 支持 | 支持 | 有（对拍） | 目标行多命中只更新一次，取首个匹配 |
+| INSERT SELECT（含 UNION ALL 源） | 支持 | 支持 | 支持 | 有（对拍） | 源使用语句父快照 |
+| INSERT SET / IGNORE / REPLACE / ON DUPLICATE KEY UPDATE | 支持 | 支持 | 支持 | 有（对拍） | REPLACE 删除全部冲突行；被引用行返回 parent change |
+| 多表 DELETE（目标表有主键） | 支持 | 支持 | 支持 | 有（对拍） | 不支持 LIMIT；目标表须有主键 |
+| 多表 DELETE（目标表无主键） | 支持 | 支持 | 不支持 | 无 | `executor/mutation_multi_delete.go` 要求目标表主键 |
+| CREATE VIEW | 支持 | 支持 | 不支持 | 无 | `executor/mutation.go` mutateSQL 默认分支 |
+| Query VIEW（SELECT ... FROM view） | 支持 | 支持 | 不支持 | 无 | 查询绑定不解析视图定义 |
+| DROP VIEW | 支持 | 支持 | 不支持 | 无 | `executor/mutation.go` mutateSQL 默认分支 |
+| CREATE TABLE AS SELECT | 支持 | 支持 | 不支持 | 无 | 同上（parser.CreateTableAs 无实现） |
+| CREATE TABLE LIKE | 支持 | 支持 | 不支持 | 无 | 同上（parser.CreateTableLike 无实现） |
+| RENAME TABLE | 支持 | 支持 | 不支持 | 无 | 同上（parser.RenameTable 无实现） |
+| SAVEPOINT / ROLLBACK TO / RELEASE SAVEPOINT | 支持 | 支持 | 不支持 | 无 | `executor/transaction_engine.go` 未接入事务开关 |
+| FK ON DELETE CASCADE / SET NULL、ON UPDATE CASCADE / SET NULL | 支持 | 支持 | 不支持 | 无 | `executor/foreign_key.go` 仅允许 RESTRICT/NO ACTION |
+| 事务快照、语句原子性、断连回滚 | 支持 | - | 支持 | 有 | 快照隔离 |
+| metadata refresh（non-RevisionReader backend） | 支持 | - | 支持 | 有 | 修复 `head = tx.Snapshot()` 后连续 revision 正确 |
 
 要点：
 
-- MVCC 语句在父事务快照上读、在 statement child transaction 上写；UPDATE JOIN 遵循同一边界，
-  任意一行失败会回滚整条语句。
-- UPDATE JOIN 目标行被多个连接输入命中时只更新一次并采用首个匹配，SET 列表从左到右生效、
-  后续表达式可见前面的赋值结果，受影响行数按命中的目标行统计。上述语义由
-  `executor/mvcc_update_join_test.go` 与 legacy 执行器对拍锁定。
-- INSERT SELECT（含 UNION ALL 源）在语句快照上读取源数据、在 statement child 事务中写入目标表，
-  自引用源不会重复读取本次插入的行，任一行 UNIQUE/CHECK/外键/类型转换失败会回滚整条语句。
-  生成自增号的语句只在语句事务提交后才发布 LastInsertID，回滚或提交失败的语句不会把未提交的
-  id 写回会话。上述语义由 `executor/mvcc_insert_select_test.go` 与 legacy 执行器对拍锁定。
-- 多表 DELETE（`DELETE t1,t2 FROM …` 与 `DELETE FROM t1,t2 USING …`）在语句快照上读取连接关系，
-  按主键去重，并按“先删引用方（子表）、后删被引用方（父表）”的顺序写入 statement child 事务，
-  使同一条语句删除父表与子表时仍满足 RESTRICT 外键；不支持 LIMIT，目标表须有主键，目标表之间
-  不允许循环外键。上述语义由 `executor/mvcc_multi_delete_test.go` 与 legacy 执行器对拍锁定。
-- INSERT 冲突处理与 legacy 一致：IGNORE 只跳过重复键行（其他约束错误仍然失败）；REPLACE 删除主键或
-  唯一键上的全部冲突行后再插入，受影响行数 = 删除行数 + 1，被引用行仍受 RESTRICT 保护；
-  ON DUPLICATE KEY UPDATE 更新首个冲突行，普通列名读取被更新的行、VALUES(列) 读取待插入值，
-  受影响行数为 1 且不发布 LastInsertID。上述语义由 `executor/mvcc_insert_modes_test.go`
-  与 legacy 执行器对拍锁定。
-- 子查询在语句的父快照事务上求值，不新开事务；相关子查询按外层行逐行求值，未限定列优先绑定内层
-  作用域、显式外层限定名按外层行绑定，两层相关可用；`NOT IN` 子查询含 NULL 时遵循三值逻辑，
-  标量子查询返回多行会报错并回滚整条语句。SELECT 与 UPDATE/DELETE/INSERT 的表达式同样适用。
-  上述语义由 `executor/mvcc_subquery_test.go` 与 legacy 执行器对拍锁定。
-- 表中“不支持”的行是 MVCC 运行时的真实缺口，不是 legacy parity 已完成。后续 A04 增量应
-  按本表逐项补齐实现和回归，而不是重复审计。
+- 查询、派生表、CTE、子查询都在语句父快照事务上求值，不新开事务；mutation 写入 statement child
+  transaction，失败整条回滚；`LastInsertID` 只在语句事务提交成功后发布。
+- 派生表/CTE 通过 `physical.Materialize` + transient schema 进入统一 pipeline，不经过旧 Result 物化管线。
+- 仍未支持的项目（递归 CTE、视图、CTAS/LIKE/RENAME、SAVEPOINT、外键级联/置空、无主键多表 DELETE）
+  都是 legacy 支持、parser 支持的 A04 真实 gap，源码位置见上表“范围限制”列。
