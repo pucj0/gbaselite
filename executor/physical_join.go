@@ -63,6 +63,7 @@ func bindJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]joinI
 	}
 	return inputs, nil
 }
+
 func joinedInput(tx storageengine.Txn, session *Session, s parser.Select) (*storage.Table, physical.Operator[storage.Row], error) {
 	inputs, err := bindJoins(tx, session, s)
 	if err != nil {
@@ -72,7 +73,22 @@ func joinedInput(tx storageengine.Txn, session *Session, s parser.Select) (*stor
 	if err = bindSQLExplainExpr(s.Where, schema); err != nil {
 		return nil, nil, err
 	}
-	op := bindScan(tx, inputs[0].definition, sqlAccessPlan{kind: sqlAccessAll}, func(v []byte) (storage.Row, error) { return decodeSQLRow(inputs[0].definition, v) })
+	left := bindScan(tx, inputs[0].definition, sqlAccessPlan{kind: sqlAccessAll}, func(v []byte) (storage.Row, error) { return decodeSQLRow(inputs[0].definition, v) })
+	op := chainJoinInputs(tx, session, inputs, left)
+	if s.Where != nil {
+		op = physical.Filter[storage.Row]{Input: op, Predicate: func(row storage.Row) (bool, error) {
+			v, err := evaluateExprWithContext(s.Where, schema, row, session, nil)
+			return truthy(v), err
+		}}
+	}
+	return schema, op, nil
+}
+
+// chainJoinInputs extends the supplied driving relation with the remaining bound
+// join inputs. Callers own the first input so SELECT can scan the base table
+// directly while UPDATE JOIN pairs the scan with row identity.
+func chainJoinInputs(tx storageengine.Txn, session *Session, inputs []joinInput, driving physical.Operator[storage.Row]) physical.Operator[storage.Row] {
+	op := driving
 	for level := 1; level < len(inputs); level++ {
 		input := inputs[level]
 		leftSchema := inputs[level-1].combined
@@ -111,14 +127,9 @@ func joinedInput(tx storageengine.Txn, session *Session, s parser.Select) (*stor
 		}
 		op = join
 	}
-	if s.Where != nil {
-		op = physical.Filter[storage.Row]{Input: op, Predicate: func(row storage.Row) (bool, error) {
-			v, err := evaluateExprWithContext(s.Where, schema, row, session, nil)
-			return truthy(v), err
-		}}
-	}
-	return schema, op, nil
+	return op
 }
+
 func joinLookup(on parser.Expr, left, right *storage.Table, row storage.Row) (parser.Expr, bool) {
 	expr, ok := on.(parser.BinaryExpr)
 	if !ok {

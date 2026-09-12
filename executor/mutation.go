@@ -192,7 +192,7 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		return e.insertSQL(ctx, read, write, session, value)
 	case parser.Update:
 		if len(value.Joins) > 0 {
-			return nil, errors.New("UPDATE JOIN is not supported")
+			return e.joinUpdateSQL(ctx, read, write, session, value)
 		}
 		definition, schema, k, err := loadVersionedTable(read, session, value.Table)
 		if err != nil {
