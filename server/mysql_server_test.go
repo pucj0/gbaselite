@@ -760,7 +760,7 @@ func TestShowTableStatusLikeFiltersNavicatTargetLookup(t *testing.T) {
 	}
 }
 
-func TestMVCCRejectsLegacyViewBeforeChangingMetadata(t *testing.T) {
+func TestMVCCRejectsAmbiguousViewColumnsBeforeChangingMetadata(t *testing.T) {
 	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)
@@ -771,16 +771,26 @@ func TestMVCCRejectsLegacyViewBeforeChangingMetadata(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// A view cannot publish the same column name twice through `SELECT *` over a join
+	// (MySQL rejects it as well), and a refused CREATE VIEW must not change metadata.
 	if _, err = ExecuteCompatible(engine, session, "CREATE VIEW legacy_join AS SELECT * FROM left_items t1 LEFT JOIN right_items t2 ON t1.id=t2.left_id"); err == nil {
-		t.Fatal("unsupported view accepted")
+		t.Fatal("view with duplicate column names accepted")
 	}
 	r, err := ExecuteCompatible(engine, session, "SELECT TABLE_SCHEMA,TABLE_NAME,COLUMN_NAME,COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='metadata_views'")
 	if err != nil || len(r.Rows) != 4 {
 		t.Fatalf("metadata changed: %+v %v", r, err)
 	}
+	// The equivalent view with an explicit column list is supported and published.
+	if _, err = ExecuteCompatible(engine, session, "CREATE VIEW named_join AS SELECT t1.id,t1.name,t2.left_id FROM left_items t1 LEFT JOIN right_items t2 ON t1.id=t2.left_id"); err != nil {
+		t.Fatalf("supported view rejected: %v", err)
+	}
+	views, err := ExecuteCompatible(engine, session, "SELECT TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA='metadata_views'")
+	if err != nil || len(views.Rows) != 1 || views.Rows[0][0] != "named_join" {
+		t.Fatalf("view metadata = %+v, %v", views, err)
+	}
 }
 
-func TestMVCCViewMetadataIsEmpty(t *testing.T) {
+func TestMVCCViewMetadataEmptyDatabase(t *testing.T) {
 	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
 	if err != nil {
 		t.Fatal(err)

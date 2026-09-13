@@ -802,7 +802,8 @@ transient schema 参与后续 JOIN/过滤/聚合，不经过旧 Result 物化管
 `v1 → v2 → v1` 循环引用返回稳定错误而不是递归。创建时先绑定校验，失败或回滚不会留下半个视图，
 `SHOW TABLES`/`SHOW FULL TABLES`/`SHOW COLUMNS`/`DESCRIBE`/`SHOW CREATE VIEW` 与基表共用命名空间。
 表与视图重名时 `CREATE TABLE`、`CREATE TABLE LIKE`、`CREATE TABLE … AS SELECT`、`RENAME TABLE`
-按 legacy 拒绝（`IF NOT EXISTS` 静默跳过），`DROP TABLE` 不会误删视图，视图本身不可写。
+按 legacy 拒绝（`IF NOT EXISTS` 静默跳过），`DROP TABLE` 不会误删视图，视图本身不可写。视图列名必须唯一
+（`SELECT *` 覆盖同名 join 列会在 `CREATE VIEW` 阶段被拒绝，与 MySQL 一致；legacy 允许重复列名，是其宽松差异）。
 `DROP DATABASE` 在同一个 statement child 事务内原子清理该数据库的 `db/`、`table/` 与 `view/` catalog
 entries，数据库内的父子外键不因 key order 阻止删除，`ROLLBACK` 会恢复整库，重新 `CREATE DATABASE`
 同名库不会复活旧视图，也不会残留 orphan view entry；该语句同时清空会话当前库（同 legacy）。

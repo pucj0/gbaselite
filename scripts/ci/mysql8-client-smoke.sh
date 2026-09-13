@@ -180,12 +180,90 @@ for index_name in PRIMARY idx_qty uq_sku; do
   printf '%s\n' "$indexes" | grep -Fx "$index_name" >/dev/null
 done
 
-if mysql_client --execute='CREATE VIEW `gbaselite-ci-export`.`active-items` AS SELECT * FROM `gbaselite-ci-export`.`order-items`;' >"$WORK_DIRECTORY/unsupported-view.out" 2>&1; then
-  echo "MVCC unexpectedly accepted an unsupported view" >&2
+# The MVCC runtime supports views, so the smoke test exercises the full view
+# lifecycle through the real MySQL 8 client instead of asserting that views are
+# rejected.
+run_view_statement() {
+  local description=$1
+  shift
+  local error_file="$WORK_DIRECTORY/view-statement.err"
+  if ! "$@" >"$error_file" 2>&1; then
+    local detail
+    detail=$(<"$error_file")
+    workflow_error "$description failed through the MySQL 8 client: ${detail:-no client error output}"
+    cat "$error_file" >&2
+    exit 1
+  fi
+}
+
+run_view_statement "CREATE VIEW" mysql_client --execute='CREATE VIEW `gbaselite-ci-export`.`active-items` AS SELECT `id`, `sku`, `qty` FROM `gbaselite-ci-export`.`order-items` WHERE `qty` > 0;'
+
+view_count=$(mysql_client --batch --raw --skip-column-names --execute='SELECT COUNT(*) FROM `gbaselite-ci-export`.`active-items`;')
+if [ "$view_count" != "1" ]; then
+  message="Unexpected active-items view count: $view_count"
+  workflow_error "$message"
+  echo "$message" >&2
   exit 1
 fi
+
+show_create_error="$WORK_DIRECTORY/show-create-view.err"
+if ! show_create=$(mysql_client --batch --raw --skip-column-names --execute='SHOW CREATE VIEW `gbaselite-ci-export`.`active-items`;' 2>"$show_create_error"); then
+  detail=$(<"$show_create_error")
+  workflow_error "SHOW CREATE VIEW failed through the MySQL 8 client: ${detail:-no client error output}"
+  cat "$show_create_error" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$show_create" | grep -F 'active-items' >/dev/null; then
+  message="SHOW CREATE VIEW output is missing the view name: $show_create"
+  workflow_error "$message"
+  echo "$message" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$show_create" | grep -Eiq 'CREATE[[:space:]]+VIEW'; then
+  message="SHOW CREATE VIEW output is missing CREATE VIEW: $show_create"
+  workflow_error "$message"
+  echo "$message" >&2
+  exit 1
+fi
+
+full_tables=$(mysql_client --database="$DATABASE" --batch --raw --skip-column-names --execute='SHOW FULL TABLES;')
+if ! printf '%s\n' "$full_tables" | grep -Eq '^order-items[[:space:]]+BASE TABLE$'; then
+  message="SHOW FULL TABLES did not report order-items as a BASE TABLE: $full_tables"
+  workflow_error "$message"
+  echo "$message" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$full_tables" | grep -Eq '^active-items[[:space:]]+VIEW$'; then
+  message="SHOW FULL TABLES did not report active-items as a VIEW: $full_tables"
+  workflow_error "$message"
+  echo "$message" >&2
+  exit 1
+fi
+
+run_view_statement "DROP VIEW" mysql_client --execute='DROP VIEW `gbaselite-ci-export`.`active-items`;'
+if mysql_client --execute='SELECT * FROM `gbaselite-ci-export`.`active-items`;' >"$WORK_DIRECTORY/dropped-view.out" 2>&1; then
+  message="A dropped view remained queryable through the MySQL 8 client"
+  workflow_error "$message"
+  echo "$message" >&2
+  exit 1
+fi
+
 storage_mode=$(mysql_client --batch --raw --skip-column-names --execute="SHOW STATUS LIKE 'Gbaselite_storage_mode';")
 printf '%s\n' "$storage_mode" | grep -Eq '[[:space:]]mvcc$'
+
+# DROP DATABASE must clear the table and view catalog entries of the database, so a
+# recreated database starts empty and the old view name is free for a table.
+run_view_statement "recreated CREATE VIEW" mysql_client --execute='CREATE VIEW `gbaselite-ci-export`.`active-items` AS SELECT `id`, `sku`, `qty` FROM `gbaselite-ci-export`.`order-items` WHERE `qty` > 0;'
+run_view_statement "DROP DATABASE" mysql_client --execute='DROP DATABASE `gbaselite-ci-export`;'
+run_view_statement "recreated CREATE DATABASE" mysql_client --execute='CREATE DATABASE `gbaselite-ci-export`;'
+remaining_relations=$(mysql_client --database="$DATABASE" --batch --raw --skip-column-names --execute='SHOW FULL TABLES;')
+if [ -n "$remaining_relations" ]; then
+  message="DROP DATABASE left relations behind in $DATABASE: $remaining_relations"
+  workflow_error "$message"
+  echo "$message" >&2
+  exit 1
+fi
+run_view_statement "CREATE TABLE reusing the dropped view name" mysql_client --database="$DATABASE" --execute='CREATE TABLE `active-items` (`id` INT);'
 
 drop_temporary_database
 echo "MySQL 8 client dump/import smoke test passed."
