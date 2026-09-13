@@ -762,7 +762,7 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 | 约束 | PRIMARY KEY、UNIQUE、CHECK（含 MySQL 的 `CHECK (...) NOT ENFORCED`）、同库外键（RESTRICT/NO ACTION/CASCADE/SET NULL，含自引用） | 不支持跨库外键；受引用表 ALTER 有限制；级联深度上限 32；`NOT ENFORCED` 只保留定义并回显（`CHECK_CONSTRAINTS.ENFORCED=NO`），不校验行 |
 | 类型 | INT/BIGINT、文本、日期时间、BOOLEAN、精确 DECIMAL、JSON 列及现有标量函数、ON UPDATE CURRENT_TIMESTAMP | TIMESTAMP 尚无独立 UTC 存储语义 |
 | 账号 | 单机用户、密码、授权及权限元数据 | 用户目录独立持久化，不参与业务事务，不经过 Raft；复制节点拒绝账号 SQL |
-| 元数据 | 已提交表结构、索引（含 `INDEX_COMMENT`）、约束、information_schema、SHOW STATUS/REPLICATION STATUS | SHOW 的行数、大小不是实时业务统计，准确计数使用 SELECT COUNT(*) |
+| 元数据 | 已提交表结构、索引（含 `INDEX_COMMENT`）、约束、information_schema、SHOW STATUS/REPLICATION STATUS | `SHOW TABLE STATUS` 与 `information_schema.TABLES` 的 `TABLE_ROWS`/`DATA_LENGTH`/`INDEX_LENGTH` 按实时扫描结果返回（线性成本），不做统计缓存 |
 | 维护 | 单机 BACKUP/RESTORE/GC/COMPACT MVCC、EXPORT DATABASE … TO 'path' 逻辑导出 | 维护命令必须在事务外且开启 autocommit；复制节点不支持这些在线维护命令；逻辑导出在语句快照上物化整库快照后写文件 |
 | 复制 | 实验性固定三节点 Raft、选主、连接代理 | 无分片、动态成员、混合版本滚动升级或生产容灾保证 |
 

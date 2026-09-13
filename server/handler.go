@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -810,7 +811,7 @@ func tableInformationInDatabase(engine *executor.Engine, session *executor.Sessi
 				continue
 			}
 			table, _ := database.Table(name)
-			result.Rows = append(result.Rows, informationSchemaTableRow(database.Name(), table))
+			result.Rows = append(result.Rows, informationSchemaTableRow(database.Name(), table, liveTableStatistics(engine, database.Name(), name, table)))
 		}
 	}
 	if tableType == "" || tableType == "VIEW" {
@@ -929,17 +930,31 @@ func informationSchemaTableColumns() []executor.Column {
 	return columns
 }
 
-func informationSchemaTableRow(schema string, table *storage.Table) []any {
+func informationSchemaTableRow(schema string, table *storage.Table, statistics executor.TableStatistics) []any {
 	comment, createdAt, updatedAt := table.Metadata()
 	createdAt = createdAt.Local().Truncate(time.Second)
 	updatedAt = updatedAt.Local().Truncate(time.Second)
-	rows := int64(table.RowCount())
-	dataLength := table.DataLength()
+	rows := statistics.Rows
 	averageLength := int64(0)
 	if rows > 0 {
-		averageLength = dataLength / rows
+		averageLength = statistics.DataLength / rows
 	}
-	return []any{"def", schema, table.Name(), "BASE TABLE", "GBaseLite", int64(10), "Dynamic", rows, averageLength, dataLength, int64(0), int64(0), int64(0), nil, createdAt, updatedAt, nil, "utf8mb4_general_ci", nil, "", comment}
+	return []any{"def", schema, table.Name(), "BASE TABLE", "GBaseLite", int64(10), "Dynamic", rows, averageLength, statistics.DataLength, int64(0), statistics.IndexLength, int64(0), nil, createdAt, updatedAt, nil, "utf8mb4_general_ci", nil, "", comment}
+}
+
+// liveTableStatistics reports the row count and encoded sizes of one MVCC table.
+// The metadata mirror lists definitions without rows, so the numbers come from the
+// backend; virtual schemas and non-MVCC stores fall back to the mirror table.
+func liveTableStatistics(engine *executor.Engine, database, name string, table *storage.Table) executor.TableStatistics {
+	fallback := executor.TableStatistics{Rows: int64(table.RowCount()), DataLength: table.DataLength()}
+	if engine == nil {
+		return fallback
+	}
+	statistics, err := engine.TableStatistics(context.Background(), database, name)
+	if err != nil {
+		return fallback
+	}
+	return statistics
 }
 
 func informationSchemaColumnRow(schema, table string, position int, column storage.Column, key string) []any {
@@ -1476,13 +1491,13 @@ func tableStatus(engine *executor.Engine, session *executor.Session, query strin
 		comment, createdAt, updatedAt := table.Metadata()
 		createdAt = createdAt.Local().Truncate(time.Second)
 		updatedAt = updatedAt.Local().Truncate(time.Second)
-		rows := int64(table.RowCount())
-		dataLength := table.DataLength()
+		statistics := liveTableStatistics(engine, database.Name(), name, table)
+		rows := statistics.Rows
 		averageLength := int64(0)
 		if rows > 0 {
-			averageLength = dataLength / rows
+			averageLength = statistics.DataLength / rows
 		}
-		result.Rows = append(result.Rows, []any{name, "GBaseLite", int64(10), "Dynamic", rows, averageLength, dataLength, int64(0), int64(0), int64(0), nil, createdAt, updatedAt, nil, "utf8mb4_general_ci", nil, "", comment})
+		result.Rows = append(result.Rows, []any{name, "GBaseLite", int64(10), "Dynamic", rows, averageLength, statistics.DataLength, int64(0), statistics.IndexLength, int64(0), nil, createdAt, updatedAt, nil, "utf8mb4_general_ci", nil, "", comment})
 	}
 	return result, nil
 }

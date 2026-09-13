@@ -1292,3 +1292,64 @@ func TestMySQLProtocolAcceptsNavicatIndexCommentDDL(t *testing.T) {
 		t.Fatalf("CHECK_CONSTRAINTS = %#v", enforced)
 	}
 }
+
+// TestMySQLProtocolTableStatisticsReportLiveRows pins the numbers Navicat shows in
+// its table list: SHOW TABLE STATUS and information_schema.TABLES must report the
+// live row count and encoded sizes of MVCC tables instead of the empty metadata
+// mirror (which reported 0 for tables that hold data).
+func TestMySQLProtocolTableStatisticsReportLiveRows(t *testing.T) {
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &executor.Session{CurrentDatabase: "stats"}
+	for _, query := range []string{
+		"CREATE DATABASE stats",
+		"CREATE TABLE stats.t (id INT PRIMARY KEY, note VARCHAR(64), KEY idx_note (note))",
+	} {
+		if _, err = ExecuteCompatible(engine, session, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	for batch := 0; batch < 5; batch++ {
+		values := make([]string, 0, 10)
+		for row := 0; row < 10; row++ {
+			values = append(values, fmt.Sprintf("(%d,'note-%d')", batch*10+row, row))
+		}
+		if _, err = ExecuteCompatible(engine, session, "INSERT INTO stats.t (id,note) VALUES "+strings.Join(values, ",")); err != nil {
+			t.Fatalf("insert batch %d: %v", batch, err)
+		}
+	}
+
+	tableRows := func(query string) []any {
+		t.Helper()
+		result, err := ExecuteCompatible(engine, session, query)
+		if err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		if len(result.Rows) != 1 {
+			t.Fatalf("%s rows = %#v", query, result.Rows)
+		}
+		return result.Rows[0]
+	}
+	assertLive := func(label string, row []any, rowsIndex, dataIndex, indexIndex int, want int64) {
+		t.Helper()
+		if got := row[rowsIndex]; got != want {
+			t.Fatalf("%s row count = %v, want %d", label, got, want)
+		}
+		if data, ok := row[dataIndex].(int64); !ok || data <= 0 {
+			t.Fatalf("%s data length = %v, want a positive size", label, row[dataIndex])
+		}
+		if index, ok := row[indexIndex].(int64); !ok || index <= 0 {
+			t.Fatalf("%s index length = %v, want a positive size", label, row[indexIndex])
+		}
+	}
+	assertLive("SHOW TABLE STATUS", tableRows("SHOW TABLE STATUS FROM stats LIKE 't'"), 4, 6, 8, 50)
+	assertLive("information_schema.TABLES", tableRows("SELECT * FROM information_schema.TABLES WHERE TABLE_SCHEMA='stats' AND TABLE_NAME='t'"), 7, 9, 11, 50)
+
+	if _, err = ExecuteCompatible(engine, session, "DELETE FROM stats.t WHERE id < 10"); err != nil {
+		t.Fatal(err)
+	}
+	assertLive("SHOW TABLE STATUS after delete", tableRows("SHOW TABLE STATUS FROM stats LIKE 't'"), 4, 6, 8, 40)
+	assertLive("information_schema.TABLES after delete", tableRows("SELECT * FROM information_schema.TABLES WHERE TABLE_SCHEMA='stats' AND TABLE_NAME='t'"), 7, 9, 11, 40)
+}
