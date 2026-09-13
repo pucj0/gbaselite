@@ -4,7 +4,7 @@ GBaseLite 是一个使用 Go 编写、默认单机运行的轻量级关系型数
 PostgreSQL，使用自己的存储文件持久化数据，并通过 MySQL 协议向 Navicat、DBeaver、
 JDBC、Go MySQL 驱动等客户端提供服务。
 
-当前版本：`1.1.3`（工作区开发改造；历史发布包以对应发布说明为准）
+当前版本：`1.1.4`（工作区开发改造；历史发布包以对应发布说明为准）
 
 **MVCC 是唯一运行事务引擎。snapshot/paged 仅作为离线迁移源格式保留。**
 
@@ -1105,13 +1105,13 @@ README、版本化裸二进制 Compose 路径、环境示例、工作流默认�
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1 `
-  -Version 1.1.3 -GoExecutable D:\env\Go\bin\go.exe
+  -Version 1.1.4 -GoExecutable D:\env\Go\bin\go.exe
 ```
 
 兼容入口 `scripts/package.ps1` 会转发到同一脚本。Linux 构建机可以使用：
 
 ```bash
-VERSION=1.1.3 ./scripts/build-release.sh
+VERSION=1.1.4 ./scripts/build-release.sh
 ```
 
 MSI 单独构建：
@@ -1119,7 +1119,7 @@ MSI 单独构建：
 ```powershell
 dotnet tool install --global wix --version 5.0.2
 wix extension add --global WixToolset.UI.wixext/5.0.2
-.\scripts\build-msi.ps1 -Version 1.1.3 `
+.\scripts\build-msi.ps1 -Version 1.1.4 `
   -SourceDirectory .\.tmp\windows-package `
   -OutputPath .\dist\GBaseLite-windows-amd64.msi
 ```
@@ -1189,9 +1189,9 @@ GHCR 和 Docker Hub 的精确版本、`major.minor` 与 `latest` 标签。GHCR �
 
 ```powershell
 .\publish-release.bat -SelfTest
-.\publish-release.bat -Version 1.1.3 -DryRun -ReplaceArtifacts
-.\publish-release.bat -Version 1.1.3 -PrepareOnly -ReplaceArtifacts
-.\publish-release.bat -Version 1.1.3 -Publish -ReplaceArtifacts
+.\publish-release.bat -Version 1.1.4 -DryRun -ReplaceArtifacts
+.\publish-release.bat -Version 1.1.4 -PrepareOnly -ReplaceArtifacts
+.\publish-release.bat -Version 1.1.4 -Publish -ReplaceArtifacts
 ```
 
 `publish-release.bat` 默认在完成或失败后暂停，双击运行时可以看到完整输出；自动化或已打开的
