@@ -754,7 +754,7 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 
 | 范围 | 当前支持 | 限制 |
 |---|---|---|
-| 连接 | MySQL TCP、认证、TLS、COM_QUERY、Prepared Statement、二进制结果 | 不是完整 MySQL 协议实现 |
+| 连接 | MySQL TCP、认证、TLS、COM_QUERY、Prepared Statement、二进制结果、`CONNECTION_ID()`、`SHOW [FULL] PROCESSLIST`、`KILL [QUERY\|CONNECTION] <id>` | 不是完整 MySQL 协议实现；连接管理只覆盖本进程内的连接，跨账号查看/终止会话需要 PROCESS 授权 |
 | DDL | 数据库/表/视图创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引、CREATE TABLE AS SELECT、CREATE TABLE LIKE、RENAME TABLE | 视图定义存入 MVCC catalog 并在引用时重新绑定，表与视图共用一个命名空间；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
 | 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源与视图源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT/RIGHT/CROSS，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …，目标表可无主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；不支持子查询作为连接输入；视图不可写 |
 | 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT/RIGHT/CROSS JOIN、派生表、非递归与递归 CTE、视图（含嵌套视图）、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询）、锁定读（按快照读处理） | 窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
@@ -810,6 +810,13 @@ entries，数据库内的父子外键不因 key order 阻止删除，`ROLLBACK` 
 递归 CTE（`WITH RECURSIVE n AS (seed UNION ALL recursive)`）按 legacy 语义执行：seed 只跑一次，每轮递归
 分支只看到上一轮增量，累计结果供外层查询使用，公共列名与类型取自 seed，列数不一致或超过 1000 轮
 时报错并回滚；整个 CTE 生命周期与物化都留在同一语句快照与结果内存预算内，不泄漏到后续语句。
+
+连接管理按 MySQL 语义作用于活动会话：`CONNECTION_ID()` 返回本会话 id，`SHOW PROCESSLIST`
+列出当前连接（未授予 PROCESS 的账号只看得到自己 user@host 的会话，字段为 Id/User/Host/db/Command/Time/State/Info），
+`KILL QUERY <id>` 中断目标会话正在执行的语句（客户端收到 1317 `Query execution was interrupted`，
+已写入部分按语句原子性回滚，目标事务保持打开），`KILL [CONNECTION] <id>` 在中断语句后关闭该连接
+并回滚它未提交的事务；未知 id 返回 1094 `Unknown thread id`，越权终止其它账号连接返回 1095。
+取消与提交竞争时仍以确定结果为准，不会把已提交事务报告为取消。
 
 同一行、唯一键或依赖表结构的并发变更可能导致提交返回 MySQL 1213，应重试整个事务。
 不同行更新可独立提交。自增号持久预留，回滚后允许空洞；会话的 LastInsertID 只在整条写入语句

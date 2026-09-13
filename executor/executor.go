@@ -4194,7 +4194,9 @@ func executeScalarSelect(session *Session, statement parser.Select) (*Result, er
 				value = session.Username + "@" + session.Host
 			}
 		case expression == "CONNECTION_ID()":
-			value = int64(0)
+			// The protocol layer assigns the session id; embedded callers that never
+			// register a connection keep the historical zero.
+			value = int64(session.ConnectionID)
 			column.Type = storage.TypeBigInt
 		case expression == "LAST_INSERT_ID()":
 			value = int64(session.LastInsertID)

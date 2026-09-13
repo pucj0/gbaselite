@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,7 +18,7 @@ import (
 	"gbaselite/journal"
 	"gbaselite/storage"
 
-	_ "github.com/go-sql-driver/mysql"
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 func TestProtocolAuditLogIncludesIdentityAndRedactsSQL(t *testing.T) {
@@ -921,5 +922,246 @@ func TestMySQLProtocolUserPrivileges(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// processListRow is one parsed SHOW PROCESSLIST row.
+type processListRow struct {
+	id       int64
+	user     string
+	host     string
+	database string
+	command  string
+	elapsed  int64
+	info     string
+}
+
+func readProcessList(t *testing.T, client *sql.Conn) map[int64]processListRow {
+	t.Helper()
+	rows, err := client.QueryContext(context.Background(), "SHOW PROCESSLIST")
+	if err != nil {
+		t.Fatalf("SHOW PROCESSLIST: %v", err)
+	}
+	defer rows.Close()
+	list := make(map[int64]processListRow)
+	for rows.Next() {
+		var (
+			id                                   int64
+			user, host, database, command, state string
+			elapsed                              int64
+			info                                 sql.NullString
+		)
+		if err = rows.Scan(&id, &user, &host, &database, &command, &elapsed, &state, &info); err != nil {
+			t.Fatalf("scan SHOW PROCESSLIST: %v", err)
+		}
+		list[id] = processListRow{id: id, user: user, host: host, database: database, command: command, elapsed: elapsed, info: info.String}
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatalf("SHOW PROCESSLIST rows: %v", err)
+	}
+	return list
+}
+
+func requireMySQLErrorCode(t *testing.T, err error, code uint16, context string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("%s: expected MySQL error %d, got success", context, code)
+	}
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		t.Fatalf("%s: error %v is not a MySQL error", context, err)
+	}
+	if mysqlErr.Number != code {
+		t.Fatalf("%s: error code = %d (%s), want %d", context, mysqlErr.Number, mysqlErr.Message, code)
+	}
+}
+
+// TestMySQLProtocolConnectionManagement pins the connection management clients use
+// to inspect and cancel work: CONNECTION_ID(), SHOW PROCESSLIST and the KILL
+// statements act on the live connection registry instead of being accepted as
+// no-ops.
+func TestMySQLProtocolConnectionManagement(t *testing.T) {
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	databaseServer := &MySQLServer{Engine: engine, Logger: log.New(io.Discard, "", 0)}
+	done := make(chan error, 1)
+	go func() { done <- databaseServer.Serve(listener) }()
+	defer func() {
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = databaseServer.Shutdown(shutdownContext)
+		<-done
+	}()
+	ctx := context.Background()
+	address := listener.Addr().String()
+	// Pinned connections: database/sql must not hide a killed connection by opening
+	// a replacement, so every assertion runs on one explicit session.
+	adminConnection, err := sql.Open("mysql", "root:123456@tcp("+address+")/?charset=utf8mb4&timeout=3s&readTimeout=60s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adminConnection.Close()
+	admin, err := adminConnection.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	workerConnection, err := sql.Open("mysql", "root:123456@tcp("+address+")/?charset=utf8mb4&timeout=3s&readTimeout=60s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer workerConnection.Close()
+	worker, err := workerConnection.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+
+	var adminID, workerID int64
+	if err = admin.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&adminID); err != nil {
+		t.Fatal(err)
+	}
+	if err = worker.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&workerID); err != nil {
+		t.Fatal(err)
+	}
+	if adminID == 0 || workerID == 0 || adminID == workerID {
+		t.Fatalf("CONNECTION_ID() = %d and %d, want distinct non-zero ids", adminID, workerID)
+	}
+
+	list := readProcessList(t, admin)
+	for _, id := range []int64{adminID, workerID} {
+		row, ok := list[id]
+		if !ok {
+			t.Fatalf("SHOW PROCESSLIST is missing connection %d: %+v", id, list)
+		}
+		if row.user != "root" || row.host == "" || row.command != "Sleep" {
+			t.Fatalf("SHOW PROCESSLIST row %d = %+v", id, row)
+		}
+	}
+
+	for _, query := range []string{"CREATE DATABASE cm", "CREATE TABLE cm.big(id INT PRIMARY KEY)"} {
+		if _, err = admin.ExecContext(ctx, query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	for batch := 0; batch < 10; batch++ {
+		values := make([]string, 0, 200)
+		for row := 0; row < 200; row++ {
+			values = append(values, fmt.Sprintf("(%d)", batch*200+row))
+		}
+		if _, err = admin.ExecContext(ctx, "INSERT INTO cm.big(id) VALUES "+strings.Join(values, ",")); err != nil {
+			t.Fatalf("insert batch %d: %v", batch, err)
+		}
+	}
+
+	// Comma joins are outside the supported grammar, so the slow statement uses
+	// explicit CROSS JOIN: 2000^3 row combinations keep it running until it is killed.
+	const longQuery = "SELECT COUNT(*) FROM cm.big a CROSS JOIN cm.big b CROSS JOIN cm.big c"
+	runLongQuery := func() chan error {
+		finished := make(chan error, 1)
+		go func() {
+			var count int64
+			finished <- worker.QueryRowContext(ctx, longQuery).Scan(&count)
+		}()
+		return finished
+	}
+	waitForRunning := func() processListRow {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if row, ok := readProcessList(t, admin)[workerID]; ok && row.command == "Query" && strings.Contains(row.info, "cm.big") {
+				return row
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatal("SHOW PROCESSLIST never reported the running statement")
+		return processListRow{}
+	}
+
+	// KILL QUERY interrupts the statement and keeps the connection usable.
+	interrupted := runLongQuery()
+	waitForRunning()
+	started := time.Now()
+	if _, err = admin.ExecContext(ctx, fmt.Sprintf("KILL QUERY %d", workerID)); err != nil {
+		t.Fatalf("KILL QUERY: %v", err)
+	}
+	select {
+	case queryErr := <-interrupted:
+		requireMySQLErrorCode(t, queryErr, 1317, "KILL QUERY")
+		if elapsed := time.Since(started); elapsed > 10*time.Second {
+			t.Fatalf("KILL QUERY took %s to interrupt the statement", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("KILL QUERY did not interrupt the running statement")
+	}
+	var one int64
+	if err = worker.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil || one != 1 {
+		t.Fatalf("connection unusable after KILL QUERY: %v", err)
+	}
+
+	// KILL CONNECTION closes the victim even while it is busy.
+	killed := runLongQuery()
+	waitForRunning()
+	if _, err = admin.ExecContext(ctx, fmt.Sprintf("KILL %d", workerID)); err != nil {
+		t.Fatalf("KILL: %v", err)
+	}
+	select {
+	case queryErr := <-killed:
+		if queryErr == nil {
+			t.Fatal("KILL CONNECTION reported a successful statement")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("KILL CONNECTION did not interrupt the running statement")
+	}
+	if err = worker.QueryRowContext(ctx, "SELECT 1").Scan(&one); err == nil {
+		t.Fatal("killed connection stayed usable")
+	}
+	if _, stillListed := readProcessList(t, admin)[workerID]; stillListed {
+		t.Fatal("killed connection is still listed by SHOW PROCESSLIST")
+	}
+
+	// Unknown ids and foreign connections follow MySQL's KILL error codes.
+	_, err = admin.ExecContext(ctx, "KILL 999999")
+	requireMySQLErrorCode(t, err, 1094, "unknown KILL target")
+	if _, err = admin.ExecContext(ctx, "KILL QUERY 999999"); err == nil {
+		t.Fatal("KILL QUERY accepted an unknown thread id")
+	}
+
+	if _, err = admin.ExecContext(ctx, "CREATE USER 'cm_reader'@'127.0.0.1' IDENTIFIED BY 'cm-secret'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = admin.ExecContext(ctx, "GRANT SELECT ON cm.* TO 'cm_reader'@'127.0.0.1'"); err != nil {
+		t.Fatal(err)
+	}
+	readerConnection, err := sql.Open("mysql", "cm_reader:cm-secret@tcp("+address+")/cm?timeout=3s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readerConnection.Close()
+	reader, err := readerConnection.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	var readerID int64
+	if err = reader.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&readerID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = reader.ExecContext(ctx, fmt.Sprintf("KILL %d", adminID)); err == nil {
+		t.Fatal("a session without PROCESS killed another account's connection")
+	} else {
+		requireMySQLErrorCode(t, err, 1095, "KILL without PROCESS")
+	}
+	readerList := readProcessList(t, reader)
+	if len(readerList) != 1 {
+		t.Fatalf("SHOW PROCESSLIST without PROCESS exposed %+v", readerList)
+	}
+	if _, ok := readerList[readerID]; !ok {
+		t.Fatalf("SHOW PROCESSLIST without PROCESS omitted the caller: %+v", readerList)
 	}
 }

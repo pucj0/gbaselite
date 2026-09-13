@@ -54,6 +54,8 @@ type MySQLServer struct {
 	activeQueries           atomic.Int64
 	abortedConnections      atomic.Uint64
 	tlsConnections          atomic.Uint64
+	connectionMu            sync.Mutex
+	connections             map[uint32]*serverConnection
 	authFailuresMu          sync.Mutex
 	authFailures            map[string]authenticationFailure
 	authFailuresLastCleanup time.Time
@@ -256,6 +258,11 @@ func (s *MySQLServer) handleConnection(raw net.Conn) {
 	initializeHandshakeCharacterSet(session, response.CharacterSet)
 	s.writeAudit(journal.AuditEvent{ConnectionID: id, Username: account.Username, RemoteIP: remoteHost, RemotePort: remotePort, Database: response.Database, Operation: "AUTHENTICATE", Result: "success"})
 	prepared := newPreparedCache(s.MaxPreparedStatements, s.MaxPreparedBytes)
+	// The protocol layer owns the live connection registry: CONNECTION_ID(),
+	// SHOW PROCESSLIST and KILL need it, and it is what lets a client interrupt a
+	// statement running here instead of waiting for it to finish.
+	connection := s.registerConnection(id, session, remote, func() { _ = raw.Close() })
+	defer s.unregisterConnection(id)
 	defer s.Engine.CloseSession(session)
 	if response.Database != "" && !virtualDatabase(response.Database) {
 		if _, err := s.Engine.Store.Database(response.Database); err != nil {
@@ -305,6 +312,7 @@ func (s *MySQLServer) handleConnection(raw net.Conn) {
 				_ = packet.WritePacket(protocol.ErrorPacket(1044, "Access denied for user '"+session.Username+"' to database '"+database+"'"))
 			} else {
 				session.CurrentDatabase = database
+				connection.refreshDatabase(database)
 				_ = protocol.WriteResult(packet, &executor.Result{InTransaction: session.InTransaction(), AutocommitDisabled: session.AutocommitDisabled}, session.CurrentDatabase, "")
 			}
 			s.auditQuery(session, remotePort, "USE `"+strings.ReplaceAll(database, "`", "``")+"`", started, &executor.Result{}, commandErr)
@@ -359,7 +367,7 @@ func (s *MySQLServer) handleConnection(raw net.Conn) {
 				s.logSlowQuery(query, started)
 				s.Logger.Printf("SQL error query=%q error=%v", queryForLog(query), executeErr)
 				s.auditQuery(session, remotePort, query, started, nil, executeErr)
-				_ = packet.WritePacket(protocol.ErrorPacket(mysqlExecutionErrorCode(executeErr), executeErr.Error()))
+				_ = packet.WritePacket(protocol.ErrorPacket(mysqlExecutionErrorCode(executeErr), mysqlErrorMessage(executeErr)))
 				break
 			}
 			if writeErr := protocol.WriteBinaryResult(packet, result, session.CurrentDatabase, ""); writeErr != nil {
@@ -385,6 +393,10 @@ func (s *MySQLServer) handleConnection(raw net.Conn) {
 		}
 		if err := packet.Flush(); err != nil {
 			s.Logger.Printf("connection id=%d flush error: %v", id, err)
+			return
+		}
+		if connection.consumeKillRequest() {
+			s.Logger.Printf("connection id=%d closed by KILL", id)
 			return
 		}
 	}
@@ -491,7 +503,7 @@ func (s *MySQLServer) handleQuery(packet *protocol.PacketConn, session *executor
 		}
 		s.auditQuery(session, session.RemotePort, query, started, nil, err)
 		s.logSlowQuery(query, started)
-		_ = packet.WritePacket(protocol.ErrorPacket(mysqlExecutionErrorCode(err), err.Error()))
+		_ = packet.WritePacket(protocol.ErrorPacket(mysqlExecutionErrorCode(err), mysqlErrorMessage(err)))
 		return
 	}
 	if err := protocol.WriteResult(packet, result, session.CurrentDatabase, ""); err != nil {
@@ -514,13 +526,42 @@ func (s *MySQLServer) executeCompatible(session *executor.Session, query string)
 		}
 	}
 	trimmed := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(query), ";"))
-	if isShowStatusQuery(strings.ToUpper(trimmed)) {
+	upper := strings.ToUpper(trimmed)
+	// Connection management needs the live registry, so the protocol layer answers
+	// it before the engine-level compatibility entry point sees the statement.
+	switch {
+	case isKillStatement(upper):
+		return s.executeKill(session, trimmed)
+	case isProcessListStatement(upper):
+		return s.processListResult(session, trimmed)
+	}
+	if isShowStatusQuery(upper) {
 		status := s.runtimeStatus()
 		if status.StorageState != "available" {
 			return nil, s.Engine.AvailabilityError()
 		}
 		return statusRows(session, trimmed, status)
 	}
+	// Every statement runs with its own cancelable context so that KILL QUERY and
+	// KILL CONNECTION can interrupt scans, joins and mutations in flight.
+	connection := s.connectionByID(session.ConnectionID)
+	parent := session.Context
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	previous := session.Context
+	session.Context = ctx
+	if connection != nil {
+		connection.beginStatement(session.CurrentDatabase, trimmed, cancel)
+	}
+	defer func() {
+		if connection != nil {
+			connection.finishStatement()
+		}
+		session.Context = previous
+		cancel()
+	}()
 	return ExecuteCompatible(s.Engine, session, query)
 }
 
@@ -599,16 +640,30 @@ func (s *MySQLServer) logSlowQuery(query string, started time.Time) {
 	}
 }
 
+// mysqlErrorMessage keeps the MySQL wording clients expect for interrupted work,
+// where the executor surfaces the cancellation as a bare context error.
+func mysqlErrorMessage(err error) string {
+	if errors.Is(err, executor.ErrQueryCanceled) || errors.Is(err, context.Canceled) {
+		return "Query execution was interrupted"
+	}
+	return err.Error()
+}
+
 func mysqlExecutionErrorCode(err error) uint16 {
 	var jsonErr *executor.JSONFunctionError
 	if errors.As(err, &jsonErr) {
 		return jsonErr.Code
 	}
+	var killErr *killError
+	if errors.As(err, &killErr) {
+		return killErr.code
+	}
 	message := strings.ToLower(err.Error())
 	switch {
 	case errors.Is(err, storage.ErrDecimalRange):
 		return 1264
-	case errors.Is(err, executor.ErrQueryTimeout), errors.Is(err, executor.ErrQueryCanceled):
+	case errors.Is(err, executor.ErrQueryTimeout), errors.Is(err, executor.ErrQueryCanceled),
+		errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return 1317
 	case errors.Is(err, storageengine.ErrWriteSetLimit), errors.Is(err, executor.ErrQueryResourceLimit):
 		return 1041
