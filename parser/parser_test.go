@@ -866,3 +866,39 @@ func TestParseIndexComments(t *testing.T) {
 		t.Fatalf("create index = %#v", statement)
 	}
 }
+
+// TestParseCheckEnforcement covers MySQL's CHECK (...) [NOT] ENFORCED options.
+func TestParseCheckEnforcement(t *testing.T) {
+	statement, err := Parse("CREATE TABLE t (id INT, CONSTRAINT ck CHECK (id > 0) NOT ENFORCED, CONSTRAINT ck2 CHECK (id < 100) ENFORCED)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	create, ok := statement.(CreateTable)
+	if !ok || len(create.Checks) != 2 {
+		t.Fatalf("statement = %#v", statement)
+	}
+	if !create.Checks[0].NotEnforced || create.Checks[0].Name != "ck" || create.Checks[0].Expression != "id > 0" {
+		t.Fatalf("first check = %#v", create.Checks[0])
+	}
+	if create.Checks[1].NotEnforced || create.Checks[1].Name != "ck2" {
+		t.Fatalf("second check = %#v", create.Checks[1])
+	}
+	for _, query := range []string{
+		"CREATE TABLE t (id INT, CHECK (id > 0) NOT ENFORCED)",
+		"CREATE TABLE t (id INT, CHECK (id > 0))",
+		"ALTER TABLE t ADD CONSTRAINT ck CHECK (id > 0) NOT ENFORCED",
+		"ALTER TABLE t ADD CHECK (id > 0) ENFORCED",
+	} {
+		if _, err := Parse(query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	statement, err = Parse("ALTER TABLE t ADD CONSTRAINT ck CHECK (id > 0) NOT ENFORCED")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alter, ok := statement.(AlterCheck)
+	if !ok || !alter.Check.NotEnforced {
+		t.Fatalf("alter check = %#v", statement)
+	}
+}

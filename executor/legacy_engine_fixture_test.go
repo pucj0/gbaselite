@@ -329,9 +329,9 @@ func (e *legacyEngine) executeStatement(session *Session, statement parser.State
 					}
 					if err == nil && table != nil {
 						for _, check := range value.Checks {
-							err = validateCheckDefinition(table, check.Expression)
+							err = validateCheckDefinition(table, check.Expression, check.NotEnforced)
 							if err == nil {
-								err = table.AddCheck(storage.CheckConstraint{Name: check.Name, Expression: check.Expression})
+								err = table.AddCheck(storage.CheckConstraint{Name: check.Name, Expression: check.Expression, NotEnforced: check.NotEnforced})
 							}
 							if err != nil {
 								break

@@ -924,8 +924,11 @@ func executeInsertDuplicateUpdate(database *storage.Database, table *storage.Tab
 }
 
 func validateCheckConstraints(table *storage.Table, row storage.Row) error {
-	for _, definition := range table.Checks() {
-		expression, err := parser.ParseExpression(definition)
+	for _, constraint := range table.CheckConstraints() {
+		if constraint.NotEnforced {
+			continue
+		}
+		expression, err := parser.ParseExpression(constraint.Expression)
 		if err != nil {
 			return fmt.Errorf("%w: %v", storage.ErrCheckConstraint, err)
 		}
@@ -934,7 +937,7 @@ func validateCheckConstraints(table *storage.Table, row storage.Row) error {
 			return fmt.Errorf("%w: %v", storage.ErrCheckConstraint, err)
 		}
 		if value != nil && !truthy(value) {
-			return fmt.Errorf("%w: %s", storage.ErrCheckConstraint, definition)
+			return fmt.Errorf("%w: %s", storage.ErrCheckConstraint, constraint.Expression)
 		}
 	}
 	return nil
@@ -1077,8 +1080,8 @@ func executeAlterTableAction(store *storage.Store, session *Session, statement p
 		if err == nil {
 			if value.Drop {
 				err = table.DropCheck(value.Name)
-			} else if err = validateCheckDefinition(table, value.Check.Expression); err == nil {
-				err = table.AddCheck(storage.CheckConstraint{Name: value.Check.Name, Expression: value.Check.Expression})
+			} else if err = validateCheckDefinition(table, value.Check.Expression, value.Check.NotEnforced); err == nil {
+				err = table.AddCheck(storage.CheckConstraint{Name: value.Check.Name, Expression: value.Check.Expression, NotEnforced: value.Check.NotEnforced})
 			}
 		}
 		return &Result{Message: "check constraint altered"}, err
@@ -1093,10 +1096,15 @@ func executeAlterTableAction(store *storage.Store, session *Session, statement p
 	}
 }
 
-func validateCheckDefinition(table *storage.Table, definition string) error {
+func validateCheckDefinition(table *storage.Table, definition string, notEnforced ...bool) error {
 	expression, err := parser.ParseExpression(definition)
 	if err != nil {
 		return fmt.Errorf("%w: %v", storage.ErrCheckConstraint, err)
+	}
+	if len(notEnforced) > 0 && notEnforced[0] {
+		// MySQL keeps NOT ENFORCED checks as metadata only: adding one never fails
+		// because of existing rows.
+		return nil
 	}
 	rows := table.Select(nil)
 	if len(rows) == 0 {
@@ -6890,7 +6898,11 @@ func createTableSQL(table *storage.Table) string {
 		parts = append(parts, definition)
 	}
 	for _, check := range table.CheckConstraints() {
-		parts = append(parts, "  CONSTRAINT "+quoteIdentifier(check.Name)+" CHECK ("+check.Expression+")")
+		rendered := "  CONSTRAINT " + quoteIdentifier(check.Name) + " CHECK (" + check.Expression + ")"
+		if check.NotEnforced {
+			rendered += " NOT ENFORCED"
+		}
+		parts = append(parts, rendered)
 	}
 	definition := fmt.Sprintf("CREATE TABLE `%s` (\n%s\n)", table.Name(), strings.Join(parts, ",\n"))
 	comment, _, _ := table.Metadata()
@@ -7150,9 +7162,17 @@ func createTableSnapshotSQL(table storage.TableSnapshot) string {
 	}
 	for _, check := range checks {
 		if check.Name != "" {
-			parts = append(parts, "  CONSTRAINT "+quoteIdentifier(check.Name)+" CHECK ("+check.Expression+")")
+			rendered := "  CONSTRAINT " + quoteIdentifier(check.Name) + " CHECK (" + check.Expression + ")"
+			if check.NotEnforced {
+				rendered += " NOT ENFORCED"
+			}
+			parts = append(parts, rendered)
 		} else {
-			parts = append(parts, "  CHECK ("+check.Expression+")")
+			rendered := "  CHECK (" + check.Expression + ")"
+			if check.NotEnforced {
+				rendered += " NOT ENFORCED"
+			}
+			parts = append(parts, rendered)
 		}
 	}
 	return fmt.Sprintf("CREATE TABLE %s (\n%s\n)", quoteIdentifier(table.Name), strings.Join(parts, ",\n"))

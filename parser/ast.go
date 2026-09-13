@@ -60,7 +60,12 @@ type ForeignKeyDef struct {
 	OnDelete   string
 	OnUpdate   string
 }
-type CheckDef struct{ Name, Expression string }
+type CheckDef struct {
+	Name, Expression string
+	// NotEnforced records MySQL's "CHECK (...) NOT ENFORCED" option: the expression
+	// is kept as metadata but the runtime does not validate rows against it.
+	NotEnforced bool
+}
 type IndexDef struct {
 	Name    string
 	Columns []string

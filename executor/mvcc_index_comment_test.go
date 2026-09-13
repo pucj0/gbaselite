@@ -98,3 +98,41 @@ func TestMVCCIndexCommentSurvivesReopenAndMaintenance(t *testing.T) {
 		t.Fatal("commented unique index stopped enforcing uniqueness")
 	}
 }
+
+// checkEnforcementScript pins MySQL's CHECK (...) NOT ENFORCED option: the constraint
+// is kept as metadata (and echoed by SHOW CREATE TABLE) but rows are not validated,
+// while enforced checks in the same table still reject them.
+var checkEnforcementScript = []parityStep{
+	{Query: "CREATE DATABASE ce", SkipAffect: true},
+	{Query: "USE ce", SkipAffect: true},
+	{Query: "CREATE TABLE t (id INT, CONSTRAINT ck_soft CHECK (id > 0) NOT ENFORCED, CONSTRAINT ck_hard CHECK (id < 100))", SkipAffect: true},
+	{Query: "SHOW CREATE TABLE t", Rows: true},
+	{Query: "INSERT INTO t VALUES (-1)"},
+	{Query: "INSERT INTO t VALUES (101)", Fail: true},
+	{Query: "SELECT id FROM t ORDER BY id", Rows: true},
+	{Query: "ALTER TABLE t ADD CONSTRAINT ck_soft2 CHECK (id > 5) NOT ENFORCED", SkipAffect: true},
+	{Query: "SHOW CREATE TABLE t", Rows: true},
+	{Query: "INSERT INTO t VALUES (3)"},
+	{Query: "SELECT id FROM t ORDER BY id", Rows: true},
+}
+
+func TestMVCCCheckEnforcementMatchesLegacyEngine(t *testing.T) {
+	legacy, err := openLegacy(t.TempDir(), "root", "123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacy.Close()
+	legacySession := &Session{}
+	legacyOutcomes := runParityScript(t, func(q string) (*Result, error) { return legacy.Execute(legacySession, q) }, checkEnforcementScript)
+
+	e, session, _ := rangeTestEngine(t)
+	mvccOutcomes := runParityScript(t, func(q string) (*Result, error) { return e.Execute(session, q) }, checkEnforcementScript)
+
+	if !reflect.DeepEqual(legacyOutcomes, mvccOutcomes) {
+		for i, step := range checkEnforcementScript {
+			if legacyOutcomes[i] != mvccOutcomes[i] {
+				t.Errorf("%s\nlegacy=%+v\nmvcc=%+v", step.Query, legacyOutcomes[i], mvccOutcomes[i])
+			}
+		}
+	}
+}

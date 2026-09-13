@@ -112,7 +112,7 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		}
 		checks := make([]storage.CheckConstraint, 0, len(value.Checks))
 		for _, check := range value.Checks {
-			checks = append(checks, storage.CheckConstraint{Name: check.Name, Expression: check.Expression})
+			checks = append(checks, storage.CheckConstraint{Name: check.Name, Expression: check.Expression, NotEnforced: check.NotEnforced})
 		}
 		for _, column := range value.Columns {
 			if column.Check != "" {

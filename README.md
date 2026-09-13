@@ -759,7 +759,7 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 | 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源与视图源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT/RIGHT/CROSS，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …，目标表可无主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；不支持子查询作为连接输入；视图不可写 |
 | 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT/RIGHT/CROSS JOIN、派生表、非递归与递归 CTE、视图（含嵌套视图）、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询）、锁定读（按快照读处理） | 窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
 | 事务 | BEGIN/COMMIT/ROLLBACK、SAVEPOINT/ROLLBACK TO/RELEASE、SET autocommit=0/1、断连回滚、语句失败回滚 | 快照隔离；不支持 LOCK TABLES、隔离级别切换或串行化保证 |
-| 约束 | PRIMARY KEY、UNIQUE、CHECK、同库外键（RESTRICT/NO ACTION/CASCADE/SET NULL，含自引用） | 不支持跨库外键；受引用表 ALTER 有限制；级联深度上限 32 |
+| 约束 | PRIMARY KEY、UNIQUE、CHECK（含 MySQL 的 `CHECK (...) NOT ENFORCED`）、同库外键（RESTRICT/NO ACTION/CASCADE/SET NULL，含自引用） | 不支持跨库外键；受引用表 ALTER 有限制；级联深度上限 32；`NOT ENFORCED` 只保留定义并回显（`CHECK_CONSTRAINTS.ENFORCED=NO`），不校验行 |
 | 类型 | INT/BIGINT、文本、日期时间、BOOLEAN、精确 DECIMAL、JSON 列及现有标量函数、ON UPDATE CURRENT_TIMESTAMP | TIMESTAMP 尚无独立 UTC 存储语义 |
 | 账号 | 单机用户、密码、授权及权限元数据 | 用户目录独立持久化，不参与业务事务，不经过 Raft；复制节点拒绝账号 SQL |
 | 元数据 | 已提交表结构、索引（含 `INDEX_COMMENT`）、约束、information_schema、SHOW STATUS/REPLICATION STATUS | SHOW 的行数、大小不是实时业务统计，准确计数使用 SELECT COUNT(*) |

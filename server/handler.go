@@ -1067,7 +1067,11 @@ func tableConstraintInformationInDatabase(engine *executor.Engine, session *exec
 			result.Rows = append(result.Rows, []any{"def", database.Name(), definition.Name, database.Name(), table.Name(), "FOREIGN KEY", "YES"})
 		}
 		for _, definition := range table.CheckConstraints() {
-			result.Rows = append(result.Rows, []any{"def", database.Name(), definition.Name, database.Name(), table.Name(), "CHECK", "YES"})
+			enforced := "YES"
+			if definition.NotEnforced {
+				enforced = "NO"
+			}
+			result.Rows = append(result.Rows, []any{"def", database.Name(), definition.Name, database.Name(), table.Name(), "CHECK", enforced})
 		}
 	}
 	return result, nil
@@ -1111,7 +1115,7 @@ func referentialConstraintInformationInDatabase(engine *executor.Engine, session
 }
 
 func checkConstraintInformation(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
-	result := emptyMetadata([]string{"CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "CHECK_CLAUSE"})
+	result := emptyMetadata([]string{"CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "CHECK_CLAUSE", "ENFORCED"})
 	return schemaMetadataInformation(engine, session, query, result.Columns, checkConstraintInformationInDatabase)
 }
 func checkConstraintInformationInDatabase(engine *executor.Engine, session *executor.Session, query string) (*executor.Result, error) {
@@ -1123,14 +1127,18 @@ func checkConstraintInformationInDatabase(engine *executor.Engine, session *exec
 	if err != nil {
 		return nil, err
 	}
-	result := emptyMetadata([]string{"CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "CHECK_CLAUSE"})
+	result := emptyMetadata([]string{"CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "CHECK_CLAUSE", "ENFORCED"})
 	for _, tableName := range database.ListTables() {
 		if !engine.Users.HasObjectAccess(session.Username, session.Host, database.Name(), tableName) {
 			continue
 		}
 		table, _ := database.Table(tableName)
 		for _, definition := range table.CheckConstraints() {
-			result.Rows = append(result.Rows, []any{database.Name(), definition.Name, definition.Expression})
+			enforced := "YES"
+			if definition.NotEnforced {
+				enforced = "NO"
+			}
+			result.Rows = append(result.Rows, []any{database.Name(), definition.Name, definition.Expression, enforced})
 		}
 	}
 	return result, nil

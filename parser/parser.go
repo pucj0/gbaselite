@@ -394,7 +394,11 @@ func (p *Parser) parseCreate() (Statement, error) {
 						if checkErr != nil {
 							return nil, checkErr
 						}
-						checks = append(checks, CheckDef{Name: constraintName, Expression: expression})
+						notEnforced, enforcementErr := p.parseCheckEnforcement()
+						if enforcementErr != nil {
+							return nil, enforcementErr
+						}
+						checks = append(checks, CheckDef{Name: constraintName, Expression: expression, NotEnforced: notEnforced})
 					} else {
 						foreignKey, foreignKeyErr := p.parseForeignKeyDefinition(constraintName)
 						if foreignKeyErr != nil {
@@ -1467,7 +1471,11 @@ func (p *Parser) parseAlterTableAction(table string) (Statement, error) {
 			if checkErr != nil {
 				return nil, checkErr
 			}
-			return AlterCheck{Table: table, Check: CheckDef{Name: constraintName, Expression: expression}}, nil
+			notEnforced, enforcementErr := p.parseCheckEnforcement()
+			if enforcementErr != nil {
+				return nil, enforcementErr
+			}
+			return AlterCheck{Table: table, Check: CheckDef{Name: constraintName, Expression: expression, NotEnforced: notEnforced}}, nil
 		}
 		unique := p.accept("UNIQUE")
 		if !unique && !p.is("INDEX") && !p.is("KEY") {
@@ -1864,6 +1872,19 @@ func (p *Parser) parseIndexMethod() {
 	if p.accept("USING") && p.current().Kind == TokenIdentifier {
 		p.position++
 	}
+}
+
+// parseCheckEnforcement consumes MySQL's optional ENFORCED / NOT ENFORCED suffix on
+// a CHECK constraint and reports whether the constraint is declared not enforced.
+func (p *Parser) parseCheckEnforcement() (bool, error) {
+	if p.accept("NOT") {
+		if err := p.expect("ENFORCED"); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	p.accept("ENFORCED")
+	return false, nil
 }
 
 // parseIndexOptions consumes the MySQL index options that follow an index's

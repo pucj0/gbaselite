@@ -1257,4 +1257,38 @@ func TestMySQLProtocolAcceptsNavicatIndexCommentDDL(t *testing.T) {
 	if _, err = ExecuteCompatible(engine, session, "INSERT INTO `portal_dic_type` (`id`, `class_key`, `parent_id`) VALUES ('2','a','p1')"); err == nil {
 		t.Fatal("commented unique index stopped rejecting duplicates")
 	}
+	// MySQL 8 CHECK (...) NOT ENFORCED is metadata only: it is accepted, reported as
+	// ENFORCED=NO and does not reject rows, while an enforced CHECK still does.
+	if _, err = ExecuteCompatible(engine, session, "CREATE TABLE `soft_checks` (`id` INT, CONSTRAINT `ck_soft` CHECK (`id` > 0) NOT ENFORCED, CONSTRAINT `ck_hard` CHECK (`id` < 100))"); err != nil {
+		t.Fatalf("NOT ENFORCED DDL rejected: %v", err)
+	}
+	softShow, err := ExecuteCompatible(engine, session, "SHOW CREATE TABLE `soft_checks`")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if definition := fmt.Sprint(softShow.Rows[0][1]); !strings.Contains(definition, "NOT ENFORCED") {
+		t.Fatalf("SHOW CREATE TABLE lost NOT ENFORCED:\n%s", definition)
+	}
+	if _, err = ExecuteCompatible(engine, session, "INSERT INTO `soft_checks` VALUES (-1)"); err != nil {
+		t.Fatalf("NOT ENFORCED check rejected a row: %v", err)
+	}
+	if _, err = ExecuteCompatible(engine, session, "INSERT INTO `soft_checks` VALUES (101)"); err == nil {
+		t.Fatal("enforced check stopped rejecting rows")
+	}
+	// The metadata layer answers information_schema with its canonical column set:
+	// CONSTRAINT_NAME is column 2 and the appended ENFORCED flag is column 4.
+	checks, err := ExecuteCompatible(engine, session, "SELECT * FROM information_schema.CHECK_CONSTRAINTS WHERE CONSTRAINT_SCHEMA='haiwei' AND TABLE_NAME='soft_checks' ORDER BY CONSTRAINT_NAME")
+	if err != nil {
+		t.Fatal(err)
+	}
+	enforced := map[string]string{}
+	for _, row := range checks.Rows {
+		if len(row) < 4 {
+			t.Fatalf("CHECK_CONSTRAINTS row = %#v", row)
+		}
+		enforced[fmt.Sprint(row[1])] = fmt.Sprint(row[3])
+	}
+	if enforced["ck_soft"] != "NO" || enforced["ck_hard"] != "YES" {
+		t.Fatalf("CHECK_CONSTRAINTS = %#v", enforced)
+	}
 }

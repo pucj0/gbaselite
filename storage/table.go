@@ -49,7 +49,12 @@ type ForeignKey struct {
 	OnDelete   string
 	OnUpdate   string
 }
-type CheckConstraint struct{ Name, Expression string }
+type CheckConstraint struct {
+	Name, Expression string
+	// NotEnforced mirrors MySQL's CHECK (...) NOT ENFORCED: the constraint stays in
+	// the table definition but row validation skips it.
+	NotEnforced bool
+}
 
 // Table owns its rows and protects them for concurrent access.
 type Table struct {
