@@ -37,6 +37,9 @@ type Index struct {
 	Columns    []string
 	Unique     bool
 	Primary    bool
+	// Comment is the MySQL index comment shown by SHOW CREATE TABLE and
+	// information_schema.STATISTICS.INDEX_COMMENT.
+	Comment string
 }
 type ForeignKey struct {
 	Name       string
@@ -341,17 +344,23 @@ func (t *Table) Truncate() int {
 	return count
 }
 
-func (t *Table) AddIndex(name string, columns []string, unique bool) error {
-	return t.addIndex(name, columns, unique, false)
+// AddIndex creates a secondary index; the optional comment is the MySQL index
+// comment that SHOW CREATE TABLE and information_schema.STATISTICS report.
+func (t *Table) AddIndex(name string, columns []string, unique bool, comment ...string) error {
+	text := ""
+	if len(comment) > 0 {
+		text = comment[0]
+	}
+	return t.addIndex(name, columns, unique, false, text)
 }
 
 // AddPrimaryKey creates the table's single primary key and makes all of its
 // columns non-nullable. Validation completes before table metadata is changed.
 func (t *Table) AddPrimaryKey(columns []string) error {
-	return t.addIndex("PRIMARY", columns, true, true)
+	return t.addIndex("PRIMARY", columns, true, true, "")
 }
 
-func (t *Table) addIndex(name string, columns []string, unique, primary bool) error {
+func (t *Table) addIndex(name string, columns []string, unique, primary bool, comment string) error {
 	if err := validateIdentifier(name); err != nil {
 		return fmt.Errorf("index name %q: %w", name, err)
 	}
@@ -376,7 +385,7 @@ func (t *Table) addIndex(name string, columns []string, unique, primary bool) er
 	if primary {
 		name = "PRIMARY"
 	}
-	definition := Index{Name: name, Columns: resolved, Unique: unique || primary, Primary: primary}
+	definition := Index{Name: name, Columns: resolved, Unique: unique || primary, Primary: primary, Comment: comment}
 	definition.Collations = collationsForIndex(definition, t.columns, t.columnIndex)
 	if primary {
 		for _, existing := range t.indexes {

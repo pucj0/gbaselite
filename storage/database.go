@@ -83,7 +83,7 @@ func (d *Database) CreateTableWithIndexes(name string, columns []Column, primary
 		}
 	}
 	for _, definition := range indexes {
-		if err := table.AddIndex(definition.Name, definition.Columns, definition.Unique); err != nil {
+		if err := table.AddIndex(definition.Name, definition.Columns, definition.Unique, definition.Comment); err != nil {
 			return nil, err
 		}
 	}
@@ -1190,7 +1190,7 @@ func newStoreFromSnapshot(snapshot StoreSnapshot, shareRows bool) (*Store, error
 				if indexSnapshot.Primary || strings.EqualFold(indexSnapshot.Name, "PRIMARY") {
 					indexErr = table.AddPrimaryKey(indexSnapshot.Columns)
 				} else {
-					indexErr = table.AddIndex(indexSnapshot.Name, indexSnapshot.Columns, indexSnapshot.Unique)
+					indexErr = table.AddIndex(indexSnapshot.Name, indexSnapshot.Columns, indexSnapshot.Unique, indexSnapshot.Comment)
 				}
 				if indexErr != nil {
 					return nil, indexErr

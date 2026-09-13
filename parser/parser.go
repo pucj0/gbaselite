@@ -369,7 +369,9 @@ func (p *Parser) parseCreate() (Statement, error) {
 					if err != nil {
 						return nil, err
 					}
-					p.parseIndexMethod()
+					if _, err = p.parseIndexOptions(); err != nil {
+						return nil, err
+					}
 				} else if p.is("UNIQUE") || p.is("KEY") || p.is("INDEX") {
 					unique := p.accept("UNIQUE")
 					p.accept("KEY")
@@ -470,8 +472,11 @@ func (p *Parser) parseCreate() (Statement, error) {
 		if err != nil {
 			return nil, err
 		}
-		p.parseIndexMethod()
-		return CreateIndex{Name: name, Table: table, Columns: columns, Unique: unique}, nil
+		comment, err := p.parseIndexOptions()
+		if err != nil {
+			return nil, err
+		}
+		return CreateIndex{Name: name, Table: table, Columns: columns, Unique: unique, Comment: comment}, nil
 	}
 	if unique {
 		return nil, p.errorf("expected INDEX or KEY after UNIQUE")
@@ -1437,7 +1442,9 @@ func (p *Parser) parseAlterTableAction(table string) (Statement, error) {
 			if err != nil {
 				return nil, err
 			}
-			p.parseIndexMethod()
+			if _, err = p.parseIndexOptions(); err != nil {
+				return nil, err
+			}
 			return CreateIndex{Name: "PRIMARY", Table: table, Columns: columns, Unique: true, Primary: true}, nil
 		}
 		constraintName := ""
@@ -1508,11 +1515,14 @@ func (p *Parser) parseAlterTableAction(table string) (Statement, error) {
 		if err != nil {
 			return nil, err
 		}
-		p.parseIndexMethod()
+		comment, err := p.parseIndexOptions()
+		if err != nil {
+			return nil, err
+		}
 		if name == "" {
 			name = columns[0]
 		}
-		return CreateIndex{Name: name, Table: table, Columns: columns, Unique: unique}, nil
+		return CreateIndex{Name: name, Table: table, Columns: columns, Unique: unique, Comment: comment}, nil
 	}
 	if p.accept("DROP") {
 		if p.accept("PRIMARY") {
@@ -1840,17 +1850,50 @@ func (p *Parser) parseTableIndexDefinition(unique bool) (IndexDef, error) {
 	if err != nil {
 		return IndexDef{}, err
 	}
-	p.parseIndexMethod()
+	comment, err := p.parseIndexOptions()
+	if err != nil {
+		return IndexDef{}, err
+	}
 	if name == "" {
 		name = columns[0]
 	}
-	return IndexDef{Name: name, Columns: columns, Unique: unique}, nil
+	return IndexDef{Name: name, Columns: columns, Unique: unique, Comment: comment}, nil
 }
 
 func (p *Parser) parseIndexMethod() {
 	if p.accept("USING") && p.current().Kind == TokenIdentifier {
 		p.position++
 	}
+}
+
+// parseIndexOptions consumes the MySQL index options that follow an index's
+// column list - USING BTREE|HASH and COMMENT 'text' - in any order, returning the
+// comment so SHOW CREATE TABLE and information_schema can echo it.
+func (p *Parser) parseIndexOptions() (string, error) {
+	comment := ""
+	for {
+		switch {
+		case p.is("USING") && p.peekKind(1) == TokenIdentifier:
+			p.position += 2
+		case p.is("COMMENT"):
+			p.position++
+			text, err := p.stringValue()
+			if err != nil {
+				return "", err
+			}
+			comment = text
+		default:
+			return comment, nil
+		}
+	}
+}
+
+// peekKind reports the kind of the token at the given offset without consuming it.
+func (p *Parser) peekKind(offset int) TokenKind {
+	if p.position+offset >= len(p.tokens) {
+		return TokenEOF
+	}
+	return p.tokens[p.position+offset].Kind
 }
 
 func (p *Parser) parseParenthesizedDefinition() (string, error) {

@@ -816,3 +816,53 @@ func TestParseMySQLViewStatements(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestParseIndexComments covers the MySQL index_option COMMENT 'text' that Navicat
+// and mysqldump emit after an index column list.
+func TestParseIndexComments(t *testing.T) {
+	const ddl = "CREATE TABLE `portal_dic_type`  (\n" +
+		"  `id` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,\n" +
+		"  `class_key` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '分类编码',\n" +
+		"  `parent_id` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '父节点',\n" +
+		"  `sort` int NULL DEFAULT 0 COMMENT '排序',\n" +
+		"  PRIMARY KEY (`id`) USING BTREE,\n" +
+		"  UNIQUE INDEX `unique_class_key`(`class_key`, `parent_id`) USING BTREE COMMENT '分类key不重复'\n" +
+		") ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = '字典类型表'"
+	statement, err := Parse(ddl)
+	if err != nil {
+		t.Fatalf("navicat DDL: %v", err)
+	}
+	create, ok := statement.(CreateTable)
+	if !ok {
+		t.Fatalf("statement = %#v", statement)
+	}
+	if len(create.PrimaryKey) != 1 || create.PrimaryKey[0] != "id" || create.Comment != "字典类型表" {
+		t.Fatalf("create table = %#v", create)
+	}
+	if len(create.Indexes) != 1 || create.Indexes[0].Name != "unique_class_key" || !create.Indexes[0].Unique || create.Indexes[0].Comment != "分类key不重复" {
+		t.Fatalf("indexes = %#v", create.Indexes)
+	}
+	if len(create.Indexes[0].Columns) != 2 || create.Indexes[0].Columns[0] != "class_key" || create.Indexes[0].Columns[1] != "parent_id" {
+		t.Fatalf("index columns = %#v", create.Indexes[0].Columns)
+	}
+
+	for _, query := range []string{
+		"CREATE INDEX idx_sort ON t (`sort`) USING BTREE COMMENT '排序索引'",
+		"CREATE UNIQUE INDEX uq_key ON t (`a`, `b`) COMMENT '唯一'",
+		"ALTER TABLE t ADD INDEX idx_a (`a`) COMMENT 'a'",
+		"ALTER TABLE t ADD UNIQUE KEY uq_a (`a`) USING BTREE COMMENT 'uq'",
+		"CREATE TABLE t (id INT, KEY k_id (id) COMMENT 'k', UNIQUE KEY uq_id (id) COMMENT 'u')",
+	} {
+		if _, err := Parse(query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	statement, err = Parse("CREATE INDEX idx_sort ON t (`sort`) COMMENT '排序索引'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, ok := statement.(CreateIndex)
+	if !ok || index.Comment != "排序索引" || index.Name != "idx_sort" {
+		t.Fatalf("create index = %#v", statement)
+	}
+}

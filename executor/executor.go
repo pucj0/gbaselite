@@ -948,7 +948,7 @@ func executeAlterTableAction(store *storage.Store, session *Session, statement p
 			if value.Primary {
 				err = table.AddPrimaryKey(value.Columns)
 			} else {
-				err = table.AddIndex(value.Name, value.Columns, value.Unique)
+				err = table.AddIndex(value.Name, value.Columns, value.Unique, value.Comment)
 			}
 		}
 		return &Result{Message: "index created"}, err
@@ -6867,7 +6867,11 @@ func createTableSQL(table *storage.Table) string {
 		if definition.Unique {
 			kind = "UNIQUE KEY"
 		}
-		parts = append(parts, fmt.Sprintf("  %s %s (%s)", kind, quoteIdentifier(definition.Name), strings.Join(columns, ", ")))
+		rendered := fmt.Sprintf("  %s %s (%s)", kind, quoteIdentifier(definition.Name), strings.Join(columns, ", "))
+		if definition.Comment != "" {
+			rendered += " COMMENT '" + strings.ReplaceAll(definition.Comment, "'", "''") + "'"
+		}
+		parts = append(parts, rendered)
 	}
 	for _, foreignKey := range table.ForeignKeys() {
 		columns := make([]string, len(foreignKey.Columns))
@@ -7112,10 +7116,16 @@ func createTableSnapshotSQL(table storage.TableSnapshot) string {
 		}
 		if index.Primary || strings.EqualFold(index.Name, "PRIMARY") {
 			parts = append(parts, "  PRIMARY KEY ("+strings.Join(columns, ", ")+")")
-		} else if index.Unique {
-			parts = append(parts, "  UNIQUE KEY "+quoteIdentifier(index.Name)+" ("+strings.Join(columns, ", ")+")")
 		} else {
-			parts = append(parts, "  KEY "+quoteIdentifier(index.Name)+" ("+strings.Join(columns, ", ")+")")
+			kind := "KEY"
+			if index.Unique {
+				kind = "UNIQUE KEY"
+			}
+			rendered := "  " + kind + " " + quoteIdentifier(index.Name) + " (" + strings.Join(columns, ", ") + ")"
+			if index.Comment != "" {
+				rendered += " COMMENT '" + strings.ReplaceAll(index.Comment, "'", "''") + "'"
+			}
+			parts = append(parts, rendered)
 		}
 	}
 	for _, foreignKey := range table.ForeignKeys {

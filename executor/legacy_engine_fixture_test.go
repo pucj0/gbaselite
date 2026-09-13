@@ -321,7 +321,7 @@ func (e *legacyEngine) executeStatement(session *Session, statement parser.State
 				if err == nil {
 					indexes := make([]storage.Index, len(value.Indexes))
 					for i, definition := range value.Indexes {
-						indexes[i] = storage.Index{Name: definition.Name, Columns: append([]string(nil), definition.Columns...), Unique: definition.Unique}
+						indexes[i] = storage.Index{Name: definition.Name, Columns: append([]string(nil), definition.Columns...), Unique: definition.Unique, Comment: definition.Comment}
 					}
 					table, err = database.CreateTableWithIndexes(tableName, columns, value.PrimaryKey, indexes)
 					if value.IfNotExists && errors.Is(err, storage.ErrTableExists) {

@@ -1192,3 +1192,69 @@ func TestMySQLProtocolConnectionManagement(t *testing.T) {
 		t.Fatalf("SHOW PROCESSLIST without PROCESS omitted the caller: %+v", readerList)
 	}
 }
+
+// TestMySQLProtocolAcceptsNavicatIndexCommentDDL pins the exact DDL Navicat Data
+// Transfer emits for the source schema: MySQL 8 index options (USING BTREE plus
+// COMMENT 'text'), a table comment, column comments and MySQL 8 collations. The
+// statement used to fail with "SQL parse error ... expected )" and aborted the
+// transfer, so this regression keeps the whole shape accepted and reported.
+func TestMySQLProtocolAcceptsNavicatIndexCommentDDL(t *testing.T) {
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &executor.Session{CurrentDatabase: "haiwei"}
+	if _, err = ExecuteCompatible(engine, session, "CREATE DATABASE haiwei"); err != nil {
+		t.Fatal(err)
+	}
+	const ddl = "CREATE TABLE `portal_dic_type`  (\n" +
+		"  `id` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NOT NULL,\n" +
+		"  `class_name` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '分类名称',\n" +
+		"  `class_key` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '分类编码',\n" +
+		"  `parent_id` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '父节点',\n" +
+		"  `sort` int NULL DEFAULT 0 COMMENT '排序',\n" +
+		"  `path` varchar(500) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '路径',\n" +
+		"  `icon` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '图标',\n" +
+		"  `creator` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL,\n" +
+		"  `create_time` datetime NULL DEFAULT NULL COMMENT '创建时间',\n" +
+		"  `updator` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL,\n" +
+		"  `update_time` datetime NULL DEFAULT NULL COMMENT '修改时间',\n" +
+		"  PRIMARY KEY (`id`) USING BTREE,\n" +
+		"  UNIQUE INDEX `unique_class_key`(`class_key`, `parent_id`) USING BTREE COMMENT '分类key不重复'\n" +
+		") ENGINE = InnoDB CHARACTER SET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT = '字典类型表'"
+	if _, err = ExecuteCompatible(engine, session, ddl); err != nil {
+		t.Fatalf("Navicat DDL rejected: %v", err)
+	}
+	show, err := ExecuteCompatible(engine, session, "SHOW CREATE TABLE `portal_dic_type`")
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := fmt.Sprint(show.Rows[0][1])
+	for _, want := range []string{"COMMENT '分类key不重复'", "COMMENT='字典类型表'", "PRIMARY KEY (`id`)", "UNIQUE KEY `unique_class_key` (`class_key`, `parent_id`)"} {
+		if !strings.Contains(definition, want) {
+			t.Fatalf("SHOW CREATE TABLE is missing %q:\n%s", want, definition)
+		}
+	}
+	stats, err := ExecuteCompatible(engine, session, "SELECT INDEX_NAME, NON_UNIQUE, INDEX_COMMENT FROM information_schema.STATISTICS WHERE TABLE_SCHEMA='haiwei' AND TABLE_NAME='portal_dic_type' ORDER BY INDEX_NAME, SEQ_IN_INDEX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	comments := map[string]string{}
+	uniqueness := map[string]int64{}
+	for _, row := range stats.Rows {
+		comments[fmt.Sprint(row[0])] = fmt.Sprint(row[2])
+		uniqueness[fmt.Sprint(row[0])] = row[1].(int64)
+	}
+	if comments["unique_class_key"] != "分类key不重复" || uniqueness["unique_class_key"] != 0 {
+		t.Fatalf("information_schema.STATISTICS = %#v, %#v", comments, uniqueness)
+	}
+	if _, listed := comments["PRIMARY"]; !listed {
+		t.Fatalf("primary key missing from STATISTICS: %#v", comments)
+	}
+	if _, err = ExecuteCompatible(engine, session, "INSERT INTO `portal_dic_type` (`id`, `class_key`, `parent_id`) VALUES ('1','a','p1')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = ExecuteCompatible(engine, session, "INSERT INTO `portal_dic_type` (`id`, `class_key`, `parent_id`) VALUES ('2','a','p1')"); err == nil {
+		t.Fatal("commented unique index stopped rejecting duplicates")
+	}
+}

@@ -102,7 +102,7 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 			}
 		}
 		for _, index := range value.Indexes {
-			indexes = append(indexes, storage.Index{Name: index.Name, Columns: index.Columns, Unique: index.Unique})
+			indexes = append(indexes, storage.Index{Name: index.Name, Columns: index.Columns, Unique: index.Unique, Comment: index.Comment})
 		}
 		mirror := storage.NewStore()
 		database, _ := mirror.CreateDatabase(db)

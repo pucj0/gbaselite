@@ -755,14 +755,14 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 | 范围 | 当前支持 | 限制 |
 |---|---|---|
 | 连接 | MySQL TCP、认证、TLS、COM_QUERY、Prepared Statement、二进制结果、`CONNECTION_ID()`、`SHOW [FULL] PROCESSLIST`、`KILL [QUERY\|CONNECTION] <id>` | 不是完整 MySQL 协议实现；连接管理只覆盖本进程内的连接，跨账号查看/终止会话需要 PROCESS 授权 |
-| DDL | 数据库/表/视图创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引、CREATE TABLE AS SELECT、CREATE TABLE LIKE、RENAME TABLE | 视图定义存入 MVCC catalog 并在引用时重新绑定，表与视图共用一个命名空间；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
+| DDL | 数据库/表/视图创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引（含 `USING BTREE` 与索引 `COMMENT '...'`）、CREATE TABLE AS SELECT、CREATE TABLE LIKE、RENAME TABLE | 视图定义存入 MVCC catalog 并在引用时重新绑定，表与视图共用一个命名空间；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
 | 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源与视图源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT/RIGHT/CROSS，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …，目标表可无主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；不支持子查询作为连接输入；视图不可写 |
 | 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT/RIGHT/CROSS JOIN、派生表、非递归与递归 CTE、视图（含嵌套视图）、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询）、锁定读（按快照读处理） | 窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
 | 事务 | BEGIN/COMMIT/ROLLBACK、SAVEPOINT/ROLLBACK TO/RELEASE、SET autocommit=0/1、断连回滚、语句失败回滚 | 快照隔离；不支持 LOCK TABLES、隔离级别切换或串行化保证 |
 | 约束 | PRIMARY KEY、UNIQUE、CHECK、同库外键（RESTRICT/NO ACTION/CASCADE/SET NULL，含自引用） | 不支持跨库外键；受引用表 ALTER 有限制；级联深度上限 32 |
 | 类型 | INT/BIGINT、文本、日期时间、BOOLEAN、精确 DECIMAL、JSON 列及现有标量函数、ON UPDATE CURRENT_TIMESTAMP | TIMESTAMP 尚无独立 UTC 存储语义 |
 | 账号 | 单机用户、密码、授权及权限元数据 | 用户目录独立持久化，不参与业务事务，不经过 Raft；复制节点拒绝账号 SQL |
-| 元数据 | 已提交表结构、索引、约束、information_schema、SHOW STATUS/REPLICATION STATUS | SHOW 的行数、大小不是实时业务统计，准确计数使用 SELECT COUNT(*) |
+| 元数据 | 已提交表结构、索引（含 `INDEX_COMMENT`）、约束、information_schema、SHOW STATUS/REPLICATION STATUS | SHOW 的行数、大小不是实时业务统计，准确计数使用 SELECT COUNT(*) |
 | 维护 | 单机 BACKUP/RESTORE/GC/COMPACT MVCC、EXPORT DATABASE … TO 'path' 逻辑导出 | 维护命令必须在事务外且开启 autocommit；复制节点不支持这些在线维护命令；逻辑导出在语句快照上物化整库快照后写文件 |
 | 复制 | 实验性固定三节点 Raft、选主、连接代理 | 无分片、动态成员、混合版本滚动升级或生产容灾保证 |
 
@@ -795,6 +795,11 @@ transient schema 参与后续 JOIN/过滤/聚合，不经过旧 Result 物化管
 无 ON 的笛卡尔积；UPDATE JOIN 以目标表为驱动，因此 RIGHT JOIN 只取其匹配子集；多表 DELETE 使用
 完整连接语义，RIGHT JOIN 中未匹配的右表行仍可作为删除目标，未匹配的左表行因空扩展不删，与 legacy
 的目标行集合一致。
+
+Navicat/mysqldump 导出的 MySQL 8 DDL 直接可用：`UNIQUE INDEX name(...) USING BTREE COMMENT '文本'`
+（`KEY`/`INDEX`/`CREATE INDEX`/`ALTER TABLE ... ADD INDEX` 同理）会被保存进表定义，
+`SHOW CREATE TABLE` 与 `information_schema.STATISTICS.INDEX_COMMENT` 原样回显，索引语义不变；
+表注释与列注释同样在 `ALTER TABLE` 重建表定义后保持不丢失。
 
 视图（`CREATE VIEW`/查询/`DROP VIEW`）以可重新解析的 SQL 定义存放在统一 MVCC catalog 中，查询时
 按 CTE → 派生表 → 视图 → 基表的顺序解析定义再进入同一 physical pipeline，因此视图读取语句快照，

@@ -76,6 +76,9 @@ func (e *Engine) alterSQL(ctx context.Context, read, write storageengine.Txn, se
 		return nil, err
 	}
 	table.SetNamedConstraints(old.Definition.ForeignKeys, old.Definition.CheckConstraints)
+	// The mirror table carries the definition forward through every ALTER action, so
+	// the table comment survives an ALTER like it does in the legacy runtime.
+	table.SetComment(old.Definition.Comment)
 	origins := make(map[string]int)
 	for i, c := range old.Definition.Columns {
 		origins[strings.ToLower(c.Name)] = i

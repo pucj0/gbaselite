@@ -1017,7 +1017,7 @@ func indexInformationInDatabase(engine *executor.Engine, session *executor.Sessi
 				if columnPosition, ok := table.ColumnIndex(columnName); ok && !storage.ColumnNullable(columns[columnPosition]) {
 					nullable = ""
 				}
-				result.Rows = append(result.Rows, []any{"def", database.Name(), table.Name(), nonUnique, database.Name(), indexName, int64(position + 1), columnName, "A", int64(table.RowCount()), nil, nil, nullable, "BTREE", "", "", "YES", nil})
+				result.Rows = append(result.Rows, []any{"def", database.Name(), table.Name(), nonUnique, database.Name(), indexName, int64(position + 1), columnName, "A", int64(table.RowCount()), nil, nil, nullable, "BTREE", "", definition.Comment, "YES", nil})
 			}
 		}
 	}

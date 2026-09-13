@@ -65,6 +65,8 @@ type IndexDef struct {
 	Name    string
 	Columns []string
 	Unique  bool
+	// Comment is the MySQL index comment (index_option COMMENT 'text').
+	Comment string
 }
 type DropTable struct {
 	Names    []string
@@ -75,6 +77,8 @@ type CreateIndex struct {
 	Columns     []string
 	Unique      bool
 	Primary     bool
+	// Comment carries the MySQL index comment (index_option COMMENT 'text').
+	Comment string
 }
 type DropIndex struct{ Name, Table string }
 type RenameIndex struct{ Table, OldName, NewName string }
