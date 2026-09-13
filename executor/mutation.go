@@ -152,27 +152,67 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		if err != nil {
 			return nil, err
 		}
+		// The legacy engine clears the session's selected database whenever the
+		// statement names it, including the IF EXISTS no-op path, so later unqualified
+		// statements fail with "no database selected" instead of writing into a stale
+		// database.
+		if strings.EqualFold(session.CurrentDatabase, name) {
+			session.CurrentDatabase = ""
+		}
 		if !exists {
 			if value.IfExists {
 				return &Result{}, nil
 			}
 			return nil, storage.ErrDatabaseNotFound
 		}
-		err = read.Scan(ctx, sqllayout.Catalog, func(k, v []byte) error {
-			if strings.HasPrefix(string(k), sqllayout.TablesPrefix(name)) {
-				var dropping versionedTable
-				if err := decodeVersioned(v, &dropping); err != nil {
+		// Collect every catalog entry of the database before mutating anything: the
+		// namespace holds table/<db>/... and view/<db>/... keys, the scan must never
+		// observe its own deletes, and no orphan view entry may survive the drop.
+		type databaseEntry struct {
+			key     []byte
+			table   versionedTable
+			isTable bool
+		}
+		var (
+			entries  []databaseEntry
+			dropping = make(map[string]bool)
+		)
+		tablePrefix := sqllayout.TablesPrefix(name)
+		viewPrefix := sqllayout.ViewsPrefix(name)
+		err = read.Scan(ctx, sqllayout.Catalog, func(entry, v []byte) error {
+			catalogName := string(entry)
+			switch {
+			case strings.HasPrefix(catalogName, tablePrefix):
+				var table versionedTable
+				if err := decodeVersioned(v, &table); err != nil {
 					return err
 				}
-				if err := rejectSQLReferencedDrop(write, dropping, session.ForeignKeyChecksDisabled); err != nil {
-					return err
-				}
-				return write.Delete(sqllayout.Catalog, k)
+				dropping[strings.ToLower(table.CatalogName)] = true
+				entries = append(entries, databaseEntry{key: append([]byte(nil), entry...), table: table, isTable: true})
+			case strings.HasPrefix(catalogName, viewPrefix):
+				entries = append(entries, databaseEntry{key: append([]byte(nil), entry...)})
 			}
 			return nil
 		})
 		if err != nil {
 			return nil, err
+		}
+		// Tables and views of the dropped database go away in one statement, so only
+		// references held by relations outside it can block the drop. Legacy drops the
+		// database unconditionally, and a parent/child pair inside it must not depend
+		// on catalog key order.
+		for _, entry := range entries {
+			if !entry.isTable {
+				continue
+			}
+			if err = rejectSQLReferencedDropExcluding(write, entry.table, dropping, session.ForeignKeyChecksDisabled); err != nil {
+				return nil, err
+			}
+		}
+		for _, entry := range entries {
+			if err = write.Delete(sqllayout.Catalog, entry.key); err != nil {
+				return nil, err
+			}
 		}
 		return &Result{AffectedRows: 1}, write.Delete(sqllayout.Catalog, k)
 	case parser.Truncate:

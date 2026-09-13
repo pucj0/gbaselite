@@ -803,6 +803,9 @@ transient schema 参与后续 JOIN/过滤/聚合，不经过旧 Result 物化管
 `SHOW TABLES`/`SHOW FULL TABLES`/`SHOW COLUMNS`/`DESCRIBE`/`SHOW CREATE VIEW` 与基表共用命名空间。
 表与视图重名时 `CREATE TABLE`、`CREATE TABLE LIKE`、`CREATE TABLE … AS SELECT`、`RENAME TABLE`
 按 legacy 拒绝（`IF NOT EXISTS` 静默跳过），`DROP TABLE` 不会误删视图，视图本身不可写。
+`DROP DATABASE` 在同一个 statement child 事务内原子清理该数据库的 `db/`、`table/` 与 `view/` catalog
+entries，数据库内的父子外键不因 key order 阻止删除，`ROLLBACK` 会恢复整库，重新 `CREATE DATABASE`
+同名库不会复活旧视图，也不会残留 orphan view entry；该语句同时清空会话当前库（同 legacy）。
 递归 CTE（`WITH RECURSIVE n AS (seed UNION ALL recursive)`）按 legacy 语义执行：seed 只跑一次，每轮递归
 分支只看到上一轮增量，累计结果供外层查询使用，公共列名与类型取自 seed，列数不一致或超过 1000 轮
 时报错并回滚；整个 CTE 生命周期与物化都留在同一语句快照与结果内存预算内，不泄漏到后续语句。

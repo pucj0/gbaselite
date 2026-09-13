@@ -23,6 +23,7 @@
 | CREATE VIEW | 支持 | 支持 | 支持 | 有（对拍） | 定义以可重新 parser.Parse 的 SQL 存入统一 MVCC catalog（`view/<db>/<name>`），CREATE 前先绑定校验，失败/回滚不留半个 view；OR REPLACE 同 legacy；parser 无 CREATE VIEW IF NOT EXISTS 形式 |
 | Query VIEW（SELECT ... FROM view） | 支持 | 支持 | 支持 | 有（对拍） | 绑定顺序 CTE → derived → view → base table；读取语句快照；支持 view over 基表/JOIN/聚合/UNION/派生表/子查询、嵌套 view、别名与限定列、INSERT SELECT 源；v1→v2→v1 循环返回稳定错误不递归；子查询 FROM 为视图时外层相关引用两引擎都报 unknown column（legacy 同） |
 | DROP VIEW | 支持 | 支持 | 支持 | 有（对拍） | 支持多视图与 IF EXISTS；走 statement child 事务，reopen 后一致 |
+| DROP DATABASE（含视图清理） | 支持 | 支持 | 支持 | 有（对拍） | 同一条 statement child 事务内删除 `db/<db>`、`table/<db>/…` 与 `view/<db>/…`；数据库内父子外键不因 catalog key order 阻止删除；rollback 恢复整库；DROP + recreate 不会复活旧 view，也不残留 orphan view entry；同时清空会话当前库（同 legacy） |
 | VIEW 元数据（SHOW TABLES / SHOW FULL TABLES / SHOW COLUMNS / DESCRIBE / SHOW CREATE VIEW） | 支持 | 支持 | 支持 | 有（对拍） | 视图发布进元数据镜像，与基表同一命名空间；表/视图重名的 CREATE TABLE、CREATE TABLE LIKE、CTAS、RENAME TABLE 按 legacy 拒绝（IF NOT EXISTS 静默跳过） |
 | EXPORT DATABASE … TO 'path' | 支持 | 支持 | 支持 | 有（对拍） | 在语句快照上物化整库快照（表定义 + 行 + 视图）后复用 legacy 逻辑备份渲染器，输出格式一致；导出只读语句快照，不修改业务数据 |
 | CREATE TABLE AS SELECT | 支持 | 支持 | 支持 | 有（对拍） | 查询快照 + 同语句 child 事务建表插数，失败不留空表 |
@@ -45,3 +46,6 @@
   `CreateView/Query VIEW/DropView/ExportDatabase`）都有 MVCC runtime 实现，上表“范围限制”列只记录
   两引擎共有的真实边界（例如 multi-table DELETE 不支持 LIMIT、递归 CTE 深度上限 1000、跨库外键不支持）。
 - 旧 snapshot/paged 数据迁移（`migrate-legacy`）同样导入视图定义；视图与基表共用命名空间，重名按 legacy 拒绝。
+- 窄范围 catalog lifecycle audit（本轮）：`CREATE DATABASE`、`DROP DATABASE`、`CREATE VIEW`、`DROP VIEW`、
+  SHOW 元数据、`EXPORT DATABASE`、`BACKUP/RESTORE MVCC`、`migrate-legacy`、reopen 均已覆盖 `view/` 命名空间，
+  未再发现 view catalog lifecycle 遗漏。

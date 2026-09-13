@@ -277,6 +277,13 @@ func validateSQLReferences(ctx context.Context, tx storageengine.Txn, table vers
 	return nil
 }
 func rejectSQLReferencedDrop(tx storageengine.Txn, table versionedTable, disabled ...bool) error {
+	return rejectSQLReferencedDropExcluding(tx, table, nil, disabled...)
+}
+
+// rejectSQLReferencedDropExcluding ignores referrers that a wider statement (DROP
+// DATABASE) removes in the same statement child transaction, so only children that
+// survive the statement can block it.
+func rejectSQLReferencedDropExcluding(tx storageengine.Txn, table versionedTable, excluding map[string]bool, disabled ...bool) error {
 	if len(disabled) > 0 && disabled[0] {
 		return nil
 	}
@@ -285,6 +292,9 @@ func rejectSQLReferencedDrop(tx storageengine.Txn, table versionedTable, disable
 		return refErr
 	}
 	for _, ref := range refs {
+		if excluding[strings.ToLower(ref)] {
+			continue
+		}
 		child, _, _, err := loadVersionedTable(tx, &Session{}, ref)
 		if errors.Is(err, storage.ErrTableNotFound) || errors.Is(err, storage.ErrDatabaseNotFound) {
 			continue

@@ -2,7 +2,9 @@ package executor
 
 import (
 	"fmt"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -159,5 +161,39 @@ func TestMVCCViewNameCollisionKeepsCatalogAtomic(t *testing.T) {
 	}
 	if got := fmt.Sprint(run("SHOW TABLES").Rows); got != "[[t] [v]]" {
 		t.Fatalf("relations=%s", got)
+	}
+}
+
+// TestMVCCViewSurvivesBackupRestore pins the maintenance lifecycle for the view
+// namespace: the engine backup carries the catalog space, so restoring it brings
+// views back with their definitions and the metadata mirror republishes them.
+func TestMVCCViewSurvivesBackupRestore(t *testing.T) {
+	_, _, run := rangeTestEngine(t)
+	run("CREATE TABLE t(id INT PRIMARY KEY,v INT)")
+	run("INSERT INTO t VALUES(1,10)")
+	run("CREATE VIEW v AS SELECT id,v FROM t")
+	run("CREATE VIEW vv AS SELECT id FROM v")
+	root := t.TempDir()
+	path := strings.ReplaceAll(filepath.Join(root, "backup"), "\\", "/")
+	run("BACKUP MVCC TO '" + path + "'")
+	run("DROP VIEW vv")
+	run("DROP VIEW v")
+	run("DROP TABLE t")
+	if got := fmt.Sprint(run("SHOW TABLES").Rows); got != "[]" {
+		t.Fatalf("relations after drop = %s", got)
+	}
+	run("RESTORE MVCC FROM '" + path + "'")
+	if got := fmt.Sprint(run("SHOW TABLES").Rows); got != "[[t] [v] [vv]]" {
+		t.Fatalf("restored relations = %s", got)
+	}
+	if got := fmt.Sprint(run("SELECT id,v FROM v").Rows); got != "[[1 10]]" {
+		t.Fatalf("restored view rows = %s", got)
+	}
+	if got := fmt.Sprint(run("SELECT id FROM vv").Rows); got != "[[1]]" {
+		t.Fatalf("restored nested view rows = %s", got)
+	}
+	show := run("SHOW CREATE VIEW v")
+	if got := fmt.Sprint(show.Rows[0][1]); !strings.Contains(got, "CREATE VIEW `v` AS SELECT id,v FROM t") {
+		t.Fatalf("restored definition = %s", got)
 	}
 }
