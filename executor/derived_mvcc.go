@@ -187,3 +187,28 @@ func storageRowBytes(row storage.Row) int64 {
 	}
 	return size
 }
+
+// identityScan scans a base table for a mutation join and appends the hidden row
+// identity value, mapping it back to the storage row key so DELETE can dedupe and
+// address rows without a primary key.
+func identityScan(tx storageengine.Txn, input *joinInput, access sqlAccessPlan, session *Session) physical.Operator[storage.Row] {
+	return physical.Scan[storage.Row]{Plan: &physical.PlanNode{Kind: scanKind(access), Attributes: map[string]string{"table": input.definition.CatalogName, "access": access.kind, "index": access.index}}, Open: func(ctx context.Context) (storageengine.Iterator, error) {
+		return openAccessIterator(ctx, tx, input.definition, access)
+	}, Decode: func(key, value []byte) (storage.Row, error) {
+		if err := checkQuery(session); err != nil {
+			return nil, err
+		}
+		row, err := decodeSQLRow(input.definition, value)
+		if err != nil {
+			return nil, err
+		}
+		input.identityNext++
+		identity := input.identityNext
+		input.identityKeys[identity] = append([]byte(nil), key...)
+		idValue, err := storage.NewValue(storage.TypeBigInt, identity)
+		if err != nil {
+			return nil, err
+		}
+		return append(row, idValue), nil
+	}}
+}

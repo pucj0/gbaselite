@@ -17,9 +17,26 @@ type joinInput struct {
 	// rows carries a derived table or CTE input. It is nil for base tables, which
 	// are scanned (and probed) per outer row instead.
 	rows []storage.Row
+	// identityColumn is set by mutation joins: every scanned base-table row gets a
+	// monotonic value in this column, and identityKeys maps it back to the storage
+	// row key so DELETE can use a stable physical identity.
+	identityColumn string
+	identityKeys   map[int64][]byte
+	identityNext   int64
 }
 
 func bindJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]joinInput, error) {
+	return bindJoinsMode(tx, session, s, false)
+}
+
+// bindJoinsIdentified is bindJoins for mutation statements: every base-table row
+// carries its storage row key as a hidden identity column so joined DELETE targets
+// can be identified without a primary key.
+func bindJoinsIdentified(tx storageengine.Txn, session *Session, s parser.Select) ([]joinInput, error) {
+	return bindJoinsMode(tx, session, s, true)
+}
+
+func bindJoinsMode(tx storageengine.Txn, session *Session, s parser.Select, identified bool) ([]joinInput, error) {
 	if len(s.Joins) > 16 {
 		return nil, fmt.Errorf("join exceeds 16 inputs")
 	}
@@ -57,9 +74,13 @@ func bindJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]joinI
 				_, alias = splitTableName(j.Table)
 			}
 		default:
-			table, schema, _, err = loadVersionedTable(tx, session, j.Table)
-			if err == nil {
-				schema, err = qualifySchema(schema, alias)
+			var isView bool
+			schema, rows, isView, err = viewRelation(ctx, tx, session, j.Table, alias)
+			if err == nil && !isView {
+				table, schema, _, err = loadVersionedTable(tx, session, j.Table)
+				if err == nil {
+					schema, err = qualifySchema(schema, alias)
+				}
 			}
 		}
 		if err != nil {
@@ -88,7 +109,25 @@ func bindJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]joinI
 				return nil, err
 			}
 		}
-		inputs = append(inputs, joinInput{definition: table, schema: schema, combined: combined, join: j, rows: rows})
+		entry := joinInput{definition: table, schema: schema, combined: combined, join: j, rows: rows}
+		if identified && rows == nil && table.ID != "" {
+			entry.identityColumn = alias + ".__rowid"
+			entry.identityKeys = make(map[int64][]byte)
+			// The identity column is part of the input schema, so it flows through
+			// the join and is null-extended with the rest of that input.
+			identitySchema, identityErr := storage.NewTransientTable("join_identity", append(append([]storage.Column(nil), schema.ColumnsView()...), storage.Column{Name: entry.identityColumn, Type: storage.TypeBigInt, MetadataVersion: 1, Nullable: true}))
+			if identityErr != nil {
+				return nil, identityErr
+			}
+			entry.schema = identitySchema
+			combinedColumns := append(append([]storage.Column(nil), columns...), storage.Column{Name: entry.identityColumn, Type: storage.TypeBigInt, MetadataVersion: 1, Nullable: j.Type == "LEFT" || j.Type == "RIGHT"})
+			entry.combined, identityErr = storage.NewTransientTable("join", combinedColumns)
+			if identityErr != nil {
+				return nil, identityErr
+			}
+			columns = combinedColumns
+		}
+		inputs = append(inputs, entry)
 	}
 	return inputs, nil
 }
@@ -123,7 +162,7 @@ func joinedInput(tx storageengine.Txn, session *Session, s parser.Select) (*stor
 func chainJoinInputs(tx storageengine.Txn, session *Session, inputs []joinInput, driving physical.Operator[storage.Row], targetDriven bool) physical.Operator[storage.Row] {
 	op := driving
 	for level := 1; level < len(inputs); level++ {
-		input := inputs[level]
+		input := &inputs[level]
 		leftSchema := inputs[level-1].combined
 		leftColumns := leftSchema.ColumnsView()
 		// inputSource opens one source row set for the join input. Base tables can be
@@ -138,6 +177,9 @@ func chainJoinInputs(tx storageengine.Txn, session *Session, inputs []joinInput,
 				if where, ok := joinLookup(input.join.On, leftSchema, input.schema, left); ok {
 					access = planSQLAccess(parser.Select{Where: where}, input.definition, input.schema, session)
 				}
+			}
+			if input.identityColumn != "" {
+				return identityScan(tx, input, access, session)
 			}
 			return bindScan(tx, input.definition, access, func(v []byte) (storage.Row, error) {
 				if err := checkQuery(session); err != nil {

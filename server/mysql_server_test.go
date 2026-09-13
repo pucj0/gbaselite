@@ -354,9 +354,12 @@ func TestMVCCRejectsLegacyNavicatCopySyntax(t *testing.T) {
 			t.Fatalf("legacy copy rejected: %s: %v", q, err)
 		}
 	}
-	// Views remain outside the migrated A04 scope.
-	if _, err = ExecuteCompatible(engine, session, "CREATE VIEW v AS SELECT * FROM itemcopy"); err == nil {
-		t.Fatal("view creation accepted")
+	// Views are part of the migrated A04 scope now: creation and query both work.
+	if _, err = ExecuteCompatible(engine, session, "CREATE VIEW v AS SELECT * FROM itemcopy"); err != nil {
+		t.Fatalf("view creation rejected: %v", err)
+	}
+	if view, err := ExecuteCompatible(engine, session, "SELECT id FROM v"); err != nil || len(view.Rows) != 1 || view.Rows[0][0] != int64(1) {
+		t.Fatalf("view query failed: %+v %v", view, err)
 	}
 	r, err := ExecuteCompatible(engine, session, "SELECT id FROM itemcopy")
 	if err != nil || len(r.Rows) != 1 || r.Rows[0][0] != int64(1) {

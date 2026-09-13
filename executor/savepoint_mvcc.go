@@ -110,16 +110,20 @@ func (e *Engine) commitSessionTransaction(session *Session) error {
 	}
 	for index := len(session.savepoints) - 1; index >= 0; index-- {
 		if _, err := session.savepoints[index].tx.Commit(operatorContext(session)); err != nil {
-			session.savepoints = nil
-			session.transaction = nil
+			// Roll back every remaining layer and the outermost transaction so no
+			// orphan transaction or savepoint state survives a failed merge.
+			rollbackSessionTransaction(session)
 			return err
 		}
 	}
 	outermost := outermostTransaction(session)
+	if _, err := outermost.Commit(operatorContext(session)); err != nil {
+		rollbackSessionTransaction(session)
+		return err
+	}
 	session.savepoints = nil
 	session.transaction = nil
-	_, err := outermost.Commit(operatorContext(session))
-	return err
+	return nil
 }
 
 // rollbackSessionTransaction discards every layer, including the outermost one.

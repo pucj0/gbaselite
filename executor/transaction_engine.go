@@ -84,6 +84,8 @@ func (e *Engine) refreshSQLMetadata(ctx context.Context) error {
 	mirror := storage.NewStore()
 	var tables []versionedTable
 	var names []string
+	var views []versionedView
+	var viewNames []string
 	iterator, err := open()
 	if err != nil {
 		return err
@@ -105,6 +107,14 @@ func (e *Engine) refreshSQLMetadata(ctx context.Context) error {
 			tables = append(tables, table)
 			names = append(names, name)
 		}
+		if strings.HasPrefix(name, sqllayout.ViewPrefix) {
+			var view versionedView
+			if err := decodeVersioned(v, &view); err != nil {
+				return err
+			}
+			views = append(views, view)
+			viewNames = append(viewNames, name)
+		}
 		return nil
 	})
 	if err != nil {
@@ -118,6 +128,24 @@ func (e *Engine) refreshSQLMetadata(ctx context.Context) error {
 		for j := range metadata.Databases {
 			if strings.EqualFold(metadata.Databases[j].Name, parts[1]) {
 				metadata.Databases[j].Tables = append(metadata.Databases[j].Tables, definition)
+			}
+		}
+	}
+	// Views are published into the same metadata mirror so SHOW TABLES,
+	// SHOW COLUMNS/DESCRIBE and the protocol metadata handlers list them exactly
+	// like the legacy engine, which keeps tables and views in one namespace.
+	for i, view := range views {
+		parts := strings.SplitN(viewNames[i], "/", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		for j := range metadata.Databases {
+			if strings.EqualFold(metadata.Databases[j].Name, parts[1]) {
+				metadata.Databases[j].Views = append(metadata.Databases[j].Views, storage.ViewSnapshot{
+					Name:       parts[2],
+					Definition: view.Definition,
+					Columns:    append([]string(nil), view.Columns...),
+				})
 			}
 		}
 	}
@@ -288,9 +316,14 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 
 	case parser.Explain:
 		return executeSQLExplain(tx, session, value.Query)
+	case parser.ExportDatabase:
+		return e.exportDatabaseSQL(ctx, tx, session, value)
 	case parser.Show:
 		if err := e.refreshSQLMetadata(ctx); err != nil {
 			return nil, err
+		}
+		if result, handled, err := e.showViewSQL(tx, session, value); handled || err != nil {
+			return result, err
 		}
 		return executeShow(e.Store, session, value)
 	}
@@ -308,10 +341,9 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		return nil, err
 	}
 	if _, err = child.Commit(ctx); err != nil {
-		if session.transaction != nil {
-			session.transaction.Rollback()
-			session.transaction = nil
-		}
+		// A failed statement commit aborts the whole user transaction, including
+		// every savepoint layer and the outermost transaction.
+		rollbackSessionTransaction(session)
 		return nil, err
 	}
 	if automatic {

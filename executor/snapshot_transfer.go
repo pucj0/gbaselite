@@ -38,6 +38,24 @@ func (e *Engine) ImportSnapshot(ctx context.Context, snapshot storage.StoreSnaps
 			}
 		}
 	}
+	// Views are migrated as catalog entries: their definitions are already
+	// validated SQL text, and the query binder re-parses them on every reference.
+	for _, db := range snapshot.Databases {
+		for _, view := range db.Views {
+			definition := versionedView{
+				CatalogName: strings.ToLower(db.Name) + "." + strings.ToLower(view.Name),
+				Definition:  view.Definition,
+				Columns:     append([]string(nil), view.Columns...),
+			}
+			encoded, err := encodeVersioned(definition)
+			if err != nil {
+				return err
+			}
+			if err = tx.Put(sqllayout.Catalog, sqllayout.ViewKey(strings.ToLower(db.Name), strings.ToLower(view.Name)), encoded); err != nil {
+				return err
+			}
+		}
+	}
 	for _, db := range snapshot.Databases {
 		session := &Session{CurrentDatabase: strings.ToLower(db.Name)}
 		for _, table := range db.Tables {
@@ -79,6 +97,16 @@ func (e *Engine) ImportSnapshot(ctx context.Context, snapshot storage.StoreSnaps
 			}
 		}
 	}
+	// Every migrated view must bind against the complete imported transaction.
+	for _, db := range snapshot.Databases {
+		for _, view := range db.Views {
+			definition := versionedView{CatalogName: strings.ToLower(db.Name) + "." + strings.ToLower(view.Name), Definition: view.Definition, Columns: view.Columns}
+			session := &Session{CurrentDatabase: strings.ToLower(db.Name)}
+			if _, _, err := viewRelationFromDefinition(ctx, tx, session, definition, strings.ToLower(view.Name)); err != nil {
+				return fmt.Errorf("migrate view %s: %w", definition.CatalogName, err)
+			}
+		}
+	}
 	// Validate every reference against the complete imported transaction.
 	for _, db := range snapshot.Databases {
 		for _, table := range db.Tables {
@@ -105,6 +133,23 @@ func (e *Engine) VerifySnapshot(ctx context.Context, snapshot storage.StoreSnaps
 	}
 	defer tx.Rollback()
 	for _, db := range snapshot.Databases {
+		for _, view := range db.Views {
+			key := sqllayout.ViewKey(strings.ToLower(db.Name), strings.ToLower(view.Name))
+			value, ok, err := tx.Get(sqllayout.Catalog, key)
+			if err != nil {
+				return err
+			}
+			var stored versionedView
+			if !ok {
+				return fmt.Errorf("migration view verification failed for %s.%s", db.Name, view.Name)
+			}
+			if err = decodeVersioned(value, &stored); err != nil {
+				return err
+			}
+			if stored.Definition != view.Definition || strings.Join(stored.Columns, "\x00") != strings.Join(view.Columns, "\x00") {
+				return fmt.Errorf("migration view definition mismatch for %s.%s", db.Name, view.Name)
+			}
+		}
 		for _, table := range db.Tables {
 			definition, _, _, err := loadVersionedTable(tx, &Session{CurrentDatabase: db.Name}, table.Name)
 			if err != nil {

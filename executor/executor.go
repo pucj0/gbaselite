@@ -6909,6 +6909,16 @@ func BackupSQL(store *storage.Store, path string, options BackupOptions) error {
 	if options.SchemaOnly && options.DataOnly {
 		return errors.New("schema-only and data-only cannot be used together")
 	}
+	databases, err := selectBackupDatabases(store, options)
+	if err != nil {
+		return err
+	}
+	return writeBackupFile(path, databases, options)
+}
+
+// selectBackupDatabases resolves the requested databases from a store snapshot and
+// returns them in the order the logical backup writes them.
+func selectBackupDatabases(store *storage.Store, options BackupOptions) ([]storage.DatabaseSnapshot, error) {
 	snapshot := store.Snapshot()
 	selectAll := len(options.Databases) == 0
 	wanted := make(map[string]bool, len(options.Databases))
@@ -6926,8 +6936,18 @@ func BackupSQL(store *storage.Store, path string, options BackupOptions) error {
 	}
 	if len(wanted) > 0 {
 		for name := range wanted {
-			return fmt.Errorf("%w: %q", storage.ErrDatabaseNotFound, name)
+			return nil, fmt.Errorf("%w: %q", storage.ErrDatabaseNotFound, name)
 		}
+	}
+	return databases, nil
+}
+
+// writeBackupFile renders a logical SQL backup for already selected databases.
+// The MVCC runtime builds the same database snapshots from its own catalog, so
+// both runtimes emit one file format.
+func writeBackupFile(path string, databases []storage.DatabaseSnapshot, options BackupOptions) error {
+	if options.SchemaOnly && options.DataOnly {
+		return errors.New("schema-only and data-only cannot be used together")
 	}
 	if len(databases) == 0 {
 		return errors.New("backup contains no databases")

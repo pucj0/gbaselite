@@ -7,6 +7,7 @@ import "encoding/binary"
 const Catalog = "catalog"
 const DatabasePrefix = "db/"
 const TablePrefix = "table/"
+const ViewPrefix = "view/"
 
 func Rows(id string) string                  { return "row/" + id }
 func UniqueIndex(id, name string) string     { return "index/" + id + "/" + name }
@@ -14,6 +15,8 @@ func SecondaryIndex(id, name string) string  { return "secondary/" + id + "/" + 
 func DatabaseKey(name string) []byte         { return []byte(DatabasePrefix + name) }
 func TableKey(database, table string) []byte { return []byte(TablePrefix + database + "/" + table) }
 func TablesPrefix(database string) string    { return TablePrefix + database + "/" }
+func ViewKey(database, view string) []byte   { return []byte(ViewPrefix + database + "/" + view) }
+func ViewsPrefix(database string) string     { return ViewPrefix + database + "/" }
 func Counter(id, column string) string       { return id + "/" + column }
 func SignedInteger(n int64) []byte {
 	key := make([]byte, 8)

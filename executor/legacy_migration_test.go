@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"gbaselite/migration/legacy"
 	"io/fs"
 	"os"
@@ -112,7 +113,7 @@ func TestMigrateLegacyFormatsToDefaultMVCC(t *testing.T) {
 }
 
 func TestMigrateLegacyRejectsUnsupportedAndDamagedSources(t *testing.T) {
-	for _, kind := range []string{"view", "truncated", "cancelled", "nested", "live"} {
+	for _, kind := range []string{"truncated", "cancelled", "nested", "live"} {
 		t.Run(kind, func(t *testing.T) {
 			root := t.TempDir()
 			source := filepath.Join(root, "source")
@@ -127,13 +128,7 @@ func TestMigrateLegacyRejectsUnsupportedAndDamagedSources(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			switch kind {
-			case "view":
-				_, err = e.Execute(s, "CREATE VIEW v AS SELECT * FROM p")
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
+
 			if err = e.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -189,6 +184,74 @@ func TestDefaultEngineRejectsRetiredRuntimeOptions(t *testing.T) {
 
 func MigrateLegacy(ctx context.Context, source, target string) error {
 	return legacy.Migrate(ctx, source, target, func(dir string) (legacy.Target, error) { return Open(dir, "", "") })
+}
+
+// A legacy source with views migrates them into the MVCC catalog, where they stay
+// queryable after reopen and keep the legacy read-only and namespace rules.
+func TestMigrateLegacyImportsViews(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	target := filepath.Join(root, "target")
+	old, err := openLegacy(source, "root", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Session{}
+	for _, q := range []string{
+		"CREATE DATABASE mv", "USE mv",
+		"CREATE TABLE t(id INT PRIMARY KEY,label VARCHAR(20))",
+		"INSERT INTO t VALUES(1,'a'),(2,'b')",
+		"CREATE VIEW v AS SELECT id,label FROM t WHERE id=1",
+		"CREATE VIEW vv AS SELECT id FROM v",
+	} {
+		if _, err = old.Execute(s, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if err = old.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = MigrateLegacy(context.Background(), source, target); err != nil {
+		t.Fatal(err)
+	}
+	e, err := Open(target, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	session := &Session{CurrentDatabase: "mv"}
+	result, err := e.Execute(session, "SELECT id,label FROM v")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != int64(1) || result.Rows[0][1] != "a" {
+		t.Fatalf("migrated view rows=%v", result.Rows)
+	}
+	if got := fmt.Sprint(mustExecute(t, e, session, "SELECT id FROM vv").Rows); got != "[[1]]" {
+		t.Fatalf("nested migrated view rows=%s", got)
+	}
+	if got := fmt.Sprint(mustExecute(t, e, session, "SHOW TABLES").Rows); got != "[[t] [v] [vv]]" {
+		t.Fatalf("migrated relations=%s", got)
+	}
+	show := mustExecute(t, e, session, "SHOW CREATE VIEW v")
+	if got := fmt.Sprint(show.Rows[0][1]); !strings.Contains(got, "CREATE VIEW `v` AS SELECT id,label FROM t WHERE id=1") {
+		t.Fatalf("show create view=%s", got)
+	}
+	if _, err = e.Execute(session, "INSERT INTO v VALUES(3,'c')"); err == nil {
+		t.Fatal("migrated view accepted a write")
+	}
+	if _, err = e.Execute(session, "CREATE TABLE v (id INT)"); err == nil {
+		t.Fatal("migrated view released its name")
+	}
+}
+
+func mustExecute(t *testing.T, e *Engine, session *Session, query string) *Result {
+	t.Helper()
+	result, err := e.Execute(session, query)
+	if err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	return result
 }
 
 // A legacy source whose foreign keys use CASCADE/SET NULL is a supported MVCC

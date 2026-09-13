@@ -39,6 +39,10 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		return e.createTableAsSQL(ctx, read, write, session, value)
 	case parser.CreateTableLike:
 		return e.createTableLikeSQL(ctx, read, write, session, value)
+	case parser.CreateView:
+		return e.createViewSQL(ctx, read, write, session, value)
+	case parser.DropView:
+		return e.dropViewSQL(ctx, read, write, session, value)
 	case parser.RenameTable:
 		return e.renameTablesSQL(ctx, read, write, session, value)
 	case parser.CreateTable:
@@ -60,6 +64,16 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 				return &Result{}, nil
 			}
 			return nil, storage.ErrTableExists
+		}
+		// A view owns the same namespace: the legacy engine refuses the table and
+		// only swallows the conflict for IF NOT EXISTS.
+		if _, exists, err := viewCatalogKey(write, session, value.Name); err != nil {
+			return nil, err
+		} else if exists {
+			if value.IfNotExists {
+				return &Result{}, nil
+			}
+			return nil, fmt.Errorf("%w: %q is a view", storage.ErrTableExists, name)
 		}
 		var columns []storage.Column
 		primary := append([]string(nil), value.PrimaryKey...)

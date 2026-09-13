@@ -34,6 +34,16 @@ func (e *Engine) createTableAsSQL(ctx context.Context, read, write storageengine
 		}
 		return nil, fmt.Errorf("%w: %q", storage.ErrTableExists, table)
 	}
+	// A view owns the same namespace; legacy refuses the table and only swallows
+	// the conflict for IF NOT EXISTS.
+	if _, exists, err := viewCatalogKey(read, session, statement.Name); err != nil {
+		return nil, err
+	} else if exists {
+		if statement.IfNotExists {
+			return &Result{Message: "table already exists"}, nil
+		}
+		return nil, fmt.Errorf("%w: %q is a view", storage.ErrTableExists, table)
+	}
 	bound, err := bindSubqueryQuery(ctx, read, session, statement.Query)
 	if err != nil {
 		return nil, err
@@ -143,6 +153,16 @@ func (e *Engine) createTableLikeSQL(ctx context.Context, read, write storageengi
 		}
 		return nil, fmt.Errorf("%w: %q", storage.ErrTableExists, table)
 	}
+	// A view owns the same namespace; legacy refuses the table and only swallows
+	// the conflict for IF NOT EXISTS.
+	if _, exists, err := viewCatalogKey(read, session, statement.Name); err != nil {
+		return nil, err
+	} else if exists {
+		if statement.IfNotExists {
+			return &Result{Message: "table already exists"}, nil
+		}
+		return nil, fmt.Errorf("%w: %q is a view", storage.ErrTableExists, table)
+	}
 	source, _, _, err := loadVersionedTable(read, session, statement.Source)
 	if err != nil {
 		return nil, err
@@ -217,6 +237,14 @@ func (e *Engine) renameTablesSQL(ctx context.Context, read, write storageengine.
 	sources := make(map[string]bool, len(pairs))
 	targets := make(map[string]bool, len(pairs))
 	for _, pair := range pairs {
+		// A view owns its name against RENAME TABLE targets, including a rename
+		// onto itself; the legacy engine reports the conflict as a table-exists
+		// error rather than moving the view.
+		if _, exists, err := viewCatalogKey(read, session, databaseName+"."+pair.to); err != nil {
+			return nil, err
+		} else if exists {
+			return nil, fmt.Errorf("%w: %q is a view", storage.ErrTableExists, pair.to)
+		}
 		if pair.from == pair.to {
 			continue
 		}

@@ -72,6 +72,18 @@ func bindPhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Sess
 		}
 		return bindSelectOutput(session, statement, schema, source, false)
 	}
+	if schema, rows, isView, viewErr := viewRelation(ctx, tx, session, statement.Table, statement.TableAlias); viewErr != nil {
+		return nil, viewErr
+	} else if isView {
+		source := derivedRows(rows)
+		if statement.Where != nil {
+			source = physical.Filter[storage.Row]{Input: source, Predicate: func(row storage.Row) (bool, error) {
+				value, evaluationErr := evaluateExprWithContext(statement.Where, schema, row, session, nil)
+				return truthy(value), evaluationErr
+			}}
+		}
+		return bindSelectOutput(session, statement, schema, source, false)
+	}
 	definition, schema, _, err := loadVersionedTableForRead(tx, session, statement.Table)
 	if err != nil {
 		return nil, err

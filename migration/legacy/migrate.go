@@ -110,11 +110,13 @@ func migrate(ctx context.Context, source, target string, open TargetOpener, chec
 	}
 	snapshot := legacy.Snapshot()
 	for _, db := range snapshot.Databases {
-		if len(db.Views) > 0 {
-			return fmt.Errorf("MVCC migration does not support views in database %s", db.Name)
-		}
 		if strings.ContainsAny(db.Name, "/\x00") {
 			return fmt.Errorf("unsupported database identifier %q", db.Name)
+		}
+		for _, view := range db.Views {
+			if strings.ContainsAny(view.Name, "/\x00.") {
+				return fmt.Errorf("unsupported view identifier %q", view.Name)
+			}
 		}
 		for _, table := range db.Tables {
 			if strings.ContainsAny(table.Name, "/\x00.") {
