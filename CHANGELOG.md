@@ -14,6 +14,12 @@ releases.
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-09-13
+
+### Changed
+
+- Automated release build.
+
 ## [1.1.2] - 2026-09-09
 
 ### Changed
