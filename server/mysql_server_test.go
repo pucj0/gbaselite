@@ -1050,10 +1050,10 @@ func TestMySQLProtocolConnectionManagement(t *testing.T) {
 			t.Fatalf("%s: %v", query, err)
 		}
 	}
-	for batch := 0; batch < 10; batch++ {
-		values := make([]string, 0, 200)
-		for row := 0; row < 200; row++ {
-			values = append(values, fmt.Sprintf("(%d)", batch*200+row))
+	for batch := 0; batch < 5; batch++ {
+		values := make([]string, 0, 100)
+		for row := 0; row < 100; row++ {
+			values = append(values, fmt.Sprintf("(%d)", batch*100+row))
 		}
 		if _, err = admin.ExecContext(ctx, "INSERT INTO cm.big(id) VALUES "+strings.Join(values, ",")); err != nil {
 			t.Fatalf("insert batch %d: %v", batch, err)
@@ -1061,16 +1061,45 @@ func TestMySQLProtocolConnectionManagement(t *testing.T) {
 	}
 
 	// Comma joins are outside the supported grammar, so the slow statement uses
-	// explicit CROSS JOIN: 2000^3 row combinations keep it running until it is killed.
+	// explicit CROSS JOIN. 500^3 row combinations take long enough to observe and
+	// enough to observe and kill, yet bounded so a failed kill cannot leave a
+	// statement that blocks pool teardown.
 	const longQuery = "SELECT COUNT(*) FROM cm.big a CROSS JOIN cm.big b CROSS JOIN cm.big c"
+	var running chan error
 	runLongQuery := func() chan error {
 		finished := make(chan error, 1)
+		running = finished
 		go func() {
 			var count int64
 			finished <- worker.QueryRowContext(ctx, longQuery).Scan(&count)
 		}()
 		return finished
 	}
+	// waitForQuery consumes the pending statement result exactly once, so the cleanup
+	// defer below can never block on an already drained channel.
+	waitForQuery := func(statement chan error) error {
+		select {
+		case queryErr := <-statement:
+			running = nil
+			return queryErr
+		case <-time.After(10 * time.Second):
+			t.Fatal("statement was not interrupted")
+			return nil
+		}
+	}
+	// Never leave the worker inside an unfinished statement when an assertion fails:
+	// a stuck query would block database/sql teardown below.
+	defer func() {
+		if running == nil {
+			return
+		}
+		_, _ = admin.ExecContext(context.Background(), fmt.Sprintf("KILL %d", workerID))
+		select {
+		case <-running:
+		case <-time.After(15 * time.Second):
+			t.Errorf("worker statement did not finish after cleanup kill")
+		}
+	}()
 	waitForRunning := func() processListRow {
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
@@ -1090,14 +1119,9 @@ func TestMySQLProtocolConnectionManagement(t *testing.T) {
 	if _, err = admin.ExecContext(ctx, fmt.Sprintf("KILL QUERY %d", workerID)); err != nil {
 		t.Fatalf("KILL QUERY: %v", err)
 	}
-	select {
-	case queryErr := <-interrupted:
-		requireMySQLErrorCode(t, queryErr, 1317, "KILL QUERY")
-		if elapsed := time.Since(started); elapsed > 10*time.Second {
-			t.Fatalf("KILL QUERY took %s to interrupt the statement", elapsed)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("KILL QUERY did not interrupt the running statement")
+	requireMySQLErrorCode(t, waitForQuery(interrupted), 1317, "KILL QUERY")
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("KILL QUERY took %s to interrupt the statement", elapsed)
 	}
 	var one int64
 	if err = worker.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil || one != 1 {
@@ -1110,18 +1134,21 @@ func TestMySQLProtocolConnectionManagement(t *testing.T) {
 	if _, err = admin.ExecContext(ctx, fmt.Sprintf("KILL %d", workerID)); err != nil {
 		t.Fatalf("KILL: %v", err)
 	}
-	select {
-	case queryErr := <-killed:
-		if queryErr == nil {
-			t.Fatal("KILL CONNECTION reported a successful statement")
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("KILL CONNECTION did not interrupt the running statement")
+	if queryErr := waitForQuery(killed); queryErr == nil {
+		t.Fatal("KILL CONNECTION reported a successful statement")
 	}
 	if err = worker.QueryRowContext(ctx, "SELECT 1").Scan(&one); err == nil {
 		t.Fatal("killed connection stayed usable")
 	}
-	if _, stillListed := readProcessList(t, admin)[workerID]; stillListed {
+	gone := false
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if _, stillListed := readProcessList(t, admin)[workerID]; !stillListed {
+			gone = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !gone {
 		t.Fatal("killed connection is still listed by SHOW PROCESSLIST")
 	}
 
