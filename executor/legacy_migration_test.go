@@ -112,7 +112,7 @@ func TestMigrateLegacyFormatsToDefaultMVCC(t *testing.T) {
 }
 
 func TestMigrateLegacyRejectsUnsupportedAndDamagedSources(t *testing.T) {
-	for _, kind := range []string{"view", "cascade", "truncated", "cancelled", "nested", "live"} {
+	for _, kind := range []string{"view", "truncated", "cancelled", "nested", "live"} {
 		t.Run(kind, func(t *testing.T) {
 			root := t.TempDir()
 			source := filepath.Join(root, "source")
@@ -130,8 +130,6 @@ func TestMigrateLegacyRejectsUnsupportedAndDamagedSources(t *testing.T) {
 			switch kind {
 			case "view":
 				_, err = e.Execute(s, "CREATE VIEW v AS SELECT * FROM p")
-			case "cascade":
-				_, err = e.Execute(s, "CREATE TABLE c(id INT,parent_id INT,FOREIGN KEY(parent_id) REFERENCES p(id) ON DELETE CASCADE)")
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -191,4 +189,64 @@ func TestDefaultEngineRejectsRetiredRuntimeOptions(t *testing.T) {
 
 func MigrateLegacy(ctx context.Context, source, target string) error {
 	return legacy.Migrate(ctx, source, target, func(dir string) (legacy.Target, error) { return Open(dir, "", "") })
+}
+
+// A legacy source whose foreign keys use CASCADE/SET NULL is a supported MVCC
+// target now, so migration must accept it instead of rejecting the schema.
+func TestMigrateLegacyAcceptsCascadeForeignKey(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.MkdirAll(source, 0700); err != nil {
+		t.Fatal(err)
+	}
+	e, err := openLegacy(source, "root", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Session{}
+	for _, q := range []string{
+		"CREATE DATABASE d", "USE d",
+		"CREATE TABLE p(id INT PRIMARY KEY)",
+		"CREATE TABLE c(id INT PRIMARY KEY,parent_id INT,FOREIGN KEY(parent_id) REFERENCES p(id) ON DELETE CASCADE ON UPDATE SET NULL)",
+		"INSERT INTO p VALUES(1)",
+		"INSERT INTO c VALUES(10,1)",
+	} {
+		if _, err = e.Execute(s, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = e.Close(); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "target")
+	if err = MigrateLegacy(context.Background(), source, target); err != nil {
+		t.Fatalf("cascade source rejected by migration: %v", err)
+	}
+	if _, err = os.Stat(filepath.Join(target, "users", "users.gob")); err != nil {
+		t.Fatalf("migrated target missing: %v", err)
+	}
+	// The migrated CASCADE schema must open on the MVCC runtime.
+	migrated, err := OpenWithOptions(target, "root", "secret", OpenOptions{StorageMode: "mvcc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	ms := &Session{}
+	if _, err = migrated.Execute(ms, "USE d"); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := migrated.Execute(&Session{CurrentDatabase: "d"}, "DELETE FROM p WHERE id=1")
+	if err != nil {
+		t.Fatalf("cascade delete after migration: %v", err)
+	}
+	if deleted.AffectedRows != 1 {
+		t.Fatalf("cascade delete affected=%d", deleted.AffectedRows)
+	}
+	count, err := migrated.Execute(&Session{CurrentDatabase: "d"}, "SELECT COUNT(*) FROM c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(count.Rows) != 1 || count.Rows[0][0] != int64(0) {
+		t.Fatalf("cascade after migration left children: %v", count.Rows)
+	}
 }

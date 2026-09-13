@@ -45,9 +45,13 @@ func prepareSQLForeignKeys(tx storageengine.Txn, table *versionedTable, session 
 			return fmt.Errorf("duplicate foreign key name")
 		}
 		seen[strings.ToLower(fk.Name)] = true
+		fk.OnDelete = normalizeSQLReferentialAction(fk.OnDelete)
+		fk.OnUpdate = normalizeSQLReferentialAction(fk.OnUpdate)
 		for _, action := range []string{fk.OnDelete, fk.OnUpdate} {
-			if action != "" && !strings.EqualFold(action, "RESTRICT") && !strings.EqualFold(action, "NO ACTION") {
-				return fmt.Errorf("foreign keys currently support RESTRICT/NO ACTION")
+			switch action {
+			case "", "RESTRICT", "NO ACTION", "CASCADE", "SET NULL":
+			default:
+				return fmt.Errorf("%w: referential action %s is not supported", storage.ErrForeignKey, action)
 			}
 		}
 		childDB, _ := splitTableName(table.CatalogName)
@@ -59,9 +63,6 @@ func prepareSQLForeignKeys(tx storageengine.Txn, table *versionedTable, session 
 			return fmt.Errorf("cross-database foreign keys are not supported")
 		}
 		fk.RefTable = db + "." + name
-		if strings.EqualFold(fk.RefTable, table.CatalogName) {
-			return fmt.Errorf("self-referencing foreign keys are not supported")
-		}
 		if len(fk.Columns) == 0 || len(fk.Columns) != len(fk.RefColumns) {
 			return storage.ErrForeignKey
 		}
@@ -72,6 +73,23 @@ func prepareSQLForeignKeys(tx storageengine.Txn, table *versionedTable, session 
 		}
 		if err := tx.Put("fkref/"+fk.RefTable, []byte(table.CatalogName), []byte{1}); err != nil {
 			return err
+		}
+		if strings.EqualFold(fk.RefTable, table.CatalogName) {
+			// Self-reference: validate against the definition under construction and
+			// record the referrer on the table itself instead of reloading it.
+			if _, indexErr := sqlFKIndex(*table, *fk); indexErr != nil {
+				return indexErr
+			}
+			found := false
+			for _, ref := range table.Referrers {
+				if strings.EqualFold(ref, table.CatalogName) {
+					found = true
+				}
+			}
+			if !found {
+				table.Referrers = append(table.Referrers, table.CatalogName)
+			}
+			continue
 		}
 		parent, _, key, err := loadVersionedTable(tx, session, fk.RefTable)
 		if session.ForeignKeyChecksDisabled && (errors.Is(err, storage.ErrTableNotFound) || errors.Is(err, storage.ErrDatabaseNotFound)) {
@@ -94,6 +112,14 @@ func prepareSQLForeignKeys(tx storageengine.Txn, table *versionedTable, session 
 			ca, cb := table.Definition.Columns[a], parent.Definition.Columns[b]
 			if ca.Type != cb.Type || !strings.EqualFold(ca.Collation, cb.Collation) {
 				return fmt.Errorf("%w: foreign key type/collation mismatch", storage.ErrForeignKey)
+			}
+		}
+		if fk.OnDelete == "SET NULL" || fk.OnUpdate == "SET NULL" {
+			for _, name := range fk.Columns {
+				position := sqlColumnPosition(*table, name)
+				if position < 0 || !storage.ColumnNullable(table.Definition.Columns[position]) {
+					return fmt.Errorf("%w: SET NULL column %s.%s is not nullable", storage.ErrForeignKey, table.CatalogName, name)
+				}
 			}
 		}
 		if session.ForeignKeyChecksDisabled {

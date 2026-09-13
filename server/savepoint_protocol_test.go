@@ -49,13 +49,13 @@ func TestMVCCRejectsSavepointsOverMySQLProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := prepared.Exec(); err == nil {
-		t.Fatal("legacy prepared savepoint accepted")
+	if _, err := prepared.Exec(); err != nil {
+		t.Fatalf("prepared savepoint rejected: %v", err)
 	}
 	prepared.Close()
 	for _, q := range []string{"SAVEPOINT p", "ROLLBACK TO p", "RELEASE SAVEPOINT p"} {
-		if _, err := tx.Exec(q); err == nil {
-			t.Fatalf("legacy savepoint accepted: %s", q)
+		if _, err := tx.Exec(q); err != nil {
+			t.Fatalf("savepoint rejected: %s: %v", q, err)
 		}
 	}
 	if _, err := tx.Exec("INSERT INTO items VALUES(2)"); err != nil {

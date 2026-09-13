@@ -53,6 +53,15 @@ func (e *Engine) multiTableDeleteSQL(ctx context.Context, read, write storageeng
 	if err != nil {
 		return nil, err
 	}
+	// A single target that drives the join is deleted through its own row scan, so
+	// the storage row key is the row identity and tables without a primary key are
+	// supported exactly like the legacy executor.
+	if len(targets) == 1 && len(inputs) > 0 && inputs[0].definition.ID == targets[0].definition.ID {
+		return e.deleteDrivingTargetSQL(ctx, read, write, session, statement, inputs, combined)
+	}
+	if err != nil {
+		return nil, err
+	}
 	driving := bindScan(read, inputs[0].definition, sqlAccessPlan{kind: sqlAccessAll}, func(v []byte) (storage.Row, error) {
 		return decodeSQLRow(inputs[0].definition, v)
 	})
@@ -104,6 +113,9 @@ func (e *Engine) multiTableDeleteSQL(ctx context.Context, read, write storageeng
 		}
 		sort.Slice(batched, func(i, j int) bool { return string(batched[i].key) < string(batched[j].key) })
 		for _, row := range batched {
+			if err := applyForeignKeyActions(ctx, write, session, row.target.definition, row.row, nil, nil, 0); err != nil {
+				return nil, err
+			}
 			if err := writeVersionedRow(ctx, write, row.target.definition, row.key, row.row, nil, ""); err != nil {
 				return nil, err
 			}
@@ -153,7 +165,9 @@ func resolveMultiDeleteTargets(read, write storageengine.Txn, session *Session, 
 			continue
 		}
 		primary, ok := sqlPrimaryIndex(input.definition)
-		if !ok {
+		if !ok && index != 0 {
+			// Only the driving target can be identified by its storage row key;
+			// joined targets still need a primary key to compute row identity.
 			return nil, fmt.Errorf("multi-table DELETE requires a primary key on %s", input.definition.CatalogName)
 		}
 		_, _, catalogKey, err := loadVersionedTable(read, session, input.definition.CatalogName)
@@ -222,4 +236,50 @@ func multiDeleteOrder(targets []multiDeleteTarget) ([]int, error) {
 		}
 	}
 	return order, nil
+}
+
+// deleteDrivingTargetSQL deletes the join-driving target row by row. Identity is
+// the storage key returned by the scan, so heap tables without a primary key are
+// handled with the same stable identity the write path uses.
+func (e *Engine) deleteDrivingTargetSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Delete, inputs []joinInput, combined *storage.Table) (*Result, error) {
+	definition := inputs[0].definition
+	driving := bindScan(read, definition, sqlAccessPlan{kind: sqlAccessAll}, func(v []byte) (storage.Row, error) {
+		return decodeSQLRow(definition, v)
+	})
+	count := 0
+	err := runRowModification(ctx, read, definition, combined, session, nil, -1, func(key []byte, row storage.Row) error {
+		left := append(storage.Row(nil), row...)
+		op := chainJoinInputs(read, session, inputs, physical.Source[storage.Row](func(_ context.Context, yield physical.Yield[storage.Row]) error {
+			return yield(left)
+		}), true)
+		if statement.Where != nil {
+			op = physical.Filter[storage.Row]{Input: op, Predicate: func(joined storage.Row) (bool, error) {
+				value, evaluationErr := evaluateExprWithContext(statement.Where, combined, joined, session, nil)
+				return truthy(value), evaluationErr
+			}}
+		}
+		matched := false
+		if runErr := (physical.Limit[storage.Row]{Input: op, Count: 1}).Run(ctx, func(storage.Row) error {
+			matched = true
+			return nil
+		}); runErr != nil {
+			return runErr
+		}
+		if !matched {
+			return nil
+		}
+		if err := applyForeignKeyActions(ctx, write, session, definition, row, nil, nil, 0); err != nil {
+			return err
+		}
+		if err := writeVersionedRow(ctx, write, definition, key, row, nil, ""); err != nil {
+			return err
+		}
+		count++
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	_ = driving
+	return &Result{AffectedRows: uint64(count)}, nil
 }

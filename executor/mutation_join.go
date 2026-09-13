@@ -121,6 +121,21 @@ func (e *Engine) joinUpdateSQL(ctx context.Context, read, write storageengine.Tx
 			updated[assignment.position] = converted
 			evaluation[assignment.joined] = converted
 		}
+		for position, column := range targetColumns {
+			if _, explicit := assigned[position]; explicit || column.OnUpdate == "" {
+				continue
+			}
+			if strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP") || strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP()") {
+				value, conversionErr := storage.NewValue(column.Type, session.Now())
+				if conversionErr != nil {
+					return conversionErr
+				}
+				updated[position] = value
+			}
+		}
+		if actionErr := applyForeignKeyActions(ctx, write, session, definition, old, updated, nil, 0); actionErr != nil {
+			return actionErr
+		}
 		if writeErr := writeVersionedRow(ctx, write, definition, key, old, updated, ""); writeErr != nil {
 			return writeErr
 		}

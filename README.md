@@ -755,12 +755,12 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 | 范围 | 当前支持 | 限制 |
 |---|---|---|
 | 连接 | MySQL TCP、认证、TLS、COM_QUERY、Prepared Statement、二进制结果 | 不是完整 MySQL 协议实现 |
-| DDL | 数据库/表创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引 | 不支持视图、CTAS/LIKE、RENAME TABLE；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
-| 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT/RIGHT/CROSS，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …，目标表须有主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；不支持子查询作为连接输入 |
-| 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT/RIGHT/CROSS JOIN、派生表、非递归 CTE、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询） | 不支持视图、递归 CTE 及锁定读；窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
-| 事务 | BEGIN/COMMIT/ROLLBACK、SET autocommit=0/1、断连回滚、语句失败回滚 | 快照隔离；不支持 SAVEPOINT、LOCK TABLES、隔离级别切换或串行化保证 |
-| 约束 | PRIMARY KEY、UNIQUE、CHECK、同库 RESTRICT/NO ACTION 外键 | 不支持级联、自引用、跨库外键；受引用表 ALTER 有限制 |
-| 类型 | INT/BIGINT、文本、日期时间、BOOLEAN、精确 DECIMAL、JSON 列及现有标量函数 | 不支持 ON UPDATE 列表达式；TIMESTAMP 尚无独立 UTC 存储语义 |
+| DDL | 数据库/表创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引、CREATE TABLE AS SELECT、CREATE TABLE LIKE、RENAME TABLE | 不支持视图；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
+| 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT/RIGHT/CROSS，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …；驱动目标可用 storage row key，joined 目标须有主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；不支持子查询作为连接输入 |
+| 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT/RIGHT/CROSS JOIN、派生表、非递归与递归 CTE、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询）、锁定读（按快照读处理） | 不支持视图；窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
+| 事务 | BEGIN/COMMIT/ROLLBACK、SAVEPOINT/ROLLBACK TO/RELEASE、SET autocommit=0/1、断连回滚、语句失败回滚 | 快照隔离；不支持 LOCK TABLES、隔离级别切换或串行化保证 |
+| 约束 | PRIMARY KEY、UNIQUE、CHECK、同库外键（RESTRICT/NO ACTION/CASCADE/SET NULL，含自引用） | 不支持跨库外键；受引用表 ALTER 有限制；级联深度上限 32 |
+| 类型 | INT/BIGINT、文本、日期时间、BOOLEAN、精确 DECIMAL、JSON 列及现有标量函数、ON UPDATE CURRENT_TIMESTAMP | TIMESTAMP 尚无独立 UTC 存储语义 |
 | 账号 | 单机用户、密码、授权及权限元数据 | 用户目录独立持久化，不参与业务事务，不经过 Raft；复制节点拒绝账号 SQL |
 | 元数据 | 已提交表结构、索引、约束、information_schema、SHOW STATUS/REPLICATION STATUS | SHOW 的行数、大小不是实时业务统计，准确计数使用 SELECT COUNT(*) |
 | 维护 | 单机 BACKUP/RESTORE/GC/COMPACT MVCC | 必须在事务外且开启 autocommit；复制节点不支持这些在线维护命令 |
@@ -793,6 +793,9 @@ transient schema 参与后续 JOIN/过滤/聚合，不经过旧 Result 物化管
 清单、多 CTE、遮蔽同名表），派生表必须带别名。RIGHT JOIN 交换驱动侧并空扩展左表列，CROSS JOIN 为
 无 ON 的笛卡尔积；UPDATE JOIN / 多表 DELETE 仍以目标表为驱动，RIGHT JOIN 只取其匹配子集，从而与
 legacy 的目标行集合一致。
+递归 CTE（`WITH RECURSIVE n AS (seed UNION ALL recursive)`）按 legacy 语义执行：seed 只跑一次，每轮递归
+分支只看到上一轮增量，累计结果供外层查询使用，公共列名与类型取自 seed，列数不一致或超过 1000 轮
+时报错并回滚；整个 CTE 生命周期与物化都留在同一语句快照与结果内存预算内，不泄漏到后续语句。
 
 同一行、唯一键或依赖表结构的并发变更可能导致提交返回 MySQL 1213，应重试整个事务。
 不同行更新可独立提交。自增号持久预留，回滚后允许空洞；会话的 LastInsertID 只在整条写入语句

@@ -35,6 +35,12 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 			return nil, storage.ErrDatabaseExists
 		}
 		return &Result{AffectedRows: 1}, write.Put(sqllayout.Catalog, k, []byte{1})
+	case parser.CreateTableAs:
+		return e.createTableAsSQL(ctx, read, write, session, value)
+	case parser.CreateTableLike:
+		return e.createTableLikeSQL(ctx, read, write, session, value)
+	case parser.RenameTable:
+		return e.renameTablesSQL(ctx, read, write, session, value)
 	case parser.CreateTable:
 		db, name, err := versionedName(session, value.Name)
 		if err != nil {
@@ -59,9 +65,8 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		primary := append([]string(nil), value.PrimaryKey...)
 		var indexes []storage.Index
 		for _, column := range value.Columns {
-			if column.OnUpdate != "" {
-				return nil, errors.New("ON UPDATE column expressions are not supported")
-			}
+			// Legacy accepts ON UPDATE expressions and applies the CURRENT_TIMESTAMP
+			// forms on UPDATE; other expressions are kept as metadata only.
 			definition, err := storageColumnDefinition(column)
 			if err != nil {
 				return nil, err
@@ -207,6 +212,7 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		if err != nil {
 			return nil, err
 		}
+		assigned := make(map[int]bool, len(value.Assignments))
 		var updated storage.Row
 		count := 0
 		limit := -1
@@ -225,6 +231,7 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 				if !ok {
 					return storage.ErrColumnNotFound
 				}
+				assigned[position] = true
 				raw, err := evaluateExprWithContext(assignment.Value, schema, updated, session, nil)
 				if err != nil {
 					return err
@@ -233,6 +240,20 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 				if err != nil {
 					return err
 				}
+			}
+			for position, column := range definition.Definition.Columns {
+				if assigned[position] || column.OnUpdate == "" {
+					continue
+				}
+				if strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP") || strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP()") {
+					updated[position], err = storage.NewValue(column.Type, session.Now())
+					if err != nil {
+						return err
+					}
+				}
+			}
+			if err := applyForeignKeyActions(ctx, write, session, definition, row, updated, nil, 0); err != nil {
+				return err
 			}
 			if err := writeVersionedRow(ctx, write, definition, key, row, updated, ""); err != nil {
 				return err
@@ -265,6 +286,9 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 			limit = value.Limit
 		}
 		err = runRowModification(ctx, read, definition, schema, session, value.Where, limit, func(key []byte, row storage.Row) error {
+			if err := applyForeignKeyActions(ctx, write, session, definition, row, nil, nil, 0); err != nil {
+				return err
+			}
 			if err := writeVersionedRow(ctx, write, definition, key, row, nil, ""); err != nil {
 				return err
 			}
@@ -433,11 +457,19 @@ func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, s
 	}
 	return result, nil
 }
+
+// writeVersionedRow validates foreign-key references before storing the row.
+// Cascade helpers use writeVersionedRowUnchecked because they must update child
+// rows before the parent row that satisfies their reference exists.
 func writeVersionedRow(ctx context.Context, tx storageengine.Txn, table versionedTable, oldKey []byte, oldRow, newRow storage.Row, fallback string) error {
-	columns := table.Definition.Columns
 	if err := validateSQLReferences(ctx, tx, table, oldRow, newRow); err != nil {
 		return err
 	}
+	return writeVersionedRowUnchecked(ctx, tx, table, oldKey, oldRow, newRow, fallback)
+}
+
+func writeVersionedRowUnchecked(ctx context.Context, tx storageengine.Txn, table versionedTable, oldKey []byte, oldRow, newRow storage.Row, fallback string) error {
+	columns := table.Definition.Columns
 	rows := tx.Table(table.ID)
 	var newKey []byte
 	if newRow != nil {

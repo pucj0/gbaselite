@@ -349,12 +349,16 @@ func TestMVCCRejectsLegacyNavicatCopySyntax(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, q := range []string{"CREATE VIEW v AS SELECT * FROM items", "CREATE TABLE copy LIKE items", "CREATE TABLE copy AS SELECT * FROM items", "RENAME TABLE items TO copy"} {
-		if _, err = ExecuteCompatible(engine, session, q); err == nil {
-			t.Fatalf("legacy copy accepted: %s", q)
+	for _, q := range []string{"CREATE TABLE copy LIKE items", "CREATE TABLE copy2 AS SELECT * FROM items", "RENAME TABLE items TO itemcopy"} {
+		if _, err = ExecuteCompatible(engine, session, q); err != nil {
+			t.Fatalf("legacy copy rejected: %s: %v", q, err)
 		}
 	}
-	r, err := ExecuteCompatible(engine, session, "SELECT id FROM items")
+	// Views remain outside the migrated A04 scope.
+	if _, err = ExecuteCompatible(engine, session, "CREATE VIEW v AS SELECT * FROM itemcopy"); err == nil {
+		t.Fatal("view creation accepted")
+	}
+	r, err := ExecuteCompatible(engine, session, "SELECT id FROM itemcopy")
 	if err != nil || len(r.Rows) != 1 || r.Rows[0][0] != int64(1) {
 		t.Fatalf("source changed: %+v %v", r, err)
 	}

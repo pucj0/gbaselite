@@ -2,7 +2,6 @@ package executor
 
 import (
 	"context"
-	"errors"
 	"gbaselite/parser"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
@@ -30,9 +29,8 @@ const (
 )
 
 func validateSQLSelectShape(s parser.Select) error {
-	if s.Locking {
-		return errors.New("MVCC SELECT locking reads are not supported; use optimistic writes and retry conflicts")
-	}
+	// Locking reads (FOR UPDATE / LOCK IN SHARE MODE) are accepted and served from
+	// the statement snapshot, matching the legacy executor, which never blocked.
 	if s.Table == "" && s.Subquery == nil {
 		return nil
 	}

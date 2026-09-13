@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func TestMVCCDefaultRejectsLegacySavepoints(t *testing.T) {
+func TestMVCCAcceptsSavepoints(t *testing.T) {
 	e, err := openTestEngine(t, t.TempDir(), "root", "secret")
 	if err != nil {
 		t.Fatal(err)
@@ -17,11 +17,11 @@ func TestMVCCDefaultRejectsLegacySavepoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer e.CloseSession(s)
-	if _, err = e.Execute(s, "SAVEPOINT p"); err == nil {
-		t.Fatal("legacy savepoint accepted")
+	if _, err = e.Execute(s, "SAVEPOINT p"); err != nil {
+		t.Fatalf("savepoint rejected: %v", err)
 	}
 	if !s.InTransaction() {
-		t.Fatal("rejected statement lost transaction")
+		t.Fatal("savepoint lost transaction")
 	}
 	if _, err = e.Execute(s, "ROLLBACK"); err != nil {
 		t.Fatal(err)

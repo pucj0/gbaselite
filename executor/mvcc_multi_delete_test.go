@@ -184,7 +184,6 @@ func TestMVCCMultiTableDeleteRejectsUnsupportedTargets(t *testing.T) {
 	run("INSERT INTO heap VALUES(1,10)")
 	run("INSERT INTO b VALUES(1,1)")
 	for _, query := range []string{
-		"DELETE heap FROM heap JOIN b ON heap.id=b.aid",
 		"DELETE missing FROM heap JOIN b ON heap.id=b.aid",
 		"DELETE heap FROM heap JOIN b ON heap.id=b.aid LIMIT 1",
 	} {
@@ -195,6 +194,7 @@ func TestMVCCMultiTableDeleteRejectsUnsupportedTargets(t *testing.T) {
 	if got := fmt.Sprint(run("SELECT COUNT(*) FROM heap").Rows); got != "[[1]]" {
 		t.Fatalf("rejected DELETE changed rows: %s", got)
 	}
+	// PK-less driving targets are covered by mvcc_multi_delete_nopk_test.go.
 }
 
 func TestMVCCMultiTableDeleteLeftJoinSkipsNullExtendedTargets(t *testing.T) {

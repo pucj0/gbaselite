@@ -207,7 +207,7 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		}
 		return e.executeAccountStatement(session, statement)
 	}
-	switch statement.(type) {
+	switch value := statement.(type) {
 	case parser.Begin:
 		if session.transaction != nil {
 			return nil, errors.New("transaction already active")
@@ -219,19 +219,19 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		if session.transaction == nil {
 			return &Result{Message: "no active transaction"}, nil
 		}
-		tx := session.transaction
-		session.transaction = nil
-		_, err := tx.Commit(ctx)
-		if err != nil {
+		if err := e.commitSessionTransaction(session); err != nil {
 			return nil, err
 		}
 		return &Result{Message: "MVCC transaction committed"}, e.refreshSQLMetadata(ctx)
 	case parser.Rollback:
-		if session.transaction != nil {
-			session.transaction.Rollback()
-			session.transaction = nil
-		}
+		rollbackSessionTransaction(session)
 		return &Result{Message: "MVCC transaction rolled back"}, nil
+	case parser.Savepoint:
+		return e.createSavepoint(session, value.Name)
+	case parser.RollbackTo:
+		return e.rollbackToSavepoint(session, value.Name)
+	case parser.ReleaseSavepoint:
+		return e.releaseSavepoint(session, value.Name)
 	}
 	tx := session.transaction
 	if tx == nil && session.AutocommitDisabled && sqlStartsImplicitTransaction(statement) {
@@ -277,7 +277,7 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 	case parser.With:
 		return e.executeWithSQL(ctx, tx, session, value)
 	case parser.WithRecursive:
-		return nil, errors.New("recursive WITH is not supported")
+		return e.executeWithRecursiveSQL(ctx, tx, session, value)
 
 	case parser.Union:
 		query, err := bindUnionWithSelect(session, value, func(s parser.Select) (*boundQuery, error) { return bindPhysicalSelect(ctx, tx, session, s) })
@@ -401,7 +401,7 @@ func replicationStatusResult(s storageengine.ReplicationStatus) *Result {
 // Autocommit mode is independent of whether a lazy transaction has started.
 func sqlStartsImplicitTransaction(statement parser.Statement) bool {
 	switch s := statement.(type) {
-	case parser.Empty, parser.Use, parser.Show, parser.Explain:
+	case parser.Empty, parser.Use, parser.Show, parser.Explain, parser.Savepoint, parser.RollbackTo, parser.ReleaseSavepoint:
 		return false
 	case parser.Select:
 		return s.Table != "" || s.Subquery != nil

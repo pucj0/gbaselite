@@ -280,8 +280,10 @@ func TestGoApplicationQueryCompatibility(t *testing.T) {
 	if id != "code-1" || name != "Desktop" {
 		t.Fatalf("unexpected join %s %s", id, name)
 	}
-	if _, err := client.Query("SELECT id FROM auth_code WHERE auth_code=? FOR UPDATE", "AUTH-001"); err == nil {
-		t.Fatal("unsupported locking read accepted")
+	if rows, err := client.Query("SELECT id FROM auth_code WHERE auth_code=? FOR UPDATE", "AUTH-001"); err != nil {
+		t.Fatalf("locking read rejected: %v", err)
+	} else {
+		rows.Close()
 	}
 
 }

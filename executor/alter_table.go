@@ -150,9 +150,6 @@ func (e *Engine) alterSQL(ctx context.Context, read, write storageengine.Txn, se
 				return nil, fmt.Errorf("adding AUTO_INCREMENT requires an explicit data migration")
 			}
 		}
-		if c.OnUpdate != "" {
-			return nil, fmt.Errorf("ON UPDATE column expressions are not supported")
-		}
 	}
 	if err = prepareSQLForeignKeys(write, &definition, session); err != nil {
 		return nil, err

@@ -78,7 +78,7 @@ func writeInsertedRow(ctx context.Context, write storageengine.Txn, session *Ses
 		return insertOutcome{affected: affected}, err
 	}
 	if mode.replace {
-		return replaceDuplicateInsertRow(ctx, write, target, row, conflicts, fallback)
+		return replaceDuplicateInsertRow(ctx, write, session, target, row, conflicts, fallback)
 	}
 	return insertOutcome{}, nil // IGNORE skips the conflicting row.
 }
@@ -152,9 +152,12 @@ func insertConflicts(tx storageengine.Txn, target *insertTarget, candidate stora
 // removed and the candidate is stored, so the affected count is one per removed
 // row plus the inserted row. Referenced conflict rows are reported exactly like
 // the legacy executor, which rejects replacing a row that child rows reference.
-func replaceDuplicateInsertRow(ctx context.Context, write storageengine.Txn, target *insertTarget, candidate storage.Row, conflicts []insertConflict, fallback string) (insertOutcome, error) {
+func replaceDuplicateInsertRow(ctx context.Context, write storageengine.Txn, session *Session, target *insertTarget, candidate storage.Row, conflicts []insertConflict, fallback string) (insertOutcome, error) {
 	outcome := insertOutcome{affected: len(conflicts) + 1}
 	for _, conflict := range conflicts {
+		if err := applyForeignKeyActions(ctx, write, session, target.definition, conflict.row, nil, nil, 0); err != nil {
+			return insertOutcome{}, err
+		}
 		if err := writeVersionedRow(ctx, write, target.definition, conflict.key, conflict.row, nil, ""); err != nil {
 			if errors.Is(err, storage.ErrForeignKey) {
 				return insertOutcome{}, storage.ErrForeignKeyReferenced

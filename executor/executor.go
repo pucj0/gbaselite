@@ -89,6 +89,7 @@ type Session struct {
 	copyTargets       map[string]string
 	correlationScopes []map[string]any
 	subqueries        *subqueryRunner
+	savepoints        []savepointLayer
 	timeLocation      *time.Location
 }
 
@@ -133,9 +134,8 @@ func (e *Engine) AvailabilityError() error {
 
 // CloseSession rolls back an unfinished MVCC transaction on disconnect.
 func (e *Engine) CloseSession(session *Session) {
-	if session != nil && session.transaction != nil {
-		session.transaction.Rollback()
-		session.transaction = nil
+	if session != nil {
+		rollbackSessionTransaction(session)
 	}
 }
 
