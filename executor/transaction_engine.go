@@ -204,6 +204,12 @@ func loadVersionedTableInternal(tx storageengine.Txn, session *Session, name str
 	}
 	return definition, schema, catalogKey, err
 }
+
+// statementTxnHook, when non-nil, observes the read/parent transaction and the statement child
+// transaction a mutation is about to run with. The A05 regression tests install it to prove the
+// parent-read / child-write split for every DML family. It is nil in production.
+var statementTxnHook func(statement parser.Statement, read, write storageengine.Txn)
+
 func (e *Engine) executeSQLStatement(session *Session, statement parser.Statement) (*Result, error) {
 	ctx := session.Context
 	if ctx == nil {
@@ -332,6 +338,9 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		return nil, err
 	}
 	defer child.Rollback()
+	if statementTxnHook != nil {
+		statementTxnHook(statement, tx, child)
+	}
 	var result *Result
 	modify := physical.Modify[parser.Statement, *Result]{Input: physical.Source[parser.Statement](func(_ context.Context, y physical.Yield[parser.Statement]) error { return y(statement) }), Apply: func(ctx context.Context, s parser.Statement) (*Result, error) {
 		return e.mutateSQL(ctx, tx, child, session, s)

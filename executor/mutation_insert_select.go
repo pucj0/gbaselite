@@ -10,17 +10,13 @@ import (
 	"gbaselite/storageengine"
 )
 
-// insertTarget is the statement-local view of an INSERT destination: the column
-// mapping plus the auto-increment floor/reservation state that must be flushed
-// to the backend counter when the statement finishes.
+// insertTarget is the statement-local view of an INSERT destination: the resolved
+// destination definition plus the column mapping. Auto-increment state lives in the
+// InsertOperator that owns the statement, not here.
 type insertTarget struct {
 	definition versionedTable
 	columns    []storage.Column
 	positions  []int
-	floors     []uint64
-	sent       []uint64
-	next       []uint64
-	last       []uint64
 }
 
 // insertSelectSQL implements INSERT ... SELECT on the MVCC runtime. The source
@@ -43,45 +39,42 @@ func (e *Engine) insertSelectSQL(ctx context.Context, read, write storageengine.
 	if len(query.Columns) != len(target.positions) {
 		return nil, fmt.Errorf("%w: expected %d values, got %d", storage.ErrColumnCount, len(target.positions), len(query.Columns))
 	}
-	result := &Result{}
+	// The SELECT pipeline is bound against the parent statement snapshot and the
+	// operator writes through the child transaction, so a self-referencing source can
+	// never read this statement's own output.
+	operator := &InsertOperator{
+		Input:   insertSelectSource(query.Input, target, session),
+		Target:  target,
+		Write:   write,
+		Engine:  e,
+		Session: session,
+		Mode:    insertStatementMode(statement),
+	}
+	if err = operator.Run(ctx); err != nil {
+		return nil, err
+	}
+	// Carry the first generated id in the result; the statement executor publishes it
+	// to the session only after the statement transaction commits.
+	return operator.Publish(ctx)
+}
+
+// insertSelectSource converts the bound SELECT/UNION output into InsertCandidate
+// values, one destination row per source row.
+//
+// Ordinal must track the statement-local input position, so the projection keeps its
+// own counter: it decides both the generated fallback key and the auto-increment
+// reservation size. buildRow stays stateless and is shared with the VALUES path.
+func insertSelectSource(input physical.Operator[[]any], target *insertTarget, session *Session) physical.Operator[InsertCandidate] {
 	ordinal := uint64(0)
-	mode := insertStatementMode(statement)
-	lastGenerated := uint64(0)
-	modify := physical.Modify[[]any, struct{}]{Input: query.Input, Apply: func(ctx context.Context, values []any) (struct{}, error) {
-		if err := ctx.Err(); err != nil {
-			return struct{}{}, err
-		}
+	return physical.Projection[[]any, InsertCandidate]{Input: input, Project: func(values []any) (InsertCandidate, error) {
 		row, err := target.buildRow(session, values)
 		if err != nil {
-			return struct{}{}, err
+			return InsertCandidate{}, err
 		}
-		generated, ok, err := e.resolveInsertAutoIncrement(ctx, target, row)
-		if err != nil {
-			return struct{}{}, err
-		}
-		outcome, writeErr := writeInsertedRow(ctx, write, session, target, mode, row, ordinal)
-		if writeErr != nil {
-			return struct{}{}, writeErr
-		}
+		candidate := InsertCandidate{Values: row, Ordinal: ordinal}
 		ordinal++
-		result.AffectedRows += uint64(outcome.affected)
-		if outcome.inserted && ok && lastGenerated == 0 {
-			lastGenerated = generated
-		}
-		return struct{}{}, nil
+		return candidate, nil
 	}}
-	if err := modify.Run(ctx, func(struct{}) error { return nil }); err != nil {
-		return nil, err
-	}
-	if err := flushInsertCounters(ctx, e, target); err != nil {
-		return nil, err
-	}
-	// Carry the first generated id in the result; the statement executor
-	// publishes it to the session only after the statement transaction commits.
-	if lastGenerated != 0 {
-		result.LastInsertID = lastGenerated
-	}
-	return result, nil
 }
 
 // bindInsertTarget resolves the destination table and maps the optional column
@@ -118,10 +111,6 @@ func (e *Engine) bindInsertTarget(write storageengine.Txn, session *Session, sta
 		definition: definition,
 		columns:    columns,
 		positions:  positions,
-		floors:     make([]uint64, len(columns)),
-		sent:       make([]uint64, len(columns)),
-		next:       make([]uint64, len(columns)),
-		last:       make([]uint64, len(columns)),
 	}, nil
 }
 
@@ -142,7 +131,7 @@ func bindSubqueryQuery(ctx context.Context, read storageengine.Txn, session *Ses
 
 // buildRow lays out one destination row: defaults and NULLs first, then the
 // source values in the mapped column order. A NULL for an auto-increment column
-// stays NULL here and is replaced by resolveInsertAutoIncrement.
+// stays NULL here and is replaced by the InsertOperator's auto-increment step.
 func (t *insertTarget) buildRow(session *Session, values []any) (storage.Row, error) {
 	row := make(storage.Row, len(t.columns))
 	for i, column := range t.columns {
@@ -176,75 +165,4 @@ func (t *insertTarget) buildRow(session *Session, values []any) (storage.Row, er
 		row[position] = value
 	}
 	return row, nil
-}
-
-// resolveInsertAutoIncrement mirrors the INSERT VALUES counter rules: explicit
-// positive values raise the floor, NULL/omitted values take the next reserved
-// id. Reservation happens one id at a time so the ids handed out match the
-// single-row INSERT path; reservations left unused by a failure are the
-// documented MVCC auto-increment gaps.
-func (e *Engine) resolveInsertAutoIncrement(ctx context.Context, target *insertTarget, row storage.Row) (uint64, bool, error) {
-	generated, ok := uint64(0), false
-	for i, column := range target.columns {
-		if !column.AutoIncrement {
-			continue
-		}
-		if !row[i].Null && row[i].Int64 > 0 {
-			value := uint64(row[i].Int64)
-			if value > target.floors[i] {
-				target.floors[i] = value
-			}
-			if value >= target.next[i] {
-				target.next[i] = value + 1
-			}
-			continue
-		}
-		if !row[i].Null {
-			continue
-		}
-		if target.next[i] == 0 || target.next[i] > target.last[i] {
-			if err := advanceInsertCounter(ctx, e, target, i); err != nil {
-				return 0, false, err
-			}
-			reserved, err := storageengine.ReserveCounter(ctx, e.Backend, target.definition.counterKey(column.Name), 1)
-			if err != nil {
-				return 0, false, err
-			}
-			target.next[i] = reserved
-			target.last[i] = reserved
-		}
-		id := target.next[i]
-		target.next[i]++
-		value, err := storage.NewValue(column.Type, int64(id))
-		if err != nil {
-			return 0, false, err
-		}
-		row[i] = value
-		if !ok {
-			generated, ok = id, true
-		}
-	}
-	return generated, ok, nil
-}
-
-// advanceInsertCounter pushes the highest explicit auto-increment value seen so
-// far to the backend counter before the next reservation.
-func advanceInsertCounter(ctx context.Context, e *Engine, target *insertTarget, position int) error {
-	if target.floors[position] <= target.sent[position] {
-		return nil
-	}
-	if err := storageengine.AdvanceCounter(ctx, e.Backend, target.definition.counterKey(target.columns[position].Name), target.floors[position]); err != nil {
-		return err
-	}
-	target.sent[position] = target.floors[position]
-	return nil
-}
-
-func flushInsertCounters(ctx context.Context, e *Engine, target *insertTarget) error {
-	for i := range target.columns {
-		if err := advanceInsertCounter(ctx, e, target, i); err != nil {
-			return err
-		}
-	}
-	return nil
 }

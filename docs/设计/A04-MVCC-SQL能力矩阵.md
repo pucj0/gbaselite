@@ -54,3 +54,88 @@
 - 窄范围 catalog lifecycle audit（本轮）：`CREATE DATABASE`、`DROP DATABASE`、`CREATE VIEW`、`DROP VIEW`、
   SHOW 元数据、`EXPORT DATABASE`、`BACKUP/RESTORE MVCC`、`migrate-legacy`、reopen 均已覆盖 `view/` 命名空间，
   未再发现 view catalog lifecycle 遗漏。
+
+------
+
+# A05：写入算子统一（Modify Pipeline）
+
+A05 是 executor 内部重构，**不新增任何 DML SQL 语法**、不改变上表任何一行的可观察行为。上表仍是
+行为契约；本节只记录"这些行为现在由哪条代码路径产生"。
+
+## 目标模型
+
+```text
+Parser / Binder
+      ↓
+Query Pipeline（读 statement parent 快照）
+      ↓
+Mutation Candidate
+      ↓
+TargetRowDedup / LIMIT / Staging
+      ↓
+InsertOperator / UpdateOperator / DeleteOperator
+      ↓
+storageengine.Txn（statement child 事务）
+```
+
+核心边界：查询管线决定"修改谁"，Modify Operator 决定"怎么修改"。
+
+## 统一进度
+
+| DML 家族 | 统一写入算子 | 状态 | 最终 row write 唯一入口 |
+|---|---|---|---|
+| INSERT VALUES / SET | `InsertOperator` | ✅ 已统一 | `modify_insert.go` → `writeInsertedRow` |
+| INSERT SELECT | `InsertOperator` | ✅ 已统一（与 VALUES 同一个算子） | 同上 |
+| 普通 UPDATE | `UpdateOperator` | ✅ 已统一 | `modify_update.go` → `writeVersionedRow` |
+| UPDATE JOIN | `UpdateOperator` | ✅ 已统一（`TargetRowDedup` 去重 + LIMIT 在 dedup 之后） | 同上 |
+| 普通 DELETE | `DeleteOperator` | ✅ 已统一 | `modify_delete.go` → `writeVersionedRow(old → nil)` |
+| 多表 DELETE | `DeleteOperator` | ✅ 已统一（`TargetRowDedup` 去重 + winner 暂存） | `multi_delete_pipeline.go` → `delete` → `modify_delete.go` |
+
+## 统一后仍保持不变的行为契约
+
+- INSERT SELECT / UPDATE JOIN / 多表 DELETE 的源查询一律在 **statement parent 快照**上求值；
+  写入一律经 **statement child 事务**；失败整条回滚；`LastInsertID` 只在语句事务提交成功后发布。
+- `statement snapshot` 与 `child transaction` 的分割是 Halloween protection 的实现基础：扫描期间
+  写入落在 child，父快照看不到本语句的写入，因此"谓词永远为真"的 UPDATE/DELETE 仍对每个物理行只改一次。
+- CHECK / UNIQUE / PRIMARY KEY / 二级索引 / FK / CASCADE / SET NULL / auto_increment 的底层实现
+  **未重构**：统一后的算子仍然调用原有的 `writeInsertedRow`、`writeVersionedRow`、
+  `applyForeignKeyActions`。
+- UPDATE JOIN 的 target 多次匹配仍只更新一次并取首个匹配（由 `physical.TargetRowDedup` 的
+  stable first-occurrence 语义实现，取代原"每 target 取 `Limit(1)`"）。
+- UPDATE 的 SET 赋值仍按语句顺序求值（`SET a=a+1, b=a` 中 `b` 读到新的 `a`）。
+- 主键 UPDATE 的 `RowIdentity` 仍是**旧**物理行标识：写路径用旧 key 删除旧行并在内部计算新 key。
+- auto_increment 允许失败后留 gap；child 提交前不发布 `LastInsertID`。
+- 多表 DELETE 仍不支持 `LIMIT`；重复 JOIN 组合命中同一物理行只删除一次；无主键表用 storage row key
+  作为行 identity，值完全相同的两行仍可区分；derived/CTE/视图作为删除目标仍被拒绝；多目标仍按
+  child-before-parent 排序，循环目标外键仍被拒绝。
+
+## 已确认的行为差异（A05 引入，均为有意变更）
+
+| 场景 | 变更 |
+|---|---|
+| `UPDATE ... JOIN ... LIMIT n` | LIMIT 现在统计**去重后的唯一 target**（原先由每 target 取首匹配间接等价）。可观察语义不变，但不再有"满足 LIMIT 后提前终止 target 扫描"的优化，需先算完 dedup 才能截断。 |
+| `UPDATE t SET col=..., col=...`（同列重复赋值） | 现在在绑定阶段报 `duplicate update column`；原实现静默取最后一次。与 UPDATE JOIN 既有行为一致，也符合"binding error 应在第一条写入前返回"。 |
+| `UPDATE ... RIGHT JOIN ...` | 现由完整 JOIN 管线求值，`bindJoinsIdentified` 支持 INNER/LEFT/RIGHT/CROSS；原 per-target 嵌套 join 只覆盖 target-driven 子集。 |
+
+## 多表 DELETE 的统一实现（Phase 7 / T070～T087 完成）
+
+`DELETE t1,t2 FROM ... JOIN ...` 与 `DELETE FROM t1,t2 USING ...` 已接入统一 Modify Pipeline：
+
+- `executor/mutation_multi_delete.go` 内**不再有任何** `writeVersionedRow` / `writeInsertedRow` 调用；
+  语句绑定一次 join 计划（`bindMultiDeletePlan`），交由 `executor/multi_delete_pipeline.go` 求值。
+- 去重改用 `physical.TargetRowDedup`（ledger 可落盘），不再是 `seen map + rows slice` 的无界收集；
+  同时移除了行累积用的 map/slice。
+- 最终删除**经过 `DeleteOperator`**：每个目标按 `multiDeleteOrder` 顺序构造一个 `DeleteOperator`
+  （`multi_delete_pipeline.go`），由它调用 `applyForeignKeyActions` 与 `writeVersionedRow(old → nil)`。
+- 行 identity 不再依赖主键探测：已识别 join 会为每个基表输入附加
+  `alias.__rowid`（identity 标记）与 `alias.__rowkey`（物理存储键）两列隐藏列，
+  外连接 NULL 扩展的判定改由 provenance 的 NULL 语义决定，而非业务列取值。
+
+先前记录的阻塞原因（`TargetRowDedup` 不携带 payload、`identityScan` 账本被嵌套循环 re-scan 覆盖）
+均已解决：`TargetRowDedup` 改为 payload-preserving（`runPayloadDedup` 按 ledger key 暂存 winner），
+identity 改由行携带的 provenance 列决定，不再依赖被覆盖的账本。
+
+**因此 A05 的 FR-025 / SC-005 已完全满足**。
+
+已知的诚实限制：去重 ledger 可落盘，但 survivor 的**暂存切片本身在内存中**，其规模以
+"不同目标行数"为上界（非 join 结果行数）。

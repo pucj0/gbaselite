@@ -90,9 +90,17 @@ type mutationRow struct {
 	row storage.Row
 }
 
-func runRowModification(ctx context.Context, tx storageengine.Txn, table versionedTable, schema *storage.Table, session *Session, where parser.Expr, limit int, apply func([]byte, storage.Row) error) error {
+// mutationScan is the shared scan/filter/limit stage of every single-table mutation.
+//
+// It keeps planSQLAccess: the access plan still decides whether the statement scans a
+// range, probes an index or falls back to a full scan, so an indexed UPDATE or DELETE
+// does not degrade into an unconditional table scan. It builds the operator directly
+// rather than routing rows through a callback, and returns it for the caller to
+// compose. The scan reads through the parent statement transaction, while the operator
+// it feeds writes through the statement child transaction.
+func mutationScan(ctx context.Context, tx storageengine.Txn, table versionedTable, schema *storage.Table, session *Session, where parser.Expr, limit int) physical.Operator[mutationRow] {
 	access := planSQLAccess(parser.Select{Where: where}, table, schema, session)
-	input := physical.Scan[mutationRow]{Open: func(ctx context.Context) (storageengine.Iterator, error) {
+	input := physical.Scan[mutationRow]{Plan: &physical.PlanNode{Kind: scanKind(access), Attributes: map[string]string{"table": table.CatalogName, "access": access.kind, "index": access.index}}, Open: func(ctx context.Context) (storageengine.Iterator, error) {
 		return openAccessIterator(ctx, tx, table, access)
 	}, Decode: func(key, value []byte) (mutationRow, error) {
 		if err := checkQuery(session); err != nil {
@@ -101,7 +109,6 @@ func runRowModification(ctx context.Context, tx storageengine.Txn, table version
 		row, err := decodeSQLRow(table, value)
 		return mutationRow{key, row}, err
 	}}
-
 	filter := physical.Filter[mutationRow]{Input: input, Predicate: func(r mutationRow) (bool, error) {
 		if where == nil {
 			return true, nil
@@ -109,8 +116,44 @@ func runRowModification(ctx context.Context, tx storageengine.Txn, table version
 		v, err := evaluateExprWithContext(where, schema, r.row, session, nil)
 		return truthy(v), err
 	}}
-	op := physical.Modify[mutationRow, struct{}]{Input: physical.Limit[mutationRow]{Input: filter, Count: limit}, Apply: func(_ context.Context, r mutationRow) (struct{}, error) { return struct{}{}, apply(r.key, r.row) }}
-	return op.Run(ctx, func(struct{}) error { return nil })
+	return physical.Limit[mutationRow]{Input: filter, Count: limit}
+}
+
+// updateCandidates projects the shared row source into the unified UPDATE model.
+//
+// Identity carries the physical storage key the scan observed for the *old* row.
+// OldRow is a private copy of the decoded row: a scan iterator may reuse its buffer for
+// the next position, and the write path re-reads OldRow to remove the old secondary and
+// unique index entries, so it must stay a valid snapshot of the row as it was read. The
+// copy also keeps the old values consistent with the identity that addresses them.
+func updateCandidates(source physical.Operator[mutationRow], table versionedTable) physical.Operator[UpdateCandidate] {
+	return physical.Projection[mutationRow, UpdateCandidate]{Input: source, Project: func(r mutationRow) (UpdateCandidate, error) {
+		oldRow := make(storage.Row, len(r.row))
+		copy(oldRow, r.row)
+		return UpdateCandidate{
+			Identity: physical.NewRowIdentity(table.ID, r.key),
+			OldRow:   oldRow,
+			EvalRow:  oldRow,
+		}, nil
+	}}
+}
+
+// deleteCandidates projects the shared row source into the unified DELETE model.
+//
+// Identity carries the physical storage key the scan observed for the row, so a deleted row
+// is addressed by where it was read rather than by its values. OldRow is a private copy of
+// the decoded row for the same reason the UPDATE projection copies it: a scan iterator may
+// reuse its buffer for the next position, and the write path re-reads OldRow to remove the
+// old secondary and unique index entries.
+func deleteCandidates(source physical.Operator[mutationRow], table versionedTable) physical.Operator[DeleteCandidate] {
+	return physical.Projection[mutationRow, DeleteCandidate]{Input: source, Project: func(r mutationRow) (DeleteCandidate, error) {
+		oldRow := make(storage.Row, len(r.row))
+		copy(oldRow, r.row)
+		return DeleteCandidate{
+			Identity: physical.NewRowIdentity(table.ID, r.key),
+			OldRow:   oldRow,
+		}, nil
+	}}
 }
 
 func scanKind(p sqlAccessPlan) string {

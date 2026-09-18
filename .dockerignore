@@ -16,3 +16,4 @@ backup.sql
 *.tar.gz
 .codex
 .agents
+spec

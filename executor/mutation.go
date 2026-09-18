@@ -260,62 +260,36 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		if err = write.Guard(sqllayout.Catalog, k); err != nil {
 			return nil, err
 		}
+		qualifier := mutationQualifier(value.Table, value.TableAlias)
 		// Always qualify the evaluation schema, like the legacy executor, so a
 		// correlated subquery can bind an explicitly qualified outer column.
-		schema, err = qualifySchema(schema, mutationQualifier(value.Table, value.TableAlias))
+		schema, err = qualifySchema(schema, qualifier)
 		if err != nil {
 			return nil, err
 		}
-		assigned := make(map[int]bool, len(value.Assignments))
-		var updated storage.Row
-		count := 0
+		_, targetTable := splitTableName(value.Table)
+		// Assignments resolve before the scan starts, so an unknown or duplicated
+		// target column fails before the first mutation.
+		assignments, err := resolveUpdateAssignments(value, definition, schema, qualifier, targetTable, qualifier, schema)
+		if err != nil {
+			return nil, err
+		}
 		limit := -1
 		if value.HasLimit {
 			limit = value.Limit
 		}
-		err = runRowModification(ctx, read, definition, schema, session, value.Where, limit, func(key []byte, row storage.Row) error {
-			if cap(updated) < len(row) {
-				updated = make(storage.Row, len(row))
-			} else {
-				updated = updated[:len(row)]
-			}
-			copy(updated, row)
-			for _, assignment := range value.Assignments {
-				position, ok := queryColumnIndex(schema, assignment.Column)
-				if !ok {
-					return storage.ErrColumnNotFound
-				}
-				assigned[position] = true
-				raw, err := evaluateExprWithContext(assignment.Value, schema, updated, session, nil)
-				if err != nil {
-					return err
-				}
-				updated[position], err = interfaceToColumnValue(raw, definition.Definition.Columns[position])
-				if err != nil {
-					return err
-				}
-			}
-			for position, column := range definition.Definition.Columns {
-				if assigned[position] || column.OnUpdate == "" {
-					continue
-				}
-				if strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP") || strings.EqualFold(column.OnUpdate, "CURRENT_TIMESTAMP()") {
-					updated[position], err = storage.NewValue(column.Type, session.Now())
-					if err != nil {
-						return err
-					}
-				}
-			}
-			if err := applyForeignKeyActions(ctx, write, session, definition, row, updated, nil, 0); err != nil {
-				return err
-			}
-			if err := writeVersionedRow(ctx, write, definition, key, row, updated, ""); err != nil {
-				return err
-			}
-			count++
-			return nil
-		})
-		return &Result{AffectedRows: uint64(count)}, err
+		operator := &UpdateOperator{
+			Input:       updateCandidates(mutationScan(ctx, read, definition, schema, session, value.Where, limit), definition),
+			Target:      definition,
+			Schema:      schema,
+			Assignments: assignments,
+			Write:       write,
+			Session:     session,
+		}
+		if err = operator.Run(ctx); err != nil {
+			return nil, err
+		}
+		return &Result{AffectedRows: operator.Result.AffectedRows}, nil
 	case parser.Delete:
 		if len(value.Joins) > 0 || len(value.Targets) > 0 {
 			return e.multiTableDeleteSQL(ctx, read, write, session, value)
@@ -334,22 +308,24 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 			return nil, err
 		}
 
-		count := 0
+		// A plain DELETE lowers into the unified delete pipeline: the access plan decides how
+		// the target rows are found, the scan and WHERE select them from the parent statement
+		// snapshot, and DeleteOperator performs the deletion through the statement child
+		// transaction.
 		limit := -1
 		if value.HasLimit {
 			limit = value.Limit
 		}
-		err = runRowModification(ctx, read, definition, schema, session, value.Where, limit, func(key []byte, row storage.Row) error {
-			if err := applyForeignKeyActions(ctx, write, session, definition, row, nil, nil, 0); err != nil {
-				return err
-			}
-			if err := writeVersionedRow(ctx, write, definition, key, row, nil, ""); err != nil {
-				return err
-			}
-			count++
-			return nil
-		})
-		return &Result{AffectedRows: uint64(count)}, err
+		operator := &DeleteOperator{
+			Input:   deleteCandidates(mutationScan(ctx, read, definition, schema, session, value.Where, limit), definition),
+			Target:  definition,
+			Write:   write,
+			Session: session,
+		}
+		if err = operator.Run(ctx); err != nil {
+			return nil, err
+		}
+		return &Result{AffectedRows: operator.Result.AffectedRows}, nil
 	default:
 		return nil, fmt.Errorf("storage engine does not support statement %T", statement)
 	}
@@ -388,128 +364,86 @@ func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, s
 			positions[i] = position
 		}
 	}
-	result := &Result{}
-	lastGenerated := uint64(0)
-	floors, sent, next, last := make([]uint64, len(columns)), make([]uint64, len(columns)), make([]uint64, len(columns)), make([]uint64, len(columns))
-	advance := func(i int) error {
-		if floors[i] <= sent[i] {
-			return nil
-		}
-		if err := storageengine.AdvanceCounter(ctx, e.Backend, definition.counterKey(columns[i].Name), floors[i]); err != nil {
-			return err
-		}
-		sent[i] = floors[i]
-		return nil
+	// INSERT VALUES lowers its literal rows into InsertCandidate and writes them
+	// through the same InsertOperator as INSERT SELECT, so target column mapping,
+	// DEFAULT handling, auto-increment, conflict policy and result accounting all have
+	// exactly one implementation.
+	target := &insertTarget{definition: definition, columns: columns, positions: positions}
+	operator := &InsertOperator{
+		Input:   valuesSource(statement, schema, columns, positions, session),
+		Target:  target,
+		Write:   write,
+		Engine:  e,
+		Session: session,
+		Mode:    insertStatementMode(statement),
+		Rows:    uint64(len(statement.Values)),
 	}
-	// The destination view and duplicate-key policy are shared with the
-	// INSERT SELECT writer so both sources handle conflicts identically.
-	target := &insertTarget{definition: definition, columns: columns, positions: positions, floors: floors, sent: sent, next: next, last: last}
-	mode := insertStatementMode(statement)
-	input := physical.Source[int](func(_ context.Context, y physical.Yield[int]) error {
-		for i := range statement.Values {
-			if err := y(i); err != nil {
+	if err = operator.Run(ctx); err != nil {
+		return nil, err
+	}
+	return operator.Publish(ctx)
+}
+
+// valuesSource lowers the statement's literal rows into InsertCandidate values.
+// Each row is assembled the way the INSERT VALUES path has always assembled it:
+// defaults first, then the mapped literals or value expressions, with every
+// conversion error surfacing before any write for that row happens.
+func valuesSource(statement parser.Insert, schema *storage.Table, columns []storage.Column, positions []int, session *Session) physical.Operator[InsertCandidate] {
+	return physical.Source[InsertCandidate](func(_ context.Context, y physical.Yield[InsertCandidate]) error {
+		for rowIndex := range statement.Values {
+			candidate, err := valuesCandidate(statement, schema, columns, positions, session, rowIndex)
+			if err != nil {
+				return err
+			}
+			if err := y(candidate); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
-	modify := physical.Modify[int, struct{}]{Input: input, Apply: func(ctx context.Context, rowIndex int) (struct{}, error) {
-		literals := statement.Values[rowIndex]
-		if err := ctx.Err(); err != nil {
-			return struct{}{}, err
-		}
-		generated := uint64(0)
-		if len(literals) != len(positions) {
-			return struct{}{}, errors.New("INSERT value count does not match columns")
-		}
-		row := make(storage.Row, len(columns))
-		for i, column := range columns {
-			row[i] = storage.NullValue(column.Type)
-			if column.HasDefault {
-				row[i], err = columnDefaultValue(column, session)
-				if err != nil {
-					return struct{}{}, err
-				}
-			}
-		}
-		for valueIndex, literal := range literals {
-			position := positions[valueIndex]
-			if expression, ok := statement.ValueExpressions[[2]int{rowIndex, valueIndex}]; ok {
-				raw, err := evaluateExprWithContext(expression, schema, row, session, nil)
-				if err != nil {
-					return struct{}{}, err
-				}
-				row[position], err = interfaceToColumnValue(raw, columns[position])
-				if err != nil {
-					return struct{}{}, err
-				}
-			} else {
-				row[position], err = literalToValue(literal, columns[position])
-				if err != nil {
-					return struct{}{}, err
-				}
-			}
-		}
-		for i, column := range columns {
-			if !column.AutoIncrement {
-				continue
-			}
-			if !row[i].Null && row[i].Int64 > 0 {
-				value := uint64(row[i].Int64)
-				if value > floors[i] {
-					floors[i] = value
-				}
-				if value >= next[i] {
-					next[i] = value + 1
-				}
-			}
-			if row[i].Null {
-				if next[i] == 0 || next[i] > last[i] {
-					if err := advance(i); err != nil {
-						return struct{}{}, err
-					}
-					count := uint64(len(statement.Values) - rowIndex)
-					reserved, err := storageengine.ReserveCounter(ctx, e.Backend, definition.counterKey(column.Name), count)
-					if err != nil {
-						return struct{}{}, err
-					}
-					next[i] = reserved
-					last[i] = reserved + count - 1
-				}
-				id := next[i]
-				next[i]++
-				row[i], err = storage.NewValue(column.Type, int64(id))
-				if err != nil {
-					return struct{}{}, err
-				}
-				if generated == 0 {
-					generated = id
-				}
-			}
-		}
-		outcome, writeErr := writeInsertedRow(ctx, write, session, target, mode, row, uint64(rowIndex))
-		if writeErr != nil {
-			return struct{}{}, writeErr
-		}
-		result.AffectedRows += uint64(outcome.affected)
-		if outcome.inserted && generated != 0 && lastGenerated == 0 {
-			lastGenerated = generated
-		}
-		return struct{}{}, nil
-	}}
-	if err := modify.Run(ctx, func(struct{}) error { return nil }); err != nil {
-		return nil, err
-	}
+}
 
-	for i := range columns {
-		if err := advance(i); err != nil {
-			return nil, err
+// valuesCandidate assembles one INSERT VALUES row into a candidate: defaults first,
+// then the mapped literals or value expressions. The row is freshly allocated per
+// candidate because the operator mutates it in place (auto-increment and, for the
+// conflict policies, expression evaluation).
+func valuesCandidate(statement parser.Insert, schema *storage.Table, columns []storage.Column, positions []int, session *Session, rowIndex int) (InsertCandidate, error) {
+	literals := statement.Values[rowIndex]
+	if len(literals) != len(positions) {
+		return InsertCandidate{}, errors.New("INSERT value count does not match columns")
+	}
+	row := make(storage.Row, len(columns))
+	for i, column := range columns {
+		row[i] = storage.NullValue(column.Type)
+		if column.HasDefault {
+			value, err := columnDefaultValue(column, session)
+			if err != nil {
+				return InsertCandidate{}, err
+			}
+			row[i] = value
 		}
 	}
-	if lastGenerated != 0 {
-		result.LastInsertID = lastGenerated
+	for valueIndex := range literals {
+		position := positions[valueIndex]
+		if expression, ok := statement.ValueExpressions[[2]int{rowIndex, valueIndex}]; ok {
+			raw, err := evaluateExprWithContext(expression, schema, row, session, nil)
+			if err != nil {
+				return InsertCandidate{}, err
+			}
+			value, err := interfaceToColumnValue(raw, columns[position])
+			if err != nil {
+				return InsertCandidate{}, err
+			}
+			row[position] = value
+			continue
+		}
+		value, err := literalToValue(literals[valueIndex], columns[position])
+		if err != nil {
+			return InsertCandidate{}, err
+		}
+		row[position] = value
 	}
-	return result, nil
+	return InsertCandidate{Values: row, Ordinal: uint64(rowIndex)}, nil
 }
 
 // writeVersionedRow validates foreign-key references before storing the row.

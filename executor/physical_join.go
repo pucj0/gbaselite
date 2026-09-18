@@ -20,9 +20,19 @@ type joinInput struct {
 	// identityColumn is set by mutation joins: every scanned base-table row gets a
 	// monotonic value in this column, and identityKeys maps it back to the storage
 	// row key so DELETE can use a stable physical identity.
+	//
+	// identityKeys is a convenience ledger, NOT a stable source of truth: a nested-loop join
+	// re-scans an input once per outer row, and the counter keeps advancing, so later scans
+	// overwrite slots earlier scans recorded. Consumers that must resolve a row's physical key
+	// after the fact read provenanceColumn instead, which travels inside the row.
 	identityColumn string
-	identityKeys   map[int64][]byte
-	identityNext   int64
+	// provenanceColumn carries the physical storage row key itself, so a mutation can address
+	// exactly the row it read no matter how often the relation is rescanned. It is
+	// null-extended by an outer join, which is how an absent target is distinguished from a
+	// real row whose own columns happen to be NULL.
+	provenanceColumn string
+	identityKeys     map[int64][]byte
+	identityNext     int64
 }
 
 func bindJoins(tx storageengine.Txn, session *Session, s parser.Select) ([]joinInput, error) {
@@ -113,14 +123,23 @@ func bindJoinsMode(tx storageengine.Txn, session *Session, s parser.Select, iden
 		if identified && rows == nil && table.ID != "" {
 			entry.identityColumn = alias + ".__rowid"
 			entry.identityKeys = make(map[int64][]byte)
-			// The identity column is part of the input schema, so it flows through
-			// the join and is null-extended with the rest of that input.
-			identitySchema, identityErr := storage.NewTransientTable("join_identity", append(append([]storage.Column(nil), schema.ColumnsView()...), storage.Column{Name: entry.identityColumn, Type: storage.TypeBigInt, MetadataVersion: 1, Nullable: true}))
+			// The identity marker says "this target exists" and the provenance key column carries
+			// the physical storage row key itself. Both travel inside the joined row, so a mutation
+			// never has to look the key up in a mutable ledger that a later re-scan could overwrite.
+			entry.provenanceColumn = alias + ".__rowkey"
+			// Both columns are part of the input schema, so they flow through the join and are
+			// null-extended with the rest of that input.
+			nullableProvenance := j.Type == "LEFT" || j.Type == "RIGHT"
+			identitySchema, identityErr := storage.NewTransientTable("join_identity", append(append([]storage.Column(nil), schema.ColumnsView()...),
+				storage.Column{Name: entry.identityColumn, Type: storage.TypeBigInt, MetadataVersion: 1, Nullable: true},
+				storage.Column{Name: entry.provenanceColumn, Type: storage.TypeText, MetadataVersion: 1, Nullable: true}))
 			if identityErr != nil {
 				return nil, identityErr
 			}
 			entry.schema = identitySchema
-			combinedColumns := append(append([]storage.Column(nil), columns...), storage.Column{Name: entry.identityColumn, Type: storage.TypeBigInt, MetadataVersion: 1, Nullable: j.Type == "LEFT" || j.Type == "RIGHT"})
+			combinedColumns := append(append([]storage.Column(nil), columns...),
+				storage.Column{Name: entry.identityColumn, Type: storage.TypeBigInt, MetadataVersion: 1, Nullable: nullableProvenance},
+				storage.Column{Name: entry.provenanceColumn, Type: storage.TypeText, MetadataVersion: 1, Nullable: nullableProvenance})
 			entry.combined, identityErr = storage.NewTransientTable("join", combinedColumns)
 			if identityErr != nil {
 				return nil, identityErr

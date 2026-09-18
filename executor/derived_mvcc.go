@@ -188,9 +188,19 @@ func storageRowBytes(row storage.Row) int64 {
 	return size
 }
 
-// identityScan scans a base table for a mutation join and appends the hidden row
-// identity value, mapping it back to the storage row key so DELETE can dedupe and
-// address rows without a primary key.
+// identityScan scans a base table for a mutation join and appends the hidden row provenance
+// columns: an identity marker and the physical storage row key itself.
+//
+// The storage key travels inside the row rather than only through the identityKeys ledger,
+// because a nested-loop join re-opens the same input once per outer row. The ledger is keyed
+// by a per-scan counter, so a re-scan advances that counter and its later writes can overwrite
+// the slots an earlier scan recorded; a row-carried key is immune to that, which is what lets a
+// mutation address exactly the physical row it read. identityKeys is still maintained so that
+// existing consumers keep working, but new consumers must read the provenance columns.
+//
+// The identity marker column is what distinguishes "this target exists" from "the outer join
+// null-extended this side": an absent target null-extends both provenance columns, so absence
+// is decided by provenance and never by whether the target's own columns happen to be NULL.
 func identityScan(tx storageengine.Txn, input *joinInput, access sqlAccessPlan, session *Session) physical.Operator[storage.Row] {
 	return physical.Scan[storage.Row]{Plan: &physical.PlanNode{Kind: scanKind(access), Attributes: map[string]string{"table": input.definition.CatalogName, "access": access.kind, "index": access.index}}, Open: func(ctx context.Context) (storageengine.Iterator, error) {
 		return openAccessIterator(ctx, tx, input.definition, access)
@@ -209,6 +219,59 @@ func identityScan(tx storageengine.Txn, input *joinInput, access sqlAccessPlan, 
 		if err != nil {
 			return nil, err
 		}
-		return append(row, idValue), nil
+		keyValue, err := storage.NewValue(storage.TypeText, string(key))
+		if err != nil {
+			return nil, err
+		}
+		return append(row, idValue, keyValue), nil
 	}}
+}
+
+// provenanceKeyAt returns the position of the hidden storage-key column for a joined input, or
+// -1 when that input carries no provenance columns.
+//
+// The identified binding appends the identity marker and then the storage key, so the key is
+// the last column of the input's schema and the marker sits immediately before it.
+func provenanceKeyAt(input *joinInput) int {
+	if input.identityColumn == "" {
+		return -1
+	}
+	return len(input.combined.ColumnsView()) - 1
+}
+
+// provenanceIdentityAt returns the position of the hidden identity-marker column for a joined
+// input, or -1 when that input carries no provenance columns.
+func provenanceIdentityAt(input *joinInput) int {
+	keyAt := provenanceKeyAt(input)
+	if keyAt < 0 {
+		return -1
+	}
+	return keyAt - 1
+}
+
+// ProvenanceKey reads the physical storage key directly from a joined row's provenance column.
+//
+// It returns ok=false when the row has no provenance columns, when the target was
+// null-extended (absent physical row), or when the recorded key is empty. Callers use this
+// instead of consulting a mutable rowid ledger, so the identity always belongs to the row it
+// was read with.
+func ProvenanceKey(row storage.Row, keyAt int) ([]byte, bool) {
+	if keyAt < 0 || keyAt >= len(row) {
+		return nil, false
+	}
+	value := row[keyAt]
+	if value.Null || value.Text == "" {
+		return nil, false
+	}
+	return []byte(value.Text), true
+}
+
+// ProvenancePresent reports whether the joined row actually contains this target: an outer join
+// null-extends both provenance columns, so absence is decided here rather than by inspecting
+// the target's own column values.
+func ProvenancePresent(row storage.Row, identityAt int) bool {
+	if identityAt < 0 || identityAt >= len(row) {
+		return false
+	}
+	return !row[identityAt].Null
 }
