@@ -91,15 +91,11 @@ func (e *Engine) multiTableDeleteSQL(ctx context.Context, read, write storageeng
 	if err != nil {
 		return nil, err
 	}
-	staged, err := plan.selection(ctx)
+	staged, err := plan.delete(ctx, write, session)
 	if err != nil {
 		return nil, err
 	}
-	affected, err := plan.delete(ctx, staged, write, session)
-	if err != nil {
-		return nil, err
-	}
-	return &Result{AffectedRows: affected}, nil
+	return &Result{AffectedRows: staged}, nil
 }
 
 // resolveMultiDeleteTargets maps the requested target names onto join inputs and validates that

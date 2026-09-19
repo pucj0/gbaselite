@@ -47,11 +47,7 @@ func (e *Engine) joinUpdateSQL(ctx context.Context, read, write storageengine.Tx
 	if err != nil {
 		return nil, err
 	}
-	selected, err := plan.winners(ctx, limit)
-	if err != nil {
-		return nil, err
-	}
-	affected, err := plan.apply(ctx, selected, definition, definition.Definition.Columns, assignments, schema, write, session)
+	affected, err := plan.run(ctx, definition, definition.Definition.Columns, assignments, schema, write)
 	if err != nil {
 		return nil, err
 	}

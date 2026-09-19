@@ -69,13 +69,13 @@ func TestLegacyBudgetedOrderAndDistinctOperators(t *testing.T) {
 func TestLegacyBudgetedSortSharedDiskBudgetAndLazyCleanup(t *testing.T) {
 	directory := t.TempDir()
 	q := newQueryControl(nil, QueryOptions{SortMemoryBytes: 128 << 10, MaxTempBytes: 100, TempDirectory: directory})
-	first, err := newExternalRowSorter(q, func(a, b []any) int { return 0 })
+	first, err := newExternalRowSorter(q, nil, func(a, b []any) int { return 0 })
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer first.Close()
 	copyControl := *q
-	second, err := newExternalRowSorter(&copyControl, func(a, b []any) int { return 0 })
+	second, err := newExternalRowSorter(&copyControl, nil, func(a, b []any) int { return 0 })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,9 +121,21 @@ func TestLegacyBudgetedSortSharedDiskBudgetAndLazyCleanup(t *testing.T) {
 }
 
 func TestLegacyBudgetedDistinctRejectsTooSmallBudget(t *testing.T) {
-	session := &Session{query: newQueryControl(nil, QueryOptions{SortMemoryBytes: 64 << 10, TempDirectory: t.TempDir()})}
+	// 32 KiB is below the sorter's floor, so DISTINCT must refuse it rather than silently run
+	// unsorted or unsafely. The halves the two dedup passes used to take are gone: they now share
+	// one pool, so the floor applies to the configured budget itself.
+	session := &Session{query: newQueryControl(nil, QueryOptions{SortMemoryBytes: 32 << 10, TempDirectory: t.TempDir()})}
 	if _, err := executeBudgetedDistinct(session, &Result{}, 0, -1); !errors.Is(err, ErrQueryResourceLimit) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestLegacyBudgetedDistinctAcceptsASortableBudget(t *testing.T) {
+	// The same statement at the floor the sorter documents must succeed: the two passes share one
+	// pool, so a 64 KiB budget is one usable sorter rather than two halves of one.
+	session := &Session{query: newQueryControl(nil, QueryOptions{SortMemoryBytes: 64 << 10, TempDirectory: t.TempDir()})}
+	if _, err := executeBudgetedDistinct(session, &Result{}, 0, -1); err != nil {
+		t.Fatalf("64 KiB budget rejected: %v", err)
 	}
 }
 

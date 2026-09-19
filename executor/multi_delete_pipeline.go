@@ -7,7 +7,6 @@ import (
 	"gbaselite/physical"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
-	"sort"
 	"strings"
 )
 
@@ -16,29 +15,39 @@ import (
 // runtime condition.
 var errMultiDeleteNoIdentity = errors.New("multi-table DELETE has no join input")
 
+// errMultiDeleteStagingPayload reports a staging run whose payload column is not the owned bytes
+// this package wrote.
+var errMultiDeleteStagingPayload = errors.New("multi-table DELETE staging payload is not owned bytes")
+
 // This file owns the multi-table DELETE pipeline:
 //
 //	JOIN
 //	 -> WHERE
-//	 -> project self-contained DeleteCandidates
-//	 -> TargetRowDedup
-//	 -> bounded/spillable staging
+//	 -> self-contained DeleteCandidate
+//	 -> TargetRowDedup (ledger and payload both spillable)
+//	 -> spillable dependency-order staging
 //	 -> multiDeleteOrder
 //	 -> DeleteOperator
 //
-// Two properties make that structure possible.
+// Three properties make that structure possible.
 //
 // First, a candidate is *self-contained*: it carries the target table, the physical storage key,
-// the old row and the target's write metadata, all captured while the joined row is in hand.
-// Nothing after dedup re-runs the join, replays an ordinal, or consults a mutable identity ledger.
+// the old row and the target's index in the statement's resolved target list, all captured while
+// the joined row is in hand. Nothing after dedup re-runs the join, replays an ordinal, or consults
+// a mutable identity ledger.
 //
-// Second, TargetRowDedup returns the winner's full payload, so the deduplicated stream is already
-// the set of rows to delete; staging only holds those winners so they can be ordered children-first
-// before the write.
+// Second, TargetRowDedup returns the winner's full payload, and the staging that reorders those
+// winners children-first is itself a bounded sorter. Neither the dedup ledger nor the staging holds
+// one entry per distinct target in memory: a winner whose payload spilled is decoded back from a
+// run file.
+//
+// Third, staging is *materialised* — it writes the ordered winners to run files and then reads them
+// back once per target. That is what lets the write phase stay phase-ordered (every child row
+// deleted before any parent row) without keeping the rows themselves in memory.
 
-// multiDeleteCandidate is one joined row observed as a delete target for one requested target table.
-// It is self-contained by construction: everything the delete needs is captured here, while the
-// joined row is still in hand.
+// multiDeleteCandidate is one joined row observed as a delete target for one requested target
+// table. It is self-contained by construction: everything the delete needs is captured here, while
+// the joined row is still in hand.
 type multiDeleteCandidate struct {
 	// target indexes the statement's resolved target list, which owns the table definition and the
 	// window arithmetic. It is a statement-local index, not a re-resolvable identity.
@@ -59,6 +68,9 @@ type multiDeletePlan struct {
 	rows     physical.Operator[storage.Row]
 	// targets holds the resolved target metadata, indexed by multiDeleteCandidate.target.
 	targets []multiDeleteTarget
+	// budget is the one sort-memory pool every sorter of this statement draws from, so the
+	// statement's peak retained sort memory is the configured budget rather than a multiple.
+	budget *sorterBudget
 }
 
 // bindMultiDeletePlan builds the join stage from an already bound identified join.
@@ -88,9 +100,12 @@ func bindMultiDeletePlan(read storageengine.Txn, session *Session, statement par
 		})
 	}
 	// The join keeps its full SQL semantics, so a RIGHT JOIN still visits unmatched right rows and a
-	// LEFT JOIN still null-extends its right side. Driving from the join rather than from a target is
-	// what lets an outer join's absent side be recognised instead of silently dropped.
+	// LEFT JOIN still null-extends its right side. Driving from the join rather than from a target
+	// is what lets an outer join's absent side be recognised instead of silently dropped.
 	plan.rows = chainJoinInputs(read, session, inputs, driving, false)
+	if session != nil && session.query != nil {
+		plan.budget = newSorterBudget(session.query.options.SortMemoryBytes)
+	}
 	return plan, nil
 }
 
@@ -109,8 +124,8 @@ func (p multiDeletePlan) matched() physical.Operator[storage.Row] {
 // requested target.
 //
 // A target whose provenance is absent (an outer join null-extended it because the other side had no
-// match) produces no candidate. That decision comes from physical provenance, never from whether the
-// target's own columns happen to be NULL, so a real row holding NULL values stays deletable.
+// match) produces no candidate. That decision comes from physical provenance, never from whether
+// the target's own columns happen to be NULL, so a real row holding NULL values stays deletable.
 func (p multiDeletePlan) candidates() physical.Operator[multiDeleteCandidate] {
 	rows := p.matched()
 	return physical.Source[multiDeleteCandidate](func(ctx context.Context, yield physical.Yield[multiDeleteCandidate]) error {
@@ -139,122 +154,156 @@ func (p multiDeletePlan) candidates() physical.Operator[multiDeleteCandidate] {
 	})
 }
 
-// selection runs the join once and deduplicates it by target identity, returning the winners.
+// deduped runs the join once and keeps the first occurrence of every target identity.
 //
-// Deduplication is TargetRowDedup: the same physical target can appear in many JOIN combinations,
-// and only its first occurrence may reach the write path. The operator's ledger is bounded and
-// spillable, so a heavily fanned-out join needs no unbounded seen map, and it returns the winner's
-// candidate unchanged — exactly the rows the join produced are the rows deleted.
-func (p multiDeletePlan) selection(ctx context.Context) ([]multiDeleteCandidate, error) {
-	// A cyclic target dependency has no valid single-statement order; reject it before any write.
-	if _, err := multiDeleteOrder(p.targets); err != nil {
-		return nil, err
-	}
-	dedup := physical.TargetRowDedup[multiDeleteCandidate]{
+// The same physical target can appear in many JOIN combinations, and only its first occurrence may
+// reach the write path. The ledger and the candidate payload both spill, so a heavily fanned-out
+// join needs neither an unbounded seen map nor an in-memory table of winners.
+func (p multiDeletePlan) deduped() *physical.TargetRowDedup[multiDeleteCandidate] {
+	codec := multiDeleteCodec{}
+	return &physical.TargetRowDedup[multiDeleteCandidate]{
 		Input: p.candidates(),
 		Identity: func(candidate multiDeleteCandidate) (RowIdentity, bool) {
 			return candidate.Identity, true
 		},
-		NewSort: func(byKey bool) (physical.Sorter[physical.TargetDedupRow[multiDeleteCandidate]], error) {
-			return newMultiDeleteSorter(p.session.query, byKey)
+		NewSort: func(byKey bool) (physical.Sorter[physical.SortRow[multiDeleteCandidate]], error) {
+			return newCandidateSorter[multiDeleteCandidate](p.session.query, p.budget, codec, byKey)
 		},
 	}
-	// Staging holds the deduplicated winners. It exists so the write can be ordered children-first;
-	// it never re-derives identity, and every entry is already a survivor.
-	staged := make([]multiDeleteCandidate, 0, len(p.targets))
-	if err := dedup.Run(ctx, func(candidate multiDeleteCandidate) error {
-		staged = append(staged, candidate)
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	return staged, nil
 }
 
-// delete runs the staged winners through the shared DeleteOperator, one operator per target in
+// dependencyRanks maps every target index to its position in the children-first dependency order.
+//
+// The rank is small — one entry per target the statement names — so it is computed once and indexed
+// by multiDeleteCandidate.target. multiDeleteOrder also rejects a cyclic target dependency here,
+// before anything is written.
+func (p multiDeletePlan) dependencyRanks() ([]string, error) {
+	order, err := multiDeleteOrder(p.targets)
+	if err != nil {
+		return nil, err
+	}
+	rank := make([]string, len(p.targets))
+	for position, index := range order {
+		rank[index] = ordinalLedgerKey(uint64(position))
+	}
+	return rank, nil
+}
+
+// stage reorders the deduplicated winners children-first into a spillable staging run, then hands
+// that materialised run to emit. The staging sorter owns the run for the whole call and is closed on
+// every path, including a dedup failure and a downstream write failure.
+//
+// The staging sorter sorts on exactly two columns: the target's rank in the dependency order, and
+// then the target row's own storage key. So a child target's rows all precede a parent target's
+// rows, and within one target the order is deterministic and reproducible.
+func (p multiDeletePlan) stage(ctx context.Context, emit func(orderedStage) error) (err error) {
+	rank, err := p.dependencyRanks()
+	if err != nil {
+		return err
+	}
+	codec := multiDeleteCodec{}
+	sorter, err := newExternalRowSorter(p.session.query, p.budget, func(a, b []any) int {
+		if c := strings.Compare(a[0].(string), b[0].(string)); c != 0 {
+			return c
+		}
+		return strings.Compare(a[1].(string), b[1].(string))
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, sorter.Close()) }()
+
+	if err := p.deduped().Run(ctx, func(candidate multiDeleteCandidate) error {
+		payload, err := codec.encode(candidate)
+		if err != nil {
+			return err
+		}
+		return sorter.Add([]any{rank[candidate.target], string(candidate.Identity.Key), payload})
+	}); err != nil {
+		return err
+	}
+	// Merge the staged rows into one run. The write phase re-reads that run once per target, so it
+	// has to be a single ordered file rather than a batch plus a pile of runs.
+	if err := sorter.mergeToSingleRun(); err != nil {
+		return err
+	}
+	return emit(orderedStage{values: sorter, codec: codec})
+}
+
+// orderedStage presents a materialised staging run as the sequence of candidates the write phase
+// reads. Reading it is repeatable: the run is already sorted, and each read is a fresh sequential
+// scan of the same file, so a later pass re-reads it rather than consuming it.
+type orderedStage struct {
+	values *externalRowSorter
+	codec  multiDeleteCodec
+}
+
+// forTarget streams the staged candidates belonging to one target, in storage-key order.
+//
+// The staged run is ordered by (dependency rank, storage key), so this is a filtered sequential scan
+// and it holds one row at a time.
+func (s orderedStage) forTarget(target int, yield func(multiDeleteCandidate) error) error {
+	return s.values.readSingleRun(func(values []any) error {
+		if len(values) != 3 {
+			return errMultiDeleteStagingPayload
+		}
+		payload, ok := values[2].([]byte)
+		if !ok {
+			return errMultiDeleteStagingPayload
+		}
+		candidate, err := s.codec.decode(payload)
+		if err != nil {
+			return err
+		}
+		// The staged run is ordered by (dependency rank, storage key), so a single sequential scan
+		// in target order yields exactly this target's rows, in storage-key order.
+		if candidate.target != target {
+			return nil
+		}
+		return yield(candidate)
+	})
+}
+
+func (s orderedStage) Close() error { return s.values.Close() }
+
+// delete applies the staged winners through the shared DeleteOperator, one operator per target in
 // dependency order, so a child table is always deleted before the parent that references it.
 //
-// Each operator owns its target's write metadata and writes through the statement child
-// transaction, while the join above read the parent statement snapshot.
-func (p multiDeletePlan) delete(ctx context.Context, staged []multiDeleteCandidate, write storageengine.Txn, session *Session) (uint64, error) {
+// The operators are built up front — there are only as many as the statement names targets, which
+// the join's own input count bounds — but the rows are not: each operator reads its own target's
+// rows from the staged run in dependency order, one row at a time, so nothing accumulates and no
+// in-memory winner slice exists at any point.
+//
+// Every operator writes through the statement child transaction, while the join above read the
+// parent statement snapshot.
+func (p multiDeletePlan) delete(ctx context.Context, write storageengine.Txn, session *Session) (uint64, error) {
 	order, err := multiDeleteOrder(p.targets)
 	if err != nil {
 		return 0, err
 	}
 	var affected uint64
-	for _, index := range order {
-		target := p.targets[index]
-		rows := make([]multiDeleteCandidate, 0, len(staged))
-		for _, candidate := range staged {
-			if candidate.target == index {
-				rows = append(rows, candidate)
+	err = p.stage(ctx, func(staged orderedStage) error {
+		for _, index := range order {
+			target := index
+			operator := &DeleteOperator{
+				Target:  p.targets[target].definition,
+				Write:   write,
+				Session: session,
 			}
+			operator.Input = physical.Source[DeleteCandidate](func(_ context.Context, yield physical.Yield[DeleteCandidate]) error {
+				return staged.forTarget(target, func(candidate multiDeleteCandidate) error {
+					return yield(DeleteCandidate{Identity: candidate.Identity, OldRow: candidate.OldRow})
+				})
+			})
+			if err := operator.Run(ctx); err != nil {
+				return err
+			}
+			affected += operator.Result.AffectedRows
 		}
-		if len(rows) == 0 {
-			continue
-		}
-		// A deterministic per-target order keeps the statement reproducible; the dependency order
-		// across targets is what the FK semantics require.
-		sort.SliceStable(rows, func(i, j int) bool {
-			return string(rows[i].Identity.Key) < string(rows[j].Identity.Key)
-		})
-		operator := &DeleteOperator{
-			Input: physical.Source[DeleteCandidate](func(_ context.Context, yield physical.Yield[DeleteCandidate]) error {
-				for _, row := range rows {
-					if err := yield(DeleteCandidate{Identity: row.Identity, OldRow: row.OldRow}); err != nil {
-						return err
-					}
-				}
-				return nil
-			}),
-			Target:  target.definition,
-			Write:   write,
-			Session: session,
-		}
-		if err := operator.Run(ctx); err != nil {
-			return affected, err
-		}
-		affected += operator.Result.AffectedRows
+		return nil
+	})
+	if err != nil {
+		return affected, err
 	}
 	return affected, nil
 }
-
-// newMultiDeleteSorter adapts the shared spillable sorter to multi-delete candidates.
-//
-// The ledger row holds primitives only, because the shared sorter compares values in order: the dedup
-// ledger key and the input ordinal. The candidate payload never travels through the sorter —
-// TargetRowDedup returns it — so a spilled ledger cannot lose a row.
-func newMultiDeleteSorter(control *queryControl, byKey bool) (physical.Sorter[physical.TargetDedupRow[multiDeleteCandidate]], error) {
-	compare := func(a, b []any) int {
-		if byKey {
-			if c := strings.Compare(a[0].(string), b[0].(string)); c != 0 {
-				return c
-			}
-		}
-		return strings.Compare(a[1].(string), b[1].(string))
-	}
-	sorter, err := newExternalRowSorter(control, compare)
-	if err != nil {
-		return nil, err
-	}
-	return multiDeleteSorter{sorter: sorter}, nil
-}
-
-type multiDeleteSorter struct {
-	sorter *externalRowSorter
-}
-
-func (s multiDeleteSorter) Add(row physical.TargetDedupRow[multiDeleteCandidate]) error {
-	return s.sorter.Add([]any{row.Key, ordinalLedgerKey(row.Ordinal)})
-}
-
-func (s multiDeleteSorter) Finish(yield func(physical.TargetDedupRow[multiDeleteCandidate]) error) error {
-	return s.sorter.Finish(func(row []any) error {
-		return yield(physical.TargetDedupRow[multiDeleteCandidate]{
-			Key:     row[0].(string),
-			Ordinal: ordinalFromLedgerKey(row[1].(string)),
-		})
-	})
-}
-
-func (s multiDeleteSorter) Close() error { return s.sorter.Close() }

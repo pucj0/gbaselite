@@ -40,7 +40,7 @@ func executeBudgetedOrderWithInput(session *Session, columns []Column, compare f
 }
 func bindOrder(session *Session, columns []Column, compare func([]any, []any) int, input physical.Operator[[]any], offset, limit int) *boundQuery {
 	q := session.query
-	sorter := physical.Sort[[]any]{Input: input, New: func() (physical.Sorter[[]any], error) { return newExternalRowSorter(q, compare) }}
+	sorter := physical.Sort[[]any]{Input: input, New: func() (physical.Sorter[[]any], error) { return newExternalRowSorter(q, nil, compare) }}
 	var op physical.Operator[[]any] = physical.Limit[[]any]{Input: sorter, Offset: offset, Count: limit}
 	if limit >= 0 {
 		op = physical.TopN[[]any]{Sort: sorter, Offset: offset, Count: limit}
@@ -101,16 +101,18 @@ func executeBudgetedDistinct(session *Session, source *Result, offset, limit int
 }
 func bindDistinct(session *Session, columns []Column, input physical.Operator[[]any], offset, limit int) *boundQuery {
 	q := session.query
+	// Both dedup passes share one pool, so DISTINCT's peak retained sort memory is the configured
+	// sort memory rather than a multiple of it. They are alive at the same time during the
+	// pass-1-to-pass-2 handoff, which is exactly when the pool matters. A budget below the sorter's
+	// floor cannot sort at all, so it is refused with a failing input instead of a nil sorter.
+	tooSmall := q.options.SortMemoryBytes > 0 && q.options.SortMemoryBytes < 64<<10
+	budget := newSorterBudget(q.options.SortMemoryBytes)
 	op := physical.Distinct[[]any]{Input: semanticInput(columns, input), Key: func(row []any) (string, error) { return groupedRowKey(row, session), nil }, NewSort: func(byKey bool) (physical.Sorter[physical.DistinctRow[[]any]], error) {
-		split := *q
-		split.options.SortMemoryBytes = q.options.SortMemoryBytes / 2
-		if q.options.SortMemoryBytes == 0 {
-			split.options.SortMemoryBytes = 2 << 20
+		// A budget below the sorter's floor is reported here, from the factory, which is where the
+		// caller can still surface it as a query error rather than as a nil sorter.
+		if tooSmall {
+			return nil, fmt.Errorf("%w: DISTINCT requires at least 65536 bytes of sort memory", ErrQueryResourceLimit)
 		}
-		if split.options.SortMemoryBytes < 64<<10 {
-			return nil, fmt.Errorf("%w: DISTINCT requires at least 131072 bytes of sort memory", ErrQueryResourceLimit)
-		}
-
 		compare := func(a, b []any) int {
 			if byKey {
 				if c := strings.Compare(a[0].(string), b[0].(string)); c != 0 {
@@ -130,7 +132,7 @@ func bindDistinct(session *Session, columns []Column, input physical.Operator[[]
 			}
 			return 0
 		}
-		sorter, err := newExternalRowSorter(&split, compare)
+		sorter, err := newExternalRowSorter(q, budget, compare)
 		if err != nil {
 			return nil, err
 		}

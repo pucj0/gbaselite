@@ -21,16 +21,16 @@ import "context"
 //     must not consume a first-occurrence slot either.
 //   - First occurrence wins and output order is input order.
 //   - The winner's T is preserved exactly: Input and output are both Operator[T]. A caller
-//     therefore does not need to re-derive the candidate — no join replay, no ordinal
-//     replay, no lookup keyed on a rescan-vulnerable ledger.
+//     therefore does not need to re-derive the candidate — no join replay, no ordinal replay,
+//     no lookup keyed on a rescan-vulnerable ledger.
 //
-// Resource model: the operator owns no unbounded seen map over every candidate. The dedup
-// ledger is the shared bounded/spillable stable-dedup kernel, exactly like Distinct, so the
-// injected sorter decides how much is retained in memory and spills the rest. The winner
-// payloads are staged one entry per *distinct target*, not one per candidate, so a target
-// matched by a thousand join combinations occupies a single payload slot.
+// Resource model: the operator owns no unbounded seen map over every candidate, and it keeps
+// no payload side table either. The winner's payload travels through the sorter itself, so
+// the injected sorter either retains it in memory or writes it to a temporary run — a winner
+// whose payload spilled is decoded back from disk rather than recovered from a map. The dedup
+// ledger is the shared bounded/spillable stable-dedup kernel, exactly like Distinct.
 //
-// Ownership: the staged payload is retained past the input's Yield callback, so whoever
+// Ownership: the sorter retains the candidate past the input's Yield callback, so whoever
 // builds the candidate must hand over owned bytes. A candidate that borrows a scan buffer
 // must be cloned before it reaches this operator, exactly as for Sort and Distinct.
 //
@@ -45,38 +45,9 @@ type TargetRowDedup[T any] struct {
 	Identity func(T) (RowIdentity, bool)
 
 	// NewSort supplies the two sorters. byKey=true orders by identity key and then ordinal,
-	// byKey=false orders by ordinal alone.
-	NewSort func(byKey bool) (Sorter[TargetDedupRow[T]], error)
-}
-
-// TargetDedupRow is the retained form of one deduped candidate: the identity ledger key, the
-// input ordinal, and the candidate itself.
-//
-// It is what a caller's sorter receives. A sorter that must spill is responsible for
-// encoding Row into primitives it can persist; a sorter that keeps everything in memory can
-// simply retain the struct as it is.
-type TargetDedupRow[T any] struct {
-	Key     string
-	Ordinal uint64
-	Row     T
-}
-
-// ledgerOnlySorter exposes a TargetDedupRow sorter to the ledger-only kernel.
-//
-// The payload-preserving path does not route the payload through the sorter — the operator
-// stages the winner itself — so the kernel only needs the key and ordinal.
-type ledgerOnlySorter[T any] struct {
-	Sorter[TargetDedupRow[T]]
-}
-
-func (s ledgerOnlySorter[T]) Add(row dedupRow[string]) error {
-	return s.Sorter.Add(TargetDedupRow[T]{Key: row.Key, Ordinal: row.Ordinal})
-}
-
-func (s ledgerOnlySorter[T]) Finish(yield func(dedupRow[string]) error) error {
-	return s.Sorter.Finish(func(row TargetDedupRow[T]) error {
-		return yield(dedupRow[string]{Key: row.Key, Ordinal: row.Ordinal})
-	})
+	// byKey=false orders by ordinal alone. The sorter must round-trip Row[T]: it is the only
+	// place the winner's payload is kept, so a sorter that drops it drops the candidate.
+	NewSort func(byKey bool) (Sorter[SortRow[T]], error)
 }
 
 // keyedCandidate is an input candidate paired with its resolved ledger key. Resolving the
@@ -88,8 +59,9 @@ type keyedCandidate[T any] struct {
 }
 
 func (d TargetRowDedup[T]) Run(ctx context.Context, y Yield[T]) error {
-	// Resolve identity once per input row. A candidate that is not a target, or whose ledger key
-	// cannot be encoded, is dropped here (empty key) because neither may reach the write path.
+	// Resolve identity once per input row. A candidate that is not a target, or whose ledger
+	// key cannot be encoded, is dropped here (empty key) because neither may reach the write
+	// path.
 	keyed := Projection[T, keyedCandidate[T]]{Input: d.Input, Project: func(row T) (keyedCandidate[T], error) {
 		resolved, ok := d.Identity(row)
 		if !ok {
@@ -107,14 +79,40 @@ func (d TargetRowDedup[T]) Run(ctx context.Context, y Yield[T]) error {
 	identity := func(candidate keyedCandidate[T]) (string, error) {
 		return candidate.key, nil
 	}
-	newSort := func(byKey bool) (Sorter[dedupRow[string]], error) {
+	// The kernel's SortRow is the sorter's row type, so the payload travels through the sorter
+	// unchanged. There is no adapter to drop it and no side table to keep in step with the ledger:
+	// a spilled winner is decoded back from the run file.
+	newSort := func(byKey bool) (Sorter[SortRow[keyedCandidate[T]]], error) {
 		sorter, err := d.NewSort(byKey)
 		if err != nil {
 			return nil, err
 		}
-		return ledgerOnlySorter[T]{Sorter: sorter}, nil
+		return candidateSorter[T]{Sorter: sorter}, nil
 	}
-	return runPayloadDedup[keyedCandidate[T]](ctx, keyed, include, identity, newSort, func(survivor keyedCandidate[T]) error {
-		return y(survivor.row)
+	return dedup[keyedCandidate[T]](ctx, keyed, include, identity, newSort, func(survivor SortRow[keyedCandidate[T]]) error {
+		return y(survivor.Row.row)
+	})
+}
+
+// candidateSorter bridges the kernel's keyed row onto the caller's payload sorter.
+//
+// It moves the candidate in both directions and nothing else: the resolved ledger key is carried
+// through so the kernel can compare groups, and the payload is passed on untouched. It is a pure
+// transformation with no retained state, which is why it cannot lose a winner.
+type candidateSorter[T any] struct {
+	Sorter[SortRow[T]]
+}
+
+func (s candidateSorter[T]) Add(row SortRow[keyedCandidate[T]]) error {
+	return s.Sorter.Add(SortRow[T]{Key: row.Key, Ordinal: row.Ordinal, Row: row.Row.row})
+}
+
+func (s candidateSorter[T]) Finish(yield func(SortRow[keyedCandidate[T]]) error) error {
+	return s.Sorter.Finish(func(row SortRow[T]) error {
+		return yield(SortRow[keyedCandidate[T]]{
+			Key:     row.Key,
+			Ordinal: row.Ordinal,
+			Row:     keyedCandidate[T]{key: row.Key, row: row.Row},
+		})
 	})
 }

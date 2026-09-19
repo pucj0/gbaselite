@@ -110,6 +110,10 @@ func acquireQueryMutex(q *queryControl, mutex *sync.RWMutex, write bool) error {
 
 // A conservative estimate includes interface and slice headers plus immutable
 // variable-sized payloads. Sharing a string can make actual usage lower.
+//
+// A []byte value is charged its length: a spilled modify-pipeline candidate payload is carried
+// as []byte, so leaving it out would let a wide candidate sit inside a sorter's batch without
+// the budget noticing.
 func queryRowBytes(row []any) int64 {
 	n := int64(48 + 24*len(row))
 	for _, value := range row {

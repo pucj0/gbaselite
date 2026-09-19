@@ -23,7 +23,7 @@ type Distinct[T any] struct {
 }
 
 func (d Distinct[T]) Run(ctx context.Context, y Yield[T]) error {
-	newSort := func(byKey bool) (Sorter[dedupRow[T]], error) {
+	newSort := func(byKey bool) (Sorter[SortRow[T]], error) {
 		sorter, err := d.NewSort(byKey)
 		if err != nil {
 			return nil, err
@@ -32,23 +32,23 @@ func (d Distinct[T]) Run(ctx context.Context, y Yield[T]) error {
 	}
 	// Distinct only needs the surviving row; the kernel's ledger key and ordinal are its own
 	// bookkeeping.
-	return dedup[T](ctx, d.Input, nil, d.Key, newSort, func(survivor dedupRow[T]) error {
+	return dedup[T](ctx, d.Input, nil, d.Key, newSort, func(survivor SortRow[T]) error {
 		return y(survivor.Row)
 	})
 }
 
-// distinctSorter adapts the exported DistinctRow sorter contract onto the internal
-// kernel row type, so an existing Distinct caller keeps its own sorter unchanged.
+// distinctSorter adapts the exported DistinctRow sorter contract onto the kernel row type, so
+// an existing Distinct caller keeps its own sorter unchanged.
 type distinctSorter[T any] struct {
 	Sorter[DistinctRow[T]]
 }
 
-func (s distinctSorter[T]) Add(row dedupRow[T]) error {
+func (s distinctSorter[T]) Add(row SortRow[T]) error {
 	return s.Sorter.Add(DistinctRow[T]{Key: row.Key, Ordinal: row.Ordinal, Row: row.Row})
 }
 
-func (s distinctSorter[T]) Finish(yield func(dedupRow[T]) error) error {
+func (s distinctSorter[T]) Finish(yield func(SortRow[T]) error) error {
 	return s.Sorter.Finish(func(row DistinctRow[T]) error {
-		return yield(dedupRow[T]{Key: row.Key, Ordinal: row.Ordinal, Row: row.Row})
+		return yield(SortRow[T]{Key: row.Key, Ordinal: row.Ordinal, Row: row.Row})
 	})
 }

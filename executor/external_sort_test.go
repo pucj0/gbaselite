@@ -19,7 +19,7 @@ import (
 func TestLegacyExternalSortSpillStableAndCleanup(t *testing.T) {
 	directory := t.TempDir()
 	q := newQueryControl(context.Background(), QueryOptions{SortMemoryBytes: 64 << 10, TempDirectory: directory, MaxTempBytes: 16 << 20})
-	sorter, err := newExternalRowSorter(q, func(a, b []any) int { return int(a[0].(int64) - b[0].(int64)) })
+	sorter, err := newExternalRowSorter(q, nil, func(a, b []any) int { return int(a[0].(int64) - b[0].(int64)) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestLegacyExternalSortCancellationAndDiskLimitCleanup(t *testing.T) {
 			if kind == "disk" {
 				options.MaxTempBytes = 100
 			}
-			sorter, err := newExternalRowSorter(newQueryControl(ctx, options), func(a, b []any) int { return int(a[0].(int64) - b[0].(int64)) })
+			sorter, err := newExternalRowSorter(newQueryControl(ctx, options), nil, func(a, b []any) int { return int(a[0].(int64) - b[0].(int64)) })
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -143,7 +143,7 @@ func TestLegacyExternalSortCancellationAndDiskLimitCleanup(t *testing.T) {
 }
 
 func TestLegacyExternalSortRejectsWideRowsAndCorruptLengths(t *testing.T) {
-	sorter, err := newExternalRowSorter(newQueryControl(nil, QueryOptions{SortMemoryBytes: 64 << 10, TempDirectory: t.TempDir()}), func(a, b []any) int { return 0 })
+	sorter, err := newExternalRowSorter(newQueryControl(nil, QueryOptions{SortMemoryBytes: 64 << 10, TempDirectory: t.TempDir()}), nil, func(a, b []any) int { return 0 })
 	if err != nil {
 		t.Fatal(err)
 	}

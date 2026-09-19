@@ -2,10 +2,13 @@ package physical
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -55,20 +58,20 @@ type boundedDedupSorter struct {
 	byKey       bool
 	maxRetained int
 	closed      *int
-	batch       []TargetDedupRow[dedupCandidate]
-	runs        [][]TargetDedupRow[dedupCandidate]
+	batch       []SortRow[dedupCandidate]
+	runs        [][]SortRow[dedupCandidate]
 	files       []string
 	closeErr    error
 }
 
-func (s *boundedDedupSorter) less(a, b TargetDedupRow[dedupCandidate]) bool {
+func (s *boundedDedupSorter) less(a, b SortRow[dedupCandidate]) bool {
 	if s.byKey && a.Key != b.Key {
 		return a.Key < b.Key
 	}
 	return a.Ordinal < b.Ordinal
 }
 
-func (s *boundedDedupSorter) Add(row TargetDedupRow[dedupCandidate]) error {
+func (s *boundedDedupSorter) Add(row SortRow[dedupCandidate]) error {
 	s.batch = append(s.batch, row)
 	if len(s.batch) <= s.maxRetained {
 		return nil
@@ -87,12 +90,12 @@ func (s *boundedDedupSorter) Add(row TargetDedupRow[dedupCandidate]) error {
 		return err
 	}
 	s.files = append(s.files, file.Name())
-	s.runs = append(s.runs, append([]TargetDedupRow[dedupCandidate](nil), s.batch...))
+	s.runs = append(s.runs, append([]SortRow[dedupCandidate](nil), s.batch...))
 	s.batch = nil
 	return nil
 }
 
-func (s *boundedDedupSorter) Finish(yield func(TargetDedupRow[dedupCandidate]) error) error {
+func (s *boundedDedupSorter) Finish(yield func(SortRow[dedupCandidate]) error) error {
 	if len(s.runs) == 0 {
 		sort.SliceStable(s.batch, func(i, j int) bool { return s.less(s.batch[i], s.batch[j]) })
 		for _, row := range s.batch {
@@ -102,7 +105,7 @@ func (s *boundedDedupSorter) Finish(yield func(TargetDedupRow[dedupCandidate]) e
 		}
 		return nil
 	}
-	merged := make([]TargetDedupRow[dedupCandidate], 0, len(s.runs)*s.maxRetained)
+	merged := make([]SortRow[dedupCandidate], 0, len(s.runs)*s.maxRetained)
 	for _, run := range s.runs {
 		merged = append(merged, run...)
 	}
@@ -161,7 +164,7 @@ func newDedupHarness(t *testing.T, maxRetained int, input Operator[dedupCandidat
 
 // newSort fails only when factoryFailOn asks it to, so a test can choose which of
 // the two sorter constructions fails and still observe the other one's cleanup.
-func (h *dedupHarness) newSort(byKey bool) (Sorter[TargetDedupRow[dedupCandidate]], error) {
+func (h *dedupHarness) newSort(byKey bool) (Sorter[SortRow[dedupCandidate]], error) {
 	h.newSortCalls++
 	if h.factoryFail != nil && h.factoryFailOn == byKey {
 		return nil, h.factoryFail
@@ -401,43 +404,75 @@ func TestTargetRowDedupWithoutTargetsProducesNoMutation(t *testing.T) {
 	}
 }
 
-// --- Goal B: payload preservation ------------------------------------------------
+// --- payload round-trip through a spilling sorter ---------------------------------
 
-// payloadDroppingSorter is a sorter that keeps only the ledger (key and ordinal) and discards
-// the candidate payload, spilling across several private run files. It models a sorter that
-// cannot encode an arbitrary candidate, which is exactly the situation the payload-preserving
-// contract must survive: the operator has to return the winner's payload regardless.
-type payloadDroppingSorter struct {
+// discardingDedupSorter is a bounded sorter that really persists the candidate payload and really
+// drops it from memory when it spills.
+//
+// It is the round-trip contract in test form: Add encodes the payload into a run file and keeps
+// only the ledger in memory, Finish reads the payload back off disk, and Close removes every run.
+// The production external sorter is this same shape — it cannot hold an arbitrary candidate in
+// memory, so the payload has to be written out — which is why the operator must depend on the
+// sorter to carry the candidate rather than on any in-memory staging of its own.
+type discardingDedupSorter struct {
 	directory   string
 	byKey       bool
 	maxRetained int
-	closed      *int
-	ledger      []TargetDedupRow[dedupCandidate]
-	files       []string
+	ledger      []SortRow[dedupCandidate]
+	// spilled records every run file written, so a test can re-read it and prove the payload
+	// really left memory.
+	spilled []string
+	files   []string
+	closed  *int
 }
 
-func (s *payloadDroppingSorter) less(a, b TargetDedupRow[dedupCandidate]) bool {
+func (s *discardingDedupSorter) less(a, b SortRow[dedupCandidate]) bool {
 	if s.byKey && a.Key != b.Key {
 		return a.Key < b.Key
 	}
 	return a.Ordinal < b.Ordinal
 }
 
-func (s *payloadDroppingSorter) Add(row TargetDedupRow[dedupCandidate]) error {
-	// Deliberately drop row.Row: only the ledger is retained, which is what makes this sorter
-	// unable to return a payload.
-	s.ledger = append(s.ledger, TargetDedupRow[dedupCandidate]{Key: row.Key, Ordinal: row.Ordinal})
+// encodeMarker is this test's payload codec. The production codec is the executor's
+// temporary-payload codec; a marker is enough to tell one winner from another and to prove that the
+// exact winning candidate survived the round trip. The ledger key is base64-encoded because it is
+// arbitrary bytes — a dedup key may contain a newline — while the run file is line-oriented.
+func encodeMarker(row SortRow[dedupCandidate]) string {
+	return fmt.Sprintf("%d\x1f%s\x1f%s\x1f%s", row.Ordinal, base64.StdEncoding.EncodeToString([]byte(row.Key)), row.Row.tableID, row.Row.marker)
+}
+
+func decodeMarker(line string) SortRow[dedupCandidate] {
+	parts := strings.Split(line, "\x1f")
+	if len(parts) != 4 {
+		panic("malformed marker row: " + line)
+	}
+	ordinal, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		panic(err)
+	}
+	key, err := base64.StdEncoding.DecodeString(parts[1])
+	if err != nil {
+		panic(err)
+	}
+	return SortRow[dedupCandidate]{
+		Key:     string(key),
+		Ordinal: ordinal,
+		Row:     dedupCandidate{tableID: parts[2], marker: parts[3]},
+	}
+}
+
+func (s *discardingDedupSorter) Add(row SortRow[dedupCandidate]) error {
+	s.ledger = append(s.ledger, row)
 	if len(s.ledger) <= s.maxRetained {
 		return nil
 	}
-	// Spill a copy of the current ledger into a private run file, so the operator is exercised
-	// against a sorter that really does own temporary resources.
-	file, err := os.CreateTemp(s.directory, "ledger-*.run")
+	// Persist the batch and forget it: from here on the payload exists only in the run file.
+	file, err := os.CreateTemp(s.directory, "payload-*.run")
 	if err != nil {
 		return err
 	}
-	for _, spilled := range s.ledger {
-		if _, err := fmt.Fprintf(file, "%s\x00%d\n", spilled.Key, spilled.Ordinal); err != nil {
+	for _, retained := range s.ledger {
+		if _, err := fmt.Fprintln(file, encodeMarker(retained)); err != nil {
 			file.Close()
 			return err
 		}
@@ -445,54 +480,74 @@ func (s *payloadDroppingSorter) Add(row TargetDedupRow[dedupCandidate]) error {
 	if err := file.Close(); err != nil {
 		return err
 	}
+	s.spilled = append(s.spilled, file.Name())
 	s.files = append(s.files, file.Name())
+	s.ledger = nil
 	return nil
 }
 
-func (s *payloadDroppingSorter) Finish(yield func(TargetDedupRow[dedupCandidate]) error) error {
-	sort.SliceStable(s.ledger, func(i, j int) bool { return s.less(s.ledger[i], s.ledger[j]) })
-	for _, row := range s.ledger {
-		// The payload is gone; only the ledger survives the round trip.
-		if err := yield(TargetDedupRow[dedupCandidate]{Key: row.Key, Ordinal: row.Ordinal}); err != nil {
+func (s *discardingDedupSorter) Finish(yield func(SortRow[dedupCandidate]) error) error {
+	rows := make([]SortRow[dedupCandidate], 0, len(s.ledger))
+	for _, path := range s.spilled {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+			if line == "" {
+				continue
+			}
+			rows = append(rows, decodeMarker(line))
+		}
+	}
+	// Whatever is still retained never reached disk; merge it with what came back off disk.
+	rows = append(rows, s.ledger...)
+	sort.SliceStable(rows, func(i, j int) bool { return s.less(rows[i], rows[j]) })
+	for _, row := range rows {
+		if err := yield(row); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *payloadDroppingSorter) Close() error {
+func (s *discardingDedupSorter) Close() error {
 	*s.closed++
+	var first error
 	for _, path := range s.files {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && first == nil {
+			first = err
 		}
 	}
 	s.files = nil
-	return nil
+	return first
 }
 
-// TestTargetRowDedupPreservesPayloadWhenSorterCannot verifies the operator returns each
-// winner's payload even when the injected sorter can only persist the dedup ledger.
-func TestTargetRowDedupPreservesPayloadWhenSorterCannot(t *testing.T) {
+// TestTargetRowDedupReturnsWinnerPayloadAfterSpill drives the operator through a sorter that drops
+// the payload from memory on every spill, so a winner's candidate can only come back if the sorter
+// round-tripped it through a run file.
+func TestTargetRowDedupReturnsWinnerPayloadAfterSpill(t *testing.T) {
 	directory := t.TempDir()
 	closed := 0
-	input := candidates(
-		dedupCandidate{"t1", []byte{0x01}, "winner-1"},
-		dedupCandidate{"t2", []byte{0x01}, "winner-2"},
-		dedupCandidate{"t1", []byte{0x01}, "loser"},
-		dedupCandidate{"t1", []byte{0x02}, "winner-3"},
-	)
+	// Ten distinct targets, each matched four times, in an order that is not sorted, so each
+	// target's winner is its first occurrence rather than its lowest key.
+	rows := make([]dedupCandidate, 0, 40)
+	for i := 0; i < 40; i++ {
+		key := byte(i % 10)
+		rows = append(rows, dedupCandidate{"t1", []byte{key}, fmt.Sprintf("r%02d", i)})
+	}
 	op := TargetRowDedup[dedupCandidate]{
-		Input:    input,
+		Input:    candidates(rows...),
 		Identity: func(row dedupCandidate) (RowIdentity, bool) { return row.identity() },
-		NewSort: func(byKey bool) (Sorter[TargetDedupRow[dedupCandidate]], error) {
-			return &payloadDroppingSorter{directory: directory, byKey: byKey, maxRetained: 1, closed: &closed}, nil
+		NewSort: func(byKey bool) (Sorter[SortRow[dedupCandidate]], error) {
+			// maxRetained 3 forces a spill every few rows, so most payloads reach the run file.
+			return &discardingDedupSorter{directory: directory, byKey: byKey, maxRetained: 3, closed: &closed}, nil
 		},
 	}
 	got := collectedMarkers(t, op)
-	want := []string{"winner-1", "winner-2", "winner-3"}
+	want := []string{"r00", "r01", "r02", "r03", "r04", "r05", "r06", "r07", "r08", "r09"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("payload-preserving dedup = %v, want %v", got, want)
+		t.Fatalf("payload after spill = %v, want %v", got, want)
 	}
 	if closed != 2 {
 		t.Fatalf("closed sorters = %d, want 2", closed)
@@ -506,39 +561,38 @@ func TestTargetRowDedupPreservesPayloadWhenSorterCannot(t *testing.T) {
 	}
 }
 
-// TestTargetRowDedupPayloadIsOwnedAcrossRuns verifies the operator does not retain the input
-// buffer: a second run over cloned candidates must produce the same payloads.
-func TestTargetRowDedupPayloadIsOwnedAcrossRuns(t *testing.T) {
+// TestTargetRowDedupSpillsWhenEveryTargetIsDistinct is the all-distinct boundary: with no key ever
+// repeating, every candidate is a winner, so the result is as large as the input and cannot depend
+// on the ledger collapsing rows.
+func TestTargetRowDedupSpillsWhenEveryTargetIsDistinct(t *testing.T) {
+	const rows = 64
 	directory := t.TempDir()
 	closed := 0
-	build := func() Operator[dedupCandidate] {
-		rows := []dedupCandidate{
-			{"t1", []byte{0x01}, "first"},
-			{"t1", []byte{0x01}, "second"},
-			{"t2", []byte{0x03}, "third"},
-		}
-		return Source[dedupCandidate](func(_ context.Context, yield Yield[dedupCandidate]) error {
-			for _, row := range rows {
-				if err := yield(row); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
+	input := make([]dedupCandidate, 0, rows)
+	want := make([]string, 0, rows)
+	for i := 0; i < rows; i++ {
+		marker := fmt.Sprintf("unique-%03d", i)
+		input = append(input, dedupCandidate{"t1", []byte{byte(i), byte(i >> 8)}, marker})
+		want = append(want, marker)
 	}
-	for run := 0; run < 2; run++ {
-		op := TargetRowDedup[dedupCandidate]{
-			Input:    build(),
-			Identity: func(row dedupCandidate) (RowIdentity, bool) { return row.identity() },
-			NewSort: func(byKey bool) (Sorter[TargetDedupRow[dedupCandidate]], error) {
-				return &payloadDroppingSorter{directory: directory, byKey: byKey, maxRetained: 8, closed: &closed}, nil
-			},
-		}
-		if got := collectedMarkers(t, op); fmt.Sprint(got) != fmt.Sprint([]string{"first", "third"}) {
-			t.Fatalf("run %d = %v", run, got)
-		}
+	op := TargetRowDedup[dedupCandidate]{
+		Input:    candidates(input...),
+		Identity: func(row dedupCandidate) (RowIdentity, bool) { return row.identity() },
+		NewSort: func(byKey bool) (Sorter[SortRow[dedupCandidate]], error) {
+			return &discardingDedupSorter{directory: directory, byKey: byKey, maxRetained: 2, closed: &closed}, nil
+		},
 	}
-	if closed != 4 {
-		t.Fatalf("closed sorters = %d, want 4", closed)
+	if got := collectedMarkers(t, op); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("all-distinct payloads = %v (%d entries), want %d", got, len(got), len(want))
+	}
+	if closed != 2 {
+		t.Fatalf("closed sorters = %d, want 2", closed)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temporary files leaked: %v", entries)
 	}
 }

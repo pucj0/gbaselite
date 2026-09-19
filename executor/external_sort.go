@@ -30,10 +30,19 @@ type externalSortRun struct {
 // externalRowSorter retains a bounded batch and merges private temporary runs.
 // Finish yields sorted rows incrementally. Call Close even after Add fails.
 // Payload strings are immutable; Add copies the row header and byte slices.
+//
+// memory is this sorter's own ceiling for the bytes it retains, and budget is the statement's
+// shared sort-memory pool: a sorter spills as soon as either its own ceiling or the shared pool
+// would be exceeded. The pool is what keeps two concurrently live sorters from retaining twice
+// the configured sort memory, and every sorter on a statement shares the statement's single
+// temporary-file budget through control.
 type externalRowSorter struct {
 	control    *queryControl
+	budget     *sorterBudget
 	compare    func([]any, []any) int
 	memory     int64
+	held       int64
+	released   bool
 	batchBytes int64
 	next       uint64
 	batch      []externalSortRow
@@ -43,15 +52,49 @@ type externalRowSorter struct {
 	closed     bool
 }
 
-func newExternalRowSorter(q *queryControl, compare func([]any, []any) int) (*externalRowSorter, error) {
+func newExternalRowSorter(q *queryControl, budget *sorterBudget, compare func([]any, []any) int) (*externalRowSorter, error) {
 	memory := int64(4 << 20)
 	if q != nil && q.options.SortMemoryBytes > 0 {
 		memory = q.options.SortMemoryBytes
 	}
+	if budget != nil {
+		memory = budget.total
+	}
 	if memory < 64<<10 {
 		return nil, fmt.Errorf("%w: sort memory must be at least 65536 bytes", ErrQueryResourceLimit)
 	}
-	return &externalRowSorter{control: q, compare: compare, memory: memory, files: make(map[string]int64)}, nil
+	if budget != nil && memory > budget.total {
+		memory = budget.total
+	}
+	return &externalRowSorter{control: q, budget: budget, compare: compare, memory: memory, files: make(map[string]int64)}, nil
+}
+
+// rowLimit is the largest single row this sorter will retain or read back. It is a fraction of
+// the budget so that neither a batch nor the merge heads can be swamped by one row.
+func (s *externalRowSorter) rowLimit() int64 {
+	limit := s.memory / 16
+	if s.budget != nil {
+		if budgetLimit := s.budget.rowLimit(); budgetLimit < limit {
+			limit = budgetLimit
+		}
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
+}
+
+// release gives the shared pool back everything this sorter still holds. Close calls it, so an
+// error path returns the bytes a sorter was accounting for.
+func (s *externalRowSorter) release() {
+	if s.released {
+		return
+	}
+	s.released = true
+	if s.budget != nil && s.held > 0 {
+		s.budget.release(s.held)
+	}
+	s.held = 0
 }
 
 func (s *externalRowSorter) less(a, b externalSortRow) bool {
@@ -59,6 +102,13 @@ func (s *externalRowSorter) less(a, b externalSortRow) bool {
 	return cmp < 0 || cmp == 0 && a.ordinal < b.ordinal
 }
 
+// Add retains one row.
+//
+// The width limit is checked against the row's *serialized* size rather than an estimate of its
+// memory footprint: a row that is written to a run and cannot be read back inside the same limit
+// would corrupt the merge, so an over-wide candidate is refused here, before it is allocated,
+// with ErrQueryResourceLimit. Nothing about a modify pipeline may route around that by adding
+// memory the budget does not account for.
 func (s *externalRowSorter) Add(values []any) error {
 	if s.closed {
 		return errors.New("external sorter is closed")
@@ -66,16 +116,27 @@ func (s *externalRowSorter) Add(values []any) error {
 	if err := s.control.check(); err != nil {
 		return err
 	}
-	size := queryRowBytes(values) + 32
-	// Reserving space for eight merge heads keeps very wide rows from evading
-	// the budget. Reject them explicitly instead of allocating an unbounded run.
-	if size > s.memory/16 {
-		return fmt.Errorf("%w: sort row requires %d bytes, maximum is %d; raise sort_memory_mb or reduce selected columns", ErrQueryResourceLimit, size, s.memory/16)
+	width := serializedRowBytes(values)
+	limit := s.rowLimit()
+	if width > limit {
+		return fmt.Errorf("%w: sort row requires %d bytes, maximum is %d; raise sort_memory_mb or reduce the rows this statement retains", ErrQueryResourceLimit, width, limit)
 	}
+	size := queryRowBytes(values) + 32
 	if s.batchBytes+size > s.memory/2 && len(s.batch) > 0 {
 		if err := s.flush(); err != nil {
 			return err
 		}
+	}
+	// Reserve from the statement's shared pool. One byte is always granted so an otherwise
+	// saturated pool still makes progress by spilling rather than deadlocking.
+	requested := size
+	if s.budget != nil {
+		granted, ok := s.budget.reserve(requested)
+		if !ok {
+			return fmt.Errorf("%w: sort memory budget exhausted", ErrQueryResourceLimit)
+		}
+		requested = granted
+		s.held += granted
 	}
 	owned := append([]any(nil), values...)
 	for i, value := range owned {
@@ -85,7 +146,7 @@ func (s *externalRowSorter) Add(values []any) error {
 	}
 	s.batch = append(s.batch, externalSortRow{owned, s.next})
 	s.next++
-	s.batchBytes += size
+	s.batchBytes += requested
 	return nil
 }
 
@@ -174,13 +235,24 @@ func (s *externalRowSorter) flush() error {
 		return err
 	}
 	s.runs = append(s.runs, externalSortRun{file.Name(), s.files[file.Name()]})
-	clear(s.batch)
-	s.batch = nil
-	s.batchBytes = 0
+	// The batch moved to disk: hand its bytes back to the shared pool so a later sorter on the
+	// same statement may retain them.
+	s.releaseBatch()
 	if len(s.runs) >= externalSortMaxRuns {
 		return s.compact()
 	}
 	return nil
+}
+
+// releaseBatch drops the retained batch and returns its accounting to the shared pool.
+func (s *externalRowSorter) releaseBatch() {
+	if s.budget != nil && s.held > 0 {
+		s.budget.release(s.held)
+	}
+	s.held = 0
+	clear(s.batch)
+	s.batch = nil
+	s.batchBytes = 0
 }
 
 func (s *externalRowSorter) removeRun(run externalSortRun) error {
@@ -267,6 +339,66 @@ func (s *externalRowSorter) Finish(yield func([]any) error) (err error) {
 	return s.merge(s.runs, func(row externalSortRow) error { return yield(row.values) })
 }
 
+// mergeToSingleRun materialises the sorted stream into exactly one run file, without yielding it.
+//
+// It exists for a pipeline that has to walk the same sorted stream more than once — the
+// multi-table DELETE reorders its winners children-first and then drains them one target at a time.
+// Materialising keeps that stream bounded: the rows live in a private run file rather than a slice,
+// and merging never holds more than externalSortFanIn heads at once. The run is removed by Close,
+// exactly like any other run this sorter owns.
+func (s *externalRowSorter) mergeToSingleRun() error {
+	if s.closed {
+		return errors.New("external sorter is closed")
+	}
+	if err := s.flush(); err != nil {
+		return err
+	}
+	for len(s.runs) > 1 {
+		if err := s.compact(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readSingleRun streams the one materialised run back, one row at a time.
+//
+// The reading goroutine holds at most a few decode buffers, so a caller can feed a write phase that
+// must not keep the rows in memory.
+func (s *externalRowSorter) readSingleRun(yield func([]any) error) error {
+	if len(s.runs) == 0 {
+		return nil
+	}
+	if len(s.runs) > 1 {
+		return errors.New("external sorter has more than one run to read")
+	}
+	file, err := os.Open(s.runs[0].path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	reader := bufio.NewReaderSize(file, 4096)
+	headLimit := s.memory / externalSortFanIn
+	if budgetLimit := s.rowLimit(); budgetLimit < headLimit {
+		headLimit = budgetLimit
+	}
+	for {
+		if err := s.control.check(); err != nil {
+			return err
+		}
+		row, err := readSortRow(reader, headLimit)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := yield(row.values); err != nil {
+			return err
+		}
+	}
+}
+
 // Close removes only paths created by this sorter. Interrupted/error paths use
 // the same cleanup; no shared temporary directory is ever recursively removed.
 func (s *externalRowSorter) Close() error {
@@ -279,8 +411,8 @@ func (s *externalRowSorter) Close() error {
 			first = err
 		}
 	}
-	clear(s.batch)
-	s.batch = nil
+	s.releaseBatch()
+	s.release()
 	s.runs = nil
 	s.closed = first == nil
 	return first
@@ -307,6 +439,13 @@ func (h *sortMergeHeap) Pop() any {
 	return v
 }
 func (s *externalRowSorter) merge(runs []externalSortRun, yield func(externalSortRow) error) error {
+	// Every merge head is retained at once, so the sum has to stay inside the sorter's own
+	// ceiling: one wide row must not let the heads together exceed the memory this sorter is
+	// allowed to hold.
+	headLimit := s.memory / externalSortFanIn
+	if budgetLimit := s.rowLimit(); budgetLimit < headLimit {
+		headLimit = budgetLimit
+	}
 	files := make([]*os.File, 0, len(runs))
 	defer func() {
 		for _, file := range files {
@@ -323,7 +462,7 @@ func (s *externalRowSorter) merge(runs []externalSortRun, yield func(externalSor
 		files = append(files, file)
 		reader := bufio.NewReaderSize(file, 4096)
 		readers = append(readers, reader)
-		row, err := readSortRow(reader, s.memory/16)
+		row, err := readSortRow(reader, headLimit)
 		if err == io.EOF {
 			continue
 		}
@@ -340,7 +479,7 @@ func (s *externalRowSorter) merge(runs []externalSortRun, yield func(externalSor
 		if err := yield(head.row); err != nil {
 			return err
 		}
-		row, err := readSortRow(readers[head.source], s.memory/16)
+		row, err := readSortRow(readers[head.source], headLimit)
 		if err == io.EOF {
 			continue
 		}
@@ -369,6 +508,38 @@ func writeSortText(w io.Writer, text string) error {
 	}
 	_, err := io.WriteString(w, text)
 	return err
+}
+
+// serializedRowBytes is the exact number of bytes writeSortRow produces for a row: the ordinal
+// and count headers plus one tag and payload per cell. It is the basis for the sorter's per-row
+// width limit, because a row that cannot be read back inside a row limit must be refused before
+// it is allocated rather than written and then rejected by the merge reader.
+func serializedRowBytes(row []any) int64 {
+	size := int64(16)
+	for _, value := range row {
+		switch v := value.(type) {
+		case nil:
+			size++
+		case string:
+			size += 9 + int64(len(v))
+		case jsonDocument:
+			size += 9 + int64(len(v))
+		case []byte:
+			size += 9 + int64(len(v))
+		case storage.Decimal:
+			size += 9 + int64(len(v))
+		case collatedText:
+			size += 1 + 8 + int64(len(v.Text)) + 8 + int64(len(v.Collation))
+		case time.Time:
+			// MarshalBinary writes a version byte, seconds, nanoseconds and a zone offset.
+			size += 22
+		default:
+			// Every scalar shape writeSortRow accepts is a tag plus eight bytes; an unsupported
+			// shape is reported by writeSortRow itself.
+			size += 9
+		}
+	}
+	return size
 }
 func writeSortRow(w io.Writer, row externalSortRow) error {
 	if err := writeSortUint(w, row.ordinal); err != nil {

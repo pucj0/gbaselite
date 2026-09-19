@@ -7,49 +7,57 @@ import (
 	"gbaselite/physical"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
-	"strings"
 )
 
-// This file owns the UPDATE JOIN mutation. It replaces the previous per-target nested
-// join, which re-ran a join for every candidate target and wrote the physical row
-// itself, with one pipeline:
+// This file owns the UPDATE JOIN mutation:
 //
 //	JOIN
 //	 -> WHERE
-//	 -> UpdateCandidate
-//	 -> TargetRowDedup
+//	 -> self-contained UpdateCandidate
+//	 -> TargetRowDedup (ledger and payload both spillable)
 //	 -> LIMIT
 //	 -> UpdateOperator
 //
-// Three details of that pipeline are worth stating explicitly.
+// The join runs exactly once. Each joined row that satisfies WHERE is turned into a complete
+// UpdateCandidate while the row is in hand — target identity, the target's own old row, and the
+// full joined evaluation row — and that candidate then travels through dedup and the write path
+// itself. Nothing re-runs the join, replays an ordinal, or looks a winner up in a ledger, so
+// there is no second pass that could observe different rows than the first.
 //
-// First, LIMIT sits *after* dedup: LIMIT counts the distinct target rows the statement
-// mutates, not the number of joined rows the source produced, so a target matched by
-// three source rows consumes one unit of the limit.
+// Two details of the pipeline are worth stating explicitly.
 //
-// Second, dedup runs over identities alone. A candidate stages its target identity plus
-// its position in the join output, so TargetRowDedup's bounded/spillable ledger never has
-// to encode a storage row. The join is then re-run and the winning positions select the
-// rows to update. Both passes read the same parent statement snapshot, so they observe
-// identical rows in identical order.
+// First, LIMIT sits *after* dedup: LIMIT counts the distinct target rows the statement mutates,
+// not the number of joined rows the source produced, so a target matched by three source rows
+// consumes one unit of the limit.
 //
-// Third, the target stays the driving side of the join (chainJoinInputs' targetDriven
-// mode), so a target matched by several source rows is visited once per matching join row
-// and never once per target.
+// Second, dedup carries payloads. A target matched by a thousand join combinations occupies one
+// entry in the sorter, and if that entry spills to a run file the candidate is decoded back from
+// disk — there is no in-memory table of winners keyed on target identity, so neither the ledger
+// nor the staging grows with the join's cardinality.
+//
+// The target stays the driving side of the join (chainJoinInputs' targetDriven mode), so a target
+// matched by several source rows is visited once per matching join row and never once per target.
 
 // updateJoinCandidate is one joined row proposed as an UPDATE target.
 //
-// It carries only what dedup needs: the target's physical identity and the row's position
-// in the join output. The joined row itself is re-read in the second pass rather than
-// retained, which is also what keeps the dedup ledger free of row payloads.
+// It is self-contained: everything the write needs is captured here, while the joined row is
+// still in hand. Identity is the target's *old* physical identity, OldRow is the target's own old
+// row, and EvalRow is the whole joined row, which is what a SET expression is evaluated against.
 type updateJoinCandidate struct {
-	identity RowIdentity
-	ordinal  uint64
+	// Ordinal is the candidate's position in the join output. Dedup uses it to keep the first
+	// occurrence and to restore source order.
+	Ordinal uint64
+	// Identity is the target's old physical identity: table identifier plus the storage key the
+	// scan observed for exactly this row.
+	Identity RowIdentity
+	// OldRow holds the target table's own columns.
+	OldRow storage.Row
+	// EvalRow holds the full joined row, so an assignment may read both the target and the
+	// joined source.
+	EvalRow storage.Row
 }
 
-// updateJoinPlan is the reusable join stage of the UPDATE JOIN pipeline. It is built once
-// and run twice: first to choose which target rows the statement updates, then to
-// materialise the chosen rows for the write.
+// updateJoinPlan is the join stage of the UPDATE JOIN pipeline.
 type updateJoinPlan struct {
 	inputs     []joinInput
 	combined   *storage.Table
@@ -60,27 +68,38 @@ type updateJoinPlan struct {
 	identityAt int
 	// provenanceAt is the position of the hidden storage-key column inside the joined row.
 	provenanceAt int
+	// targetCount is the number of the target's own columns, which is the prefix of the joined row.
+	targetCount int
+	// limit is the statement's LIMIT, or -1 for unlimited. It is applied after dedup.
+	limit int
+	// budget is the one sort-memory pool every sorter of this statement draws from, so the
+	// statement's peak retained sort memory is the configured budget rather than a multiple.
+	budget *sorterBudget
 }
 
-// errUpdateJoinNoIdentity reports a target whose physical identity the join could not
-// observe. A base-table target always has one, so this is a binding guard rather than an
-// expected runtime condition.
+// errUpdateJoinNoIdentity reports a target whose physical identity the join could not observe. A
+// base-table target always has one, so this is a binding guard rather than an expected runtime
+// condition.
 var errUpdateJoinNoIdentity = errors.New("UPDATE JOIN target has no physical identity")
+
+// updateJoinBuildHook, when non-nil, observes every UPDATE JOIN pipeline binding. The pipeline binds
+// and runs the join exactly once per statement, so a test can assert that the join is not replayed
+// to recover candidate payloads. Nil in production, so it costs nothing there.
+var updateJoinBuildHook func(plan *updateJoinPlan)
 
 // bindUpdateJoinPlan binds the join chain of an UPDATE ... JOIN statement.
 //
-// It uses the identified binding, so every joined base table carries the hidden storage
-// row key its scan observed. That is the same provenance a multi-table DELETE relies on,
-// and it is what gives the target a physical identity that also works for a target
-// without a primary key.
+// It uses the identified binding, so every joined base table carries the hidden storage row key
+// its scan observed. That is the same provenance a multi-table DELETE relies on, and it is what
+// gives the target a physical identity that also works for a target without a primary key.
 func bindUpdateJoinPlan(ctx context.Context, read storageengine.Txn, session *Session, statement parser.Update, table versionedTable, schema *storage.Table, limit int) (updateJoinPlan, []updateAssignment, error) {
-	plan := updateJoinPlan{session: session, table: table}
+	plan := updateJoinPlan{session: session, table: table, limit: limit}
 	inputs, err := bindJoinsIdentified(read, session, parser.Select{Table: statement.Table, TableAlias: statement.TableAlias, Joins: statement.Joins})
 	if err != nil {
 		return plan, nil, err
 	}
-	// identityKeys is populated while the join scans, so only the identity column's
-	// presence is checked here; the target's keys are resolved per row during the passes.
+	// identityKeys is populated while the join scans, so only the identity column's presence is
+	// checked here; the target's keys are resolved per row.
 	if len(inputs) == 0 || inputs[0].identityColumn == "" {
 		return plan, nil, errUpdateJoinNoIdentity
 	}
@@ -94,6 +113,10 @@ func bindUpdateJoinPlan(ctx context.Context, read storageengine.Txn, session *Se
 	if len(inputs[0].schema.ColumnsView()) < len(targetColumns) {
 		return plan, nil, errUpdateJoinNoIdentity
 	}
+	// The target's own columns are the prefix of the joined row, so the target row width is the
+	// target authority's width. The inputs' own schemas also carry the hidden provenance columns, so
+	// they cannot be used to derive it.
+	plan.targetCount = len(targetColumns)
 	// The target is the driving input, so its columns are the prefix of the joined row and the two
 	// hidden provenance columns follow them: the identity marker and then the physical storage
 	// key. This is the same layout arithmetic the multi-table DELETE target resolution uses.
@@ -108,12 +131,18 @@ func bindUpdateJoinPlan(ctx context.Context, read storageengine.Txn, session *Se
 	if err != nil {
 		return plan, nil, err
 	}
-	// The driver reuses the statement's access plan, so an indexed UPDATE JOIN still
-	// probes an index instead of scanning the target table. It is an identity scan, so the
-	// hidden identity column the identified binding defined for the target is part of the
-	// joined row and every target row carries the storage key its scan observed.
+	// The driver reuses the statement's access plan, so an indexed UPDATE JOIN still probes an
+	// index instead of scanning the target table. It is an identity scan, so the hidden identity
+	// column the identified binding defined for the target is part of the joined row and every
+	// target row carries the storage key its scan observed.
 	driver := identityScan(read, &inputs[0], planSQLAccess(parser.Select{Where: statement.Where}, table, schema, session), session)
 	plan.rows = chainJoinInputs(read, session, inputs, driver, true)
+	if session != nil && session.query != nil {
+		plan.budget = newSorterBudget(session.query.options.SortMemoryBytes)
+	}
+	if updateJoinBuildHook != nil {
+		updateJoinBuildHook(&plan)
+	}
 	return plan, assignments, nil
 }
 
@@ -152,139 +181,74 @@ func (p updateJoinPlan) identity(row storage.Row) RowIdentity {
 	return RowIdentity{TableID: p.table.ID, Key: key, Valid: true}
 }
 
-// winners runs the join once, dedups target identities with TargetRowDedup (bounded and
-// spillable, never an unbounded seen map) and applies LIMIT after dedup.
+// candidates turns every joined row that satisfies WHERE into a complete UpdateCandidate.
 //
-// The result is the set of join-output positions the statement updates. First occurrence
-// wins, so a target matched by several source rows is updated once, with the first
-// matching source row supplying the assignment values.
-func (p updateJoinPlan) winners(ctx context.Context, limit int) (map[uint64]struct{}, error) {
-	var ordinal uint64
-	dedup := physical.TargetRowDedup[updateJoinCandidate]{
-		Input: physical.Projection[storage.Row, updateJoinCandidate]{Input: p.matched(), Project: func(row storage.Row) (updateJoinCandidate, error) {
-			position := ordinal
-			ordinal++
-			return updateJoinCandidate{identity: p.identity(row), ordinal: position}, nil
-		}},
-		Identity: func(candidate updateJoinCandidate) (RowIdentity, bool) {
-			return candidate.identity, true
-		},
-		NewSort: func(byKey bool) (physical.Sorter[physical.TargetDedupRow[updateJoinCandidate]], error) {
-			return newUpdateJoinSorter(p.session.query, byKey)
-		},
-	}
-	selected := make(map[uint64]struct{})
-	count := 0
-	err := dedup.Run(ctx, func(candidate updateJoinCandidate) error {
-		if limit >= 0 && count >= limit {
-			return nil
+// The candidate owns its bytes: OldRow is cloned out of the joined row and EvalRow is cloned for
+// the same reason, because the sorter retains the candidate past the scan that produced it.
+func (p updateJoinPlan) candidates(ordinal *uint64) physical.Operator[updateJoinCandidate] {
+	return physical.Projection[storage.Row, updateJoinCandidate]{Input: p.matched(), Project: func(row storage.Row) (updateJoinCandidate, error) {
+		position := *ordinal
+		*ordinal = position + 1
+		if len(row) < p.targetCount {
+			return updateJoinCandidate{Ordinal: position}, nil
 		}
-		selected[candidate.ordinal] = struct{}{}
-		count++
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return selected, nil
-}
-
-// apply re-runs the join and mutates the winning rows through the shared UpdateOperator.
-//
-// OldRow is the target's own columns and EvalRow is the whole joined row, so a SET
-// expression may read both the target and the joined source, and the source row that
-// produced the identity is the one that supplies the values.
-func (p updateJoinPlan) apply(ctx context.Context, selected map[uint64]struct{}, target versionedTable, targetColumns []storage.Column, assignments []updateAssignment, schema *storage.Table, write storageengine.Txn, session *Session) (uint64, error) {
-	// Pass two walks the same rows in the same order, so the ordinal sequence lines up
-	// with the one that produced the winners.
-	ordinal := uint64(0)
-	filtered := physical.Filter[storage.Row]{Input: p.matched(), Predicate: func(storage.Row) (bool, error) {
-		position := ordinal
-		ordinal++
-		_, ok := selected[position]
-		return ok, nil
-	}}
-	candidates := physical.Projection[storage.Row, UpdateCandidate]{Input: filtered, Project: func(row storage.Row) (UpdateCandidate, error) {
-		if len(row) < len(targetColumns) {
-			return UpdateCandidate{}, nil
-		}
-		return UpdateCandidate{
+		owned := append(storage.Row(nil), row...)
+		return updateJoinCandidate{
+			Ordinal:  position,
 			Identity: p.identity(row),
-			OldRow:   append(storage.Row(nil), row[:len(targetColumns)]...),
-			EvalRow:  row,
+			OldRow:   append(storage.Row(nil), owned[:p.targetCount]...),
+			EvalRow:  owned,
 		}, nil
 	}}
+}
+
+// deduped runs the join once and keeps the first occurrence of every target identity. The ledger
+// and the candidate payload both spill, so a heavily matched target costs one sorter entry rather
+// than one per join combination.
+func (p updateJoinPlan) deduped(ordinal *uint64) *physical.TargetRowDedup[updateJoinCandidate] {
+	codec := updateJoinCodec{}
+	return &physical.TargetRowDedup[updateJoinCandidate]{
+		Input: p.candidates(ordinal),
+		Identity: func(candidate updateJoinCandidate) (RowIdentity, bool) {
+			return candidate.Identity, true
+		},
+		NewSort: func(byKey bool) (physical.Sorter[physical.SortRow[updateJoinCandidate]], error) {
+			return newCandidateSorter[updateJoinCandidate](p.session.query, p.budget, codec, byKey)
+		},
+	}
+}
+
+// run executes the whole pipeline and reports how many rows the statement updated.
+//
+// The candidate the write path receives is the one dedup selected, so the source row that produced
+// the identity is also the one that supplies the assignment values: first match wins.
+func (p updateJoinPlan) run(ctx context.Context, target versionedTable, targetColumns []storage.Column, assignments []updateAssignment, schema *storage.Table, write storageengine.Txn) (uint64, error) {
+	var ordinal uint64
+	// The write path consumes the deduplicated candidates directly. A candidate only has to be
+	// reshaped so OldRow is exactly the target's own columns; the joined evaluation row and the old
+	// physical identity come straight from the winner, whether it was retained in memory or decoded
+	// from a spill run.
 	operator := &UpdateOperator{
-		Input: candidates,
-		// Only the target's own columns are written; assignments evaluate against the whole
-		// joined row, which is why EvalSchema is the joined schema.
+		Input: physical.Projection[updateJoinCandidate, UpdateCandidate]{
+			Input: physical.Limit[updateJoinCandidate]{
+				Input: p.deduped(&ordinal),
+				Count: p.limit,
+			},
+			Project: func(candidate updateJoinCandidate) (UpdateCandidate, error) {
+				return candidate.rebuild(p.targetCount), nil
+			},
+		},
+		// Only the target's own columns are written; assignments evaluate against the whole joined
+		// row, which is why EvalSchema is the joined schema.
 		Target:      target,
 		Schema:      schema,
 		EvalSchema:  p.combined,
 		Assignments: assignments,
 		Write:       write,
-		Session:     session,
+		Session:     p.session,
 	}
 	if err := operator.Run(ctx); err != nil {
 		return 0, err
 	}
 	return operator.Result.AffectedRows, nil
-}
-
-// newUpdateJoinSorter adapts the shared spillable sorter to dedup candidates. The ledger
-// row holds primitives only: the identity ledger key and the join position, ordered
-// numerically through its big-endian string form.
-func newUpdateJoinSorter(control *queryControl, byKey bool) (physical.Sorter[physical.TargetDedupRow[updateJoinCandidate]], error) {
-	compare := func(a, b []any) int {
-		if byKey {
-			if c := strings.Compare(a[0].(string), b[0].(string)); c != 0 {
-				return c
-			}
-		}
-		return strings.Compare(a[1].(string), b[1].(string))
-	}
-	sorter, err := newExternalRowSorter(control, compare)
-	if err != nil {
-		return nil, err
-	}
-	return updateJoinSorter{sorter: sorter}, nil
-}
-
-type updateJoinSorter struct {
-	sorter *externalRowSorter
-}
-
-func (s updateJoinSorter) Add(row physical.TargetDedupRow[updateJoinCandidate]) error {
-	return s.sorter.Add([]any{row.Key, ordinalLedgerKey(row.Ordinal)})
-}
-
-func (s updateJoinSorter) Finish(yield func(physical.TargetDedupRow[updateJoinCandidate]) error) error {
-	return s.sorter.Finish(func(row []any) error {
-		ordinal := ordinalFromLedgerKey(row[1].(string))
-		return yield(physical.TargetDedupRow[updateJoinCandidate]{
-			Key:     row[0].(string),
-			Ordinal: ordinal,
-			Row:     updateJoinCandidate{ordinal: ordinal},
-		})
-	})
-}
-
-func (s updateJoinSorter) Close() error { return s.sorter.Close() }
-
-// ordinalLedgerKey renders an ordinal so a bytewise comparison orders it numerically,
-// which the shared sorter needs because it compares sort values in order.
-func ordinalLedgerKey(ordinal uint64) string {
-	var scratch [8]byte
-	for i := range scratch {
-		scratch[7-i] = byte(ordinal >> (8 * i))
-	}
-	return string(scratch[:])
-}
-
-func ordinalFromLedgerKey(key string) uint64 {
-	var ordinal uint64
-	for i := 0; i < len(key) && i < 8; i++ {
-		ordinal = ordinal<<8 | uint64(key[i])
-	}
-	return ordinal
 }
