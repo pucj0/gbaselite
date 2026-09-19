@@ -84,6 +84,32 @@ func (s *externalRowSorter) rowLimit() int64 {
 	return limit
 }
 
+// checkRowWidth preflights a row's serialized width against rowLimit without retaining or
+// allocating anything for it. It returns the width so a caller can account for it, and reports
+// ErrQueryResourceLimit when the row is too wide.
+//
+// This is what lets a caller whose payload is expensive to build — the modify pipeline's candidate
+// codec, which encodes a whole joined or old row — refuse an over-wide candidate *before* encoding
+// it. Add calls it too, so the check is authoritative in both places rather than advisory.
+func (s *externalRowSorter) checkRowWidth(width int64) (int64, error) {
+	limit := s.rowLimit()
+	if width > limit {
+		return width, fmt.Errorf("%w: sort row requires %d bytes, maximum is %d; raise sort_memory_mb or reduce the rows this statement retains", ErrQueryResourceLimit, width, limit)
+	}
+	return width, nil
+}
+
+// preflightWidth reports whether a row of the given serialized width fits this sorter, without
+// building the row.
+//
+// A caller that knows the serialized size of an expensive payload can therefore reject an over-wide
+// row before allocating that payload at all, and still let the sorter's own Add stay the
+// authoritative check for every other caller.
+func (s *externalRowSorter) preflightWidth(width int64) error {
+	_, err := s.checkRowWidth(width)
+	return err
+}
+
 // release gives the shared pool back everything this sorter still holds. Close calls it, so an
 // error path returns the bytes a sorter was accounting for.
 func (s *externalRowSorter) release() {
@@ -116,10 +142,8 @@ func (s *externalRowSorter) Add(values []any) error {
 	if err := s.control.check(); err != nil {
 		return err
 	}
-	width := serializedRowBytes(values)
-	limit := s.rowLimit()
-	if width > limit {
-		return fmt.Errorf("%w: sort row requires %d bytes, maximum is %d; raise sort_memory_mb or reduce the rows this statement retains", ErrQueryResourceLimit, width, limit)
+	if _, err := s.checkRowWidth(serializedRowBytes(values)); err != nil {
+		return err
 	}
 	size := queryRowBytes(values) + 32
 	if s.batchBytes+size > s.memory/2 && len(s.batch) > 0 {
@@ -510,34 +534,51 @@ func writeSortText(w io.Writer, text string) error {
 	return err
 }
 
-// serializedRowBytes is the exact number of bytes writeSortRow produces for a row: the ordinal
-// and count headers plus one tag and payload per cell. It is the basis for the sorter's per-row
-// width limit, because a row that cannot be read back inside a row limit must be refused before
-// it is allocated rather than written and then rejected by the merge reader.
+// The fixed part of a serialized sort row: the ordinal header and the column-count header, each a
+// little-endian uint64 written by writeSortRow.
+const sortOrdinalAndCountBytes = 16
+
+// sortTagAndLengthBytes is the per-cell overhead writeSortRow adds for a variable-length payload: one
+// tag byte plus the uint64 length prefix.
+const sortTagAndLengthBytes = 9
+
+// sortCellBytes is the exact serialized size of one sort cell: its tag byte plus its payload, with
+// no value materialised.
+//
+// It is the single place the per-value encoding sizes live, so serializedRowBytes and a caller doing
+// a width preflight cannot drift apart from writeSortRow.
+func sortCellBytes(value any) int64 {
+	switch v := value.(type) {
+	case nil:
+		return 1
+	case string:
+		return 9 + int64(len(v))
+	case jsonDocument:
+		return 9 + int64(len(v))
+	case []byte:
+		return 9 + int64(len(v))
+	case storage.Decimal:
+		return 9 + int64(len(v))
+	case collatedText:
+		return 1 + 8 + int64(len(v.Text)) + 8 + int64(len(v.Collation))
+	case time.Time:
+		// MarshalBinary writes a version byte, seconds, nanoseconds and a zone offset.
+		return 22
+	default:
+		// Every scalar shape writeSortRow accepts is a tag plus eight bytes; an unsupported shape is
+		// reported by writeSortRow itself.
+		return 9
+	}
+}
+
+// serializedRowBytes is the exact number of bytes writeSortRow produces for a row: the ordinal and
+// count headers plus one tag and payload per cell. It is the basis for the sorter's per-row width
+// limit, because a row that cannot be read back inside a row limit must be refused before it is
+// allocated rather than written and then rejected by the merge reader.
 func serializedRowBytes(row []any) int64 {
-	size := int64(16)
+	size := int64(sortOrdinalAndCountBytes)
 	for _, value := range row {
-		switch v := value.(type) {
-		case nil:
-			size++
-		case string:
-			size += 9 + int64(len(v))
-		case jsonDocument:
-			size += 9 + int64(len(v))
-		case []byte:
-			size += 9 + int64(len(v))
-		case storage.Decimal:
-			size += 9 + int64(len(v))
-		case collatedText:
-			size += 1 + 8 + int64(len(v.Text)) + 8 + int64(len(v.Collation))
-		case time.Time:
-			// MarshalBinary writes a version byte, seconds, nanoseconds and a zone offset.
-			size += 22
-		default:
-			// Every scalar shape writeSortRow accepts is a tag plus eight bytes; an unsupported
-			// shape is reported by writeSortRow itself.
-			size += 9
-		}
+		size += sortCellBytes(value)
 	}
 	return size
 }

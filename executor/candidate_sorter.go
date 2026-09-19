@@ -86,7 +86,26 @@ type candidateSorter[T any] struct {
 // ordinal; the other pass orders by ordinal alone to restore source order.
 type sorterOrder bool
 
+// addCandidate writes one candidate through the sorter.
+//
+// The order matters: the candidate's payload is encoded only after the sorter has accepted the
+// row's width. The codec reports the payload's exact serialized length, so the full row width —
+// ledger key, ordinal, payload, and the sorter's own tag and header overhead — is known before
+// codec.encode allocates anything. An over-wide candidate therefore costs nothing: it is refused
+// with ErrQueryResourceLimit instead of allocating a payload that would then be rejected.
+//
+// The sorter's own Add repeats the width check, so this preflight is an optimisation for the
+// expensive caller rather than the only guard.
 func (s candidateSorter[T]) Add(row physical.SortRow[T]) error {
+	// The payload column is sized as the materialised cell the codec will hand back — tag, length
+	// prefix and payload — from the payload length the codec reports. Sizing it as a nil cell would
+	// under-count by the cell header and let an over-wide row slip past this check and be caught only
+	// after its payload had been allocated.
+	width := sortOrdinalAndCountBytes + sortCellBytes(row.Key) + sortCellBytes(ordinalLedgerKey(row.Ordinal)) +
+		sortTagAndLengthBytes + int64(s.codec.bytes(row.Row))
+	if err := s.sorter.preflightWidth(width); err != nil {
+		return err
+	}
 	payload, err := s.codec.encode(row.Row)
 	if err != nil {
 		return err
