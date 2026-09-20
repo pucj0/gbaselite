@@ -238,7 +238,9 @@ child commit 是 MERGED。
 
 ### D3. read-only commit 不推进 Head
 
-保持当前行为与性能。
+保持当前行为与性能。此处的 read-only 指 §7 的 A 类：既无 Put/Delete 也无
+Guard/GuardRange 的 empty / ordinary read-only root（`ACTIVE -> COMMITTED`、
+`HasCommitTS=false`）。
 
 ### D4. root transaction 是 retention owner
 
@@ -247,6 +249,17 @@ savepoint/child 只做 diagnostics registration。
 ### D5. publication marker 是 commit point
 
 cancel 和错误处理以 publication 是否 durable 为最终边界。
+
+### D6. dependency-only root 仍然是可发布写事务
+
+`Guard`/`GuardRange` 是显式 commit-time validation dependency，不是 ordinary read
+observation，因此只有 Guard/GuardRange 的 root 走
+`ACTIVE -> COMMITTING -> COMMITTED`，获得 durable commit revision（`HasCommitTS=true`）并
+推进 Head，同时不安装任何数据 version。B01 保留该既有实现，不修改代码语义；结论与三类
+root 的完整定义见 spec.md FR-004/FR-005/§7、research.md R6b、contracts/transaction-diagnostics.md。
+对应测试：`mvcc/transaction_invariants_baseline_test.go` 的
+`TestDependencyOnlyCommitPublishesRevision`（由原 characterization test
+`TestBaselineGuardOnlyCommitCurrentlyAdvancesHead` 转成的正式 contract test）。
 
 ## Testing Strategy
 

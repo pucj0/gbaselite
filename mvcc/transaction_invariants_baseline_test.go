@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	bolt "go.etcd.io/bbolt"
 )
 
 // B01 baseline: the transaction invariants every later refactor must preserve.
@@ -13,6 +15,10 @@ import (
 // for new behaviour, and they do not need the Transaction Manager to exist.
 // They are the executable half of specs/001-b01-mvcc-transaction-manager/spec.md
 // §6 (INV-001..INV-008) plus the parent/child and publication boundaries of §5.
+//
+// A case that the spec has since decided is no longer a characterization: it is
+// named as the contract it now is, and a change to it has to change the spec first
+// (for example TestDependencyOnlyCommitPublishesRevision).
 //
 // Every test here synchronizes on channels or a protocol gate; none of them uses
 // a sleep to decide ordering.
@@ -453,27 +459,143 @@ func TestBaselineEmptyAndReadOnlyCommitDoNotAdvanceHead(t *testing.T) {
 // though it installs no row version. spec.md §7 names only "empty" and
 // "read-only" commits, so B01 has to decide this case explicitly; this test
 // makes the current behaviour visible and fails loudly if it changes.
-func TestBaselineGuardOnlyCommitCurrentlyAdvancesHead(t *testing.T) {
+// installedDataVersions counts the data versions installed at one revision, in both
+// physical layouts, so a test can prove that a publication installed none.
+func installedDataVersions(t *testing.T, s *Store, revision uint64) int {
+	t.Helper()
+	installed := 0
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		if err := tx.Bucket(dataBucket).ForEach(func(k, _ []byte) error {
+			if rows := tx.Bucket(dataBucket).Bucket(k); rows != nil && rows.Get(sequence(revision)) != nil {
+				installed++
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		flat := tx.Bucket(flatVersionsBucket)
+		if flat == nil {
+			return nil
+		}
+		return flat.ForEach(func(k, _ []byte) error {
+			_, version, err := splitFlatVersionKey(k)
+			if err != nil {
+				return err
+			}
+			if number(version) == revision {
+				installed++
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return installed
+}
+
+// The decided contract for a dependency-only root transaction: Guard/GuardRange and no
+// Put/Delete (spec.md FR-004, FR-005, §7 "事务结束" and §9 Clarifications).
+//
+// Guard and GuardRange are explicit commit-time validation dependencies, not ordinary
+// read observations, so they make the transaction publishable even though they install
+// no value. Such a root therefore moves ACTIVE -> COMMITTING -> COMMITTED, records a
+// durable commit revision and advances the head, while installing zero data versions.
+// HasCommitTS reports "this root has a durable commit revision"; it never promises that
+// the transaction installed data. This is a contract test, not a characterization: the
+// case is decided, so a change to it must change the spec first.
+func TestDependencyOnlyCommitPublishesRevision(t *testing.T) {
 	s := baselineStore(t)
 	seed := beginBaseline(t, s)
 	mustPut(t, seed, "k", "v")
 	mustCommit(t, seed)
 	before := mustHead(t, s)
 
+	// A second transaction shares the pre-revision snapshot and guards the same key, so
+	// the revision this test publishes is observed from before it exists.
+	concurrent := beginBaseline(t, s)
+	if err := concurrent.Guard(baselineSpace, []byte("absent")); err != nil {
+		t.Fatal(err)
+	}
+
 	guarded := beginBaseline(t, s)
 	if err := guarded.Guard(baselineSpace, []byte("absent")); err != nil {
 		t.Fatal(err)
 	}
-	sequence, err := guarded.Commit(context.Background())
-	if err != nil {
+	if err := guarded.GuardRange(baselineSpace, KeyRange{Lower: []byte("a"), Upper: []byte("z")}); err != nil {
 		t.Fatal(err)
 	}
-	after := mustHead(t, s)
-	if after == before {
-		t.Fatalf("guard-only commit no longer advances the head (%d -> %d); B01 must decide this case and update this characterization", before, after)
+	revision, err := guarded.Commit(context.Background())
+	if err != nil {
+		t.Fatalf("dependency-only commit: %v", err)
 	}
-	if sequence != after {
-		t.Fatalf("guard-only commit sequence %d does not equal the published head %d", sequence, after)
+
+	// Head advances, the revision is the published one, and the transaction is a
+	// COMMITTED root with a durable commit revision.
+	after := mustHead(t, s)
+	if after <= before {
+		t.Fatalf("dependency-only commit did not advance the head: %d -> %d", before, after)
+	}
+	if revision != after {
+		t.Fatalf("dependency-only commit revision %d does not equal the published head %d", revision, after)
+	}
+	info := guarded.Info()
+	if info.State != TransactionCommitted {
+		t.Fatalf("state = %s, want COMMITTED", info.State)
+	}
+	if !info.HasCommitTS || info.CommitTS != revision {
+		t.Fatalf("lifecycle = %+v, want a commit revision of %d", info, revision)
+	}
+	if published, committed := s.Committed(guarded.ID); !committed || published != revision {
+		t.Fatalf("publication marker = (%d, %v), want (%d, true)", published, committed, revision)
+	}
+	// The dependency set is publishable work, but it is not a data mutation: a guard is
+	// a dependency rather than a write, so it contributes no write count and no write
+	// bytes, and only the dependency counters move. HasCommitTS therefore cannot be read
+	// as "this transaction installed data".
+	if info.Writes != 0 || info.WriteBytes != 0 {
+		t.Fatalf("dependency-only write set = (%d writes, %d bytes), want none", info.Writes, info.WriteBytes)
+	}
+	if info.PointDependencies != 1 || info.RangeDependencies != 1 {
+		t.Fatalf("dependency counters = %+v, want one point and one range dependency", info)
+	}
+
+	// The revision exists; no data version does.
+	if installed := installedDataVersions(t, s, revision); installed != 0 {
+		t.Fatalf("dependency-only commit installed %d data versions at revision %d", installed, revision)
+	}
+
+	// An ordinary reader at that revision sees exactly the committed data: a dependency
+	// revision never fabricates a row for the key it guarded.
+	reader := beginBaseline(t, s)
+	if reader.Snapshot != after {
+		t.Fatalf("fresh reader snapshot = %d, want the published revision %d", reader.Snapshot, after)
+	}
+	requireValue(t, reader, "k", "v")
+	requireMissing(t, reader, "absent")
+
+	// A dependency-only publication is a revision rather than a data change, so it does
+	// not by itself invalidate a guard that was taken before it.
+	if _, err := concurrent.Commit(context.Background()); err != nil {
+		t.Fatalf("guard taken before a dependency-only revision failed: %v", err)
+	}
+
+	// Dependency validation still runs: a guard-only transaction whose guarded key was
+	// written after its snapshot must fail on commit.
+	contended := beginBaseline(t, s)
+	if err := contended.Guard(baselineSpace, []byte("contended")); err != nil {
+		t.Fatal(err)
+	}
+	writer := beginBaseline(t, s)
+	mustPut(t, writer, "contended", "value")
+	mustCommit(t, writer)
+	if _, err := contended.Commit(context.Background()); !errors.Is(err, ErrConflict) {
+		t.Fatalf("dependency-only commit over a newer write = %v, want ErrConflict", err)
+	}
+	if info := contended.Info(); info.State != TransactionAborted || info.AbortReason != "conflict" {
+		t.Fatalf("conflicted dependency-only outcome = %+v", info)
+	}
+	if info := contended.Info(); info.HasCommitTS {
+		t.Fatalf("a conflicted dependency-only commit kept a commit revision: %+v", info)
 	}
 }
 

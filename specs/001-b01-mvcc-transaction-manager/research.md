@@ -29,7 +29,8 @@
 - `ReadTS = StartTS`
 - `CommitTS = durable publish 时的 commit/version sequence`
 - child merge 不分配 CommitTS
-- read-only commit 不分配 CommitTS
+- read-only（无 Put/Delete/Guard/GuardRange）commit 不分配 CommitTS
+- dependency-only（只有 Guard/GuardRange）commit 分配 CommitTS（见 R12）
 
 ### Rationale
 
@@ -78,10 +79,12 @@
 
 至少维护：
 
-- `activeByID: TxnID -> TxnInfo`
+- `activeByID: TxnID -> *transactionEntry`
 - root snapshot retention refs：`ReadTS -> root count`
 
-child transaction 可以在 `activeByID` 中出现，但不重复占用 root retention。
+`activeByID` 的 value 是内部 `*transactionEntry`（不是公开 DTO；公开的是
+`TransactionInfo`）。child transaction 可以在 `activeByID` 中出现，但不重复占用 root
+retention。
 
 ### Rationale
 
@@ -99,7 +102,62 @@ child transaction 可以在 `activeByID` 中出现，但不重复占用 root ret
 - ABORTED
 - MERGED
 
+internal 枚举另有 0 值 `TransactionUnset`（未注册/无效，不是生命周期状态）；public
+diagnostics 词表另有 fail-closed 的 `UNKNOWN`，两者见 contracts/transaction-diagnostics.md。
+
+有效转换（root）：
+
+- ACTIVE -> COMMITTING（有可发布工作，需要 durable publication）
+- ACTIVE -> COMMITTED（empty / ordinary read-only root）
+- ACTIVE -> ABORTED
+- COMMITTING -> COMMITTED
+- COMMITTING -> ABORTED
+
+child：
+
+- ACTIVE -> MERGED
+- ACTIVE -> ABORTED
+
 失败原因单独放 AbortReason，不制造大量状态枚举。
+
+## R6b. Guard-only（dependency-only）commit 语义
+
+### Decision
+
+仅含 `Guard`/`GuardRange` 的 root transaction 是 **可发布写事务**：它走
+`ACTIVE -> COMMITTING -> COMMITTED`，获得 durable commit revision（`HasCommitTS=true`）并推进
+Head，但 **不安装任何数据 version**。B01 保留这一既有行为，不修改代码语义。
+
+因此：
+
+```text
+has publishable transaction work  !=  has data mutation
+HasCommitTS=true 只表示"有 durable commit revision"，不保证安装了数据 version
+```
+
+### Rationale
+
+`Guard`/`GuardRange` 是显式 commit-time validation dependency（R4），不是 ordinary read
+observation，所以它属于"需要 durable publication 的事务工作"。publication marker 是 commit
+point（R9），一次成功的 dependency-only publication 因此必须得到一个 revision；只是这次
+publication 携带依赖集而不是数据版本。
+
+### Consequences（已写入 spec.md FR-004/FR-005/§7、data-model.md §7/§10）
+
+- 判定的依据是"是否持有 staged 写集（Put/Delete 或 Guard/GuardRange）"，而不是"是否安装了
+  数据 version"：A 类 empty / ordinary read-only 走 `ACTIVE -> COMMITTED` 且 `HasCommitTS=false`。
+- `Writes`/`WriteBytes` 只统计数据写，guard 贡献 0，因此 `Writes=0`/`WriteBytes=0` 与
+  `HasCommitTS=true` 可以同时成立。
+- commit sequence 序列中允许出现"没有对应数据 version 的 revision"；INV-002 只约束数据
+  version，可见性只看 `version <= ReadTS` 且有 publication marker，所以不影响 SI。
+- dependency-only publication 不安装 version，因此它本身不会使另一个事务的 guard 失败；而
+  dependency-only root 自己的 guard 仍按 R8 规则校验。
+
+### Rejected
+
+- 让 dependency-only commit 走 A 类（不发布、直接 `ACTIVE -> COMMITTED`）：会让 guard 校验缺少
+  durable publication 边界，并改变既有 Head/sequence 行为。
+- 为 dependency-only commit 安装一个数据 version：会凭空产生数据，破坏可见性语义。
 
 ## R7. Unified Visibility
 
@@ -171,5 +229,9 @@ type TransactionDiagnostics interface {
     TransactionStats() TransactionStats
 }
 ```
+
+DTO 字段表、状态词表（含 fail-closed `UNKNOWN`）、`ActiveTransactions` 的 registry 语义、
+计数器定义与非 nil slice 保证，以 contracts/transaction-diagnostics.md 为准；该文件已与实际
+实现逐项同步。
 
 SQL SHOW 命令不是 B01 必须项。

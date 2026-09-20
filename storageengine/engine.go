@@ -186,11 +186,15 @@ const (
 	TransactionCommitting TransactionState = "COMMITTING"
 	// TransactionCommitted is a root transaction that ended successfully.
 	//
-	// A write transaction reaches it with HasCommitTS=true and a durable
-	// publication marker. A read-only or empty root reaches it with
-	// HasCommitTS=false: it allocated no commit sequence, published no marker and
-	// did not advance the head, so the sequence itself must never be treated as the
-	// evidence of a commit.
+	// A data-writing transaction reaches it with HasCommitTS=true, a durable
+	// publication marker and installed data versions. A dependency-only
+	// transaction (Guard/GuardRange and no Put/Delete) also reaches it with
+	// HasCommitTS=true and an advanced head, but installs no data version, because a
+	// guard is a validation dependency rather than a value. A read-only or empty
+	// root reaches it with HasCommitTS=false: it allocated no commit sequence,
+	// published no marker and did not advance the head. The sequence itself must
+	// therefore never be treated as the evidence of a commit, and HasCommitTS must
+	// never be read as "this transaction changed data".
 	TransactionCommitted TransactionState = "COMMITTED"
 	// TransactionAborted is an ended transaction whose writes were discarded, whether
 	// it was rolled back or ended by conflict, cancellation, or a failed commit.
@@ -225,6 +229,11 @@ type TransactionInfo struct {
 
 	// CommitTS is the commit sequence, valid only when HasCommitTS is true. Sequence
 	// 0 is a legal value, so the boolean rather than the value reports presence.
+	//
+	// HasCommitTS reports that this root transaction has a durable commit revision.
+	// It does not promise that the transaction installed a data version: a
+	// dependency-only commit has a revision and no version. Use Writes/WriteBytes to
+	// ask whether the transaction changed data.
 	CommitTS    uint64
 	HasCommitTS bool
 
@@ -234,19 +243,25 @@ type TransactionInfo struct {
 	Generation uint64
 	StartedAt  time.Time
 
-	// Observation counters for work this transaction performed.
+	// Observation counters for work this transaction performed. RowsObserved and
+	// BytesObserved are bounded summaries: the keys and values a transaction read are
+	// never retained here.
 	PointReads    uint64
 	RangeReads    uint64
 	RowsObserved  uint64
 	BytesObserved uint64
 
-	// Writes and WriteBytes describe the staged write set, including bytes spooled to
-	// staging storage; they are not a durable size.
+	// Writes and WriteBytes describe the current logical data write set, including
+	// bytes spooled to staging storage; they are not a durable size, and they are not
+	// a call history: replacing a key changes its contribution instead of adding one.
+	// A guard is a dependency rather than a write, so it contributes to neither
+	// counter, and Writes=0 with HasCommitTS=true is a legal combination.
 	Writes     uint64
 	WriteBytes int64
 
 	// PointDependencies and RangeDependencies count the optimistic validation
-	// dependencies from Guard and GuardRange. They are dependencies, not locks.
+	// dependencies from Guard and GuardRange. They are dependencies, not locks, and
+	// ordinary reads never appear here.
 	PointDependencies uint64
 	RangeDependencies uint64
 
@@ -284,9 +299,18 @@ type TransactionStats struct {
 // Both methods are safe to call concurrently with Begin, Commit and Rollback, and
 // neither blocks on transaction progress. They observe; they do not control.
 type TransactionDiagnostics interface {
-	// ActiveTransactions returns the currently registered transactions. The slice is
-	// owned by the caller, is never nil, and has no guaranteed order.
+	// ActiveTransactions returns the transactions currently registered in the
+	// backend registry. The slice is owned by the caller, is never nil, and has no
+	// guaranteed order.
+	//
+	// "Registered" is not the same as State == ACTIVE: an entry that reached a
+	// terminal state but has not been unregistered yet is still returned for that
+	// short window. A caller that wants live transactions only must filter on State.
 	ActiveTransactions() []TransactionInfo
 	// TransactionStats returns the aggregate counters and the current GC horizon.
+	//
+	// ActiveRoot and ActiveChildren count only non-terminal registered transactions,
+	// so len(ActiveTransactions()) may briefly exceed their sum between a terminal
+	// transition and the unregister that follows it.
 	TransactionStats() TransactionStats
 }

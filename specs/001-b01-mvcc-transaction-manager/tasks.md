@@ -271,7 +271,15 @@ P2 diagnostics 与 cancel/overflow hardening 可随后增量完成，但最终 B
 ### 未完成项
 
 - **T089 已完成**（见下方 CI 证据）：race 在 GitHub Linux runner 上验证通过。本机 `CGO_ENABLED=0` 且无 gcc/clang，`go test -race` 直接报 `-race requires cgo`，因此本机结果不作为完成依据。
-- **T091–T093**：需要 Spec Kit 的 `/speckit.analyze`、`/speckit.implement`、`/speckit.converge` 命令执行环境，本仓库未执行这些命令，因此不勾选。已知的文档级待澄清项（非 critical/high 代码问题）记录在 spec 措辞层面：guard-only commit 是否推进 Head 的描述、状态表示分层说明、`HasOldestReadTS` 说明、`ACTIVE→COMMITTED` 边、retention 释放时机。
+- **T091–T093**：需要 Spec Kit 的 `/speckit.analyze`、`/speckit.implement`、`/speckit.converge` 命令执行环境，本仓库未执行这些命令，因此不勾选。
+
+### `/speckit.analyze` 后续（H-1/H-2 已关闭）
+
+`/speckit.analyze` 报出 CRITICAL 0 / HIGH 2 / MEDIUM 8 / LOW 8。其中两个 HIGH 已在本阶段以纯文档方式关闭，未修改任何 MVCC 行为：
+
+- **H-1（guard-only 提交语义未进入 spec）**：已正式决策并写入 `spec.md`（FR-004、FR-005、FR-010、INV-002 说明、§7 "事务结束" 的三类 root 表、§9 Clarifications 8/9、US1.5/US1.9）、`data-model.md`（§1/§2/§7/§8/§10）、`research.md`（R2/R5/R6/R6b/R11）、`plan.md`（D3 限定 + D6）、`contracts/transaction-diagnostics.md`。原 characterization test `TestBaselineGuardOnlyCommitCurrentlyAdvancesHead` 已转为正式 contract test `TestDependencyOnlyCommitPublishesRevision`。
+- **H-2（TransactionDiagnostics contract 与实际公共 API 不一致）**：`contracts/transaction-diagnostics.md` 已按实现重写（完整 18 字段 DTO、`UNKNOWN` fail-closed 词表与映射、`ActiveTransactions` 的 registry 语义、`ActiveRoot`/`ActiveChildren` 只计 non-terminal、非 nil slice、计数器定义、`HasCommitTS` 不保证数据 version），并与 `storageengine/engine.go` 的公共注释同步；`data-model.md` §1–§5 的结构与状态图同步为实际实现。
+- 其余 MEDIUM/LOW（M-2 部分结构漂移已在本次 H-2 同步中顺带修正，M-3/M-4/M-5/M-6/M-8 等代码覆盖项与 L 系列）尚未处理，留待后续按需安排。
 
 ### CI 证据（B01 race）
 

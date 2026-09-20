@@ -52,10 +52,11 @@ B01 不重新实现 MVCC 存储，也不改变现有 SQL 能力。B01 的目标�
 2. root transaction 的 `startTS == readTS == Begin 时观察到的 committed Head`。
 3. 事务执行期间 `readTS` 固定。
 4. 成功写事务提交后生成 `commitTS`。
-5. 只读事务提交不推进 Head，`commitTS` 保持 unset。
+5. 只读事务提交不推进 Head，`commitTS` 保持 unset。此处的 "只读" 指 §7 "事务结束" 的 A 类（既无 Put/Delete 也无 Guard/GuardRange）；只有 Guard/GuardRange 的 C 类仍会推进 Head 并设置 `commitTS`（见 FR-004 与 §7）。
 6. child transaction commit 只进入 `MERGED`，不产生独立 durable commitTS。
 7. rollback 后状态为 `ABORTED`。
 8. double commit 返回明确 closed error；double rollback 幂等。
+9. 仅含 Guard/GuardRange 的 root transaction 成功提交后：状态 `COMMITTED`、`HasCommitTS=true`、Head 前进，但没有数据 version 被安装，普通读取者不会因此看到任何新数据。
 
 ### US2 - 活动事务注册表与 GC Horizon（P1）
 
@@ -179,6 +180,20 @@ B01 不重新实现 MVCC 存储，也不改变现有 SQL 能力。B01 的目标�
 - child merge 不设置 durable commitTS。
 - read-only commit 不分配新 version，commitTS 为 unset。
 
+"root 写事务" 的判定是 **是否持有可发布的事务工作**，即是否持有 staged 写集
+（`Put`/`Delete` 数据写，或 `Guard`/`GuardRange` 依赖），而 **不是** 是否安装了数据
+version。因此：
+
+- Put/Delete（数据写）成功提交：设置 commitTS，并安装数据 version。
+- 仅 Guard/GuardRange（dependency-only，见 §7 "事务结束" C 类）成功提交：同样设置
+  commitTS 并推进 Head，但 **不安装任何数据 version**。
+- 既无 Put/Delete 也无 Guard/GuardRange（empty / ordinary read-only，A 类）：commitTS 为
+  unset，不推进 Head。
+
+因此 `HasCommitTS=true` 只表示 **"该 root transaction 获得了 durable commit revision"**，
+它 **不保证** 该事务安装了数据 version。判定"是否有数据变更"必须看数据写集（例如
+`TransactionInfo.Writes`/`WriteBytes`），不能看 `HasCommitTS`。
+
 ### FR-005 Transaction State Machine
 
 至少支持：
@@ -189,15 +204,22 @@ B01 不重新实现 MVCC 存储，也不改变现有 SQL 能力。B01 的目标�
 - `ABORTED`
 - `MERGED`（child only）
 
-有效转换：
+有效转换（root）：
 
-- ACTIVE -> COMMITTING -> COMMITTED
-- ACTIVE -> COMMITTING -> ABORTED
+- ACTIVE -> COMMITTING（有可发布工作需要 durable publication）
+- ACTIVE -> COMMITTED（无 Put/Delete/Guard/GuardRange 的 empty / ordinary read-only root）
 - ACTIVE -> ABORTED
-- child ACTIVE -> MERGED
-- child ACTIVE -> ABORTED
+- COMMITTING -> COMMITTED
+- COMMITTING -> ABORTED
 
-终态不得重新进入 ACTIVE。
+有效转换（child）：
+
+- ACTIVE -> MERGED
+- ACTIVE -> ABORTED
+
+`ACTIVE -> COMMITTED` 只用于 A 类（empty / ordinary read-only root）；dependency-only
+root（C 类）走 `ACTIVE -> COMMITTING -> COMMITTED`，因为它有可发布的依赖集。终态不得
+重新进入 ACTIVE，终态只允许自我确认（重复 rollback / 重复终态上报为幂等 no-op）。
 
 ### FR-006 Transaction Manager
 
@@ -246,6 +268,11 @@ B01 不重新实现 MVCC 存储，也不改变现有 SQL 能力。B01 的目标�
 - `GuardRange`
 
 表示，并形成逻辑 Dependency Set。
+
+Dependency Set 是"可发布事务工作"的一部分（FR-004、§7 C 类）：持有 Guard/GuardRange 的事务
+在提交时需要 durable publication 与 validation，因此即使没有 Put/Delete 也会获得 commit
+revision 并推进 Head，但不安装数据 version。ordinary Get/Scan 只更新 bounded counters
+（FR-009），既不进入 Dependency Set，也不使事务成为可发布写事务。
 
 ### FR-011 Visibility Rule
 
@@ -319,6 +346,12 @@ Store restore / generation change 后：
 
 所有 durable committed write version 拥有严格单调、不可回绕的 commit sequence。
 
+说明：INV-002 约束的是**数据 version** 的 sequence 单调性。dependency-only root（§7 C 类）
+的 publication 会消费一个 commit revision 并推进 Head，但不安装数据 version，因此
+commit sequence 序列中允许存在"没有对应数据 version 的 revision"。这不违反 INV-002，也不
+影响可见性：可见性只按 `version <= ReadTS` 且存在 publication marker 判定（INV-003/INV-008），
+不存在 version 的 revision 不会产生任何可见行。
+
 ### INV-003 Visibility
 
 某事务只能看到：
@@ -357,8 +390,35 @@ child write 在 merge 前只对 child 可见；merge 后对 parent 可见；pare
 
 ### 事务结束
 
-- 空事务 Commit：成功，不推进 Head。
-- read-only transaction Commit：成功，不推进 Head。
+root transaction 按"是否持有可发布工作 / 是否安装数据 version"分为三类，三类语义都已正式
+决策并作为 contract 固定：
+
+| 类别 | 持有 | 成功结束的转换 | HasCommitTS | Head | 数据 version |
+|---|---|---|---|---|---|
+| A. empty / ordinary read-only root | 无 Put/Delete/Guard/GuardRange | ACTIVE -> COMMITTED | false | 不变 | 无 |
+| B. data-writing root | Put/Delete（可同时含 Guard/GuardRange） | ACTIVE -> COMMITTING -> COMMITTED | true | 前进 | 发布 |
+| C. dependency-only root | 只有 Guard/GuardRange，无 Put/Delete | ACTIVE -> COMMITTING -> COMMITTED | true | 前进 | **不安装** |
+
+C 类存在的原因：`Guard`/`GuardRange` 是 **显式 commit-time validation dependency**，不是
+ordinary read observation（FR-009/FR-010）。因此在当前 GBaseLite 事务模型中：
+
+```text
+has publishable transaction work  !=  has data mutation
+```
+
+dependency-only transaction 仍然通过 durable transaction publication 获得 commit revision，
+只是这次 publication 携带的是依赖集而不是数据版本；commit-time validation 对依赖集的校验
+照常执行（`latestCommittedChange > ReadTS => ErrConflict`）。又因为该 publication 不安装
+version，它本身不会使另一个事务的 guard 失败（guard 校验的是已提交数据版本，而不是
+revision 计数）。
+
+`HasCommitTS=true` 不保证该事务一定安装了数据 version；它只表示"该 root transaction 有
+durable commit revision"。
+
+其余结束语义：
+
+- 空事务 Commit：成功，不推进 Head（A 类）。
+- ordinary read-only transaction Commit：成功，不推进 Head（A 类）。
 - failed commit：不得设置 CommitTS。
 - rollback before writes：正常 ABORTED。
 - double rollback：成功/幂等。
@@ -438,6 +498,8 @@ Transaction diagnostics 能准确列出 active root/child transaction，并在 c
 2. **startTS/readTS**：当前版本中相等，均来自 Begin 时 committed Head。
 3. **普通 read-set**：不做全量 key retention，仅记录统计；显式 dependency 由 Guard/GuardRange 表示。
 4. **child commit**：状态为 MERGED，不产生独立 commitTS。
-5. **read-only commit**：不分配 commit version。
+5. **read-only commit**：不分配 commit version。此处的 read-only 指 A 类（无 Put/Delete/Guard/GuardRange）。
 6. **Transaction Manager registry**：root retention 与 child diagnostics 分离。
 7. **时间来源**：MVCC ordering 只使用逻辑 revision；wall clock 仅用于 diagnostics。
+8. **dependency-only commit（B01 决策）**：仅含 `Guard`/`GuardRange` 的 root transaction 仍是一个可发布写事务，走 `ACTIVE -> COMMITTING -> COMMITTED`，设置 `HasCommitTS=true` 并推进 Head，但不安装数据 version。理由：Guard/GuardRange 是显式 commit-time validation dependency，属于"可发布事务工作"，不是 ordinary read observation。因此 `has publishable transaction work != has data mutation`，且 `HasCommitTS=true` 只表示存在 durable commit revision。实现的现有行为即为最终行为，B01 不修改该语义。
+9. **状态词表分层**：internal 状态（`mvcc.TransactionState`）与 public diagnostics 状态（`storageengine.TransactionState`）是两层概念：internal 含 `TransactionUnset`（未注册/无效，0 值），public 用 `UNKNOWN` 作为 fail-closed 分类，二者不是同一个枚举，映射见 contracts/transaction-diagnostics.md。
