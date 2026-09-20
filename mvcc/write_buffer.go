@@ -101,6 +101,9 @@ func (t *Tx) bufferWrite(op Op, k, value []byte) error {
 		t.buffered[string(k)] = value
 		t.bufferBytes += cost - oldCost
 	}
+	// Diagnostics describe the current logical write set, so a replacement moves the
+	// key from its previous classification instead of accumulating call history.
+	t.trackStagedOp(k, previous, value)
 	t.stagedBytes += delta
 	return nil
 }

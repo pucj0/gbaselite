@@ -63,7 +63,7 @@ func architectureViolations(path string, src any) []string {
 				if strings.HasPrefix(path, "physical/") {
 					if id, ok := n.X.(*ast.Ident); ok && imports[id.Name] == "gbaselite/storageengine" {
 						switch n.Sel.Name {
-						case "Engine", "RevisionReader", "CounterAllocator", "ReplicatedEngine", "Maintenance", "Diagnostics", "Availability":
+						case "Engine", "RevisionReader", "CounterAllocator", "ReplicatedEngine", "Maintenance", "Diagnostics", "TransactionDiagnostics", "Availability":
 							issues = append(issues, "engine capability leaked into physical operator")
 						}
 					}
@@ -156,6 +156,7 @@ func TestArchitectureChecksRejectRegressionFixtures(t *testing.T) {
 		{"executor/physical_binding.go", "package executor; func f(){sourceOperator(callback)}"},
 		{"executor/physical_select.go", "package executor; func f(){_ = Result{Rows: rows}}"},
 		{"physical/bad.go", "package physical; import s \"gbaselite/storageengine\"; var engine s.Maintenance"},
+		{"physical/bad.go", "package physical; import s \"gbaselite/storageengine\"; func f(e s.Engine){ _ = e.(s.TransactionDiagnostics) }"},
 	}
 	for _, f := range fixtures {
 		if _, err := parser.ParseFile(token.NewFileSet(), f.path, f.source, 0); err != nil {

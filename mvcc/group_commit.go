@@ -110,22 +110,22 @@ func (s *Store) commitLocalGroup(group []*localCommitRequest) {
 			if r.err = r.ctx.Err(); r.err != nil {
 				continue
 			}
-			// A fresh reader observes markers published by earlier requests in this
-			// same physical transaction, including conflicting writes within the group.
-			reader := newVisibilityReader(tx, ^uint64(0))
-			for _, op := range r.ops {
-				k, _ := key(op.Space, op.Key)
-				_, version, _ := reader.visible(k)
-				if version > r.snapshot {
-					r.err = ErrConflict
-					break
-				}
-			}
-			if r.err != nil {
+			// A fresh lookup per request observes the markers published by earlier
+			// requests in this same physical transaction, so within a group the group
+			// is serialized in selection order.
+			validator := newConflictValidator(r.snapshot, newViewChangeLookup(tx))
+			if err := validator.validateOps(r.ops); err != nil {
+				r.err = err
 				continue
 			}
-			s.localSeq++
-			r.index = s.localSeq
+			index, err := s.nextSequence()
+			if err != nil {
+				// The sequence is exhausted: this request fails closed while the
+				// requests already published in this group keep their sequence.
+				r.err = err
+				continue
+			}
+			r.index = index
 			version := sequence(r.index)
 			catalogChanged := false
 			for _, op := range r.ops {

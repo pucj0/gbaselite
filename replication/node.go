@@ -230,6 +230,16 @@ func (n *Node) Barrier(ctx context.Context) error {
 	return wait(ctx, n.raft.Barrier(timeout(ctx)))
 }
 func (n *Node) Propose(ctx context.Context, command mvcc.Command) (mvcc.Result, error) {
+	// The publication marker is the durable commit point, so a commit that is
+	// already published reports its committed sequence even when the caller's
+	// context is done. The FSM applies commands through Store.Apply, which never
+	// observes a client context, so this lookup is the only thing that can turn an
+	// interrupted client wait into a definitive answer.
+	if command.Kind == "commit" {
+		if sequence, committed := n.store.Committed(command.ID); committed {
+			return mvcc.Result{Sequence: sequence}, nil
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return mvcc.Result{}, err
 	}
@@ -248,6 +258,15 @@ func (n *Node) Propose(ctx context.Context, command mvcc.Command) (mvcc.Result, 
 	}
 	future := n.raft.Apply(encoded, timeout(ctx))
 	if err = wait(ctx, future); err != nil {
+		// The wait can be interrupted after the entry was already applied, because
+		// applying it is what publishes the marker. Consult the marker before
+		// reporting the failure: anything else would report a durable commit as a
+		// failed, retryable transaction.
+		if command.Kind == "commit" {
+			if sequence, committed := n.store.Committed(command.ID); committed {
+				return mvcc.Result{Sequence: sequence}, nil
+			}
+		}
 		return mvcc.Result{}, err
 	}
 	response, ok := future.Response().(mvcc.Result)

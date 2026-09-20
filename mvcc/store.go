@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"gbaselite/storageengine"
 	bolt "go.etcd.io/bbolt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,15 @@ const MaxValueBytes = storageengine.MaxValueBytes
 
 var ErrConflict = storageengine.ErrConflict
 var ErrClosed = storageengine.ErrClosed
+
+// ErrSequenceExhausted reports that no further commit sequence can be allocated.
+//
+// The last legal sequence is math.MaxUint64, and it is refused rather than wrapped
+// because sequence 0 is not a version: committing at 0 would install a record the
+// version layout rejects and could shadow committed history. Every allocation site
+// fails closed with this error, so a store at the end of its sequence stays
+// readable while refusing new writes.
+var ErrSequenceExhausted = errors.New("mvcc: commit sequence exhausted")
 var dataBucket = []byte("versions")
 var metaBucket = []byte("meta")
 var pendingBucket = []byte("pending")
@@ -56,6 +66,9 @@ func (r Result) Err() error {
 	if r.Error == ErrConflict.Error() {
 		return ErrConflict
 	}
+	if r.Error == ErrSequenceExhausted.Error() {
+		return ErrSequenceExhausted
+	}
 	if r.Error != "" {
 		return errors.New(r.Error)
 	}
@@ -79,7 +92,7 @@ type Store struct {
 	groupBytes    int
 	apply         sync.Mutex
 	views         sync.Mutex
-	active        map[uint64]int
+	txns          *TransactionManager
 	localSeq      uint64
 	localWAL      bool
 	writeSetLimit int64
@@ -115,7 +128,7 @@ func OpenWithOptions(directory string, options Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, path: path, active: make(map[uint64]int), writeSetLimit: options.WriteSetLimitBytes, localWAL: options.LocalWAL}
+	s := &Store{db: db, path: path, txns: NewTransactionManager(), writeSetLimit: options.WriteSetLimitBytes, localWAL: options.LocalWAL}
 	err = db.Update(func(tx *bolt.Tx) error {
 		for _, name := range [][]byte{dataBucket, metaBucket, pendingBucket, commitsBucket, countersBucket} {
 			if _, e := tx.CreateBucketIfNotExists(name); e != nil {
@@ -184,6 +197,31 @@ func sequence(n uint64) []byte {
 	var value [8]byte
 	binary.BigEndian.PutUint64(value[:], n)
 	return value[:]
+}
+
+// nextSequence reserves the next commit sequence, or reports exhaustion.
+//
+// This is the single allocation point for every local commit path, so no path can
+// wrap to 0 or hand out a sequence twice. The caller must hold apply. Sequence 0 is
+// never returned: the first allocation is 1.
+func (s *Store) nextSequence() (uint64, error) {
+	if s.localSeq == math.MaxUint64 {
+		return 0, ErrSequenceExhausted
+	}
+	s.localSeq++
+	return s.localSeq, nil
+}
+
+// validateCommitSequence rejects a commit sequence that may not be used as a new
+// version: sequence 0 is reserved and is never a version. It returns the bare
+// sentinel because a replicated apply carries its index from the log, and the
+// Result channel that reports the failure back to the FSM is a string by wire
+// contract, so the error must be recognisable by its message.
+func validateCommitSequence(index uint64) error {
+	if index == 0 {
+		return ErrSequenceExhausted
+	}
+	return nil
 }
 func validateKey(space string, rowKey []byte) error {
 	keyLimit := 8192
@@ -392,26 +430,46 @@ func validateCommand(command Command) error {
 	return nil
 }
 func (s *Store) Propose(ctx context.Context, command Command) (Result, error) {
+	// The publication marker is the durable commit point, so a commit that is
+	// already published reports its committed sequence even when the caller's
+	// context is done: answering with a cancellation would invite a retry of a
+	// transaction that committed. This is also what keeps commit replay
+	// idempotent for a client whose wait was interrupted.
+	if command.Kind == "commit" {
+		if sequence, committed := s.Committed(command.ID); committed {
+			// A crash between publication and cleanup can leave a staged leftover;
+			// drop it under apply so the db handle cannot be swapped mid-write.
+			s.apply.Lock()
+			err := s.clearPending(command.ID)
+			s.apply.Unlock()
+			if err != nil {
+				return Result{}, err
+			}
+			return Result{Sequence: sequence}, nil
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
 	}
 	s.apply.Lock()
 	defer s.apply.Unlock()
-	s.localSeq++
+	index, err := s.nextSequence()
+	if err != nil {
+		return Result{}, err
+	}
 	if err := s.AvailabilityError(); err != nil {
 		return Result{}, err
 	}
 	var result Result
-	var err error
 	if command.Kind == "commit" {
 		err = validateCommand(command)
 		if err == nil {
-			result, err = s.commitContext(ctx, s.localSeq, command)
+			result, err = s.commitContext(ctx, index, command)
 		}
 	} else {
-		result, err = s.applyCommand(s.localSeq, command)
+		result, err = s.applyCommand(index, command)
 	}
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, ErrSequenceExhausted) {
 		s.failure.Lock()
 		s.fatal = err
 		s.failure.Unlock()
@@ -531,6 +589,11 @@ func (s *Store) commitContext(ctx context.Context, index uint64, command Command
 			result.Sequence = number(done)
 			return nil
 		}
+		// A replicated apply carries its index from the log, so the version-0 rule is
+		// checked here rather than at allocation time.
+		if err := validateCommitSequence(index); err != nil {
+			return err
+		}
 		if number(tx.Bucket(metaBucket).Get([]byte("applied"))) >= index {
 			return ErrConflict
 		}
@@ -538,16 +601,14 @@ func (s *Store) commitContext(ctx context.Context, index uint64, command Command
 		if pending == nil {
 			return errors.New("missing staged transaction")
 		}
-		reader := newVisibilityReader(tx, ^uint64(0))
-		return pending.ForEach(func(k, v []byte) error {
+		// Every staged dependency -- writes and guards alike -- is validated against
+		// the shared commit rule through one lookup per view.
+		validator := newConflictValidator(command.Snapshot, newViewChangeLookup(tx))
+		return pending.ForEach(func(k, _ []byte) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			_, version, _ := reader.visible(k)
-			if version > command.Snapshot {
-				return ErrConflict
-			}
-			return nil
+			return validator.validateKey(k)
 		})
 	})
 	if err != nil {
@@ -717,6 +778,54 @@ func (s *Store) CatalogHead() (uint64, error) {
 	var head uint64
 	err := s.db.View(func(tx *bolt.Tx) error { head = number(tx.Bucket(metaBucket).Get([]byte("catalog_head"))); return nil })
 	return head, err
+}
+
+// ActiveTransactions returns a diagnostics snapshot of the registered transactions.
+//
+// It is a read-only view of the transaction registry: it neither observes nor
+// changes visibility, conflict validation, garbage collection or the commit path,
+// and it is not part of transaction semantics. The result is a copy, so the caller
+// may retain or mutate it. Entries that reached a terminal state but were not
+// unregistered yet are included, because they are still registered. Iteration order
+// is unspecified. A store whose registry was replaced by Restore reports only the
+// transactions of the current generation.
+func (s *Store) ActiveTransactions() []TransactionInfo { return s.txns.ActiveTransactions() }
+
+// TransactionStats returns the aggregate diagnostics counters and the current GC
+// horizon of this store. Like ActiveTransactions it is a read-only view: the active
+// counts and the horizon are a point-in-time observation, not a consistency
+// guarantee against a concurrent commit, and the monotonic counters cover the
+// process lifetime rather than the currently open database.
+func (s *Store) TransactionStats() TransactionStats { return s.txns.Stats() }
+
+// Committed reports the durable publication sequence for one transaction ID.
+//
+// The publication marker is the commit point, so this is the authority a client
+// commit path consults when its own wait was interrupted: a marker means the
+// transaction committed, and no cancellation may then be reported as a rollback.
+func (s *Store) Committed(id string) (uint64, bool) {
+	if id == "" {
+		return 0, false
+	}
+	s.gate.RLock()
+	defer s.gate.RUnlock()
+	return s.committedLocked(id)
+}
+
+// committedLocked reads the publication marker. The caller must hold apply or
+// gate, which is what keeps the database handle stable across a restore.
+func (s *Store) committedLocked(id string) (uint64, bool) {
+	var sequence uint64
+	found := false
+	if err := s.db.View(func(tx *bolt.Tx) error {
+		if marker := tx.Bucket(commitsBucket).Get([]byte(id)); marker != nil {
+			sequence, found = number(marker), true
+		}
+		return nil
+	}); err != nil {
+		return 0, false
+	}
+	return sequence, found
 }
 
 func (s *Store) AvailabilityError() error { s.failure.Lock(); defer s.failure.Unlock(); return s.fatal }

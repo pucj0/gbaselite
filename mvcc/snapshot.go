@@ -72,7 +72,10 @@ func (s *Store) Restore(reader io.Reader) error {
 	// Invalid input must not invalidate active transactions in the healthy store.
 	// Invalidate only once the validated image is ready to replace the database.
 	s.generation.Add(1)
-	s.active = make(map[uint64]int)
+	// Purge the registry with the generation change: transactions from the
+	// replaced generation are invalid and must not keep pinning history for the
+	// new one.
+	s.txns.Reset()
 	if err = s.db.Close(); err != nil {
 		return err
 	}

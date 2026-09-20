@@ -33,16 +33,17 @@ func (t *Tx) commitLocalStream(ctx context.Context) (index uint64, err error) {
 		return 0, err
 	}
 	defer func() {
-		if err != nil && !errors.Is(err, ErrConflict) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		if err != nil && !errors.Is(err, ErrConflict) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, ErrSequenceExhausted) {
 			s.failure.Lock()
 			s.fatal = err
 			s.failure.Unlock()
 		}
 	}()
-	// Validate all guards using encoded keys. The frozen stage is read-only;
-	// no payload copy or namespace reconstruction is needed for conflict checks.
+	// Validate every dependency -- writes and guards alike -- through the shared
+	// commit rule, using the encoded keys of the frozen stage. Nothing is installed
+	// yet on this path, so the view is the only change source.
 	err = s.db.View(func(dbtx *bolt.Tx) error {
-		reader := newVisibilityReader(dbtx, ^uint64(0))
+		validator := newConflictValidator(t.Snapshot, newViewChangeLookup(dbtx))
 		return t.stage.View(func(stageTx *bolt.Tx) error {
 			return stageTx.Bucket([]byte("writes")).ForEach(func(k, encoded []byte) error {
 				if err := ctx.Err(); err != nil {
@@ -51,19 +52,17 @@ func (t *Tx) commitLocalStream(ctx context.Context) (index uint64, err error) {
 				if _, err := stagedOpHeader(k, encoded); err != nil {
 					return err
 				}
-				_, version, _ := reader.visible(k)
-				if version > t.Snapshot {
-					return ErrConflict
-				}
-				return nil
+				return validator.validateKey(k)
 			})
 		})
 	})
 	if err != nil {
 		return 0, err
 	}
-	s.localSeq++
-	index = s.localSeq
+	if index, err = s.nextSequence(); err != nil {
+		// Exhausted: fail closed before installing anything.
+		return 0, err
+	}
 	if s.localWAL {
 		err = s.writeLocalWAL(ctx, func(w *localWALWriter) error {
 			if err := w.begin(index, t.ID); err != nil {

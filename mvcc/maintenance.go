@@ -35,10 +35,12 @@ func (s *Store) CompactHistory(ctx context.Context) error {
 			if err != nil {
 				return false, err
 			}
-			for snapshot := range s.active {
-				if snapshot < horizon {
-					horizon = snapshot
-				}
+			// The GC horizon is the oldest read timestamp still pinned by a
+			// registered root transaction. Child and savepoint transactions never
+			// pin, so they cannot hold history alive on their own, and a root
+			// releases its pin as soon as it ends, by commit or by rollback.
+			if oldest, ok := s.txns.OldestReadTS(); ok && oldest < horizon {
+				horizon = oldest
 			}
 			done := false
 			err = s.db.Update(func(tx *bolt.Tx) error {

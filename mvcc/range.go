@@ -230,6 +230,13 @@ func (t *Tx) ScanRange(ctx context.Context, space string, r KeyRange, yield func
 	if t.closed || t.generation != t.store.generation.Load() {
 		return ErrClosed
 	}
+	var observation transactionObservation
+	wrapped := func(k, v []byte) error {
+		observation.add(k, v)
+		return yield(k, v)
+	}
+	// Range reads are recorded once per call, even when the consumer stops early.
+	defer func() { t.observeRangeRead(observation) }()
 	prefix, err := key(space, nil)
 	if err != nil {
 		return err
@@ -287,7 +294,7 @@ func (t *Tx) ScanRange(ctx context.Context, space string, r KeyRange, yield func
 			iters[i].position++
 		}
 		if winner != nil && !winner.deleted {
-			if err = yield(winner.key, winner.value); err != nil {
+			if err = wrapped(winner.key, winner.value); err != nil {
 				return err
 			}
 		}

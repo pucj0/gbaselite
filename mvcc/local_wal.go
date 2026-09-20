@@ -314,9 +314,11 @@ func (s *Store) failLocalWAL(err error) {
 	}
 }
 func (s *Store) commitLocalWALGroup(group []*localCommitRequest) {
-	seen := make(map[string]uint64)
+	// This path validates before it installs, so the shared commit rule is layered
+	// with the changes accepted earlier in the same group.
+	acceptedChanges := make(map[string]uint64)
 	err := s.db.View(func(tx *bolt.Tx) error {
-		reader := newVisibilityReader(tx, ^uint64(0))
+		base := newViewChangeLookup(tx)
 		for _, r := range group {
 			if r.err != nil {
 				continue
@@ -324,32 +326,27 @@ func (s *Store) commitLocalWALGroup(group []*localCommitRequest) {
 			if r.err = r.ctx.Err(); r.err != nil {
 				continue
 			}
-			for _, op := range r.ops {
-				k, _ := key(op.Space, op.Key)
-				_, v, _ := reader.visible(k)
-				v = max(v, seen[string(k)])
-				if op.Space == rangeGuardSpace {
-					for changed, index := range seen {
-						if rangeDependencyContains(op.Key, []byte(changed)) {
-							v = max(v, index)
-						}
-					}
-				}
-				if v > r.snapshot {
-					r.err = ErrConflict
-					break
-				}
-			}
-			if r.err != nil {
+			validator := newConflictValidator(r.snapshot, newGroupChangeLookup(base, acceptedChanges))
+			if err := validator.validateOps(r.ops); err != nil {
+				r.err = err
 				continue
 			}
-			s.localSeq++
-			r.index = s.localSeq
+			index, err := s.nextSequence()
+			if err != nil {
+				// Exhausted: fail this request closed and keep the accepted ones.
+				r.err = err
+				continue
+			}
+			r.index = index
 			for _, op := range r.ops {
-				if !op.Check {
-					k, _ := key(op.Space, op.Key)
-					seen[string(k)] = r.index
+				if op.Check {
+					continue
 				}
+				k, err := key(op.Space, op.Key)
+				if err != nil {
+					return err
+				}
+				acceptedChanges[string(k)] = r.index
 			}
 		}
 		return nil

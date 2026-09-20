@@ -5,6 +5,7 @@ package storageengine
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // MaxValueBytes is the portable SQL record budget, independent of physical pages.
@@ -169,3 +170,117 @@ type Maintenance interface {
 	Compact(context.Context, string) error
 }
 type Diagnostics interface{ PendingBytes() (int64, error) }
+
+// TransactionState is the neutral, backend-independent lifecycle state a storage
+// engine reports through TransactionDiagnostics. It is a diagnostics classification
+// only: it carries no promise about visibility, conflict resolution or durability
+// beyond what Txn.Commit already reports, and SQL does not branch on it.
+type TransactionState string
+
+const (
+	// TransactionActive accepts reads and writes and has not ended.
+	TransactionActive TransactionState = "ACTIVE"
+	// TransactionCommitting is a root transaction whose durable publication is in
+	// progress. The commit point has not been reached, so callers must not treat it
+	// as committed and must not read a commit sequence for it.
+	TransactionCommitting TransactionState = "COMMITTING"
+	// TransactionCommitted is a root transaction whose publication marker is durable.
+	TransactionCommitted TransactionState = "COMMITTED"
+	// TransactionAborted is an ended transaction whose writes were discarded, whether
+	// it was rolled back or ended by conflict, cancellation, or a failed commit.
+	TransactionAborted TransactionState = "ABORTED"
+	// TransactionMerged is a child transaction whose writes were merged into its
+	// parent. It has no durable commit sequence of its own.
+	TransactionMerged TransactionState = "MERGED"
+	// TransactionUnknown is the fail-closed classification: a backend that cannot
+	// classify a transaction must report this instead of claiming it is ACTIVE.
+	TransactionUnknown TransactionState = "UNKNOWN"
+)
+
+// TransactionInfo is one transaction's diagnostics snapshot. Fields describe the
+// transaction at the instant the snapshot was taken, so a caller must not read the
+// combination as an ordered history: State may already be terminal while CommitTS is
+// absent, and vice versa is never legal.
+//
+// Counters are process-local observations, not durable state, and they are never
+// keys or values: no SQL text, key bytes or row data appears here.
+type TransactionInfo struct {
+	// ID is the transaction identifier reported by Txn.ID; empty when unavailable.
+	ID string
+	// ParentID is the owning transaction for a child, empty for a root.
+	ParentID string
+
+	// StartTS is the head the transaction began at; ReadTS is the snapshot it reads.
+	// They are equal for a normal begin. A child inherits its parent's snapshot
+	// instead of taking a new one, so it reports the parent's values and pins no
+	// history of its own.
+	StartTS uint64
+	ReadTS  uint64
+
+	// CommitTS is the commit sequence, valid only when HasCommitTS is true. Sequence
+	// 0 is a legal value, so the boolean rather than the value reports presence.
+	CommitTS    uint64
+	HasCommitTS bool
+
+	// State is the lifecycle classification. Generation identifies the database
+	// generation the transaction belongs to, and StartedAt is when it registered.
+	State      TransactionState
+	Generation uint64
+	StartedAt  time.Time
+
+	// Observation counters for work this transaction performed.
+	PointReads    uint64
+	RangeReads    uint64
+	RowsObserved  uint64
+	BytesObserved uint64
+
+	// Writes and WriteBytes describe the staged write set, including bytes spooled to
+	// staging storage; they are not a durable size.
+	Writes     uint64
+	WriteBytes int64
+
+	// PointDependencies and RangeDependencies count the optimistic validation
+	// dependencies from Guard and GuardRange. They are dependencies, not locks.
+	PointDependencies uint64
+	RangeDependencies uint64
+
+	// AbortReason is a bounded category such as "conflict" or "canceled". It never
+	// contains keys, values or SQL text.
+	AbortReason string
+}
+
+// TransactionStats is the aggregate diagnostics view of one engine.
+type TransactionStats struct {
+	// ActiveRoot and ActiveChildren count registered transactions that have not
+	// reached a terminal state.
+	ActiveRoot     uint64
+	ActiveChildren uint64
+	// Committed, Aborted and Conflicts are monotonic process-lifetime counters of
+	// terminal outcomes; they are not limited to the currently open database.
+	Committed uint64
+	Aborted   uint64
+	Conflicts uint64
+
+	// OldestReadTS is the GC horizon: the smallest read timestamp still pinned by a
+	// registered root transaction, so history at or after it must be retained. The
+	// boolean is required because 0 is a legal timestamp and cannot act as "unset".
+	OldestReadTS    uint64
+	HasOldestReadTS bool
+}
+
+// TransactionDiagnostics is an optional Engine capability exposing read-only
+// transaction diagnostics. It is deliberately separate from Engine, Txn,
+// Diagnostics and FullEngine: a backend may implement none, one, or several, and
+// callers must detect each capability explicitly and fall back to ErrUnsupported
+// when it is absent. Absence is not an error and never changes transaction
+// semantics.
+//
+// Both methods are safe to call concurrently with Begin, Commit and Rollback, and
+// neither blocks on transaction progress. They observe; they do not control.
+type TransactionDiagnostics interface {
+	// ActiveTransactions returns the currently registered transactions. The slice is
+	// owned by the caller, is never nil, and has no guaranteed order.
+	ActiveTransactions() []TransactionInfo
+	// TransactionStats returns the aggregate counters and the current GC horizon.
+	TransactionStats() TransactionStats
+}

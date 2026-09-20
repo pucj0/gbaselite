@@ -17,6 +17,12 @@ func (t *Tx) mergeParent(ctx context.Context) error {
 		p.stagedBytes, p.bufferBytes = t.stagedBytes, t.bufferBytes
 		t.stage, t.buffered = nil, nil
 		t.stagedBytes, t.bufferBytes = 0, 0
+		// The parent's write set was empty, so the child's counters can be folded in
+		// wholesale: its write set becomes the parent's, and the work it did was done
+		// on the parent's behalf.
+		p.stats().addWriteSet(t.stats())
+		p.stats().addDependencies(t.stats())
+		p.stats().addObservations(t.stats())
 		return nil
 	}
 	if err := t.WalkWrites(ctx, p.write); err != nil {
@@ -25,5 +31,8 @@ func (t *Tx) mergeParent(ctx context.Context) error {
 		_ = p.Rollback()
 		return err
 	}
+	// The parent's write and dependency counters were updated by re-buffering each
+	// operation above; only the child's read observations still need folding in.
+	p.stats().addObservations(t.stats())
 	return nil
 }
