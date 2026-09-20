@@ -33,10 +33,12 @@ type Tx struct {
 	buffered    map[string][]byte
 	bufferBytes int64
 
-	// mu guards the lifecycle fields below. The owning goroutine writes them in
-	// applyTransition, while State and Info are diagnostics accessors that a caller
-	// may reach from another goroutine, so those four fields are the one part of a
-	// transaction that is safe to read concurrently. The rest of Tx keeps the
+	// mu guards the mutable lifecycle fields below: state, commitTS, hasCommitTS and
+	// abortReason. The owning goroutine writes them in applyTransition, while State and
+	// Info are diagnostics accessors that a caller may reach from another goroutine, so
+	// those four fields are the one part of a transaction that is safe to read
+	// concurrently. startedAt sits in the same block but is written once at construction
+	// and then immutable, so Info reads it without the lock. The rest of Tx keeps the
 	// documented single-goroutine contract.
 	mu          sync.Mutex
 	startedAt   time.Time

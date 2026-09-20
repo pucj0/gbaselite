@@ -285,6 +285,13 @@ bounded layer model：capacity check 必须在任何 state mutation 之前完成
 （exact boundary、replacement below ceiling、replacement at ceiling fail-closed 且名字仍可用、
 repeated same-name 不能增长 layer 链、RELEASE 不能腾出名额、ROLLBACK 释放全部 layer）。
 
+`ROLLBACK TO SAVEPOINT` 截断 layer 链时，executor 必须对**目标及其之上每个被丢弃的 child** 显式
+调用 `Tx.Rollback()`（最内层优先）并 `clear` slice 尾部引用：registry 的 descendant 清理只覆盖
+diagnostics 状态与 retention，只有 `Tx.cleanup()` 会释放 staging bbolt handle 与
+`<store>/transactions/<id>.tmp`。单个 cleanup 失败不得跳过其余 layer（用 `errors.Join` 聚合后
+上报）。对应测试：`executor/mvcc_savepoint_resource_test.go` 的四个用例（discarded layer 立即释放、
+多层丢弃全部释放、同进程 close+reopen 成功、重复 ROLLBACK TO 不累积 stage）。
+
 ## Testing Strategy
 
 ### Unit

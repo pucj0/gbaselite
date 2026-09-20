@@ -51,12 +51,13 @@ StartTS == ReadTS == Begin Head
 ordinary reads 不做全量 key-level validation
 Guard/GuardRange 才是 dependency
 child commit == MERGED
-read-only commit 不推进 Head
+A 类（无 Put/Delete/Guard/GuardRange）read-only commit 不推进 Head；
+C 类 dependency-only 仍走 publication 并推进 Head
 publication marker == durable commit point
 root transaction 才拥有 GC retention
 ```
 
-## 6. 推荐单测命名
+## 6. 推荐单测命名（示意名称，实际测试名以仓库为准）
 
 ```text
 TestTransactionManagerLifecycle
@@ -106,7 +107,7 @@ go vet ./...
 若项目 CI 支持 race：
 
 ```bash
-go test -race ./mvcc ./executor ./server
+go test -race ./mvcc ./storageengine/... ./executor ./server
 ```
 
 然后运行：

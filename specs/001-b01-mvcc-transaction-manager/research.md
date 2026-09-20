@@ -30,7 +30,7 @@
 - `CommitTS = durable publish 时的 commit/version sequence`
 - child merge 不分配 CommitTS
 - read-only（无 Put/Delete/Guard/GuardRange）commit 不分配 CommitTS
-- dependency-only（只有 Guard/GuardRange）commit 分配 CommitTS（见 R12）
+- dependency-only（只有 Guard/GuardRange）commit 分配 CommitTS（见 R6b）
 
 ### Rationale
 

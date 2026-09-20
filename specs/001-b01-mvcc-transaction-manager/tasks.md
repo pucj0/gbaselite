@@ -259,13 +259,13 @@ P2 diagnostics 与 cancel/overflow hardening 可随后增量完成，但最终 B
 
 ### 证据索引
 
-- Foundational 与 US1：`mvcc/transaction_state.go`、`mvcc/transaction_manager.go`、`mvcc/transaction.go`、`mvcc/transaction_manager_test.go`（15 例）、`mvcc/transaction_lifecycle_test.go`（15 例，覆盖 T015–T018、double commit/rollback、终态不被 cleanup 改写）、`mvcc/transaction_invariants_baseline_test.go`（12 例）。
+- Foundational 与 US1：`mvcc/transaction_state.go`、`mvcc/transaction_manager.go`、`mvcc/transaction.go`、`mvcc/transaction_manager_test.go`（15 例）、`mvcc/transaction_lifecycle_test.go`（16 例，覆盖 T015–T018、double commit/rollback、终态不被 cleanup 改写）、`mvcc/transaction_invariants_baseline_test.go`（12 例）。
 - US2 与 GC：`mvcc/maintenance.go` 经 `TransactionManager.OldestReadTS()` 取 horizon；`mvcc/history_retention_test.go`（6 例，含 disconnect rollback 与 generation change）；`TestTransactionManagerChildrenNeverPinSnapshot`（T011/T026/T034）。
 - US3：`mvcc/visibility_contract_test.go`（11 例，含重复读与多读取路径一致性）。契约测试未暴露需要修改读取路径实现的差异，因此 T036 无实现改动，也未做机械合并；`visibilityReader`/`visible` 的实现在 `mvcc/store.go`（`newVisibilityReader`、`visibilityReader.visible`），flat path 在 `mvcc/flat_scan.go`。
 - US4：`mvcc/conflict.go` 为唯一 validator；实际接入点为 `mvcc/group_commit.go`（`commitLocal` → `commitLocalGroup`，bounded + group 两条路径）、`mvcc/local_stream.go`、`mvcc/local_wal.go`、`mvcc/store.go` 的 `commitContext`（replicated/staged）；`mvcc/conflict_matrix_test.go`（5 例，含 write skew 与 commit-path matrix）。
-- US5：`mvcc/observation.go`（`trackStagedOp`/`stagedOpKindOf` 是 point/range dependency 计数器的实际实现位置，经 `mvcc/write_buffer.go` 的 `bufferWrite` 调用；`mvcc/range_guard.go` 只负责把 `GuardRange` 编码成依赖，不含计数逻辑）、`mvcc/transaction_diagnostics_test.go`（11 例）、`mvcc/resource_boundary_test.go`（含 MaxUint64 与 write-limit 边界，T071–T078）；能力与 DTO 见 `storageengine/engine.go`、diagnostics adapter 位于 `storageengine/mvccadapter/diagnostics.go`（与 `adapter.go` 同包，故 T059 的实现位置以该文件为准）及其 11 个测试。
+- US5：`mvcc/observation.go`（`trackStagedOp`/`stagedOpKindOf` 是 point/range dependency 计数器的实际实现位置，经 `mvcc/write_buffer.go` 的 `bufferWrite` 调用；`mvcc/range_guard.go` 只负责把 `GuardRange` 编码成依赖，不含计数逻辑）、`mvcc/transaction_diagnostics_test.go`（11 例）、`mvcc/resource_boundary_test.go`（含 MaxUint64 与 write-limit 边界，T071–T078）；能力与 DTO 见 `storageengine/engine.go`、diagnostics adapter 位于 `storageengine/mvccadapter/diagnostics.go`（与 `adapter.go` 同包，故 T059 的实现位置以该文件为准）及其测试（`storageengine/mvccadapter/diagnostics_test.go` 8 例 + `diagnostics_internal_test.go` 3 例）。
 - US6：`mvcc/cancel_publication_test.go`（6 例）、`replication/commit_cancel_test.go`、`mvcc/transaction_reset_test.go`（含 stale Get/Commit/Rollback 与 stale Put/Delete fail-closed）、`storageengine/mvccadapter/diagnostics_internal_test.go::TestDiagnosticsExposeCommittingStateThroughTheAdapter`。
-- Executor/Savepoint 与断连：`executor/mvcc_autocommit_registry_test.go`（autocommit=0 隐式 root 的 registry 生命周期，经 `storageengine.TransactionDiagnostics` 断言）、`executor/mvcc_savepoint_test.go`、`executor/mvcc_savepoint_failure_test.go`、`executor/mvcc_savepoint_limit_test.go`（MVCC savepoint layer 上限 32 与 replacement/RELEASE bypass 回归）、`executor/mvcc_transaction_invariants_test.go`、`server/mvcc_disconnect_registry_test.go`（协议层 KILL/断连后 registry 清空且未提交写入不可见）；断连清理路径为 `server/mysql_server.go` 的 `defer s.Engine.CloseSession(session)` → `executor.CloseSession` → `rollbackSessionTransaction`。
+- Executor/Savepoint 与断连：`executor/mvcc_autocommit_registry_test.go`（autocommit=0 隐式 root 的 registry 生命周期，经 `storageengine.TransactionDiagnostics` 断言）、`executor/mvcc_savepoint_test.go`、`executor/mvcc_savepoint_failure_test.go`、`executor/mvcc_savepoint_limit_test.go`（MVCC savepoint layer 上限 32 与 replacement/RELEASE bypass 回归）、`executor/mvcc_savepoint_resource_test.go`（ROLLBACK TO 丢弃 layer 的资源释放、同进程 reopen、重复 ROLLBACK TO 不累积 stage）、`executor/mvcc_transaction_invariants_test.go`、`server/mvcc_disconnect_registry_test.go`（协议层 KILL/断连后 registry 清空且未提交写入不可见）；断连清理路径为 `server/mysql_server.go` 的 `defer s.Engine.CloseSession(session)` → `executor.CloseSession` → `rollbackSessionTransaction`。
 - T086–T088：`gofmt`、`git diff --check`、`go vet ./...`、`go test ./... -count=1` 全部通过。
 - T090：本文件与 `checklists/requirements.md` 的 CHK001–CHK050 已逐条对照 `spec.md`/`plan.md` 审查通过（该清单按自身说明只表示需求质量，不代表代码完成）。
 
@@ -286,7 +286,13 @@ P2 diagnostics 与 cancel/overflow hardening 可随后增量完成，但最终 B
 - **M-6（stale Put/Delete fail-closed）**：新增 `mvcc/transaction_reset_test.go::TestStaleTransactionRejectsWritesAfterReset`（stale root 不新建 stage、已有 stage 不被替换、head 与 retention 不变、数据不可见、stale child/parent 同样拒绝写入）。
 - **M-7（证据引用修正）**：本文件证据索引已按真实实现位置改写（`visibilityReader`/`visible` 在 `mvcc/store.go`、flat path 在 `mvcc/flat_scan.go`、validator 接入点在 `mvcc/group_commit.go` 等、dependency counters 在 `mvcc/observation.go`、diagnostics adapter 在 `storageengine/mvccadapter/diagnostics.go`），并把 T001 改为按证据规则不勾选。
 - **M-8（replicated MaxUint64 → local 分配）**：新增 `mvcc/resource_boundary_test.go::TestReplicatedMaxSequenceThenLocalAllocationFailsClosed`（经真实 `Apply` 入口把 high-water mark 推到 `MaxUint64`，随后的本地提交必须 `ErrSequenceExhausted`、不 wrap、无 version 0、无 marker、无 CommitTS）；`plan.md` Phase 8 的措辞已修正为"apply 侧只拒绝 sequence=0；MaxUint64 是最后合法 revision；后续本地分配必须 fail closed"。
-- 其余 MEDIUM/LOW（M-2 部分结构漂移已在 H-2 同步中顺带修正，M-3 等其余项与 L 系列）尚未处理，留待后续按需安排。
+
+### 第二轮 `/speckit/analyze`（HEAD `42fff71` 之后）
+
+第二轮结论为 CRITICAL 0 / HIGH 1 / MEDIUM 2 / LOW 若干。其中唯一 HIGH 已修复并关闭：
+
+- **HIGH-1（`ROLLBACK TO SAVEPOINT` 丢弃的 child layer 未释放资源）**：`rollbackToSavepoint` 原先只对目标 layer 调用 `Rollback()`，目标之上的 layer 仅从 slice 中截断。registry 的 descendant 清理只移除 diagnostics 条目与 retention 引用，`Tx.cleanup()`（关闭 staging bbolt handle、删除 `<store>/transactions/<id>.tmp`）不会执行，因此每次 `ROLLBACK TO` 都可能遗留打开的文件句柄与临时文件；实测可导致同进程 `OpenWithOptions` 在 Windows 上因清理旧 `.tmp` 失败而无法重开 store。现改为：对目标及其之上每个被丢弃 child 按**最内层优先**显式 `Rollback()`（单个失败不跳过其余，`errors.Join` 聚合上报）、`clear` slice 尾部引用后再重建同名 fresh layer（`executor/savepoint_mvcc.go`）。回归测试：`executor/mvcc_savepoint_resource_test.go` 的 4 个用例（丢弃 layer 的 stage 在 ROLLBACK TO 后立即消失且句柄已关闭、多层丢弃全部释放、同进程 close+reopen 成功、重复 ROLLBACK TO 不累积 stage/registry）；变异验证（恢复原实现）时四个用例全部失败，其中 reopen 用例复现 `used by another process`。
+- 其余第二轮 MEDIUM/LOW（savepoint 错误码分类、`createSavepoint` 的失败顺序、data-model 措辞等）按计划未处理，留待后续按需安排。
 
 ### CI 证据（B01 race）
 

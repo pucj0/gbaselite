@@ -30,9 +30,13 @@ contracts/transaction-diagnostics.md。
 - dependency-only root（C 类：只有 Guard/GuardRange）committed transaction 的 CommitTS
   非空（`HasCommitTS=true`）、Head 前进，但没有数据 version 被安装：见 spec.md FR-004、§7。
 - 终态：Committed / Aborted / Merged；终态只允许自我确认，不得回到 ACTIVE。
-- 合法转换：root `ACTIVE -> COMMITTING`、`ACTIVE -> COMMITTED`（仅 A 类）、
+- 合法转换（状态机层）：root `ACTIVE -> COMMITTING`、`ACTIVE -> COMMITTED`、
   `ACTIVE -> ABORTED`、`COMMITTING -> COMMITTED`、`COMMITTING -> ABORTED`；child
   `ACTIVE -> MERGED`、`ACTIVE -> ABORTED`。
+  状态表本身对**任意 root** 允许 `ACTIVE -> COMMITTED`（`transactionTransitionKind` 只校验
+  root-only，不看写集）。"仅 A 类"是**生产调用约定**而非状态机约束：`commitRoot()` 只有在
+  `!hasWriteSet()` 时才走这条直接转换，B/C 类必须经过 `COMMITTING` 以获得 durable commit
+  revision。若要由状态机自身保证该约束，需另做设计变更。
 
 ## 2. TransactionInfo
 
@@ -234,8 +238,11 @@ root (session.transaction)
 - 资源上限是 **maximum live MVCC savepoint layers per user transaction**（`maxMVCCSavepoints`
   = 32），统计的是存活 layer 数（含匿名 boundary），不是 named savepoint 数；B01 不做匿名
   layer compaction。达到 ceiling 后即使 named 数为 0 也不能创建新 `SAVEPOINT`。
-- `ROLLBACK TO SAVEPOINT` 丢弃目标 layer 及其之上的 layer，并以同一 parent 重新开一个同名
-  layer；被丢弃 layer 的 child 由 manager 的 descendant 清理从 registry 释放。
+- `ROLLBACK TO SAVEPOINT` 丢弃目标 layer 及其之上的 layer（最内层优先），并以同一 parent 重新
+  开一个同名 layer。被丢弃的每个 child 必须由 executor 显式 `Tx.Rollback()`：registry 的
+  descendant 清理只移除 diagnostics 条目与 retention 引用，而 staging bbolt handle 与
+  `<store>/transactions/<id>.tmp` 只在 `Tx.cleanup()` 中释放，两者不可互相替代；截断后还需
+  清除 slice 尾部对这些 child 的引用，避免它们仍被底层数组持有。
 - `COMMIT` 自内向外把每个 layer merge 进它的 parent，最终只留下 root 的 durable commit；
   `ROLLBACK` 丢弃整条链。
 

@@ -95,17 +95,38 @@ func (e *Engine) rollbackToSavepoint(session *Session, name string) (*Result, er
 		return nil, fmt.Errorf("%w: %s", errMVCCSavepointNotFound, name)
 	}
 	layer := session.savepoints[index]
-	if err := layer.tx.Rollback(); err != nil {
-		return nil, err
+	// The target and every layer above it are logically discarded, so each one must end
+	// its own lifecycle and release its own resources. Dropping them from the registry is
+	// not enough: the registry owns diagnostics state, while storageengine.Txn cleanup
+	// (closing the staging database and removing its file) only happens when the child
+	// transaction itself is rolled back. Innermost first, and every layer is attempted
+	// even if one cleanup fails, so a single failure cannot leave the rest of the
+	// discarded subtree holding staging handles.
+	discarded := session.savepoints[index:]
+	var cleanupErr error
+	for i := len(discarded) - 1; i >= 0; i-- {
+		if err := discarded[i].tx.Rollback(); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
 	}
-	// Savepoints above the target are discarded, and the target keeps its name on a
-	// fresh child of the same parent so the transaction can continue.
+	// Shortening the slice does not drop the backing array's references to the discarded
+	// layers, and an abandoned layer would keep its staging handle alive, so the dropped
+	// range is cleared explicitly.
+	clear(discarded)
+	session.savepoints = session.savepoints[:index]
+	// The target keeps its name on a fresh child of the same parent so the transaction
+	// can continue. That parent is outside the discarded range by construction.
 	fresh, err := layer.parent.Child()
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(cleanupErr, err)
 	}
-	session.savepoints = append(session.savepoints[:index], savepointLayer{name: layer.name, tx: fresh, parent: layer.parent})
+	session.savepoints = append(session.savepoints, savepointLayer{name: layer.name, tx: fresh, parent: layer.parent})
 	session.transaction = fresh
+	if cleanupErr != nil {
+		// The discarded writes are gone and the chain was rebuilt, so the logical outcome
+		// is decided; only a resource release failed, and that error is reported.
+		return nil, cleanupErr
+	}
 	return &Result{Message: "rolled back to savepoint"}, nil
 }
 

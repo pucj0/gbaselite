@@ -386,7 +386,10 @@ child write 在 merge 前只对 child 可见；merge 后对 parent 可见；pare
 - Head=0 时可以 Begin，ReadTS=0 合法。
 - 0 不可用作 ReadTS 的 unset sentinel。
 - CommitTS 必须使用 optional/has-value 语义。
-- MaxUint64 前必须阻止下一次 sequence allocation。
+- sequence 0 永远不是合法 version（由 replicated apply 侧的 `index == 0` 校验拒绝）。
+- MaxUint64 是最后一个合法 revision：apply 侧允许使用它，并把 high-water mark 推到 MaxUint64。
+- high-water mark 达到 MaxUint64 后，任何下一次本地 sequence allocation 必须 fail closed
+  （`ErrSequenceExhausted`），不得 wrap 到 0。
 
 ### 事务结束
 
@@ -454,7 +457,13 @@ durable commit revision"。
 - savepoint replacement（未达 layer ceiling 时：老同名 layer 变成匿名 boundary，新同名 layer
   指向当前 transaction position，其它名字继续有效）；
 - rollback to savepoint（丢弃目标 layer 及目标之上的所有 layer，并以同一 parent 重新开一个
-  同名 layer；被丢弃 layer 的子事务由 manager 的 descendant 清理释放）；
+  同名 layer）。被丢弃的每个 child layer 都必须由 executor **显式 `Rollback()`**：只有
+  `storageengine.Txn` 的 rollback 会结束该事务的 lifecycle 并执行资源 cleanup（关闭 staging
+  bbolt handle、释放 buffered 引用、删除 `<store>/transactions/<id>.tmp`）。TransactionManager
+  只负责 registry/diagnostics 状态（终态转换、descendant 条目清理、retention），**不能替代
+  `Tx.cleanup()`**；从 registry 消失不等于资源已释放。执行顺序为最内层 descendant → 目标 layer
+  （倒序），单次 cleanup 失败不得跳过其余 layer，且截断后必须清除 slice 尾部对被丢弃 layer 的
+  引用；新的同名 layer 在目标 layer 的 parent 上重新创建，因此 parent 必然不在被丢弃区间内。
 - **maximum live MVCC savepoint layers per user transaction**（上限 32）：
   - 约束对象是**实际存活的 savepoint child layer 数**，不是"不同名字的个数"；
   - `RELEASE SAVEPOINT` 只释放名字/rollback target，不回收 MVCC child layer，被释放的
