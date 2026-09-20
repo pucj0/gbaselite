@@ -184,7 +184,13 @@ const (
 	// progress. The commit point has not been reached, so callers must not treat it
 	// as committed and must not read a commit sequence for it.
 	TransactionCommitting TransactionState = "COMMITTING"
-	// TransactionCommitted is a root transaction whose publication marker is durable.
+	// TransactionCommitted is a root transaction that ended successfully.
+	//
+	// A write transaction reaches it with HasCommitTS=true and a durable
+	// publication marker. A read-only or empty root reaches it with
+	// HasCommitTS=false: it allocated no commit sequence, published no marker and
+	// did not advance the head, so the sequence itself must never be treated as the
+	// evidence of a commit.
 	TransactionCommitted TransactionState = "COMMITTED"
 	// TransactionAborted is an ended transaction whose writes were discarded, whether
 	// it was rolled back or ended by conflict, cancellation, or a failed commit.

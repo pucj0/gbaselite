@@ -39,6 +39,9 @@ jobs:
       - name: Failover race regression
         if: runner.os == 'Linux'
         run: go test -race ./failover -count=10
+      - name: MVCC transaction race regression
+        if: runner.os == 'Linux'
+        run: go test -race ./mvcc ./storageengine/... ./executor ./server -count=1
 
   mysql-8-client:
     needs: quality
