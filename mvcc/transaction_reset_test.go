@@ -189,3 +189,160 @@ func TestStaleChildTransactionAfterResetIsSafe(t *testing.T) {
 	requireCancelValue(t, s, "existing", "committed")
 	requireNoOrphans(t, s)
 }
+
+// M-6: a stale transaction must fail closed on writes too. Get, Commit and Rollback were
+// already covered; Put and Delete must reject the new generation in exactly the same way
+// as a closed transaction (ErrClosed through checkOpen/write), and nothing about the
+// refused write may reach the new generation: no staging database is opened, no registry
+// entry appears, the head does not move, retention is untouched, and neither the refused
+// value nor a refused delete becomes visible.
+func TestStaleTransactionRejectsWritesAfterReset(t *testing.T) {
+	t.Run("a stale root without a stage never opens one", func(t *testing.T) {
+		s := baselineStore(t)
+		seed := beginBaseline(t, s)
+		putVisible(t, seed, "existing", "committed")
+		mustCommit(t, seed)
+		head := mustHead(t, s)
+
+		stale := beginBaseline(t, s)
+		image := captureStoreImage(t, s)
+		if err := s.Restore(bytes.NewReader(image)); err != nil {
+			t.Fatal(err)
+		}
+		oldestBefore, hasOldestBefore := s.txns.OldestReadTS()
+
+		if stale.stage != nil || len(stale.buffered) != 0 || stale.stagedBytes != 0 {
+			t.Fatalf("the fixture is not a write-free transaction: stage=%v buffered=%d bytes=%d",
+				stale.stage != nil, len(stale.buffered), stale.stagedBytes)
+		}
+		if err := stale.Put(visibilitySpace, []byte("k"), []byte("v")); !errors.Is(err, ErrClosed) {
+			t.Fatalf("stale Put = %v, want ErrClosed", err)
+		}
+		if err := stale.Delete(visibilitySpace, []byte("existing")); !errors.Is(err, ErrClosed) {
+			t.Fatalf("stale Delete = %v, want ErrClosed", err)
+		}
+		// Fail closed: the refused writes created no staging state and no accounting.
+		if stale.stage != nil || len(stale.buffered) != 0 || stale.stagedBytes != 0 {
+			t.Fatalf("a refused write created staging state: stage=%v buffered=%d bytes=%d",
+				stale.stage != nil, len(stale.buffered), stale.stagedBytes)
+		}
+		if _, ok := s.txns.Info(stale.ID); ok {
+			t.Fatal("a refused write registered the stale transaction")
+		}
+		if after := mustHead(t, s); after != head {
+			t.Fatalf("a refused write moved head %d -> %d", head, after)
+		}
+		if oldest, ok := s.txns.OldestReadTS(); ok != hasOldestBefore || (ok && oldest != oldestBefore) {
+			t.Fatalf("a refused write changed retention to (%d, %v)", oldest, ok)
+		}
+		if stats := s.txns.Stats(); stats.ActiveRoot != 0 || stats.ActiveChildren != 0 || stats.HasOldestReadTS {
+			t.Fatalf("a refused write left registry state: %+v", stats)
+		}
+		if _, _, ok, err := s.Get(^uint64(0), visibilitySpace, []byte("k")); err != nil || ok {
+			t.Fatalf("a refused stale write became visible: ok=%v err=%v", ok, err)
+		}
+		if _, _, ok, err := s.Get(^uint64(0), visibilitySpace, []byte("existing")); err != nil || !ok {
+			t.Fatalf("a refused stale delete removed committed data: ok=%v err=%v", ok, err)
+		}
+	})
+
+	t.Run("a stale root keeps its existing stage untouched", func(t *testing.T) {
+		s := baselineStore(t)
+		seed := beginBaseline(t, s)
+		putVisible(t, seed, "existing", "committed")
+		mustCommit(t, seed)
+		head := mustHead(t, s)
+
+		stale := beginBaseline(t, s)
+		path := staleTransactionStage(t, stale)
+		stage, stagedBytes := stale.stage, stale.stagedBytes
+		infoBefore := stale.Info()
+		image := captureStoreImage(t, s)
+		if err := s.Restore(bytes.NewReader(image)); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := stale.Put(visibilitySpace, []byte("late"), []byte("v")); !errors.Is(err, ErrClosed) {
+			t.Fatalf("stale Put with an open stage = %v, want ErrClosed", err)
+		}
+		if err := stale.Delete(visibilitySpace, []byte("existing")); !errors.Is(err, ErrClosed) {
+			t.Fatalf("stale Delete with an open stage = %v, want ErrClosed", err)
+		}
+		// The existing staging database is neither replaced nor grown.
+		if stale.stage != stage {
+			t.Fatal("a refused write replaced the staging database")
+		}
+		if stale.stagedBytes != stagedBytes {
+			t.Fatalf("a refused write changed the write-set accounting: %d -> %d", stagedBytes, stale.stagedBytes)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("a refused write removed the staging file: %v", err)
+		}
+		if after := stale.Info(); after != infoBefore {
+			t.Fatalf("a refused write changed the transaction snapshot: %+v -> %+v", infoBefore, after)
+		}
+		if after := mustHead(t, s); after != head {
+			t.Fatalf("a refused write moved head %d -> %d", head, after)
+		}
+		// The stale transaction still ends safely and releases what it held.
+		if err := stale.Rollback(); err != nil {
+			t.Fatalf("stale rollback = %v", err)
+		}
+		requireStagingReleased(t, path)
+		if _, ok := s.txns.Info(stale.ID); ok {
+			t.Fatal("stale cleanup registered a new-generation entry")
+		}
+	})
+
+	t.Run("a stale child rejects writes as well", func(t *testing.T) {
+		s := baselineStore(t)
+		seed := beginBaseline(t, s)
+		putVisible(t, seed, "existing", "committed")
+		mustCommit(t, seed)
+
+		parent := beginBaseline(t, s)
+		child, err := parent.Child()
+		if err != nil {
+			t.Fatal(err)
+		}
+		image := captureStoreImage(t, s)
+		if err := s.Restore(bytes.NewReader(image)); err != nil {
+			t.Fatal(err)
+		}
+		before := s.txns.Stats()
+
+		if err := child.Put(visibilitySpace, []byte("c"), []byte("child")); !errors.Is(err, ErrClosed) {
+			t.Fatalf("stale child Put = %v, want ErrClosed", err)
+		}
+		if err := child.Delete(visibilitySpace, []byte("existing")); !errors.Is(err, ErrClosed) {
+			t.Fatalf("stale child Delete = %v, want ErrClosed", err)
+		}
+		if err := parent.Put(visibilitySpace, []byte("p"), []byte("parent")); !errors.Is(err, ErrClosed) {
+			t.Fatalf("stale parent Put = %v, want ErrClosed", err)
+		}
+		if err := parent.Delete(visibilitySpace, []byte("existing")); !errors.Is(err, ErrClosed) {
+			t.Fatalf("stale parent Delete = %v, want ErrClosed", err)
+		}
+		// Neither the child nor the parent opened a stage or reached the registry.
+		if child.stage != nil || len(child.buffered) != 0 || child.stagedBytes != 0 {
+			t.Fatalf("a refused child write created staging state: stage=%v buffered=%d bytes=%d",
+				child.stage != nil, len(child.buffered), child.stagedBytes)
+		}
+		if parent.stage != nil || len(parent.buffered) != 0 || parent.stagedBytes != 0 {
+			t.Fatalf("a refused parent write created staging state: stage=%v buffered=%d bytes=%d",
+				parent.stage != nil, len(parent.buffered), parent.stagedBytes)
+		}
+		if _, ok := s.txns.Info(child.ID); ok {
+			t.Fatal("a refused child write re-entered the registry")
+		}
+		if _, ok := s.txns.Info(parent.ID); ok {
+			t.Fatal("a refused parent write re-entered the registry")
+		}
+		if after := s.txns.Stats(); after != before {
+			t.Fatalf("refused writes left registry state: %+v -> %+v", before, after)
+		}
+		requireInvisible(t, s, "c")
+		requireCancelValue(t, s, "existing", "committed")
+		requireNoOrphans(t, s)
+	})
+}

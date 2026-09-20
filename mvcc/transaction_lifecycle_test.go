@@ -735,3 +735,115 @@ func TestLifecycleDiagnosticsSnapshotUnderConcurrentCommit(t *testing.T) {
 		t.Fatalf("final lifecycle = %+v, want COMMITTED with %d", info, outcome.sequence)
 	}
 }
+
+// FR-015: a transaction that ended cannot be used again. Get, Put, Delete, Child and
+// Commit must report ErrClosed (or a documented compatible error), while the outcome
+// the transaction already reached must stay exactly as it was.
+//
+// Observed error categories, which this test pins rather than unifies:
+//
+//   - closed (committed / rolled back / merged): every operation above returns ErrClosed.
+//   - generation-invalidated (stale) transactions are covered separately: Get, Put,
+//     Delete and Child report ErrClosed through checkOpen/write, while Commit reports
+//     ErrConflict because the generation check runs first. FR-015 allows the
+//     compatible error, so this difference is contract, not a defect.
+//   - Rollback stays the documented exception: a repeated rollback is an idempotent
+//     no-op returning nil, because "already ended" is the state it is asked to reach.
+func TestClosedTransactionAPIContract(t *testing.T) {
+	ctx := context.Background()
+	s := baselineStore(t)
+	seed := beginBaseline(t, s)
+	putVisible(t, seed, "existing", "committed")
+	mustCommit(t, seed)
+
+	committed := beginBaseline(t, s)
+	putVisible(t, committed, "committed-key", "value")
+	commitSequence := mustCommit(t, committed)
+
+	rolledBack := beginBaseline(t, s)
+	putVisible(t, rolledBack, "rolled-back-key", "value")
+	if err := rolledBack.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	parent := beginBaseline(t, s)
+	merged, err := parent.Child()
+	if err != nil {
+		t.Fatal(err)
+	}
+	putVisible(t, merged, "merged-key", "value")
+	if _, err := merged.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	probes := []struct {
+		name string
+		tx   *Tx
+		want TransactionState
+	}{
+		{"committed root", committed, TransactionCommitted},
+		{"rolled back root", rolledBack, TransactionAborted},
+		{"merged child", merged, TransactionMerged},
+	}
+	for _, probe := range probes {
+		t.Run(probe.name, func(t *testing.T) {
+			tx := probe.tx
+			before := tx.Info()
+			if before.State != probe.want {
+				t.Fatalf("state = %s, want %s", before.State, probe.want)
+			}
+
+			if value, ok, err := tx.Get(visibilitySpace, []byte("committed-key")); !errors.Is(err, ErrClosed) || ok || value != nil {
+				t.Fatalf("Get = (%q, %v, %v), want ErrClosed", value, ok, err)
+			}
+			if err := tx.Put(visibilitySpace, []byte("new"), []byte("value")); !errors.Is(err, ErrClosed) {
+				t.Fatalf("Put = %v, want ErrClosed", err)
+			}
+			if err := tx.Delete(visibilitySpace, []byte("existing")); !errors.Is(err, ErrClosed) {
+				t.Fatalf("Delete = %v, want ErrClosed", err)
+			}
+			child, err := tx.Child()
+			if !errors.Is(err, ErrClosed) || child != nil {
+				t.Fatalf("Child = (%v, %v), want ErrClosed and no child", child, err)
+			}
+			if _, err := tx.Commit(ctx); !errors.Is(err, ErrClosed) {
+				t.Fatalf("Commit = %v, want ErrClosed", err)
+			}
+			// The refused calls must not have changed the decided outcome or the
+			// counters behind it.
+			after := tx.Info()
+			if after != before {
+				t.Fatalf("a refused call changed the outcome: %+v -> %+v", before, after)
+			}
+			// Rollback remains the idempotent exception.
+			if err := tx.Rollback(); err != nil {
+				t.Fatalf("repeated Rollback = %v, want nil", err)
+			}
+			if after := tx.Info(); after != before {
+				t.Fatalf("repeated Rollback changed the outcome: %+v -> %+v", before, after)
+			}
+		})
+	}
+
+	// The ended transactions left durable state and other transactions untouched.
+	if sequence, ok := s.Committed(committed.ID); !ok || sequence != commitSequence {
+		t.Fatalf("committed transaction marker = (%d, %v), want (%d, true)", sequence, ok, commitSequence)
+	}
+	requireCancelValue(t, s, "committed-key", "value")
+	if _, _, ok, err := s.Get(^uint64(0), visibilitySpace, []byte("rolled-back-key")); err != nil || ok {
+		t.Fatalf("rolled back write became visible: ok=%v err=%v", ok, err)
+	}
+	// A merged child's write is durable only with its parent: the parent still sees
+	// it, another transaction cannot, and committing the parent publishes it. The
+	// closed-child probes above must not have disturbed that.
+	if _, _, ok, err := s.Get(^uint64(0), visibilitySpace, []byte("merged-key")); err != nil || ok {
+		t.Fatalf("merged child write was visible before its parent committed: ok=%v err=%v", ok, err)
+	}
+	if value := conflictRead(t, parent, "merged-key"); value != "value" {
+		t.Fatalf("parent lost the merged write: %q", value)
+	}
+	if _, err := parent.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	requireCancelValue(t, s, "merged-key", "value")
+}

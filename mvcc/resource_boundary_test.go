@@ -357,6 +357,97 @@ func TestReplicatedApplyRejectsUsedSequence(t *testing.T) {
 	requireCancelValue(t, s, "k", "value")
 }
 
+// M-8: the replicated apply path carries its index from the log, so the last legal
+// revision can arrive from the log rather than from the local allocator. The sequence
+// model pinned here is:
+//
+//   - sequence 0 is never a version (rejected where the index arrives, see
+//     TestReplicatedApplyRejectsZeroSequence);
+//   - MaxUint64 is the last legal revision, and a replicated apply may use it;
+//   - once the high-water mark is MaxUint64, every later *local* allocation must fail
+//     closed instead of wrapping to 0.
+//
+// The high-water mark is reached through the real Apply entry point rather than by
+// setting localSeq in the test, so this covers the hand-off from the replicated path to
+// the local allocator.
+func TestReplicatedMaxSequenceThenLocalAllocationFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	s := newExhaustionStore(t, false)
+	head := seedExhaustionStore(t, s)
+
+	// A replicated transaction staged at the next index and committed at MaxUint64 is a
+	// legal commit: the last revision is usable.
+	id := randomID()
+	_, applied, _ := storeMeta(t, s)
+	if _, err := s.Apply(applied+1, Command{Kind: "stage", ID: id, Ops: smallWriteSet(t, s)}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.Apply(math.MaxUint64, Command{Kind: "commit", ID: id, Snapshot: head})
+	if err != nil {
+		t.Fatalf("replicated apply at MaxUint64 = %v, want success", err)
+	}
+	if err := result.Err(); err != nil {
+		t.Fatalf("replicated apply at MaxUint64 reported %v", err)
+	}
+	if result.Sequence != math.MaxUint64 {
+		t.Fatalf("replicated sequence = %d, want %d", result.Sequence, uint64(math.MaxUint64))
+	}
+	if published, committed := s.Committed(id); !committed || published != math.MaxUint64 {
+		t.Fatalf("Committed = (%d, %v), want (%d, true)", published, committed, uint64(math.MaxUint64))
+	}
+	lastHead, lastApplied, lastAllocated := storeMeta(t, s)
+	if lastHead != math.MaxUint64 || lastApplied != math.MaxUint64 || lastAllocated != math.MaxUint64 {
+		t.Fatalf("metadata = head %d applied %d allocated %d, want MaxUint64 for all three",
+			lastHead, lastApplied, lastAllocated)
+	}
+	if s.localSeq != math.MaxUint64 {
+		t.Fatalf("localSeq = %d after a MaxUint64 apply, want %d", s.localSeq, uint64(math.MaxUint64))
+	}
+	requireCancelValue(t, s, "k", "value")
+	requireCancelValue(t, s, "existing", "committed")
+
+	// Every local allocation is now refused: no wrap, no version 0, no metadata move.
+	writer := beginCancelTx(t, s, nil)
+	defer writer.Rollback()
+	putVisible(t, writer, "after", "value")
+	if _, err := writer.Commit(ctx); !errors.Is(err, ErrSequenceExhausted) {
+		t.Fatalf("local commit after a MaxUint64 apply = %v, want ErrSequenceExhausted", err)
+	}
+	if s.localSeq != math.MaxUint64 {
+		t.Fatalf("the local allocator wrapped to %d", s.localSeq)
+	}
+	if _, committed := s.Committed(writer.ID); committed {
+		t.Fatal("the refused local commit published a marker")
+	}
+	info := writer.Info()
+	if info.State != TransactionAborted || info.HasCommitTS {
+		t.Fatalf("refused local commit lifecycle = %+v, want ABORTED without a commit revision", info)
+	}
+	if afterHead, afterApplied, afterAllocated := storeMeta(t, s); afterHead != lastHead || afterApplied != lastApplied || afterAllocated != lastAllocated {
+		t.Fatalf("a refused local commit moved metadata: head %d->%d applied %d->%d allocated %d->%d",
+			lastHead, afterHead, lastApplied, afterApplied, lastAllocated, afterAllocated)
+	}
+	// Exhaustion is a refused write, not a broken store.
+	if err := s.AvailabilityError(); err != nil {
+		t.Fatalf("exhaustion poisoned the store: %v", err)
+	}
+	requireCancelValue(t, s, "k", "value")
+	requireCancelValue(t, s, "existing", "committed")
+	requireInvisible(t, s, "after")
+	requireNoVersionZero(t, s)
+
+	// A replicated apply may still use an index at or below the high-water mark: the
+	// store stays readable and idempotent for replay, it just cannot allocate a new one.
+	reader := beginBaseline(t, s)
+	if reader.Snapshot != math.MaxUint64 {
+		t.Fatalf("a new snapshot = %d, want the last revision %d", reader.Snapshot, uint64(math.MaxUint64))
+	}
+	requireCancelValue(t, s, "existing", "committed")
+	if _, err := reader.Commit(ctx); err != nil {
+		t.Fatalf("read-only commit after exhaustion: %v", err)
+	}
+}
+
 // --- Write-set budget -------------------------------------------------------
 
 // exactPutCost is the staged cost of one write, the unit the budget uses.

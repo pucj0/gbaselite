@@ -454,11 +454,6 @@ func TestBaselineEmptyAndReadOnlyCommitDoNotAdvanceHead(t *testing.T) {
 	}
 }
 
-// Characterization, not an endorsement. Today a guard-only transaction is
-// treated as a write transaction: it allocates a version and moves the head even
-// though it installs no row version. spec.md §7 names only "empty" and
-// "read-only" commits, so B01 has to decide this case explicitly; this test
-// makes the current behaviour visible and fails loudly if it changes.
 // installedDataVersions counts the data versions installed at one revision, in both
 // physical layouts, so a test can prove that a publication installed none.
 func installedDataVersions(t *testing.T, s *Store, revision uint64) int {

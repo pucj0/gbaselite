@@ -211,20 +211,30 @@ server disconnect cleanup
 
 ### Phase 8: Sequence overflow hardening
 
-在所有 version allocation 路径统一检查：
+sequence 规则分两处，二者合起来禁止 `uint64` 回绕：
 
 ```text
-localSeq == MaxUint64
+分配点（nextSequence，所有本地提交路径的唯一入口）：
+    localSeq == MaxUint64 时拒绝分配（ErrSequenceExhausted）
+
+apply 侧（replicated apply 携带日志 index）：
+    sequence = 0 非法（0 从不是 version）
+    MaxUint64 是合法的最后 revision，apply 侧不拒绝它
 ```
 
-禁止 `++` 回绕。
+因此准确表述是：
 
-必须覆盖：
+- replicated apply 拒绝 `sequence=0`；
+- `MaxUint64` 可以作为最后合法 revision（由日志给出），它把 high-water mark 推到
+  `MaxUint64`；
+- 此后任何本地 sequence allocation（local commit / group commit / streaming commit /
+  local WAL）必须 fail closed，返回 `ErrSequenceExhausted`，不得 wrap 到 0。
 
-- local commit
-- group commit
-- streaming commit
-- replicated apply / allocated high-water mark
+覆盖测试：`mvcc/resource_boundary_test.go` 的 `TestLastLegalSequenceIsUsable`、
+`TestSequenceExhaustionFailsClosedEveryPath`、`TestReplicatedApplyRejectsZeroSequence`、
+`TestReplicatedApplyRejectsUsedSequence`、
+`TestReplicatedMaxSequenceThenLocalAllocationFailsClosed`（经真实 `Apply` 入口把 high-water
+mark 推到 MaxUint64，再验证下一次本地分配 fail closed）。
 
 ## Design Decisions
 

@@ -14,7 +14,8 @@
 
 ## Phase 1: Setup / Baseline
 
-- [x] T001 记录 B01 实施前完整基线测试结果：`go test ./mvcc ./storageengine/... ./executor ./server ./replication` 和 `go test ./...`
+- [ ] T001 记录 B01 实施前完整基线测试结果：`go test ./mvcc ./storageengine/... ./executor ./server ./replication` 和 `go test ./...`
+      （基线已在 B01 实施过程中实际执行并全绿，但仓库中没有独立的历史 artifact；按 Spec Kit 的证据规则不勾选，也不补造日志。）
 - [x] T002 [P] 审查仓库 `.specify/memory/constitution.md`（如存在），将 constitution gates 补回 `specs/001-b01-mvcc-transaction-manager/plan.md`
 - [x] T003 [P] 为 B01 新增测试辅助同步 primitive/hook 约定，禁止使用 `time.Sleep()` 构造事务时序，目标文件 `mvcc/*_test.go`
 
@@ -260,26 +261,32 @@ P2 diagnostics 与 cancel/overflow hardening 可随后增量完成，但最终 B
 
 - Foundational 与 US1：`mvcc/transaction_state.go`、`mvcc/transaction_manager.go`、`mvcc/transaction.go`、`mvcc/transaction_manager_test.go`（15 例）、`mvcc/transaction_lifecycle_test.go`（15 例，覆盖 T015–T018、double commit/rollback、终态不被 cleanup 改写）、`mvcc/transaction_invariants_baseline_test.go`（12 例）。
 - US2 与 GC：`mvcc/maintenance.go` 经 `TransactionManager.OldestReadTS()` 取 horizon；`mvcc/history_retention_test.go`（6 例，含 disconnect rollback 与 generation change）；`TestTransactionManagerChildrenNeverPinSnapshot`（T011/T026/T034）。
-- US3：`mvcc/visibility_contract_test.go`（11 例，含重复读与多读取路径一致性）。契约测试未暴露需要修改 `visibility.go` / `flat_scan.go` / `visibility_reader.go` 的差异，因此 T036 无实现改动，也未做机械合并。
-- US4：`mvcc/conflict.go` 为唯一 validator；调用点 `group_commit.go`（bounded + group）、`local_stream.go`、`local_wal.go`、`store.go`（replicated/staged）；`mvcc/conflict_matrix_test.go`（5 例，含 write skew 与 commit-path matrix）。
-- US5：`mvcc/observation.go`、`mvcc/transaction_diagnostics_test.go`（11 例）、`mvcc/resource_boundary_test.go`（10 例，含 MaxUint64 与 write-limit 边界，T071–T078）；能力与 DTO 见 `storageengine/engine.go`、`storageengine/mvccadapter/diagnostics.go` 与其 11 个测试。
-- US6：`mvcc/cancel_publication_test.go`（6 例）、`replication/commit_cancel_test.go`、`mvcc/transaction_reset_test.go`（3 例）、`storageengine/mvccadapter/diagnostics_internal_test.go::TestDiagnosticsExposeCommittingStateThroughTheAdapter`。
-- Executor/Savepoint 与断连：`executor/mvcc_autocommit_registry_test.go`（autocommit=0 隐式 root 的 registry 生命周期，经 `storageengine.TransactionDiagnostics` 断言）、`executor/mvcc_savepoint_test.go`、`executor/mvcc_savepoint_failure_test.go`、`executor/mvcc_transaction_invariants_test.go`、`server/mvcc_disconnect_registry_test.go`（协议层 KILL/断连后 registry 清空且未提交写入不可见）；断连清理路径为 `server/mysql_server.go` 的 `defer s.Engine.CloseSession(session)` → `executor.CloseSession` → `rollbackSessionTransaction`。
+- US3：`mvcc/visibility_contract_test.go`（11 例，含重复读与多读取路径一致性）。契约测试未暴露需要修改读取路径实现的差异，因此 T036 无实现改动，也未做机械合并；`visibilityReader`/`visible` 的实现在 `mvcc/store.go`（`newVisibilityReader`、`visibilityReader.visible`），flat path 在 `mvcc/flat_scan.go`。
+- US4：`mvcc/conflict.go` 为唯一 validator；实际接入点为 `mvcc/group_commit.go`（`commitLocal` → `commitLocalGroup`，bounded + group 两条路径）、`mvcc/local_stream.go`、`mvcc/local_wal.go`、`mvcc/store.go` 的 `commitContext`（replicated/staged）；`mvcc/conflict_matrix_test.go`（5 例，含 write skew 与 commit-path matrix）。
+- US5：`mvcc/observation.go`（`trackStagedOp`/`stagedOpKindOf` 是 point/range dependency 计数器的实际实现位置，经 `mvcc/write_buffer.go` 的 `bufferWrite` 调用；`mvcc/range_guard.go` 只负责把 `GuardRange` 编码成依赖，不含计数逻辑）、`mvcc/transaction_diagnostics_test.go`（11 例）、`mvcc/resource_boundary_test.go`（含 MaxUint64 与 write-limit 边界，T071–T078）；能力与 DTO 见 `storageengine/engine.go`、diagnostics adapter 位于 `storageengine/mvccadapter/diagnostics.go`（与 `adapter.go` 同包，故 T059 的实现位置以该文件为准）及其 11 个测试。
+- US6：`mvcc/cancel_publication_test.go`（6 例）、`replication/commit_cancel_test.go`、`mvcc/transaction_reset_test.go`（含 stale Get/Commit/Rollback 与 stale Put/Delete fail-closed）、`storageengine/mvccadapter/diagnostics_internal_test.go::TestDiagnosticsExposeCommittingStateThroughTheAdapter`。
+- Executor/Savepoint 与断连：`executor/mvcc_autocommit_registry_test.go`（autocommit=0 隐式 root 的 registry 生命周期，经 `storageengine.TransactionDiagnostics` 断言）、`executor/mvcc_savepoint_test.go`、`executor/mvcc_savepoint_failure_test.go`、`executor/mvcc_savepoint_limit_test.go`（MVCC savepoint 32 层边界）、`executor/mvcc_transaction_invariants_test.go`、`server/mvcc_disconnect_registry_test.go`（协议层 KILL/断连后 registry 清空且未提交写入不可见）；断连清理路径为 `server/mysql_server.go` 的 `defer s.Engine.CloseSession(session)` → `executor.CloseSession` → `rollbackSessionTransaction`。
 - T086–T088：`gofmt`、`git diff --check`、`go vet ./...`、`go test ./... -count=1` 全部通过。
 - T090：本文件与 `checklists/requirements.md` 的 CHK001–CHK050 已逐条对照 `spec.md`/`plan.md` 审查通过（该清单按自身说明只表示需求质量，不代表代码完成）。
 
 ### 未完成项
 
+- **T001**：按 Spec Kit 证据规则不勾选——B01 实施前的基线测试已在实施过程中执行（`go test ./mvcc ./storageengine/... ./executor ./server ./replication` 与 `go test ./...` 全绿，无既存失败），但仓库内没有该次运行的历史 artifact，本文件不为此补造日志。
 - **T089 已完成**（见下方 CI 证据）：race 在 GitHub Linux runner 上验证通过。本机 `CGO_ENABLED=0` 且无 gcc/clang，`go test -race` 直接报 `-race requires cgo`，因此本机结果不作为完成依据。
 - **T091–T093**：需要 Spec Kit 的 `/speckit.analyze`、`/speckit.implement`、`/speckit.converge` 命令执行环境，本仓库未执行这些命令，因此不勾选。
 
-### `/speckit.analyze` 后续（H-1/H-2 已关闭）
+### `/speckit.analyze` 后续（H-1/H-2 与 M-4..M-8 已关闭）
 
-`/speckit.analyze` 报出 CRITICAL 0 / HIGH 2 / MEDIUM 8 / LOW 8。其中两个 HIGH 已在本阶段以纯文档方式关闭，未修改任何 MVCC 行为：
+`/speckit.analyze` 报出 CRITICAL 0 / HIGH 2 / MEDIUM 8 / LOW 8。两个 HIGH 以及 M-4/M-5/M-6/M-7/M-8 已关闭，未修改任何 MVCC 事务语义。
 
 - **H-1（guard-only 提交语义未进入 spec）**：已正式决策并写入 `spec.md`（FR-004、FR-005、FR-010、INV-002 说明、§7 "事务结束" 的三类 root 表、§9 Clarifications 8/9、US1.5/US1.9）、`data-model.md`（§1/§2/§7/§8/§10）、`research.md`（R2/R5/R6/R6b/R11）、`plan.md`（D3 限定 + D6）、`contracts/transaction-diagnostics.md`。原 characterization test `TestBaselineGuardOnlyCommitCurrentlyAdvancesHead` 已转为正式 contract test `TestDependencyOnlyCommitPublishesRevision`。
 - **H-2（TransactionDiagnostics contract 与实际公共 API 不一致）**：`contracts/transaction-diagnostics.md` 已按实现重写（完整 18 字段 DTO、`UNKNOWN` fail-closed 词表与映射、`ActiveTransactions` 的 registry 语义、`ActiveRoot`/`ActiveChildren` 只计 non-terminal、非 nil slice、计数器定义、`HasCommitTS` 不保证数据 version），并与 `storageengine/engine.go` 的公共注释同步；`data-model.md` §1–§5 的结构与状态图同步为实际实现。
-- 其余 MEDIUM/LOW（M-2 部分结构漂移已在本次 H-2 同步中顺带修正，M-3/M-4/M-5/M-6/M-8 等代码覆盖项与 L 系列）尚未处理，留待后续按需安排。
+- **M-4（FR-015 closed transaction API 覆盖）**：新增 `mvcc/transaction_lifecycle_test.go::TestClosedTransactionAPIContract`（committed root / rolled back root / merged child 三组子测试，逐项覆盖 Get/Put/Delete/Child/Commit 返回 `ErrClosed`，并固定"重复 Rollback 仍幂等返回 nil"这一既有契约）。
+- **M-5（MVCC savepoint 最大层数）**：新增 `executor/mvcc_savepoint_limit_test.go::TestMVCCSavepointLayerLimit`（恰好 `maxMVCCSavepoints` 层成功、超限 fail closed 且事务仍可用、达到上限时同名 replacement 语义、COMMIT/ROLLBACK 后 registry 清空）。
+- **M-6（stale Put/Delete fail-closed）**：新增 `mvcc/transaction_reset_test.go::TestStaleTransactionRejectsWritesAfterReset`（stale root 不新建 stage、已有 stage 不被替换、head 与 retention 不变、数据不可见、stale child/parent 同样拒绝写入）。
+- **M-7（证据引用修正）**：本文件证据索引已按真实实现位置改写（`visibilityReader`/`visible` 在 `mvcc/store.go`、flat path 在 `mvcc/flat_scan.go`、validator 接入点在 `mvcc/group_commit.go` 等、dependency counters 在 `mvcc/observation.go`、diagnostics adapter 在 `storageengine/mvccadapter/diagnostics.go`），并把 T001 改为按证据规则不勾选。
+- **M-8（replicated MaxUint64 → local 分配）**：新增 `mvcc/resource_boundary_test.go::TestReplicatedMaxSequenceThenLocalAllocationFailsClosed`（经真实 `Apply` 入口把 high-water mark 推到 `MaxUint64`，随后的本地提交必须 `ErrSequenceExhausted`、不 wrap、无 version 0、无 marker、无 CommitTS）；`plan.md` Phase 8 的措辞已修正为"apply 侧只拒绝 sequence=0；MaxUint64 是最后合法 revision；后续本地分配必须 fail closed"。
+- 其余 MEDIUM/LOW（M-2 部分结构漂移已在 H-2 同步中顺带修正，M-3 等其余项与 L 系列）尚未处理，留待后续按需安排。
 
 ### CI 证据（B01 race）
 
