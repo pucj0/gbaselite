@@ -187,7 +187,7 @@
 - [x] T086 运行 `gofmt` 和 `git diff --check`
 - [x] T087 运行 `go vet ./...`
 - [x] T088 运行 `go test ./...`
-- [ ] T089 [P] 在可用 CI/Linux 环境运行 `go test -race ./mvcc ./executor ./server`
+- [x] T089 [P] 在可用 CI/Linux 环境运行 `go test -race ./mvcc ./executor ./server`
 - [x] T090 对照 `checklists/requirements.md` 完成 requirements-quality review
 - [ ] T091 运行 `/speckit.analyze`，修复 spec/plan/tasks 的 critical/high inconsistency
 - [ ] T092 运行 `/speckit.implement` 后执行 `/speckit.converge`
@@ -270,5 +270,17 @@ P2 diagnostics 与 cancel/overflow hardening 可随后增量完成，但最终 B
 
 ### 未完成项
 
-- **T089**：race 需要在 GitHub Linux runner 上验证。本机 `CGO_ENABLED=0` 且无 gcc/clang，`go test -race` 直接报 `-race requires cgo`，因此本机结果不能作为完成证据。`.github/workflows/test.yml` 已新增 Linux 步骤 `MVCC transaction race regression`（`go test -race ./mvcc ./storageengine/... ./executor ./server -count=1`），并保留原有 `Failover race regression`；只有在 GitHub Actions 上该步骤真正通过后才可勾选。
+- **T089 已完成**（见下方 CI 证据）：race 在 GitHub Linux runner 上验证通过。本机 `CGO_ENABLED=0` 且无 gcc/clang，`go test -race` 直接报 `-race requires cgo`，因此本机结果不作为完成依据。
 - **T091–T093**：需要 Spec Kit 的 `/speckit.analyze`、`/speckit.implement`、`/speckit.converge` 命令执行环境，本仓库未执行这些命令，因此不勾选。已知的文档级待澄清项（非 critical/high 代码问题）记录在 spec 措辞层面：guard-only commit 是否推进 Head 的描述、状态表示分层说明、`HasOldestReadTS` 说明、`ACTIVE→COMMITTED` 边、retention 释放时机。
+
+### CI 证据（B01 race）
+
+- Workflow：`.github/workflows/test.yml`，Linux 步骤 `MVCC transaction race regression`：
+  `go test -race ./mvcc ./storageengine/... ./executor ./server -count=1`；既有 `Failover race regression`
+  （`go test -race ./failover -count=10`）保留。
+- Run：<https://github.com/pucj0/gbaselite/actions/runs/35496213448>（commit `d7292d3`）整体 `success`。
+  覆盖范围含 TransactionManager registry、Tx lifecycle、State/Info、diagnostics counters、
+  ActiveTransactions、commit/rollback、adapter diagnostics、executor 事务集成与 server 断连清理。
+- 逐步骤结论：`quality (ubuntu-latest)` success（`Test` 44s、`Failover race regression` 70s、
+  `MVCC transaction race regression` 50s，整 job 176s）；`quality (windows-latest)` success（两个 race 步骤按
+  `if: runner.os == 'Linux'` skipped）；`build` linux/windows success；`mysql-8-client` success。
