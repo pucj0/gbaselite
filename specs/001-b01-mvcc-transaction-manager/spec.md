@@ -451,9 +451,20 @@ durable commit revision"。
 - child commit then parent rollback；
 - child rollback；
 - multiple nested children；
-- savepoint replacement；
-- rollback to savepoint；
-- max savepoint count。
+- savepoint replacement（未达 layer ceiling 时：老同名 layer 变成匿名 boundary，新同名 layer
+  指向当前 transaction position，其它名字继续有效）；
+- rollback to savepoint（丢弃目标 layer 及目标之上的所有 layer，并以同一 parent 重新开一个
+  同名 layer；被丢弃 layer 的子事务由 manager 的 descendant 清理释放）；
+- **maximum live MVCC savepoint layers per user transaction**（上限 32）：
+  - 约束对象是**实际存活的 savepoint child layer 数**，不是"不同名字的个数"；
+  - `RELEASE SAVEPOINT` 只释放名字/rollback target，不回收 MVCC child layer，被释放的
+    layer 变为匿名 boundary 并**继续占用**一个 layer 名额；同名 replacement 同理；
+  - B01 不实现匿名 layer compaction（不做 child reparent / rebase / 匿名 merge /
+    savepoint tree rewrite / write-set migration）；
+  - 因此在 layer 数达到 ceiling 后，即使 named savepoint 数远小于 32，任何新的 `SAVEPOINT`
+    （新名字或已存在名字）都必须 fail closed 返回 resource limit；
+  - capacity check 必须在任何 state mutation 之前完成，失败不得留下副作用（尤其是不得先把
+    被替换的同名 savepoint 匿名化）。
 
 ### Cancel/Failure
 

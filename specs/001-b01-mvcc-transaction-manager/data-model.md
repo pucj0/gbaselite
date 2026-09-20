@@ -218,6 +218,27 @@ Root ACTIVE
 - 其逻辑写全部丢弃；
 - 已 MERGED child 的写也随 parent 丢弃。
 
+### Savepoint layer chain
+
+`executor/savepoint_mvcc.go` 的 savepoint 是 root 之上的一串嵌套 child layer：
+
+```text
+root (session.transaction)
+  └─ layer1 (SAVEPOINT a)      ── 每个 layer 持有一个 storageengine.Txn child
+       └─ layer2 (SAVEPOINT b)
+            └─ layer3 (当前 statement 写入的 layer)
+```
+
+- `RELEASE SAVEPOINT` 只把 layer 的名字清空，layer 及其 child transaction **仍然存活**，
+  成为匿名 boundary；同名 replacement 同样只让老 layer 匿名化。
+- 资源上限是 **maximum live MVCC savepoint layers per user transaction**（`maxMVCCSavepoints`
+  = 32），统计的是存活 layer 数（含匿名 boundary），不是 named savepoint 数；B01 不做匿名
+  layer compaction。达到 ceiling 后即使 named 数为 0 也不能创建新 `SAVEPOINT`。
+- `ROLLBACK TO SAVEPOINT` 丢弃目标 layer 及其之上的 layer，并以同一 parent 重新开一个同名
+  layer；被丢弃 layer 的 child 由 manager 的 descendant 清理从 registry 释放。
+- `COMMIT` 自内向外把每个 layer merge 进它的 parent，最终只留下 root 的 durable commit；
+  `ROLLBACK` 丢弃整条链。
+
 ## 8. Retention Ownership
 
 ```text

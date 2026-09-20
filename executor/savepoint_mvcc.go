@@ -12,6 +12,11 @@ import (
 // its parent, and RELEASE only drops the name so later savepoints stay valid.
 // Every layer commits into its parent, so COMMIT merges the whole chain into the
 // single outermost transaction; nothing opens an extra top-level transaction.
+//
+// maxMVCCSavepoints bounds the live child layers of one user transaction, not the
+// distinct savepoint names. A released or replaced name leaves its layer behind as an
+// anonymous boundary, and B01 does not compact those, so the layer count is the
+// resource that must stay bounded.
 const maxMVCCSavepoints = 32
 
 var (
@@ -47,21 +52,23 @@ func (e *Engine) createSavepoint(session *Session, name string) (*Result, error)
 	if session.transaction == nil {
 		return &Result{Message: "no active transaction"}, nil
 	}
-	// Re-issuing a name moves the restore point to the current position; the older
-	// layer becomes an anonymous boundary, matching the legacy replacement rule.
+	// The budget bounds the live MVCC savepoint layers, not the names. RELEASE and a
+	// same-name replacement only anonymize a layer, so the child transaction it holds
+	// keeps occupying a slot: counting only named savepoints would let
+	// "SAVEPOINT x; RELEASE x" -- or a repeated "SAVEPOINT x" -- grow the layer chain
+	// without bound. The check runs before any mutation, so a refused SAVEPOINT cannot
+	// anonymize an existing name as a side effect.
+	if len(session.savepoints) >= maxMVCCSavepoints {
+		return nil, fmt.Errorf("%w: at most %d savepoint layers per transaction", errSavepointResource, maxMVCCSavepoints)
+	}
+	// Below the ceiling, re-issuing a name still moves the restore point to the current
+	// position; the older layer becomes an anonymous boundary, matching the legacy
+	// replacement rule. An anonymous boundary is not compacted, so it keeps counting
+	// against the layer budget above.
 	for index := range session.savepoints {
 		if session.savepoints[index].name != "" && strings.EqualFold(session.savepoints[index].name, name) {
 			session.savepoints[index].name = ""
 		}
-	}
-	active := 0
-	for _, layer := range session.savepoints {
-		if layer.name != "" {
-			active++
-		}
-	}
-	if active >= maxMVCCSavepoints {
-		return nil, fmt.Errorf("%w: at most %d savepoints per transaction", errSavepointResource, maxMVCCSavepoints)
 	}
 	parent := session.transaction
 	child, err := parent.Child()

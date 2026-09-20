@@ -271,6 +271,20 @@ root 的完整定义见 spec.md FR-004/FR-005/§7、research.md R6b、contracts/
 `TestDependencyOnlyCommitPublishesRevision`（由原 characterization test
 `TestBaselineGuardOnlyCommitCurrentlyAdvancesHead` 转成的正式 contract test）。
 
+### D7. savepoint 资源上限约束实际存活的 layer 数
+
+`executor/savepoint_mvcc.go` 的 resource budget 约束一个 user transaction 的**实际存活
+MVCC savepoint child layer 数**（上限 `maxMVCCSavepoints = 32`），而不是"当前有名字的
+savepoint 个数"：`RELEASE SAVEPOINT` 与同名 replacement 只把 layer 的名字清空，layer 本身
+（及其 child transaction）继续占用名额。B01 明确不实现匿名 layer compaction，因此采用
+bounded layer model：capacity check 必须在任何 state mutation 之前完成，达到 ceiling 后
+任何新的 `SAVEPOINT`（新名字或已存在名字）都 fail closed 返回 resource limit，且失败无副作用
+（不得先把被替换的同名 savepoint 匿名化）。
+
+对应测试：`executor/mvcc_savepoint_limit_test.go` 的 `TestMVCCSavepointLayerLimit`
+（exact boundary、replacement below ceiling、replacement at ceiling fail-closed 且名字仍可用、
+repeated same-name 不能增长 layer 链、RELEASE 不能腾出名额、ROLLBACK 释放全部 layer）。
+
 ## Testing Strategy
 
 ### Unit
