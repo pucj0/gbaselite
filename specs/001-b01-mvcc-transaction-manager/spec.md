@@ -464,6 +464,14 @@ durable commit revision"。
   `Tx.cleanup()`**；从 registry 消失不等于资源已释放。执行顺序为最内层 descendant → 目标 layer
   （倒序），单次 cleanup 失败不得跳过其余 layer，且截断后必须清除 slice 尾部对被丢弃 layer 的
   引用；新的同名 layer 在目标 layer 的 parent 上重新创建，因此 parent 必然不在被丢弃区间内。
+  - **fallback invariant**：截断 discarded chain 之后、尝试创建 fresh child 之前，
+    `session.transaction` 必须立即恢复为仍可达的 `layer.parent`。即使 fresh child 创建失败
+    （parent 已关闭或 generation 已被 `RESTORE MVCC FROM` / Raft snapshot 作废），session 也必须
+    继续持有对 surviving parent/root 的引用，从而使后续显式 `ROLLBACK`、disconnect /
+    `CloseSession` 仍能完成整个 remaining user transaction（含 root）的最终 resource cleanup，
+    包括删除 root 自己的 staging `.tmp`。
+  - **fresh child 必须在 discarded layer 清理之后创建**：不得先创建 fresh child 再清理旧 layer，
+    否则在 layer 数已达 ceiling 时会短暂出现第 33 个 live child，违反下面的上限契约。
 - **maximum live MVCC savepoint layers per user transaction**（上限 32）：
   - 约束对象是**实际存活的 savepoint child layer 数**，不是"不同名字的个数"；
   - `RELEASE SAVEPOINT` 只释放名字/rollback target，不回收 MVCC child layer，被释放的
@@ -473,7 +481,10 @@ durable commit revision"。
   - 因此在 layer 数达到 ceiling 后，即使 named savepoint 数远小于 32，任何新的 `SAVEPOINT`
     （新名字或已存在名字）都必须 fail closed 返回 resource limit；
   - capacity check 必须在任何 state mutation 之前完成，失败不得留下副作用（尤其是不得先把
-    被替换的同名 savepoint 匿名化）。
+    被替换的同名 savepoint 匿名化）；
+  - 同理，`SAVEPOINT` 必须先成功创建 child 再改动 savepoint 名字：若 child 创建失败（parent
+    已关闭或 generation 已作废），已存在的同名 savepoint 名字必须保持原样；
+  - 任何可观察时刻（包括失败路径与并发 diagnostics 快照）都不得出现 live child 数 > 32。
 
 ### Cancel/Failure
 

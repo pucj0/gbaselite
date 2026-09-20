@@ -65,15 +65,19 @@ func (e *Engine) createSavepoint(session *Session, name string) (*Result, error)
 	// position; the older layer becomes an anonymous boundary, matching the legacy
 	// replacement rule. An anonymous boundary is not compacted, so it keeps counting
 	// against the layer budget above.
-	for index := range session.savepoints {
-		if session.savepoints[index].name != "" && strings.EqualFold(session.savepoints[index].name, name) {
-			session.savepoints[index].name = ""
-		}
-	}
+	//
+	// The child is created before any name is touched: if that fails (a closed or
+	// generation-invalidated parent), the statement must not have dropped a savepoint
+	// name as a side effect.
 	parent := session.transaction
 	child, err := parent.Child()
 	if err != nil {
 		return nil, err
+	}
+	for index := range session.savepoints {
+		if session.savepoints[index].name != "" && strings.EqualFold(session.savepoints[index].name, name) {
+			session.savepoints[index].name = ""
+		}
 	}
 	session.savepoints = append(session.savepoints, savepointLayer{name: name, tx: child, parent: parent})
 	session.transaction = child
@@ -114,8 +118,18 @@ func (e *Engine) rollbackToSavepoint(session *Session, name string) (*Result, er
 	// range is cleared explicitly.
 	clear(discarded)
 	session.savepoints = session.savepoints[:index]
+	// Fallback invariant: the session must always reference a live, reachable
+	// transaction that can still be cleaned up. Point it at the surviving parent before
+	// the fresh child is attempted, because that attempt can fail (a closed or
+	// generation-invalidated parent). Without this, a failure at index 0 would leave the
+	// session holding only the discarded, now closed layer, so the root would be
+	// unreachable and its staging handle and file could never be released by ROLLBACK,
+	// CloseSession or Store.Close.
+	session.transaction = layer.parent
 	// The target keeps its name on a fresh child of the same parent so the transaction
-	// can continue. That parent is outside the discarded range by construction.
+	// can continue. That parent is outside the discarded range by construction, so the
+	// live layer count never exceeds the ceiling: the fresh child is created only after
+	// the discarded range is gone.
 	fresh, err := layer.parent.Child()
 	if err != nil {
 		return nil, errors.Join(cleanupErr, err)

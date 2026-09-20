@@ -294,6 +294,13 @@ P2 diagnostics 与 cancel/overflow hardening 可随后增量完成，但最终 B
 - **HIGH-1（`ROLLBACK TO SAVEPOINT` 丢弃的 child layer 未释放资源）**：`rollbackToSavepoint` 原先只对目标 layer 调用 `Rollback()`，目标之上的 layer 仅从 slice 中截断。registry 的 descendant 清理只移除 diagnostics 条目与 retention 引用，`Tx.cleanup()`（关闭 staging bbolt handle、删除 `<store>/transactions/<id>.tmp`）不会执行，因此每次 `ROLLBACK TO` 都可能遗留打开的文件句柄与临时文件；实测可导致同进程 `OpenWithOptions` 在 Windows 上因清理旧 `.tmp` 失败而无法重开 store。现改为：对目标及其之上每个被丢弃 child 按**最内层优先**显式 `Rollback()`（单个失败不跳过其余，`errors.Join` 聚合上报）、`clear` slice 尾部引用后再重建同名 fresh layer（`executor/savepoint_mvcc.go`）。回归测试：`executor/mvcc_savepoint_resource_test.go` 的 4 个用例（丢弃 layer 的 stage 在 ROLLBACK TO 后立即消失且句柄已关闭、多层丢弃全部释放、同进程 close+reopen 成功、重复 ROLLBACK TO 不累积 stage/registry）；变异验证（恢复原实现）时四个用例全部失败，其中 reopen 用例复现 `used by another process`。
 - 其余第二轮 MEDIUM/LOW（savepoint 错误码分类、`createSavepoint` 的失败顺序、data-model 措辞等）按计划未处理，留待后续按需安排。
 
+### 第三轮 `/speckit/analyze`（HEAD `3918924` 之后）
+
+第三轮更正后的结论为 CRITICAL 0 / HIGH 1 / MEDIUM 1 / LOW 5，其中唯一 HIGH 已修复并关闭：
+
+- **HIGH-2（generation change 后 `ROLLBACK TO` 可能让 root Tx 失去引用）**：`rollbackToSavepoint` 原先在截断 discarded 区间之后才创建 fresh target child；若该 child 创建失败（parent 已关闭，或 generation 被 `RESTORE MVCC FROM` / Raft snapshot 作废），`session.transaction` 仍指向已关闭的 discarded layer。当 `index == 0` 时被丢弃区间是整个切片，root（`layer.parent`）不再被 session 引用，`outermostTransaction`/`rollbackSessionTransaction`/`CloseSession` 都会把已关闭的 layer 当作 outermost，root 的 staging bbolt handle 与 `<store>/transactions/<id>.tmp` 因此无法回收，并导致同进程 `OpenWithOptions` 在 Windows 上以 `used by another process` 失败。现改为采用 **fallback-parent** 顺序：截断后立即 `session.transaction = layer.parent`，再尝试 `layer.parent.Child()`；失败时 session 仍持有 surviving parent，后续 `ROLLBACK` / disconnect 可完成最终 cleanup。fresh child 仍在清理之后创建，因此不会瞬时产生第 33 个 live child（M-5 不受影响）。回归测试：`executor/mvcc_savepoint_resource_test.go` 的 `TestMVCCRollbackToSavepointAfterRestoreKeepsRootReclaimable`（双 session + 真实 `BACKUP`/`RESTORE`，显式 `ROLLBACK` 与 `CloseSession` 两条 cleanup 路径各自断言 staging 归零、`session.transaction`/`savepoints` 已清空、同进程 reopen 成功）与 `TestMVCCCreateSavepointAfterRestoreKeepsExistingName`（被拒绝的 `SAVEPOINT` 不得丢失同名 savepoint）；变异验证（去掉 fallback 赋值 / 恢复旧的 `createSavepoint` 顺序）时对应用例分别失败。
+- 其余第三轮 MEDIUM/LOW（savepoint 错误码分类、legacy fixture parity、`Txn.Commit` 返回值文档、`validateCommand` ID 上限测试、`time.Sleep` 清理）按计划未处理。
+
 ### CI 证据（B01 race）
 
 - Workflow：`.github/workflows/test.yml`，Linux 步骤 `MVCC transaction race regression`：

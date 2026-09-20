@@ -1,11 +1,14 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gbaselite/storageengine"
 )
 
 // HIGH-1 regression: ROLLBACK TO SAVEPOINT discards the target layer and every layer
@@ -231,5 +234,201 @@ func TestMVCCRollbackToSavepointDoesNotAccumulateStages(t *testing.T) {
 	requireEmptySavepointRegistry(t, diagnostics)
 	if files := stagingFiles(t, dir); len(files) != 0 {
 		t.Fatalf("staging files survived the transaction: %v", files)
+	}
+}
+
+// HIGH-2 regression: after a real generation change (RESTORE MVCC FROM in another
+// session, or a raft snapshot install on a replica) the fresh target child cannot be
+// created, so ROLLBACK TO fails. The session must still reference a live, reachable
+// transaction — the surviving parent — so the remaining chain, including the root and
+// its staging file, can still be reclaimed by ROLLBACK or by a disconnect.
+//
+// The failure is driven through SQL, never by stubbing Child(): two sessions on one
+// engine, a real BACKUP/RESTORE pair, and enough writes that both the root and the
+// savepoint layer own a real staging database.
+
+type savepointRestoreFixture struct {
+	e       *Engine
+	dir     string
+	root    storageengine.Txn
+	session *Session
+	run     func(string) *Result
+}
+
+// newRestoreFixture creates the HIGH-2 scenario: session A holds a backup, session B
+// holds an open chain whose root and savepoint layer both spilled to staging, and the
+// restore has already invalidated B's generation.
+func newRestoreFixture(t *testing.T) savepointRestoreFixture {
+	t.Helper()
+	dir := t.TempDir()
+	e, _, runA := openSavepointStore(t, dir)
+	backup := filepath.Join(dir, "snapshot.mvcc")
+	runA("BACKUP MVCC TO '" + backup + "'")
+
+	sessionB := &Session{CurrentDatabase: "probe"}
+	runB := func(q string) *Result {
+		t.Helper()
+		result, err := e.Execute(sessionB, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return result
+	}
+	runB("BEGIN")
+	root := sessionB.transaction
+	if root == nil {
+		t.Fatal("BEGIN did not open a transaction")
+	}
+	spillIntoCurrentLayer(t, runB, 0) // the root owns a staging file
+	runB("SAVEPOINT s0")
+	spillIntoCurrentLayer(t, runB, 100) // s0 owns a staging file
+
+	if files := stagingFiles(t, dir); len(files) < 2 {
+		t.Fatalf("fixture did not spill in both the root and s0: %v", files)
+	}
+	runA("RESTORE MVCC FROM '" + backup + "'")
+	return savepointRestoreFixture{e: e, dir: dir, root: root, session: sessionB, run: runB}
+}
+
+// requireFailedRollbackToSavepoint drives the failing ROLLBACK TO and asserts the
+// fallback-parent contract: the discarded layer is released, the session still points
+// at the surviving root, and the live layer count never exceeds the ceiling.
+func requireFailedRollbackToSavepoint(t *testing.T, f savepointRestoreFixture, diagnostics storageengine.TransactionDiagnostics) {
+	t.Helper()
+	before := stagingFiles(t, f.dir)
+	if _, err := f.e.Execute(f.session, "ROLLBACK TO SAVEPOINT s0"); !errors.Is(err, storageengine.ErrClosed) {
+		t.Fatalf("ROLLBACK TO after a generation change = %v, want ErrClosed", err)
+	}
+	// The discarded savepoint layer is released immediately, even though the statement
+	// failed: its staging file is gone while the root's is still legitimately held.
+	after := stagingFiles(t, f.dir)
+	if len(after) != len(before)-1 {
+		t.Fatalf("staging files = %v, want the discarded layer released from %v", after, before)
+	}
+	// The fallback invariant: the session must reference the surviving root, never the
+	// closed discarded layer, so a later ROLLBACK/CloseSession can still reach it.
+	if f.session.transaction == nil {
+		t.Fatal("the session lost its transaction reference after a failed ROLLBACK TO")
+	}
+	if f.session.transaction != f.root {
+		t.Fatalf("session.transaction = %v, want the surviving root %v", f.session.transaction, f.root)
+	}
+	if len(f.session.savepoints) != 0 {
+		t.Fatalf("savepoints = %d, want the discarded chain removed", len(f.session.savepoints))
+	}
+	if stats := diagnostics.TransactionStats(); stats.ActiveChildren > maxMVCCSavepoints {
+		t.Fatalf("live savepoint children = %d, above the ceiling", stats.ActiveChildren)
+	}
+}
+
+func TestMVCCRollbackToSavepointAfterRestoreKeepsRootReclaimable(t *testing.T) {
+	t.Run("explicit rollback reclaims the root", func(t *testing.T) {
+		f := newRestoreFixture(t)
+		diagnostics := transactionDiagnostics(t, f.e)
+		requireFailedRollbackToSavepoint(t, f, diagnostics)
+
+		// The stale root is still reachable, so an explicit ROLLBACK must perform its
+		// local resource cleanup even though the generation moved.
+		f.run("ROLLBACK")
+		if f.session.transaction != nil {
+			t.Fatalf("session.transaction = %v after ROLLBACK, want nil", f.session.transaction)
+		}
+		if len(f.session.savepoints) != 0 {
+			t.Fatalf("savepoints = %v after ROLLBACK, want empty", f.session.savepoints)
+		}
+		requireEmptySavepointRegistry(t, diagnostics)
+		if files := stagingFiles(t, f.dir); len(files) != 0 {
+			t.Fatalf("ROLLBACK left staging files: %v", files)
+		}
+
+		// Windows: an unreleased staging handle would make this fail with a sharing
+		// violation on the still-mapped <id>.tmp.
+		if err := f.e.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := OpenWithOptions(f.dir, "root", "pw", OpenOptions{StorageMode: "mvcc"})
+		if err != nil {
+			t.Fatalf("in-process reopen after ROLLBACK failed: %v", err)
+		}
+		if err := reopened.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("disconnect reclaims the root", func(t *testing.T) {
+		f := newRestoreFixture(t)
+		diagnostics := transactionDiagnostics(t, f.e)
+		requireFailedRollbackToSavepoint(t, f, diagnostics)
+
+		// A disconnect (COM_QUIT, KILL, COM_RESET_CONNECTION) must reclaim the whole
+		// remaining user transaction, root included, without a manual ROLLBACK.
+		f.e.CloseSession(f.session)
+		if f.session.transaction != nil {
+			t.Fatalf("session.transaction = %v after CloseSession, want nil", f.session.transaction)
+		}
+		if len(f.session.savepoints) != 0 {
+			t.Fatalf("savepoints = %v after CloseSession, want empty", f.session.savepoints)
+		}
+		requireEmptySavepointRegistry(t, diagnostics)
+		if files := stagingFiles(t, f.dir); len(files) != 0 {
+			t.Fatalf("CloseSession left staging files: %v", files)
+		}
+		if err := f.e.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := OpenWithOptions(f.dir, "root", "pw", OpenOptions{StorageMode: "mvcc"})
+		if err != nil {
+			t.Fatalf("in-process reopen after CloseSession failed: %v", err)
+		}
+		if err := reopened.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// The same generation change also hits createSavepoint: a refused SAVEPOINT must not
+// have anonymized an existing savepoint name, because the child is created before any
+// name is touched.
+func TestMVCCCreateSavepointAfterRestoreKeepsExistingName(t *testing.T) {
+	dir := t.TempDir()
+	e, _, runA := openSavepointStore(t, dir)
+	defer e.Close()
+	backup := filepath.Join(dir, "snapshot.mvcc")
+	runA("BACKUP MVCC TO '" + backup + "'")
+
+	sessionB := &Session{CurrentDatabase: "probe"}
+	runB := func(q string) *Result {
+		t.Helper()
+		result, err := e.Execute(sessionB, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		return result
+	}
+	runB("BEGIN")
+	runB("SAVEPOINT keep")
+	layers := len(sessionB.savepoints)
+
+	runA("RESTORE MVCC FROM '" + backup + "'")
+
+	// Re-issuing the existing name now fails on the closed parent, and the failure must
+	// leave the name in place.
+	if _, err := e.Execute(sessionB, "SAVEPOINT keep"); !errors.Is(err, storageengine.ErrClosed) {
+		t.Fatalf("SAVEPOINT after a generation change = %v, want ErrClosed", err)
+	}
+	if len(sessionB.savepoints) != layers {
+		t.Fatalf("savepoints = %d, want the refused SAVEPOINT to append nothing", len(sessionB.savepoints))
+	}
+	if name := sessionB.savepoints[0].name; !strings.EqualFold(name, "keep") {
+		t.Fatalf("the existing savepoint name became %q, want it untouched", name)
+	}
+	// Behavioural proof: the name still resolves, so the failure is the generation
+	// error and not "SAVEPOINT does not exist".
+	if _, err := e.Execute(sessionB, "ROLLBACK TO SAVEPOINT keep"); errors.Is(err, errMVCCSavepointNotFound) {
+		t.Fatalf("ROLLBACK TO lost the existing name: %v", err)
+	}
+	e.CloseSession(sessionB)
+	if files := stagingFiles(t, dir); len(files) != 0 {
+		t.Fatalf("cleanup left staging files: %v", files)
 	}
 }

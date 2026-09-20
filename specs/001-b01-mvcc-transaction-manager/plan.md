@@ -292,6 +292,21 @@ diagnostics 状态与 retention，只有 `Tx.cleanup()` 会释放 staging bbolt 
 上报）。对应测试：`executor/mvcc_savepoint_resource_test.go` 的四个用例（discarded layer 立即释放、
 多层丢弃全部释放、同进程 close+reopen 成功、重复 ROLLBACK TO 不累积 stage）。
 
+截断完成后、尝试创建 fresh target child 之前，`session.transaction` 必须立即恢复为仍可达的
+`layer.parent`（fallback invariant）。fresh child 创建可能失败——parent 已关闭，或 generation 被
+`RESTORE MVCC FROM`（`executor/maintenance.go` → `mvcc/snapshot.go` 的 generation bump）或副本应用
+Raft snapshot（`replication/node.go` → `Store.Restore`）作废；此时若 session 仍指向已关闭的
+discarded layer，`index == 0` 会让 root 从可达链中消失，`rollbackSessionTransaction` /
+`CloseSession` 都无法再回收 root 的 staging handle 与 `.tmp`。因此失败路径的 contract 是：
+`session.savepoints` 只保留 target 以下的 lower layer，`session.transaction` 指向 `layer.parent`
+（不得为 nil、不得指向已关闭或被 clear 的 Tx），使后续 `ROLLBACK` / disconnect 仍能完成最终资源
+清理。同时 **fresh child 只能在清理之后创建**，否则在 layer 数已达 32 时会瞬时产生第 33 个 live
+child，违反 M-5 的 ceiling contract。对应测试：同文件的
+`TestMVCCRollbackToSavepointAfterRestoreKeepsRootReclaimable`（双 session + 真实
+BACKUP/RESTORE，分别用显式 ROLLBACK 与 `CloseSession` 证明 root 被回收、staging 归零、同进程
+reopen 成功）与 `TestMVCCCreateSavepointAfterRestoreKeepsExistingName`（被拒绝的 `SAVEPOINT`
+不得丢失已存在的同名 savepoint）。
+
 ## Testing Strategy
 
 ### Unit

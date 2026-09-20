@@ -243,6 +243,12 @@ root (session.transaction)
   descendant 清理只移除 diagnostics 条目与 retention 引用，而 staging bbolt handle 与
   `<store>/transactions/<id>.tmp` 只在 `Tx.cleanup()` 中释放，两者不可互相替代；截断后还需
   清除 slice 尾部对这些 child 的引用，避免它们仍被底层数组持有。
+  截断后、创建 fresh child 前，`session.transaction` 必须立即回到仍可达的 `layer.parent`：即使
+  fresh child 创建失败（parent 关闭或 generation 被 `RESTORE MVCC FROM` / Raft snapshot 作废），
+  session 也必须保留对 surviving parent/root 的引用，使后续 `ROLLBACK` / disconnect /
+  `CloseSession` 仍能回收整个 remaining user transaction（含 root 的 staging 文件）。fresh child
+  只能在被丢弃 layer 清理之后创建，否则在 ceiling 处会瞬时出现第 33 个 live child。
+- `SAVEPOINT` 先创建 child 再改动名字：child 创建失败时不得把已存在的同名 savepoint 匿名化。
 - `COMMIT` 自内向外把每个 layer merge 进它的 parent，最终只留下 root 的 durable commit；
   `ROLLBACK` 丢弃整条链。
 
