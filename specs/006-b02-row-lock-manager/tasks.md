@@ -135,6 +135,14 @@ setup/foundation/polish无US标签；六个story阶段均标[USn]。
 > 因此本阶段的内核**尚未被任何 engine 装配**，SQL/raw 路径都无法触发它。
 > 也**未**接入 SQL DML、Current Read 或 Gap/Next-Key（`interval.go`、`graph.go`、
 > `diagnostics.go`、`lock_plan.go` 均不存在）。
+>
+> **现状更新（第五轮，基线 626be316 之后）**：以上"不存在/未装配"的现状描述**已过时**，保留在此
+> 仅为历史审查记录。现在 `storageengine/mvccadapter/locking.go`、`mvcc/locking.go`、
+> `lockmanager/interval.go`、`diagnostics`/lock plan 均已存在，`enginefactory/default.go` 会在
+> 打开 MVCC 引擎时创建并装配**每 engine 一个** lock manager（T018 已验收），raw `Txn.Put/Delete`
+> 也在暂存前取得 Record X（T019 已验收）；仍未接入的是 Gap/Next-Key/II（T024）、
+> leader-only Current Read（T054）、预算配置传递（T056）与 LockDiagnostics（T060）。
+> 详见 §第五轮。
 > `gofmt` 无输出，`go test ./...` 与 `go vet ./...` 均退出 0（22 包 / 0 FAIL）。
 > 既有 354 个生产 Go 文件逐个 SHA-256 比对 **CHANGED=0 / MISSING=0**。
 > 证据：`.tmp/b02-phase3-validation.md`。
@@ -190,16 +198,42 @@ setup/foundation/polish无US标签；六个story阶段均标[USn]。
       初始 blocker 边由 `Edges()` 按 (from,to,request) 去重后给出 `EdgeHolder`/`EdgeOlderWaiter`。
       升级：`grantLocked` 用 `upgradeNeeded` 决定是否提升 mode，**等待期间不释放已有 S**
       （由 `TestB02UpgradeWaitsWithoutReleasingShared`、`TestB02UpgradeCompetition` 锁定）。
-- [ ] T018 [US1] 在 `storageengine/mvccadapter/locking.go`（新）绑定每engine manager、root/scope与实际namespace标签；验收：多engine不共享锁、SQL/raw资源身份一致，neutral接口不泄露backend；FR-026/029。
-      **未执行**（本轮范围外：用户要求"不提前接入 SQL DML、Current Read 或 Gap Lock"，
-      且该任务需要把锁管理器装配进 engine，属于跨阶段接线）。
-- [ ] T019 [US1] 在 `mvcc/locking.go`（新）与 `mvcc/transaction.go` 接入已有key覆盖/删除的raw client X锁与查询scope context；验收：raw writer不能绕过record holder，Get不变；FR-014/026/029/030。
-      **未执行**（同上；依赖 T018 的装配入口）。
+- [x] T018 [US1] 在 `storageengine/mvccadapter/locking.go`（新）绑定每engine manager、root/scope与实际namespace标签；验收：多engine不共享锁、SQL/raw资源身份一致，neutral接口不泄露backend；FR-026/029。
+      **已完成（第五轮，基线 626be316 之后）**。历史注记：本轮之前该文件不存在、`enginefactory` 未装配，
+      故当时记为未执行；现在 `mvccadapter.Open` 为**每个 engine 创建一个** `lockmanager.Manager`
+      并用 `Store.AttachLocks` 装配（`enginefactory/default.go` 是唯一组合根），
+      `storageengine.LockingTxnOf` 提供可选中立能力。验收证据（8 项逐条）：
+      `TestB02LockingCapabilityIsPresentOnAnAdapterTxn`/`TestT018LockCapabilityIsAbsentOnAnEngineWithoutALockManager`
+      （可选能力）、`TestB02LockManagersAreNotSharedBetweenEngines`/`TestT018EachEngineOwnsItsOwnLockManager`
+      （多 engine 不共享）、`TestT018ChildGrantUsesTheRootOwnerAndTheChildsOwnScope`/`TestB02ChildGrantBelongsToTheRootAndSurvivesTheChild`
+      （root/child/scope 映射：grant 属于 root，子 scope 建在父 scope 的子树内）、
+      `TestB02ComponentIdentityIsPassedThroughUnchanged`（namespace/TableID/IndexID/Key 与写路径原样一致）、
+      `TestB02NeutralWaitedGrantIsCompleteAndStable`（grant 的 ID/owner/scope/components/Generation/Term 完整）、
+      `TestB02T018NeutralPackageNeverImportsABackend`/`TestB02T018NeutralLockingDTOsCarryNoBackendType`
+      （中立接口不泄漏 mvcc/bbolt/lockmanager 类型）、
+      `TestT018NoLockResidueAfterRootRollback`/`...AfterRootCommit`/`TestT018EpochChangeWakesTheWaiterAndLeavesNothingBehind`/`TestT018ClosedEngineReleasesLocksAndRefusesReuse`
+      （Close/Rollback/EpochReset 无残留；`Manager.Closed()` 现已导出并被断言）。
+      已知差异（已在契约/报告中写明，不作为勾选依据）：`storageengine.LockingTxnOf` 是类型断言，
+      对"engine 未装配 manager"的事务仍返回非 nil 能力，各操作以 `ErrUnsupported` fail-closed；
+      权威判断是 `LockingTxn()` 或 engine 的 `Locking()`。
+- [x] T019 [US1] 在 `mvcc/locking.go`（新）与 `mvcc/transaction.go` 接入已有key覆盖/删除的raw client X锁与查询scope context；验收：raw writer不能绕过record holder，Get不变；FR-014/026/029/030。
+      **已完成（第五轮）**。`mvcc.Tx.write`（`Put`/`Delete` 的唯一入口）在**暂存之前**调用
+      `AcquireRawWriteLock`：取该 `(Space, Key)` 的 Record X 并在 `LockOpWait` 时等待，因此等待期间
+      不持有 bbolt 写事务；`Get` 不变（快照读，不取锁不等待）。同一资源的身份由"标签不参与
+      record/interval 身份"保证（`ResourceKey = Generation+Kind+Space+Key/bounds`），故 raw 写与 SQL 写
+      互为排他。验收证据：`mvcc/raw_locking_test.go`（raw↔raw、SQL 形状↔raw 双向等待、删除同锁、
+      Get 快照、epoch reset 取消 raw 等待、等待期间无持久化闩锁、commit/rollback 无残留、child 归 root）
+      与 `executor/raw_lock_test.go`（真实 SQL session ↔ 中立 raw `Txn.Put` 双向阻塞/唤醒/提交冲突）。
+      **本轮范围明确排除**：缺失 key 的 Gap/Insert Intention 保护与 raw 写的 table intention 登记
+      属 Phase 4 的 T024/T026，未实现、未宣称。
 
 **Independent Test / Checkpoint**: T013/T014+adapter raw-key fixture通过。MVP只代表record内核，
 gap/new-key写和完整SQL发布仍依赖后续phase，不能将US1当作完整B02上线。
-**实际状态**：T013–T017 的独立 `lockmanager` 夹具通过；**adapter raw-key fixture 未建立**，
-因此 checkpoint 只完成了一半——内核可验收，接线未验收。
+**实际状态（更新）**：T013–T017 的独立 `lockmanager` 夹具通过；**adapter raw-key fixture 已建立**
+（`storageengine/mvccadapter/locking_*_test.go` 的 raw/neutral 身份与 grant 断言，见 T018），
+且 raw client 的 X 锁已接入（T019），因此 US1 的"record 内核 + 装配 + raw 写入参与同资源协调"
+三部分都已有真实证据；**仍未完成**的是 Gap/Next-Key/II（T024/T025）与完整 SQL 发布路径，
+所以 US1 仍未构成端到端可宣称的 B02 上线。
 
 ## Phase 4: US2 区间与插入保护 (T020–T027, P1)
 **Goal**: 稳定Gap、Next-Key、II及proven/fallback计划；独立资源夹具可验证。
@@ -210,6 +244,10 @@ gap/new-key写和完整SQL发布仍依赖后续phase，不能将US1当作完整B
 > `mvccadapter` 没有 `locking.go`，`enginefactory` 不创建 lock manager，
 > `AttachLocks` 只有测试调用（`executor/access_plan.go` 自述 "Locking reads ... are served from
 > the statement snapshot"）。经用户确认（Option 1），本轮先补 SQL 接入基础。
+>
+> **现状更新（第五轮）**：`mvccadapter/locking.go` 已存在，`enginefactory` 已创建并装配
+> 每 engine 一个 lock manager，`Store.AttachLocks` 已被生产装配调用；`executor` 已读取
+> `Select.Locking` 并接入 Current Read（见 §第三轮）。以上描述仅保留为历史审查记录。
 >
 > 已完成：
 > - `lockmanager/interval.go`（新，T022）：`containsPoint`（nil 边界=无穷、空非 nil 键是合法点、
@@ -487,7 +525,9 @@ gap/new-key写和完整SQL发布仍依赖后续phase，不能将US1当作完整B
       **不影响 retention/计量**：B01 的 `oldestReadTS` 与 `txns.Reset` 逻辑未改；锁侧只额外注销 owner。
       **未定 publish 不假 rollback**：`TestB02FailedPublicationIsReconciledAfterARestore` 断言未定事务
       `Committed()` 为 false、commit 被拒为 `ErrConflict`、状态为终态且锁全部释放。
-      **adapter 部分未执行**：`storageengine/mvccadapter/locking.go` 不存在（T018/T054 范围）。
+      **adapter 部分（现状更新，第五轮）**：`storageengine/mvccadapter/locking.go` 现已存在
+      （T018 已完成）；T054 仍未执行的部分是 leader-only Current Read 的 Barrier/Term fence 与
+      loss-wake 接线本身，而不是"文件不存在"。
 - [ ] T054 [US5] 在 `replication/node.go`、`storageengine/mvccadapter/locking.go` 接入leader-onlyCurrentRead的Barrier/Termfence与losswake；验收：VerifyLeader不冒充barrier、FSMapply不等待、无新Command字段；FR-011/019/022/026/029。
 - [ ] T055 [US5] 在 `mvcc/locking_commit_matrix_test.go`、`replication/locking_commit_test.go`（新）参数化bounded/group/stream/WAL/Raft含acceptedChanges及rawapply干预；验收：final latest>readTS拒绝、三类root与marker一致，不改validator/codec；FR-018/019/022/030，SC-004/007。
 - [ ] T056 [US5] 在 `config/config.go`、`cmd/gbaselite/main.go`、`executor/open_options.go`、`enginefactory/default.go`、`storageengine/engine.go` 传递lock预算与默认配置，在 `server/handler.go` 接入1205/1213中立映射；验收：符合contracts配置表、env优先级、单位/0/default/overflow明确、原冲突映射保持；FR-009/010/025/026/031。
@@ -664,11 +704,11 @@ Task 的 test 标记不等于测试已执行；勾选项均附真实命令输出
 一个性能悬崖）、关键不变量逐条核对、race 环境限制、未解决问题。
 
 ### 进入 Phase 4（US2 区间与插入保护）的阻断条件
-1. **T018/T019 仍必须先做**（阻断）：`lockmanager` 现已通过 `mvcc` 接入事务生命周期
-   （`Store.AttachLocks`），但 `storageengine/mvccadapter` **没有** `locking.go`，
-   `enginefactory` 也**没有**创建或装配 lock manager，而 `executor`/`server` 完全不感知锁。
-   因此生产二进制仍然是无锁运行的：**测试之外没有任何代码路径会创建一个 lock manager**。
-   直接做 US2 会在"无法从引擎驱动"的基础上叠加区间规则，无法做端到端验收。
+1. ~~**T018/T019 仍必须先做**（阻断）~~ **已解除（第五轮）**：`storageengine/mvccadapter/locking.go`
+   已存在，`enginefactory/default.go` 会在打开 MVCC 引擎时为**每个 engine** 创建并装配 lock manager
+   （`Store.AttachLocks`），raw `Txn.Put/Delete` 也已在暂存前取得 Record X。历史记录：在此之前
+   `enginefactory` 未创建 lock manager、`executor`/`server` 不感知锁，生产二进制是无锁运行的。
+   现在仍**不**等于"生产二进制完全无锁运行"已解决：SQL 侧的锁定读取/Gap/II 仍受 T024/T054/T056 限制。
 2. **T052/T054 是剩下的接线（阻断 SQL 可达性）**：`executor/transaction_engine.go` +
    `server/connection.go`（statement scope、timeout rollback、disconnect/reset）与
    `replication/node.go`（term fence）。`mvcc` 侧入口已就绪并被测试，**接线未做**。
@@ -783,6 +823,63 @@ Task 的 test 标记不等于测试已执行；勾选项均附真实命令输出
 契约同步（随代码一起修订，先改契约再改实现）：`contracts/lock-manager.md` 新增
 §共享等待：终态广播与取消所有权；`data-model.md` 的 LockRequest 字段改为"终态广播 + origin 标记"。
 本轮未改 WAL、Raft Command、存储格式，未进入其他 Phase，未部署。
+
+### 第五轮（Joiner Scope 生命周期 + T018/T019 收尾）证据与任务口径
+
+证据文件 `.tmp/b02r5-fix-report.md`：三项工作的复现/验收证据、根因、修复、命令与退出码、
+race 工具链限制、T018/T019 逐条验收对照，以及"能否开始 Phase 4"的判断。
+辅助原始输出：`.tmp/b02r5-before-scope.txt`（joiner scope 关闭缺陷复现）、
+`.tmp/b02r5-lockmanager-count10.txt`、`.tmp/b02r5-affected.txt`、`.tmp/b02r5-gotest-all.txt`、
+`.tmp/b02r5-race.txt`。
+
+**1. Joiner Scope 关闭语义（本轮判定并修正）**。判定：原行为**不安全**——加入者 scope 关闭后其调用者
+仍在等待，最终会收到一个它已无权使用的 GRANTED；`CloseLockScope` 只按 request.ScopeID 撤销，对加入者
+无作用。修正遵循两条原则：加入者 scope 关闭**只结束该加入者自己的等待**（`ErrScopeUnknown`，中立边界映射
+为可重试冲突），**不撤销**创建者创建的共享 request；request 与其它等待者不受影响。实现：
+`requestBundle.joins`（scope→join 通道）+ `Manager.closeJoinsLocked`（`CloseScope`/`BeginCloseScope`
+调用）+ `LockHandle.scopeDone`（等待路径 select，且**已决定的终态优先**，保证 grant 与 scope 关闭同时
+发生时只有一个可观察结果）。契约同步：`contracts/lock-manager.md` §共享等待、`data-model.md`。
+测试：`shared_wait_test.go` 的 `TestB02JoinerScopeCloseEndsOnlyTheJoinersWait`、
+`TestB02JoinerScopeCloseRacingTheGrantHasOneVisibleOutcome`（两个顺序）、以及改写后的
+`TestB02ScopeAndRootLifecyclesAroundASharedRequest/joiner scope close ...`。
+
+**2. T018 验收（已完成，见上文勾选）**。除 8 条验收外，本轮还修正两处映射/可观测性问题：
+子事务自己的 scope 现在**建在父事务 scope 的子树内**（`mvcc.beginTransactionScope` 传
+`parent.lockScopeID`），使"丢弃外层 savepoint ⇒ 子树内的请求被撤销"成立
+（`mvcc/locking_lifecycle_test.go:TestB02ClosingAnEnclosingScopeCancelsAChildsQueuedRequest`、
+`storageengine/mvccadapter/locking_internal_test.go` 的 parentage 断言）；
+`lockmanager.Manager.Closed()` 导出，使"Engine Close 后 manager 确实关闭"可被断言。
+已知差异：`storageengine.LockingTxnOf` 为类型断言，engine 未装配 manager 时仍返回非 nil 能力，
+操作 fail-closed（`ErrUnsupported`），权威判断是 `LockingTxn()`/`Locking()`。
+
+**3. T019 验收（已完成）**。raw `Txn.Put/Delete` 在暂存前取得该 key 的 Record X；
+身份规则按契约收敛为 `(Generation, Space, Key)`——`TableID`/`IndexID` 不再参与 `ResourceKey`，
+否则 raw 写与 SQL 锁会成为两个资源（`lockmanager/resource.go`、`resource_test.go` 已同步）。
+验收：raw↔raw、SQL 形状↔raw 双向等待、Delete 同锁、`Get` 快照读不变、epoch reset 取消 raw 等待、
+等待期间无持久化闩锁（第三方可继续提交无关 key）、commit/rollback 无残留、child 写归 root；
+executor 层为真实 SQL session ↔ 中立 raw `Txn.Put` 的双向阻塞/唤醒/提交冲突。
+
+**4. 本轮发现并修正的真实缺陷（2 个）**：
+- `Manager.ResetEpoch` 结束 owner 时**从不退还 ledger 计费**（`releaseGrantsLocked` 只 drop claim，
+  退款只在 `ReleaseOwner` 里做），epoch 变更后 `Totals()` 仍计着已释放的组件；
+  修复为在解锁后对每个 ended owner 调 `ledger.ReleaseOwner`（与 `ReleaseOwner` 同序，避免嵌套锁）。
+  由 `mvcc/raw_locking_test.go` 与 T018 的 epoch 用例暴露，两处现已断言归零。
+- raw 写路径最初忽略 `LockOpWait`（拿到 WAIT 句柄却不等待），等于"加锁但不阻塞"；
+  修复为等待句柄（`mvcc.AcquireRawWriteLock`），并由 `TestB02RawPutWaitsForAnotherRootsRecordLock`
+  等用例锁定（该缺陷在"加锁后立即返回"的自测中暴露出 mvcc 既有冲突用例被静默放过）。
+
+**5. 因新语义而必须改写的既有测试（不是放宽断言，而是断言对象改变）**：
+`mvcc/current_read_test.go` 的 absent/tombstone 用例（"行在锁下出现"已不可达 ⇒ 改为断言
+absent 的 baseline=0 与"锁授权的正是它观察到的事实"）、`mvcc/locking_commit_test.go` 的
+`TestB02LockingDoesNotChangeConflictDetection`（第二个写者现在先等待再冲突）、
+`storageengine/mvccadapter/diagnostics_test.go` 的冲突计数用例（同一 key 的两个写者改为
+"先结束、后写、再冲突"）、`storageengine/testkit/contract.go` 的 `WriteAndPointGuards`
+（同上，两处契约夹具）。四处的**断言意图都保留**：提交期乐观冲突仍然存在，锁只是把它排到等待之后。
+
+**6. race 说明（如实记录）**：本机无 C 工具链，`go test -race` 无法运行（`-race requires cgo`；
+`CGO_ENABLED=1` 时 `cgo: C compiler "gcc" not found`；gcc/clang/zig/cl 均不存在、无网络安装）。
+本轮**不伪报 race 通过**，并把 `./lockmanager` 加入 `.github/workflows/test.yml` 的 Linux race 步骤
+（新增 "Lock manager race regression"），由 CI 在 Ubuntu runner 上提供真实 race 证据。
 
 ### 本轮证据文件
 | 文件 | 内容 |

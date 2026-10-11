@@ -27,6 +27,13 @@ var _ storageengine.LockingTxn = (*txn)(nil)
 //
 // The capability is optional by contract: a backend without a lock manager returns false and a
 // caller that requires locking must then fail closed rather than run unprotected.
+//
+// This method answers "does this engine have a lock manager", and it is the authoritative check: it
+// returns false for a transaction whose engine was opened without one. The neutral helper
+// `storageengine.LockingTxnOf` is a type assertion instead, so for this backend it reports the
+// capability as present even then, and every operation on it fails closed with ErrUnsupported (see
+// `lockManager()` below, which each entry point checks). A caller that must distinguish the two
+// states asks this method, or the engine's `Locking()`, rather than relying on the assertion.
 func (t *txn) LockingTxn() (storageengine.LockingTxn, bool) {
 	if t.lockManager() == nil {
 		return nil, false
@@ -314,6 +321,13 @@ func neutralLockError(err error) error {
 	case errors.Is(err, lockmanager.ErrUnsupportedMode):
 		return storageengine.ErrUnsupported
 	case errors.Is(err, lockmanager.ErrOwnerEnding), errors.Is(err, lockmanager.ErrConflict):
+		return storageengine.ErrConflict
+	case errors.Is(err, lockmanager.ErrScopeUnknown):
+		// The scope this request came from no longer exists: a statement whose scope was closed
+		// while it waited for a request it had joined, or a caller using a scope after its close.
+		// That is a statement-level cancellation, not an internal fault, so it maps onto the
+		// retryable conflict the storage contract already uses for "this attempt is over, start
+		// again" instead of leaking a lock-manager sentinel through the neutral boundary.
 		return storageengine.ErrConflict
 	default:
 		// Anything else is a programming error (a malformed component, an unknown scope) or an

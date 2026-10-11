@@ -343,3 +343,13 @@ Phase 3（US1）的前置条件已就绪：
 | 「多次等待同一 handle 由 ctx 取消兜底」 | 该兜底已不再需要：`TestB02HandleWaitAndStatusAgreeUnderConcurrency` 的注释与断言随之更新为广播语义（grant 与 ctx 同时到达时仍必须报告 GRANTED）。 |
 | 新建测试 | `lockmanager/shared_wait_test.go`：2/10 个等待者同时获授、加入者取消隔离、创建者取消撤销、加入者 `Cancel` 无操作、五种终态（grant/cancel/timeout/deadlock/epoch）全部唤醒全部等待者、终态不被消费、三种 scope/root 生命周期；每个用例都断言无 goroutine 遗留（全部 outcome 被接收）与无锁资源/预算残留。 |
 
+## A10. 第五轮修订（Joiner Scope 生命周期 + T018/T019）
+
+| 上一版结论 | 现状（`.tmp/b02r5-fix-report.md`） |
+|---|---|
+| 加入者 scope 关闭只影响 `Cancel`/context，scope 关闭"不影响它未创建的 request" | **已补全**：只结束该加入者自己的等待（`ErrScopeUnknown` → 中立 `ErrConflict`），request 与其它等待者不受影响；新增 `requestBundle.joins`+`Manager.closeJoinsLocked`+`LockHandle.scopeDone`，等待路径对"已决定终态"优先。复现：加入者 scope 关闭后其调用者永不返回（`.tmp/b02r5-before-scope.txt`）。 |
+| T018 未执行（`mvccadapter/locking.go` 不存在、`enginefactory` 未装配） | **已完成**：每 engine 一个 manager 装配、可选能力、root/child/scope 映射（子 scope 现建在父 scope 子树内）、身份与写路径一致、engine 隔离、中立接口不泄漏 backend 类型、grant 完整、Close/Rollback/EpochReset 无残留（`Manager.Closed()` 已导出可断言）。 |
+| T019 未执行（raw client 不参与锁） | **已完成**：`mvcc.Tx.Put/Delete` 在暂存前取该 key 的 Record X 并等待；`Get` 保持快照读；身份收敛为 `(Generation, Space, Key)`（TableID/IndexID 是标签不参与身份），故 raw 写与 SQL 锁互为排他。T024 的 Gap/II 与 T026 的 binding 登记仍明确未做。 |
+| `ResetEpoch` 归零 owner/图/请求 | **发现并修复**：它从不退还 ledger 计费（退款只在 `ReleaseOwner`），epoch 变更后仍计着已释放组件；现对每个 ended owner 调 `ledger.ReleaseOwner`（解锁后调用，避免嵌套 registry 锁）。 |
+| 既有测试只覆盖"无锁 raw 写" | 四处既有测试的**断言对象**随新语义更新（不是放宽）：absent/tombstone 的 current read、`TestB02LockingDoesNotChangeConflictDetection`、diagnostics 冲突计数、`testkit` `WriteAndPointGuards`；提交期乐观冲突的断言全部保留，只是现在发生在等待之后。 |
+

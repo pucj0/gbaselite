@@ -42,6 +42,12 @@ jobs:
       - name: MVCC transaction race regression
         if: runner.os == 'Linux'
         run: go test -race ./mvcc ./storageengine/... ./executor ./server -count=1
+      # The lock manager is race-tested here rather than locally: it has no C toolchain on the
+      # development host, so this step is the only place the shared-request broadcast, the join
+      # bookkeeping and the raw-write lock path are exercised under the race detector.
+      - name: Lock manager race regression
+        if: runner.os == 'Linux'
+        run: go test -race ./lockmanager -count=2
 
   mysql-8-client:
     needs: quality

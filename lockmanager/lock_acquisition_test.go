@@ -23,11 +23,16 @@ import (
 // It is deliberately spelled out rather than reused from the helpers: the identity fields
 // are the point of these tests, and a helper that quietly filled them in would hide exactly
 // what is being asserted.
+//
+// The space is built the way the SQL layout builds it — `index/<table>/<index>` — because the
+// space is the resource identity: a helper that put only the index name in the space would make
+// two tables' indexes the same resource and then need the TableID label to separate them, which
+// is exactly the label-versus-identity confusion the contract resolves the other way.
 func indexRecord(tableID, indexID string, key []byte) ResourceRef {
 	return ResourceRef{Identity: Identity{
 		Kind:    KindRecord,
 		Mode:    ModeX,
-		Space:   "index/" + indexID,
+		Space:   "index/" + tableID + "/" + indexID,
 		TableID: tableID,
 		IndexID: indexID,
 		Key:     key,
@@ -226,7 +231,7 @@ func TestB02ReentrantAcquisitionIsFree(t *testing.T) {
 		t.Fatalf("repeated acquisition op = %s, want REENTRANT", second.Op)
 	}
 	// Repeating it with the weaker mode is also satisfied by what is held.
-	weaker := []ResourceRef{{Identity: Identity{Kind: KindRecord, Mode: ModeS, Space: "index/PRIMARY", TableID: "t1", IndexID: "PRIMARY", Key: []byte("k1")}}, isIntent("t1")}
+	weaker := []ResourceRef{indexRecordOf(ModeS, "t1", "PRIMARY", []byte("k1")), isIntent("t1")}
 	if got := owner.acquire(ctx, weaker...); got.Op != LockOpReentrant {
 		t.Fatalf("weaker repeated acquisition op = %s, want REENTRANT", got.Op)
 	}

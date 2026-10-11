@@ -295,8 +295,16 @@ func TestB02BaselineIsPerKeyNotPerTransaction(t *testing.T) {
 	}
 }
 
-// TestB02BaselineRecordsZeroForAbsentAndTombstone proves a locked read of a missing row does not
-// authorise inserting over a row that appeared afterwards.
+// TestB02BaselineRecordsZeroForAbsentAndTombstone proves what a locked read of a key that does not
+// exist records, and that the record is the observation and not a stale readTS.
+//
+// The shape this test used to exercise — another root creating the row underneath the observing
+// caller — is no longer reachable, and that is the point of the lock: a raw write now takes the same
+// record X the observer holds, so the other root waits instead of appearing. What remains to check
+// here is the observation itself: absence records baseline 0 (no change at all), a tombstone keeps
+// its deleting sequence, and each is distinguishable from the other. The guard that an *unlocked*
+// observation of absence must never authorise an overwrite lives in
+// TestB02UnlockedCurrentReadRecordsNoBaseline, which is the case the baseline must not weaken.
 func TestB02BaselineRecordsZeroForAbsentAndTombstone(t *testing.T) {
 	f := newCurrentReadFixture(t)
 	ctx := context.Background()
@@ -314,26 +322,27 @@ func TestB02BaselineRecordsZeroForAbsentAndTombstone(t *testing.T) {
 	if observation.Tombstone {
 		t.Fatal("a key that never existed was reported as a tombstone")
 	}
-
-	// Another transaction creates it after the observation.
-	concurrent := mustBegin(t, f.store)
-	if err := concurrent.Put("index/PRIMARY", []byte("missing"), []byte("appeared")); err != nil {
+	// The baseline is keyed by the logical store key, which is what the commit validator looks up.
+	logicalKey, err := key("index/PRIMARY", []byte("missing"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := concurrent.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if version, recorded := reader.writeBaselineFor(logicalKey); !recorded {
+		t.Fatal("a locked read of an absent key recorded no baseline")
+	} else if version != 0 {
+		t.Fatalf("the absent key's baseline = %d, want 0 (no version observed)", version)
 	}
-
-	// The reader's own insert/update of that key must conflict: the row appeared underneath a
-	// caller that had locked it as missing.
+	// The lock authorises exactly what it observed: creating the key it locked as missing publishes
+	// the row, and nothing changed underneath it because a concurrent writer could not get in.
 	if err := reader.Put("index/PRIMARY", []byte("missing"), []byte("mine")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reader.Commit(ctx); !errors.Is(err, ErrConflict) {
-		t.Fatalf("insert over an observed-absent key committed: err = %v, want ErrConflict", err)
+	if _, err := reader.Commit(ctx); err != nil {
+		t.Fatalf("inserting the key this transaction locked as absent: %v", err)
 	}
 
-	// The same for a tombstone: a deleted-and-locked key that is reinserted conflicts.
+	// The same for a tombstone: a deleted-and-locked key is reported as a tombstone with its
+	// deleting sequence, and is distinguishable from a key that never existed.
 	g := newCurrentReadFixture(t)
 	seed := mustBegin(t, g.store)
 	if err := seed.Put("index/PRIMARY", []byte("gone"), []byte("x")); err != nil {

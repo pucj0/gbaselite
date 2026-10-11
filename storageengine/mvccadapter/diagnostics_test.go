@@ -215,15 +215,21 @@ func TestDiagnosticsDropTerminalTransactionsAndCountOutcomes(t *testing.T) {
 	}
 
 	// A conflict is an abort too, and it is counted separately as well.
-	loser := begin(t, e)
+	//
+	// The two writers cannot overlap on one key any more: a raw write takes the record lock, so a
+	// second writer on the same key would wait instead of conflicting. Both transactions therefore
+	// start on one snapshot and the first one ends before the second writes: the second write finds
+	// the lock free and its commit then meets the same optimistic conflict the overlap used to
+	// produce. What the counters see is unchanged — one commit and one conflict.
 	winner := begin(t, e)
-	if err := loser.Table("t").Put([]byte("a"), []byte("loser")); err != nil {
-		t.Fatal(err)
-	}
+	loser := begin(t, e)
 	if err := winner.Table("t").Put([]byte("a"), []byte("winner")); err != nil {
 		t.Fatal(err)
 	}
 	commit(t, winner)
+	if err := loser.Table("t").Put([]byte("a"), []byte("loser")); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := loser.Commit(ctx); !errors.Is(err, storageengine.ErrConflict) {
 		t.Fatalf("loser commit = %v, want ErrConflict", err)
 	}

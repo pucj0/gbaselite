@@ -29,8 +29,6 @@ func TestB02ResourceIdentityIsolation(t *testing.T) {
 	variants := map[string]Identity{
 		"generation": {Generation: 2},
 		"space":      {Space: "index/u1"},
-		"table":      {TableID: "t2"},
-		"index":      {IndexID: "u1"},
 		"kind":       {Kind: KindInterval, Mode: ModeGap, Key: nil, Lower: []byte{0x00, 0x01}, Upper: []byte{0x00, 0x02}},
 		"key":        {Key: []byte{0x00, 0x02}},
 	}
@@ -40,12 +38,6 @@ func TestB02ResourceIdentityIsolation(t *testing.T) {
 		other.Generation = patch.Generation
 		if patch.Space != "" {
 			other.Space = patch.Space
-		}
-		if patch.TableID != "" {
-			other.TableID = patch.TableID
-		}
-		if patch.IndexID != "" {
-			other.IndexID = patch.IndexID
 		}
 		if patch.Kind != "" {
 			other.Kind = patch.Kind
@@ -62,6 +54,29 @@ func TestB02ResourceIdentityIsolation(t *testing.T) {
 		}
 		if other.ResourceKey() == baseKey {
 			t.Fatalf("%s must produce a different resource identity", name)
+		}
+	}
+
+	// The SQL labels are labels, not identity. Record identity is (Generation, Space, Key), so the
+	// same space and key are the same resource whether or not the caller happens to know the table
+	// and index labels. That is what lets a raw `Put` and a SQL row lock meet on one resource
+	// instead of one of them bypassing the other; the space already separates tables and indexes.
+	for name, patch := range map[string]Identity{
+		"table label": {TableID: "t2"},
+		"index label": {IndexID: "u1"},
+	} {
+		other := base
+		if patch.TableID != "" {
+			other.TableID = patch.TableID
+		}
+		if patch.IndexID != "" {
+			other.IndexID = patch.IndexID
+		}
+		if err := other.Validate(); err != nil {
+			t.Fatalf("%s variant: %v", name, err)
+		}
+		if other.ResourceKey() != baseKey {
+			t.Fatalf("the %s must not change the resource identity: a raw write and a SQL lock would be two resources", name)
 		}
 	}
 

@@ -183,6 +183,14 @@ type LockHandle struct {
 	// withdraws the shared request, while a joiner's context ending stops its own wait and leaves
 	// the request to the callers still waiting for it.
 	origin bool
+	// scopeDone is closed when the scope this caller joined from closes. It is nil for the origin
+	// handle, and selecting on a nil channel simply never fires, so the owning caller is unaffected
+	// by the mechanism.
+	//
+	// A joined caller waits for a request it does not own, so its own scope closing is the one
+	// event that must end its wait without touching the request: a statement that has been
+	// discarded must not keep blocking, and must never be handed a grant it can no longer use.
+	scopeDone <-chan struct{}
 }
 
 // requestState is the shared decision of one queued request.
@@ -337,12 +345,12 @@ func (h *LockHandle) resolvedGrant() (LockGrant, bool) {
 	return h.decision.resolvedGrant()
 }
 
-// newHandle returns the caller-side view of one queued request.
+// newHandle returns the caller-side view of the request this caller created.
 //
 // Every path that hands a caller a queued request goes through here, so a request that a caller
-// started and a request it joined are the same handle: same request id, same decision, same
-// broadcast. origin records which of the two roles this caller has, because only the caller that
-// created the request may withdraw it.
+// started and a request it joined share one identity: same request id, same decision, same
+// broadcast. The origin handle owns the withdrawal right and has no scope-close channel, because
+// its scope closing cancels the request itself.
 func newHandle(bundle *requestBundle, origin bool) *LockHandle {
 	return &LockHandle{
 		RequestID:      bundle.req.ID,
@@ -350,6 +358,19 @@ func newHandle(bundle *requestBundle, origin bool) *LockHandle {
 		decision:       bundle.decision,
 		origin:         origin,
 	}
+}
+
+// newJoinedHandle returns the caller-side view of a request this caller joined.
+//
+// It differs from newHandle in the one way that matters for ownership: the handle carries the
+// channel that the joining scope's close closes, so the caller stops waiting when the scope it
+// came from is discarded, while the request keeps waiting for its owner and its other joiners.
+func newJoinedHandle(bundle *requestBundle, join *scopeJoin) *LockHandle {
+	handle := newHandle(bundle, false)
+	if join != nil {
+		handle.scopeDone = join.closed
+	}
+	return handle
 }
 
 // settled returns the broadcast channel this handle's request closes when it ends.
@@ -392,6 +413,15 @@ func (h *LockHandle) Wait(ctx context.Context) (RequestStatus, error) {
 	select {
 	case <-h.settled():
 		return h.Status(), nil
+	case <-h.scopeDone:
+		// The scope this caller joined from was discarded. A request that was already decided in
+		// the same instant still wins, exactly as it does when the context ends: a caller must not
+		// discard an outcome the manager has already recorded. It is reported so the caller knows
+		// the root holds what it waited for, even though its own statement is gone.
+		if status := h.Status(); status.Terminal() {
+			return status, nil
+		}
+		return RequestCanceled, ErrScopeUnknown
 	case <-ctx.Done():
 		// The context ended, but a grant may have been decided at the same moment. Consult
 		// the recorded decision before reporting the cancellation: reporting a cancel for a
@@ -702,6 +732,14 @@ func (m *Manager) waitWithDeadline(ctx context.Context, rootID string, handle *L
 		// decision, so two waiters cannot observe different outcomes and none of them consumes
 		// another's.
 		return handle.Status(), nil
+	case <-handle.scopeDone:
+		// The joining scope was discarded while the request is still queued. This caller's wait is
+		// over and the request is not: a decided outcome in the same instant still wins, so a grant
+		// is never silently dropped by a scope close.
+		if status := handle.Status(); status.Terminal() {
+			return status, nil
+		}
+		return RequestCanceled, ErrScopeUnknown
 	case <-ctx.Done():
 		if status := handle.Status(); status.Terminal() {
 			return status, nil
@@ -839,6 +877,14 @@ func (m *Manager) PendingRequests(rootID string) int { return m.inner.PendingReq
 
 // Stats returns the aggregate diagnostics view.
 func (m *Manager) Stats() Stats { return m.inner.Stats() }
+
+// Closed reports whether this manager was closed.
+//
+// It is part of the diagnostics surface because "the engine closed and the lock manager went with
+// it" is an observable contract, not an implementation detail: a caller holding the manager after
+// the engine ended must be able to see that it can no longer serve requests, instead of inferring it
+// from a refused registration.
+func (m *Manager) Closed() bool { return m.inner.Closed() }
 
 // Ledger exposes the accounting ledger.
 func (m *Manager) Ledger() *Ledger { return m.inner.Ledger() }
@@ -1047,7 +1093,15 @@ func (m *manager) BeginCloseScope(rootID string, scopeID uint64) ([]uint64, erro
 	if _, err := scopes.BeginClose(scopeID); err != nil {
 		return nil, err
 	}
-	return scopes.CloseSubtree(scopeID), nil
+	closed := scopes.CloseSubtree(scopeID)
+	discarded := make(map[uint64]bool, len(closed))
+	for _, id := range closed {
+		discarded[id] = true
+	}
+	// A scope becomes unable to issue requests here, so the callers that joined a request from it
+	// must stop waiting now rather than at the later close.
+	m.closeJoinsLocked(discarded)
+	return closed, nil
 }
 
 // CloseScope closes one scope and returns the ids it closed. The caller cancels the
@@ -1074,7 +1128,34 @@ func (m *manager) CloseScope(rootID string, scopeID uint64) ([]uint64, error) {
 	m.cancelRequestsLocked(func(entry *lockRequest) bool {
 		return entry.req.OwnerID == rootID && discarded[entry.req.ScopeID]
 	}, RequestCanceled)
+	m.closeJoinsLocked(discarded)
 	return closed, nil
+}
+
+// closeJoinsLocked ends the waits of the callers that joined a request from one of the discarded
+// scopes.
+//
+// A join is a caller waiting for a request it did not create, so discarding the scope the join came
+// from has to end that caller's wait: a closed statement scope must not keep blocking, and it must
+// never be handed a grant for a statement that no longer exists. The request itself is deliberately
+// untouched — it belongs to the scope that created it, to the root and to every other caller still
+// waiting for it — which is why this is not part of cancelRequestsLocked.
+//
+// The scan runs over the queued requests, which are bounded by the waiter budget, and each scope's
+// join record is removed as it is closed, so a repeated scope close finds nothing left to do.
+func (m *manager) closeJoinsLocked(discarded map[uint64]bool) {
+	if len(discarded) == 0 || len(m.waiting) == 0 {
+		return
+	}
+	for bundle := range m.waiting {
+		for scopeID, join := range bundle.joins {
+			if !discarded[scopeID] {
+				continue
+			}
+			join.close()
+			delete(bundle.joins, scopeID)
+		}
+	}
 }
 
 // Ancestors returns the scope chain of one open scope, nearest first. A read layer
@@ -1262,7 +1343,7 @@ func (m *manager) AcquireWith(ctx context.Context, rootID string, scopeID uint64
 			// the fail-fast answer; reporting the queued request as held would be a lie.
 			return AcquireResult{}, ErrConflict
 		}
-		return AcquireResult{Op: LockOpWait, Wait: newHandle(queued, false)}, nil
+		return AcquireResult{Op: LockOpWait, Wait: newJoinedHandle(queued, queued.joinFor(scopeID))}, nil
 	}
 
 	reservation, err := m.ledger.Reserve(rootID, deduped, true)
@@ -2188,6 +2269,10 @@ func (m *manager) ReleaseOwner(rootID string) BudgetUsage {
 // A dropped grant makes the resource's queue try again, so the fair order decides which
 // waiter moves next. An entry that is left with neither holder nor waiter is removed, so
 // a released table grows no further.
+//
+// It drops claims, not charges: both of its callers refund the owner's whole ledger entry
+// afterwards (ReleaseOwner and ResetEpoch), which is why neither of them can leave accounting
+// behind, and why a caller must not use this function on its own.
 func (m *manager) releaseGrantsLocked(ownerID string, resourceKey string) {
 	for key, entry := range m.locks.entries {
 		if resourceKey != "" && key != resourceKey {
@@ -2463,7 +2548,6 @@ func (m *Manager) OfferedMode(rootID string, resource ResourceRef) (Mode, bool) 
 // publication stays with the transaction layer, not here.
 func (m *manager) ResetEpoch(generation, term uint64) int {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	invalidated := 0
 	ended := make([]string, 0, len(m.owners))
 	for rootID, owner := range m.owners {
@@ -2501,6 +2585,16 @@ func (m *manager) ResetEpoch(generation, term uint64) int {
 	// changes, while the return value reports how many owners this one change affected.
 	m.invalidated++
 	m.bindings.Reset(generation)
+	m.mu.Unlock()
+
+	// The ledger has its own lock, so the manager mutex is released first, exactly as ReleaseOwner
+	// does: the two registries are independent and are never nested here. The refund is not
+	// optional bookkeeping — the owners were deleted above, so a charge left behind would account a
+	// lock that no owner holds and no generation can release, which is the "epoch change leaves no
+	// lock resource behind" half of the contract.
+	for _, rootID := range ended {
+		m.ledger.ReleaseOwner(rootID)
+	}
 	return invalidated
 }
 

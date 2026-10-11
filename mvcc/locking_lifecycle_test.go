@@ -132,6 +132,25 @@ func (f *lockTestFixture) pendingOf(rootID string) int {
 	return f.manager.PendingRequests(rootID)
 }
 
+// waitForPending blocks until one root has exactly the expected number of queued requests.
+//
+// It is a barrier on observed state, not a delay used to create an order: the loop ends when the
+// manager reports the queue entry, and the sleep is only the polling interval of that observation.
+// A waiter that never queues fails the test instead of being mistaken for a scheduling artifact.
+func (f *lockTestFixture) waitForPending(t *testing.T, rootID string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if f.manager.PendingRequests(rootID) == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never reached %d queued requests (now %d)", rootID, want, f.manager.PendingRequests(rootID))
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // requireNoLockState asserts the whole lock manager is idle.
 func (f *lockTestFixture) requireNoLockState() {
 	f.t.Helper()
@@ -144,6 +163,70 @@ func (f *lockTestFixture) requireNoLockState() {
 	if owners := f.manager.Stats().ActiveOwners; owners != 0 {
 		f.t.Fatalf("%d lock owners survived cleanup, want 0", owners)
 	}
+}
+
+// TestB02ClosingAnEnclosingScopeCancelsAChildsQueuedRequest proves the scope tree is load-bearing.
+//
+// A savepoint's requests belong to the savepoint layer, so discarding that layer must cancel them
+// even when the request was issued through a scope the child opened itself. That is only true if the
+// child's own transaction scope is nested inside the scope of the transaction that created it: a
+// root-level sibling scope would survive the enclosing rollback and leave a request queued for a
+// layer that no longer exists.
+func TestB02ClosingAnEnclosingScopeCancelsAChildsQueuedRequest(t *testing.T) {
+	f := newLockTestFixture(t)
+	ctx := context.Background()
+
+	// One root holds the row, so the child's request has to queue instead of being granted.
+	blocker := f.begin(ctx)
+	f.lockRow(ctx, blocker, "k1")
+
+	parent := f.begin(ctx)
+	parentScope := parent.lockScopeID
+	child := f.child(ctx, parent)
+	childScope, err := child.BeginLockScope(ctx, LockScopeOptions{Kind: storageengine.LockScopeSavepoint})
+	if err != nil {
+		t.Fatalf("open the child's savepoint scope: %v", err)
+	}
+
+	outcome := make(chan error, 1)
+	go func() {
+		// The two-step shape a real caller uses: ask, then wait for what the answer said to wait for.
+		_, op, wait, err := child.AcquireLock(ctx, childScope, []lockmanager.ResourceRef{indexRecordRef("k1"), tableIntentRef()}, nil)
+		if err != nil {
+			outcome <- err
+			return
+		}
+		if op != lockmanager.LockOpWait {
+			outcome <- nil
+			return
+		}
+		_, err = child.WaitForLock(ctx, wait)
+		outcome <- err
+	}()
+	f.waitForPending(t, parent.ID, 1)
+
+	// Discarding the enclosing layer closes its whole subtree, which now contains the child's own
+	// scope and every scope the child opened under it.
+	if _, err := parent.CloseLockScope(ctx, parentScope); err != nil {
+		t.Fatalf("close the enclosing scope: %v", err)
+	}
+	select {
+	case err := <-outcome:
+		if !errors.Is(err, lockmanager.ErrConflict) {
+			// The manager reports a cancelled request as a conflict; the adapter maps it to the
+			// neutral conflict the statement layer retries.
+			t.Fatalf("the child's queued request returned %v, want a cancelled request (lockmanager.ErrConflict)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the child's queued request survived the enclosing scope's close")
+	}
+	if pending := f.pendingOf(parent.ID); pending != 0 {
+		t.Fatalf("%d requests survived the enclosing scope's close", pending)
+	}
+	_ = child.Rollback()
+	_ = parent.Rollback()
+	_ = blocker.Rollback()
+	f.requireNoLockState()
 }
 
 // TestB02RootCommitReleasesLocks covers the commit half of the root lifecycle.

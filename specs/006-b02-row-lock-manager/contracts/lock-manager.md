@@ -5,8 +5,12 @@
 
 ## Identity and atomicity
 Record identity = `(Generation, Space, Key)`；interval conflict domain = `(Generation, Space)`。
-Table intent identity = `(Generation, immutable TableID)`。SQL TableID/IndexID 标签来自现有 metadata；
-manager 不解析 SQL key，不能把 label 加入 record identity 导致 raw Write 与 SQL Lock 是两个资源。
+Table intent identity = `(Generation, immutable TableID)`。SQL TableID/IndexID 标签来自现有 metadata，
+是**标签而不是身份**：manager 不解析 SQL key，`ResourceKey` 也不把它们编入 record/interval 身份。
+namespace（`row/<table>`、`index/<table>/<name>`、`secondary/<table>/<name>`）本身就是 table/index 的
+区分，所以两个 table 不会共用身份；反过来，若把标签编入身份，一个不认识标签的 raw 写就会与 SQL 锁成为
+两个资源，正是 FR-026 禁止的绕过（实现与本条一致性由 `lockmanager/resource_test.go` 与
+`mvcc/raw_locking_test.go` 断言）。标签仍随身份传递，用于 intent 前置条件、namespace binding 与诊断。
 未绑定的 raw namespace 使用 namespace intent，绑定的 row/index namespace沿用 TableID；中立
 NamespaceBinding 在 adapter 发布/验证，冲突绑定报错误，计入预算，generation reset时清理。
 
@@ -113,10 +117,32 @@ handle）以及所有**加入者**（`origin=false`，见上文"重复申请加�
 | 创建者 scope 关闭 | 撤销该 request（scope 只撤销自己发起的请求），全部等待者被唤醒 |
 | 加入者 context 结束 | 只结束**它自己**的等待并返回它自己的 ctx 错误；request 保持排队，创建者与其他加入者不受影响 |
 | 加入者 `Cancel(root, joined handle)` | 无操作，返回 request 当前状态（加入者没有自己的 request 可撤销） |
-| 加入者 scope 关闭 | 不影响它未创建的 request |
+| **加入者 scope 关闭（含 savepoint/statement 层被丢弃）** | **只结束该 scope 的加入者自己的等待**（返回 `ErrScopeUnknown`，经中立边界映射为可重试冲突）；request 与其它等待者不受影响 |
 | root 终态 / epoch reset / deadlock victim | 撤销该 root（或该 epoch 的）全部 request，全部等待者被唤醒 |
 
-加入不产生第二份 claim，也不重复扣预算：加入路径在 `Reserve` 之前返回，且不创建 request。
+`CloseScope`/`BeginCloseScope` 关闭一个 scope 时做两件事，二者不可混淆：撤销**由该 scope 发起**的
+request（`cancelRequestsLocked`），并结束**由该 scope 加入**的等待（`closeJoinsLocked` 关闭该 scope 的
+join 通道）。前者动 request，后者只动调用者。已授予的 root lock 在任何一种情况下都不会因加入者取消而
+提前释放：grant 属于 root，只有 root 终态/`ReleaseOwner`/epoch reset 才释放。
+
+**决定与 scope 关闭同时发生**：等待者同时 select「request 已决定」与「我的 scope 已关闭」两个通道，
+若 request 已有终态则**终态优先**（与 context 结束的规则一致），因此一个已记录的 grant 不会因为 scope
+关闭而被丢弃，调用者观察到的结果唯一。request 仍未决定时，scope 关闭就是该调用者等待的终点。
+
+### 原始写入口（T019）
+
+`mvcc.Tx.Put`/`Delete`（即 `storageengine.Txn.Put`/`Delete` 的实现）在**暂存之前**取得该 key 的
+**Record X**：
+
+- 身份就是写路径的字节：`Space` 与编码后的 `Key` 原样传入，manager 不解析/不重编码，因此 raw 写与
+  SQL 写落在同一资源上，互为对方的排他对象（acceptance：raw 不能绕过 SQL，SQL 不能绕过 raw）。
+- **必须先取锁再暂存**：等待期间不得持有 bbolt 写事务或任何持久化闩锁。取锁在 `bufferWrite` 之前，
+  因此等待发生在打开 stage 库之前。
+- `Get` 不变：仍是快照读，既不取锁也不等待。
+- raw 路径没有 per-statement context（中立 `Txn.Put` 不带 context），因此等待由 manager 自身的等待期限
+  界定；raw 等待的取消来自 manager 生命周期（rollback、root 终态、`Close`、epoch reset）。
+- **本轮范围**：只有精确 key 的 Record X。缺失 key 的 Gap/Insert Intention 保护、以及 raw 写对
+  table intention 的登记（需要先发布 namespace binding）属于 Phase 4 的 T024/T026，本轮不实现、不宣称。
 
 ## Deadline and errors
 等待期限是会话lock期限与ctx期限的较早者；未来可注入clock，生产使用monotonic elapsed time。

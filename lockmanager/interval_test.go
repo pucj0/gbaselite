@@ -263,19 +263,33 @@ func TestB02UnboundedAndSupremumBoundaries(t *testing.T) {
 }
 
 // TestB02IntervalIdentityIsPerNamespaceAndIndex proves two identically shaped ranges in different
-// indexes are different resources, so one index's gap cannot block another index's insert.
+// spaces are different resources, so one index's gap cannot block another index's insert.
+//
+// The namespace carries the separation: an interval's identity is (Generation, Space), so a
+// different index or table gets a different space — the SQL layout builds `index/<table>/<name>`
+// for exactly that reason. The table and index labels are metadata and must not be what separates
+// two resources, or a caller that does not know a label would address a different resource than the
+// writer it must exclude.
 func TestB02IntervalIdentityIsPerNamespaceAndIndex(t *testing.T) {
 	primary := gap("a", "z", false, false)
 	secondary := primary
 	secondary.IndexID = "idx_v"
-	secondary.Space = "index/idx_v"
+	secondary.Space = "index/t1/idx_v"
 	if primary.ResourceKey() == secondary.ResourceKey() {
 		t.Fatal("a gap in the primary and in a secondary index share one resource identity")
 	}
 	otherTable := primary
 	otherTable.TableID = "t2"
+	otherTable.Space = "index/t2/PRIMARY"
 	if primary.ResourceKey() == otherTable.ResourceKey() {
 		t.Fatal("a gap in t1 and in t2 share one resource identity")
+	}
+	// The label alone does not separate: the space does.
+	relabelled := primary
+	relabelled.TableID = "t2"
+	relabelled.IndexID = "other"
+	if primary.ResourceKey() != relabelled.ResourceKey() {
+		t.Fatal("a table or index label changed the interval identity; only the space may separate intervals")
 	}
 	if !intervalComponentsEqual(primary, gap("a", "z", false, false)) {
 		t.Fatal("two identical interval components were reported as different")

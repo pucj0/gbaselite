@@ -110,6 +110,47 @@ type requestBundle struct {
 	blockedByOlderWaiter bool
 	// decision is the shared, single terminal status a caller reads through its handle.
 	decision *requestState
+	// joins records, per scope, the callers that joined this request instead of creating it. A
+	// joined caller waits for a request it does not own, so it needs its own way out: closing the
+	// scope a join came from must end that caller's wait without touching the request (see
+	// closeJoinsLocked).
+	joins map[uint64]*scopeJoin
+}
+
+// scopeJoin is one scope's wait on a request it did not create.
+//
+// The channel is closed when that scope closes, which is what lets a joined caller stop waiting
+// while the request stays queued for its owner. It is created lazily, only for a scope that really
+// joins, so a request that nobody joined carries no extra state.
+type scopeJoin struct {
+	closed chan struct{}
+	done   bool
+}
+
+// close ends the join's wait. It is idempotent because a scope can be closed more than once (a
+// repeated CloseScope returns the same subtree ids), and closing a channel twice would panic.
+func (j *scopeJoin) close() {
+	if j == nil || j.done {
+		return
+	}
+	j.done = true
+	close(j.closed)
+}
+
+// joinFor returns the join record of one scope, creating it on first use.
+//
+// It is called with the manager mutex held, which is what makes the lazy creation safe and keeps
+// the "created once per scope" property that the idempotent close relies on.
+func (b *requestBundle) joinFor(scopeID uint64) *scopeJoin {
+	if b.joins == nil {
+		b.joins = make(map[uint64]*scopeJoin, 1)
+	}
+	join, ok := b.joins[scopeID]
+	if !ok {
+		join = &scopeJoin{closed: make(chan struct{})}
+		b.joins[scopeID] = join
+	}
+	return join
 }
 
 // complete reports whether every component of the bundle is held.

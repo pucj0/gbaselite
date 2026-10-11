@@ -272,7 +272,10 @@ func TestB02FailedPublicationIsReconciledAfterARestore(t *testing.T) {
 // TestB02LockingDoesNotChangeConflictDetection proves the SI conflict path is untouched.
 //
 // Two roots that write the same key from the same snapshot still conflict, whether or not a lock
-// manager is attached. Locking is an addition, not a substitute for the optimistic check.
+// manager is attached. Locking is an addition, not a substitute for the optimistic check — and it
+// runs *before* it, so the second writer first waits for the first row lock and then meets the same
+// commit-time conflict it always did. The wait is what makes the two writers ordered now; the
+// conflict is still decided by the validator.
 func TestB02LockingDoesNotChangeConflictDetection(t *testing.T) {
 	f := newLockTestFixture(t)
 	ctx := context.Background()
@@ -282,12 +285,25 @@ func TestB02LockingDoesNotChangeConflictDetection(t *testing.T) {
 	if err := first.Put("index/PRIMARY", []byte("k1"), []byte("first")); err != nil {
 		t.Fatal(err)
 	}
-	if err := second.Put("index/PRIMARY", []byte("k1"), []byte("second")); err != nil {
-		t.Fatal(err)
-	}
+
+	// The second raw write asks for the same record and has to queue behind the first one. The
+	// barrier is the manager's own queue state, so the test observes the wait instead of guessing it.
+	secondErr := make(chan error, 1)
+	go func() { secondErr <- second.Put("index/PRIMARY", []byte("k1"), []byte("second")) }()
+	f.waitForPending(t, second.ID, 1)
+
 	if _, err := first.Commit(ctx); err != nil {
 		t.Fatalf("first commit: %v", err)
 	}
+	select {
+	case err := <-secondErr:
+		if err != nil {
+			t.Fatalf("the woken raw write failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second raw write was not woken by the first commit")
+	}
+
 	// The second transaction was built on the same snapshot, so publishing it must conflict.
 	if _, err := second.Commit(ctx); !errors.Is(err, ErrConflict) {
 		t.Fatalf("second commit err = %v, want ErrConflict", err)

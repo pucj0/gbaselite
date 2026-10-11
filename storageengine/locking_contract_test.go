@@ -42,9 +42,15 @@ func TestB02LockingCapabilityIsAbsentByDefault(t *testing.T) {
 		t.Fatal("a minimal transaction must not advertise lock methods")
 	}
 	// The capability helpers are the documented way to ask, and they must report the
-	// absence as ErrUnsupported rather than as a nil-but-usable value.
+	// absence as ErrUnsupported rather than as a nil-but-usable value. A nil transaction
+	// is the degenerate case of the same rule: a caller that has no transaction has no
+	// capability, and a nil capability with a nil error would be indistinguishable from a
+	// usable answer.
 	if _, err := storageengine.LockingTxnOf(tx); !errors.Is(err, storageengine.ErrUnsupported) {
 		t.Fatalf("LockingTxnOf on a minimal txn = %v, want ErrUnsupported", err)
+	}
+	if _, err := storageengine.LockingTxnOf(nil); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("LockingTxnOf(nil) = %v, want ErrUnsupported", err)
 	}
 	if _, err := storageengine.LockDiagnosticsOf(engine); !errors.Is(err, storageengine.ErrUnsupported) {
 		t.Fatalf("LockDiagnosticsOf on a minimal engine = %v, want ErrUnsupported", err)

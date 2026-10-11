@@ -433,6 +433,121 @@ func TestB02SharedTerminalStatusIsObservableRepeatedly(t *testing.T) {
 	requireNoResidue(t, f)
 }
 
+// TestB02JoinerScopeCloseEndsOnlyTheJoinersWait is the lifecycle boundary this round settles.
+//
+// A statement scope that joined a request belongs to a statement that can be discarded while the
+// shared request is still queued. When that happens the caller must stop waiting — a closed scope
+// must not keep a caller blocked, and it must certainly not hand it a grant it is no longer allowed
+// to act on — while the request itself, which belongs to the scope that created it, stays queued
+// for its owner. This is the difference between "the joiner stops waiting" and "the request is
+// cancelled": only the owning scope, the root and an epoch change may do the latter.
+func TestB02JoinerScopeCloseEndsOnlyTheJoinersWait(t *testing.T) {
+	f := newSharedWaitFixture(t)
+
+	// One request created by the owning scope, joined twice from two other scopes of the same root.
+	firstJoin := f.join()
+	secondJoin := f.queue(f.openScope("a-third"))
+	if secondJoin.RequestID != f.first.RequestID {
+		t.Fatalf("the third scope started request %d, want to join request %d", secondJoin.RequestID, f.first.RequestID)
+	}
+
+	park := parkWaiters(t, 3)
+	ownerDone := f.watch(context.Background(), f.first)
+	firstDone := f.watch(context.Background(), firstJoin)
+	secondDone := f.watch(context.Background(), secondJoin)
+	park.awaitAll(t, 3)
+
+	// Only the first joining scope closes: its caller stops waiting, the other two keep waiting.
+	if _, err := f.m.CloseScope(f.rootID, f.joiner); err != nil {
+		t.Fatal(err)
+	}
+	park.release()
+
+	stopped := awaitOutcome(t, firstDone, "the caller whose scope closed")
+	if !errors.Is(stopped.err, ErrScopeUnknown) {
+		t.Fatalf("the caller whose scope closed returned %v, want ErrScopeUnknown", stopped.err)
+	}
+	if status := firstJoin.Status(); status != RequestPending {
+		t.Fatalf("the shared request is %s, want PENDING while its owner still waits", status)
+	}
+	// A closed scope can no longer start or join work at all.
+	if _, err := f.m.Acquire(context.Background(), f.rootID, f.joiner, f.bundle); !errors.Is(err, ErrScopeUnknown) {
+		t.Fatalf("a closed scope started a request: err = %v, want ErrScopeUnknown", err)
+	}
+	// Closing the same scope twice must be harmless.
+	if _, err := f.m.CloseScope(f.rootID, f.joiner); err != nil {
+		t.Fatalf("closing the same scope twice: %v", err)
+	}
+
+	// The surviving callers are still waiting and are granted together.
+	f.releaseBlocker()
+	owner := awaitOutcome(t, ownerDone, "the owning caller")
+	survivor := awaitOutcome(t, secondDone, "the caller whose scope is still open")
+	requireOneGrantForAll(t, []waitOutcome{owner, survivor}, "a surviving caller")
+	requireNoResidue(t, f)
+}
+
+// TestB02JoinerScopeCloseRacingTheGrantHasOneVisibleOutcome pins the precedence rule between the
+// two events that can end a joined wait: the shared request being decided and the joining scope
+// being discarded.
+//
+// Both orders are legal — the manager mutex decides which critical section runs first — but only one
+// outcome may be observable per caller, and an outcome the manager has already recorded must never
+// be replaced: a decided grant is reported as a grant even when the scope closes in the same
+// instant, exactly as a grant racing the caller's context is. When the request is still queued, the
+// scope close is what ends the join.
+func TestB02JoinerScopeCloseRacingTheGrantHasOneVisibleOutcome(t *testing.T) {
+	t.Run("a decided grant wins over the scope closing", func(t *testing.T) {
+		f := newSharedWaitFixture(t)
+		joiner := f.join()
+		park := parkWaiters(t, 2)
+		ownerDone := f.watch(context.Background(), f.first)
+		joinerDone := f.watch(context.Background(), joiner)
+		park.awaitAll(t, 2)
+
+		// The grant is decided first, the scope closes immediately afterwards, and only then are the
+		// callers released: both wake-up channels are ready at the same moment.
+		f.releaseBlocker()
+		if _, err := f.m.CloseScope(f.rootID, f.joiner); err != nil {
+			t.Fatal(err)
+		}
+		park.release()
+
+		owner := awaitOutcome(t, ownerDone, "the owning caller")
+		joined := awaitOutcome(t, joinerDone, "the joined caller")
+		requireOneGrantForAll(t, []waitOutcome{owner, joined}, "a caller of the granted request")
+		requireNoResidue(t, f)
+	})
+
+	t.Run("a scope close on a queued request ends only the join", func(t *testing.T) {
+		f := newSharedWaitFixture(t)
+		joiner := f.join()
+		park := parkWaiters(t, 2)
+		ownerDone := f.watch(context.Background(), f.first)
+		joinerDone := f.watch(context.Background(), joiner)
+		park.awaitAll(t, 2)
+
+		// The scope closes while the request is still queued, so the join ends.
+		if _, err := f.m.CloseScope(f.rootID, f.joiner); err != nil {
+			t.Fatal(err)
+		}
+		park.release()
+		joined := awaitOutcome(t, joinerDone, "the joined caller after its scope closed")
+		if !errors.Is(joined.err, ErrScopeUnknown) {
+			t.Fatalf("the joined caller returned %v, want ErrScopeUnknown", joined.err)
+		}
+		if status := joiner.Status(); status != RequestPending {
+			t.Fatalf("the shared request is %s, want PENDING", status)
+		}
+
+		// The request is granted afterwards to the callers that are still entitled to it.
+		f.releaseBlocker()
+		owner := awaitOutcome(t, ownerDone, "the owning caller")
+		requireOneGrantForAll(t, []waitOutcome{owner}, "the owning caller")
+		requireNoResidue(t, f)
+	})
+}
+
 // TestB02EveryTerminalOutcomeWakesEveryWaiter proves the broadcast covers every way a request can
 // end: an explicit cancel, the wait deadline, a deadlock victim and an epoch reset.
 func TestB02EveryTerminalOutcomeWakesEveryWaiter(t *testing.T) {
@@ -572,7 +687,7 @@ func TestB02ScopeAndRootLifecyclesAroundASharedRequest(t *testing.T) {
 		requireNoResidue(t, f)
 	})
 
-	t.Run("joiner scope close leaves the shared request queued", func(t *testing.T) {
+	t.Run("joiner scope close ends the joiner's wait and leaves the request queued", func(t *testing.T) {
 		f := newSharedWaitFixture(t)
 		joiner := f.join()
 		park := parkWaiters(t, 2)
@@ -583,17 +698,24 @@ func TestB02ScopeAndRootLifecyclesAroundASharedRequest(t *testing.T) {
 		if _, err := f.m.CloseScope(f.rootID, f.joiner); err != nil {
 			t.Fatalf("close the joining scope: %v", err)
 		}
-		// The request belongs to the owning scope, so closing another scope of the same root must
-		// not withdraw it: the owning caller is still entitled to it.
+		park.release()
+
+		// The calling scope is gone, so its caller must stop waiting: a closed statement scope that
+		// kept waiting could still be handed a grant it is no longer allowed to act on.
+		joined := awaitOutcome(t, joinerDone, "the joined caller after its scope closed")
+		if !errors.Is(joined.err, ErrScopeUnknown) {
+			t.Fatalf("the joined caller returned %v, want ErrScopeUnknown for a closed scope", joined.err)
+		}
+		if status := joiner.Status(); status != RequestPending {
+			t.Fatalf("the joined handle reports %s, want the shared request to stay PENDING", status)
+		}
+		// The request belongs to the owning scope, so it is still queued and its owner still gets it.
 		if pending := f.m.PendingRequests(f.rootID); pending != 1 {
 			t.Fatalf("pending requests = %d after a joining scope closed, want the shared request", pending)
 		}
-
 		f.releaseBlocker()
-		park.release()
 		owner := awaitOutcome(t, creatorDone, "the owning caller")
-		joined := awaitOutcome(t, joinerDone, "the joined caller")
-		requireOneGrantForAll(t, []waitOutcome{owner, joined}, "a caller of the shared request")
+		requireOneGrantForAll(t, []waitOutcome{owner}, "the owning caller")
 		requireNoResidue(t, f)
 	})
 

@@ -252,6 +252,13 @@ func (t *Tx) write(op Op) error {
 	if err := validateCommand(Command{Ops: []Op{op}}); err != nil {
 		return err
 	}
+	// Every raw write entry point participates in the same lock domain as SQL: a Put or Delete
+	// takes the exclusive record lock of its exact key before anything is staged, so neither layer
+	// can bypass the other and no bbolt write transaction is open while a caller waits. A guard is
+	// an optimistic dependency and takes no lock.
+	if err := t.AcquireRawWriteLock(op); err != nil {
+		return err
+	}
 	k, _ := key(op.Space, op.Key)
 	return t.bufferWrite(op, k, encodeStagedOp(op))
 }

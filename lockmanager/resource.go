@@ -106,16 +106,25 @@ func (id Identity) Clone() Identity {
 //
 // The kind is encoded as one fixed byte right after the generation, so the byte order
 // of this key is also the canonical resource order and a table's intention always
-// sorts before the rows it protects. Mode is deliberately excluded: a mode is a
-// request, not part of the identity.
+// sorts before the rows it protects.
+//
+// TableID and IndexID are deliberately NOT part of the key. Record identity is
+// (Generation, Space, Key) and interval identity is (Generation, Space): the space is the
+// logical namespace — `row/<table>`, `index/<table>/<name>`, `secondary/<table>/<name>` —
+// so it already separates one table's rows from another's and one index from another. A
+// label is metadata that the SQL layer happens to have and a raw writer does not, and
+// including it would make "the same row" two different resources depending on which layer
+// asked: a raw `Put` could then bypass a row X held by SQL, which is exactly the bypass
+// FR-026 forbids. The labels still travel on the identity for the table-intent
+// prerequisite, the namespace bindings and diagnostics; they are labels, not identity.
+//
+// Mode is deliberately excluded too: a mode is a request, not part of the identity.
 func (id Identity) ResourceKey() string {
 	var b bytes.Buffer
 	b.Grow(len(id.Space) + len(id.Key) + len(id.Lower) + len(id.Upper) + 64)
 	writeUint64(&b, id.Generation)
 	b.WriteByte(kindCode(id.Kind))
 	writeField(&b, id.Space)
-	writeField(&b, id.TableID)
-	writeField(&b, id.IndexID)
 	writeField(&b, string(id.Key))
 	writeField(&b, string(id.Lower))
 	writeField(&b, string(id.Upper))

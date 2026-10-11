@@ -165,8 +165,12 @@ func Run(t *testing.T, factory Factory) {
 		e := fresh(t)
 		a, b := begin(t, e), begin(t, e)
 		put(t, a, "a", "first")
-		put(t, b, "a", "second")
+		// Both writers share one snapshot, but the second write happens after the first transaction
+		// ends. Overlapping the writes on one key is no longer possible — a write takes the record
+		// lock, so the second writer would wait instead of reaching its commit — and the conflict
+		// this contract asserts is decided by the commit validator either way.
 		commit(t, a)
+		put(t, b, "a", "second")
 		if _, err := b.Commit(ctx); !errors.Is(err, storageengine.ErrConflict) {
 			t.Fatal(err)
 		}

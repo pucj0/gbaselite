@@ -188,21 +188,34 @@ func (t *Tx) LockManager() (*lockmanager.Manager, bool) {
 // A root gets a statement scope, because a root is the origin of a top-level statement; a child
 // gets a child scope, which is what SQL opens for a savepoint or statement layer. The scope is a
 // request origin for diagnostics only: it never owns a grant.
+//
+// A child's scope is nested inside the scope its parent transaction opened. That is what makes the
+// scope tree real rather than decorative: discarding an enclosing layer closes its whole subtree,
+// so the requests a savepoint's scope issued are cancelled by rolling back the layer that owns
+// them. A root-level sibling scope would survive its savepoint's rollback and keep a request alive
+// for a layer that no longer exists.
 func (s *Store) beginTransactionScope(tx *Tx) error {
 	if s.locks == nil {
 		return nil
 	}
 	kind := lockmanager.ScopeChild
+	parentScopeID := uint64(0)
 	if tx.parent == nil {
 		kind = lockmanager.ScopeStatement
+	} else {
+		parentScopeID = tx.parent.lockScopeID
 	}
-	return s.openLockScope(tx, kind, tx.lockDeadline)
+	return s.openLockScope(tx, kind, parentScopeID, tx.lockDeadline)
 }
 
 // openLockScope opens one lock scope for a transaction and records it as the transaction's own.
-func (s *Store) openLockScope(tx *Tx, kind lockmanager.ScopeKind, deadline time.Time) error {
+//
+// parentScopeID is passed in rather than read from the transaction, because a transaction's own
+// scope does not exist yet while it is being opened and because a caller may deliberately nest a
+// new scope under an older one.
+func (s *Store) openLockScope(tx *Tx, kind lockmanager.ScopeKind, parentScopeID uint64, deadline time.Time) error {
 	ownerID := tx.LockOwnerID()
-	scope, err := s.locks.manager.OpenScope(ownerID, tx.ID, tx.lockScopeID, kind, deadline)
+	scope, err := s.locks.manager.OpenScope(ownerID, tx.ID, parentScopeID, kind, deadline)
 	if err != nil {
 		return err
 	}
@@ -323,6 +336,78 @@ func (t *Tx) WaitForLock(ctx context.Context, handle *lockmanager.LockHandle) (l
 		return lockmanager.LockGrant{}, err
 	}
 	return result.Grant, nil
+}
+
+// AcquireRawWriteLock takes the exclusive record lock one raw write to one key needs.
+//
+// It exists so the raw client cannot bypass SQL and SQL cannot bypass the raw client: the raw
+// write entry points (`Tx.Put`, `Tx.Delete`) take the same resource a SQL write of the same
+// namespace and key takes, because the identity is the one the storage write path uses — the
+// encoded namespace and the key bytes travel unchanged, and the manager never re-encodes them.
+// Record identity is (Generation, Space, Key), so the SQL layer's table and index labels do not
+// split the resource: a raw client that has never heard of a table label addresses the same row.
+//
+// Scope of this round: the lock is an exact-key record X. Gap, missing-key and insert-intention
+// protection for a raw write is Phase 4 (T024); until then a raw write to a key that does not exist
+// reserves only that key and does not protect the interval around it, and this function must not
+// pretend otherwise.
+//
+// The raw path has no per-statement context — neither `storageengine.Txn.Put` nor `mvcc.Tx.Put`
+// carries one — so the wait is bounded by the manager's own wait deadline (the session default,
+// 50 seconds) rather than by a caller deadline. Cancellation of a raw wait is therefore reached
+// through the manager's own lifecycle (rollback, root end, Close, epoch reset), not through a
+// context.
+//
+// It must be called before anything is staged: no bbolt write transaction may be open while a
+// caller waits, which is why `Tx.write` acquires here and only then buffers the op.
+func (t *Tx) AcquireRawWriteLock(op Op) error {
+	if op.Check {
+		// A guard is an optimistic dependency, not a write: it protects nothing and takes no lock.
+		return nil
+	}
+	if _, ok := t.LockManager(); !ok {
+		// The engine runs without a lock manager. That is a legitimate configuration (the neutral
+		// capability is optional), and there is no lock to take.
+		return nil
+	}
+	ownerID := t.LockOwnerID()
+	if ownerID == "" {
+		// The transaction no longer participates in locking, so it must not write either: failing
+		// closed here is what keeps "every raw write is protected" true after a close.
+		return ErrClosed
+	}
+	if t.lockScopeID == 0 {
+		// A transaction without its own scope cannot attribute a request. Begin always opens one
+		// while a manager is attached, so this is a closed or partially built transaction.
+		return ErrClosed
+	}
+	components := []lockmanager.ResourceRef{{
+		Identity: lockmanager.Identity{
+			Kind:  lockmanager.KindRecord,
+			Mode:  lockmanager.ModeX,
+			Space: op.Space,
+			Key:   op.Key,
+		},
+	}}
+	// context.Background is deliberate: Put/Delete carry no context, and inventing one would
+	// silently drop the caller's deadline. The manager bounds the wait itself.
+	_, acquired, wait, err := t.AcquireLock(context.Background(), t.lockScopeID, components, nil)
+	if err != nil {
+		return err
+	}
+	if acquired == lockmanager.LockOpWait {
+		// A conflicting acquisition is not a grant. The write must block here — before anything is
+		// staged — and continue only once the manager has decided this request; returning on WAIT
+		// would let the caller write while another root still holds the row, which is exactly the
+		// bypass this function exists to prevent.
+		if wait == nil {
+			return storageengine.ErrConflict
+		}
+		if _, err := t.WaitForLock(context.Background(), wait); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // AbortRequested reports whether a detector asked this transaction's root to stop.
