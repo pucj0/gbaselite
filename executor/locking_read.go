@@ -134,27 +134,40 @@ func bindLockedRead(ctx context.Context, tx storageengine.Txn, session *Session,
 		// A backend without a lock manager must never serve a locking read from its snapshot.
 		return nil, errLockedReadUnavailable
 	}
-	// The session's lock-wait budget travels as the scope's per-wait budget, so each claim the
-	// statement makes has its own bound while the statement's context still caps all of them.
-	scope, err := locking.BeginLockScopeBudget(operatorContext(session), storageengine.LockScopeStatement, session.LockWaitTimeout())
-	if err != nil {
-		return nil, err
-	}
 	node := &physical.PlanNode{Kind: scanKind(plan), Attributes: map[string]string{
 		"table": table.CatalogName, "access": plan.kind, "index": plan.index,
 		"locks": lockPlan.Annotation(true),
 	}}
 	return physical.Scan[storage.Row]{Plan: node, Open: func(openCtx context.Context) (storageengine.Iterator, error) {
-		// A scope opened for a statement is closed once the rows have been produced, which cancels
-		// requests that were still waiting and keeps every grant the statement took: in an explicit
-		// transaction those locks live until COMMIT/ROLLBACK, and in autocommit until the root that
-		// owns them ends after this result is consumed.
+		// The scope is opened here, together with the source that owns it, and closed on every failure
+		// below. Opening it while *binding* the statement instead would leak it whenever the statement
+		// fails before this operator is opened — a projection error, a refused plan, a closed
+		// transaction, a LIMIT that never pulls a row — because nothing would be left to close it.
+		//
+		// The session's lock-wait budget travels as the scope's per-wait budget, so each claim the
+		// statement makes has its own bound while the statement's context still caps all of them.
+		scope, err := locking.BeginLockScopeBudget(openCtx, storageengine.LockScopeStatement, session.LockWaitTimeout())
+		if err != nil {
+			return nil, err
+		}
 		it, err := openLockedSource(openCtx, locking, scope, table, plan, lockPlan, mode)
 		if err != nil {
+			closeLockScope(locking, scope)
 			return nil, err
 		}
 		return &lockedSource{Iterator: it, locks: locking, scope: scope}, nil
 	}, Decode: func(_, v []byte) (storage.Row, error) { return decode(v) }}, nil
+}
+
+// closeLockScope closes a statement scope whose source never came into existence.
+//
+// It reports nothing: the caller is already returning the error that made the source fail, and a scope
+// that cannot be closed is a lock-manager invariant violation, not a second failure for the statement.
+func closeLockScope(locking storageengine.LockingTxn, scope uint64) {
+	// The context is deliberately fresh: closing a scope has to work even when the statement's own
+	// context was cancelled or already past its deadline, or a cancelled statement would keep its
+	// pending requests alive.
+	_ = locking.CloseLockScope(context.Background(), scope)
 }
 
 // openLockedSource opens the byte-level source of one locked read.
@@ -214,21 +227,9 @@ func openLockedPoint(ctx context.Context, locking storageengine.LockingTxn, scop
 		return &lockedRow{value: observation.Value}, nil
 	}
 	// The row is absent. Reading it under the claim already proves it was absent *while the claim was
-	// held*, which is what the insert path conflicts with; the interval that contains the insertion
-	// position additionally covers a row that arrives through the gap.
-	upper, ok, err := nextKeyAfter(ctx, locking, space, key)
-	if err != nil {
-		return nil, err
-	}
-	bounds := storageengine.KeyRange{Lower: key, LowerInclusive: true}
-	if ok {
-		bounds.Upper = upper
-	}
-	gap := storageengine.LockRequest{Components: []storageengine.LockComponent{
-		readTableIntent(table, mode),
-		intervalComponent(space, table.ID, plan.index, bounds),
-	}, ShouldWait: lockedReadWaitDecision(space)}
-	if _, err := locking.Acquire(ctx, scope, gap); err != nil {
+	// held*, which is what the insert path conflicts with; the gap around the insertion position
+	// additionally covers a row that arrives through it.
+	if err := protectInsertionPosition(ctx, locking, scope, table, space, plan.index, key, mode); err != nil {
 		return nil, err
 	}
 	// Re-read under the wider claim: a row that arrived between the two claims must be returned
@@ -344,15 +345,22 @@ func openEntryClaim(ctx context.Context, locking storageengine.LockingTxn, scope
 	return locking.Acquire(ctx, scope, storageengine.LockRequest{Components: components, ShouldWait: lockedReadWaitDecision(space)})
 }
 
-// protectInsertionPosition claims the interval that contains one absent key's insertion point.
+// protectInsertionPosition claims the gap that contains one absent key's insertion position.
+//
+// The gap is bounded by the key's two published neighbours, which is what makes the protection the
+// neighbourhood of the absent key rather than everything after it: with 10 and 100 in the table, a
+// read of an absent 42 protects the positions strictly between them. A missing neighbour on either side
+// means the gap reaches that end of the index, which is the same shape a next-key gap lock has.
 func protectInsertionPosition(ctx context.Context, locking storageengine.LockingTxn, scope uint64, table versionedTable, space, indexID string, key []byte, mode storageengine.LockMode) error {
-	upper, ok, err := nextKeyAfter(ctx, locking, space, key)
+	previous, next, err := locking.KeysAround(ctx, space, key)
 	if err != nil {
 		return err
 	}
-	bounds := storageengine.KeyRange{Lower: key, LowerInclusive: true}
-	if ok {
-		bounds.Upper = upper
+	bounds := storageengine.KeyRange{Lower: previous, LowerInclusive: false, Upper: next, UpperInclusive: false}
+	if previous == nil {
+		// No key below: the gap starts at the beginning of the namespace. The lower bound stays nil so
+		// the interval really is unbounded there rather than starting at the absent key.
+		bounds.Lower = nil
 	}
 	_, err = locking.Acquire(ctx, scope, storageengine.LockRequest{
 		Components: []storageengine.LockComponent{readTableIntent(table, mode), intervalComponent(space, table.ID, indexID, bounds)},
@@ -360,35 +368,6 @@ func protectInsertionPosition(ctx context.Context, locking storageengine.Locking
 	})
 	return err
 }
-
-// nextKeyAfter finds the successor of one key in a namespace, which bounds the gap that contains an
-// absent key's insertion position.
-//
-// It reads through a bounded page and stops at the first key, so no storage view outlives the call;
-// the scan is a snapshot read on purpose: the bound only has to be a key that currently exists, and a
-// concurrent insertion inside the resulting interval is exactly what the interval then excludes.
-func nextKeyAfter(ctx context.Context, locking storageengine.LockingTxn, space string, key []byte) ([]byte, bool, error) {
-	provider, ok := locking.(interface {
-		ScanLatestRange(ctx context.Context, space string, bounds storageengine.KeyRange, yield func([]byte, []byte) error) error
-	})
-	if !ok {
-		// Without the enumeration the whole namespace is the only sound bound, and the caller's gap
-		// then covers it. That is wider than necessary but never narrower than the truth.
-		return nil, false, nil
-	}
-	var found []byte
-	err := provider.ScanLatestRange(ctx, space, storageengine.KeyRange{Lower: key, LowerInclusive: false}, func(k, v []byte) error {
-		found = append([]byte(nil), k...)
-		return errStopFirstKey
-	})
-	if err != nil && err != errStopFirstKey {
-		return nil, false, err
-	}
-	return found, found != nil, nil
-}
-
-// errStopFirstKey ends a one-key probe after its first row.
-var errStopFirstKey = fmt.Errorf("first key found")
 
 // lockedReadSpace names the namespace the row-based locked paths protect.
 //
@@ -447,9 +426,11 @@ func (s *lockedSource) finish() {
 		return
 	}
 	s.done = true
-	// The context is deliberately not the statement's: closing a scope must succeed even when the
-	// statement's context was already cancelled, or a cancelled read would leak its scope.
-	_ = s.locks.CloseLockScope(context.Background(), s.scope)
+	// Closing the scope ends the statement's request origin and keeps every grant the statement took:
+	// in an explicit transaction those locks live until COMMIT/ROLLBACK, and in autocommit until the
+	// root that owns them ends once this result has been consumed. It must never release a grant, or a
+	// statement that succeeded would silently drop the protection its transaction still relies on.
+	closeLockScope(s.locks, s.scope)
 }
 
 // lockedRow is the single-row source of the point path: zero rows when the row is absent, one row

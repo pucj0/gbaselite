@@ -1152,6 +1152,21 @@ T1 回滚后 T2 被唤醒，最后校验数据（50/300 都在）、被释放的
   等待期间无关写入与提交不被阻塞、锁身份与 DML 一致；确定性 barrier（`lockedReadWaitHook`）或短预算判定等待，
   不依赖 Sleep；`-count=5` 多轮通过。
 
+### 第十二轮（P1 共享范围读表意向、P2 缺席键 Gap 边界与 Scope 生命周期）
+
+证据：`.tmp/b12-phase5-report.md`、`.tmp/b12-acceptance.txt`。新增：`executor/locking_read_share_test.go`
+（P1 三项 + P2a 两项）、`executor/locking_read_lifecycle_test.go`（P2b 七种终态 + 拒绝形态）。
+生产改动：`lockmanager/compatibility.go`（标签 interval 的表意向可为 IS，IX 仍满足）、
+`storageengine/locking.go`（新增中立 `KeysAround`）、`storageengine/mvccadapter/locking.go`（实现 + 探测）、
+`storageengine/locking_contract_test.go`（夹具）、`executor/locking_read.go`（scope 在 Open 内创建并清理、
+Gap 用前驱/后继限定）、`storageengine/mvccadapter/iterator.go`（逐行 claim 的错误经中立映射）。
+
+- [x] **T034**（复验通过）：`FOR SHARE` 范围读、全表共享读、缺席键共享读全部可用；区间内写/插等待、
+  区间外写完成；两个共享范围读兼容。
+- [x] **T035**（复验通过）。
+- [x] **T036**（复验通过 + 边界补齐）：新增缺席键 Gap 边界（10/100/42/150、最小/最大/空表）、
+  七种 statement 终态清理、共享范围读与 INSERT/UPDATE 的冲突与兼容。
+
 ### 本轮证据文件
 | 文件 | 内容 |
 |---|---|

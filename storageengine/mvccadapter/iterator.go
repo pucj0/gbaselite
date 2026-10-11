@@ -344,23 +344,29 @@ func (i *currentIterator) Next() bool {
 //
 // The claim may wait. The listing that produced the key already finished and released its view, so
 // nothing of the storage is open while the manager decides.
+//
+// Every error leaving here is mapped to the neutral set, exactly like the errors of the adapter's
+// Acquire: this loop is the one place a lock request is made *inside* the adapter rather than through
+// its neutral entry point, and without the mapping a range scan that ran out of its wait budget would
+// hand a lock-manager sentinel to a caller that only knows the storage contract — a caller pressing
+// `errors.Is(err, storageengine.ErrLockWaitTimeout)` would not recognise its own timeout.
 func (i *currentIterator) claimAndRead(key []byte) ([]byte, bool, error) {
 	record := currentScanRecord(i.space, key, i.mode)
 	grant, op, wait, err := i.tx.AcquireLock(i.ctx, i.scope, []lockmanager.ResourceRef{record}, nil)
 	if err != nil {
-		return nil, false, err
+		return nil, false, neutralLockError(err)
 	}
 	if op == lockmanager.LockOpWait {
 		if wait == nil {
 			return nil, false, storageengine.ErrConflict
 		}
 		if grant, err = i.tx.WaitForLock(i.ctx, wait); err != nil {
-			return nil, false, err
+			return nil, false, neutralLockError(err)
 		}
 	}
 	observation, err := i.tx.ReadCurrentLocked(i.ctx, i.space, key, grant)
 	if err != nil {
-		return nil, false, err
+		return nil, false, neutralLockError(err)
 	}
 	if !observation.Exists {
 		return nil, false, nil

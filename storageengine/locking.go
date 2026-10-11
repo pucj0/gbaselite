@@ -290,6 +290,16 @@ type LockingTxn interface {
 	// NewCurrentIterator opens a bounded locked scan. The iterator follows the
 	// existing borrowed-bytes and Close contract.
 	NewCurrentIterator(ctx context.Context, scope uint64, request CurrentScanRequest) (Iterator, error)
+	// KeysAround returns the published keys immediately below and above one key in a namespace: the
+	// largest key less than it and the smallest key greater than it, either nil when there is none.
+	//
+	// A locked read of an *absent* key protects that key's insertion position, and the position is
+	// bounded by exactly those two neighbours. Without them the only sound bound is "everything from
+	// this key onwards", which would exclude insertions the statement never asked to exclude. The
+	// implementation must not hold a storage view across any wait, and it reads the latest published
+	// state (plus the transaction's own overlay) rather than the statement snapshot: a neighbour the
+	// statement cannot see is still the neighbour in the index.
+	KeysAround(ctx context.Context, space string, key []byte) (previous, next []byte, err error)
 	// CloseLockScope cancels this scope's pending requests and keeps every grant.
 	CloseLockScope(ctx context.Context, scope uint64) error
 }

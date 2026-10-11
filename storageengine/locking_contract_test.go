@@ -184,6 +184,34 @@ func (t *lockingTxnFixture) NewCurrentIterator(ctx context.Context, scope uint64
 	return t.inner.NewIterator(ctx, storageengine.ScanRequest{Space: request.Space, Range: request.Range, Limit: request.Limit})
 }
 
+// KeysAround mirrors the documented neighbour contract over the fixture's own store: the previous and
+// next published keys, either nil when there is none.
+func (t *lockingTxnFixture) KeysAround(ctx context.Context, space string, key []byte) ([]byte, []byte, error) {
+	var previous, next []byte
+	collect := func(bounds storageengine.KeyRange) ([]byte, error) {
+		var found []byte
+		err := t.inner.ScanRange(ctx, space, bounds, func(k, v []byte) error {
+			found = append([]byte(nil), k...)
+			return errFixtureProbeDone
+		})
+		if err != nil && err != errFixtureProbeDone {
+			return nil, err
+		}
+		return found, nil
+	}
+	var err error
+	if next, err = collect(storageengine.KeyRange{Lower: key}); err != nil {
+		return nil, nil, err
+	}
+	if previous, err = collect(storageengine.KeyRange{Upper: key, Reverse: true}); err != nil {
+		return nil, nil, err
+	}
+	return previous, next, nil
+}
+
+// errFixtureProbeDone ends the fixture's one-key probe.
+var errFixtureProbeDone = errors.New("fixture probe complete")
+
 func (t *lockingTxnFixture) CloseLockScope(_ context.Context, scope uint64) error {
 	delete(t.scopes, scope)
 	return nil

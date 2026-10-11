@@ -210,12 +210,17 @@ func MissingTableIntents(components []ResourceRef, bindings *Bindings) []string 
 			// An unbound raw namespace has no table to intend.
 			continue
 		}
+		// A labelled interval needs a *table intention* to be declared, and a shared one is enough: an
+		// interval claims insertion positions rather than the rows themselves, so a shared range read
+		// (which declares IS, as the contract requires of a shared read) and an exclusive one (IX) both
+		// declare a legal intention for it. Requiring IX would have refused every `FOR SHARE` range
+		// read, and the intent a statement declares is a property of the statement, not of the gap.
+		// IX satisfies IS in the pinned-mode bookkeeping below, so an exclusive bundle passes unchanged
+		// while a bundle that declares no intention at all is still refused.
 		need := ModeIS
 		switch component.Kind {
 		case KindInterval:
-			// A gap locks insert positions, which is a write intention on the table: IX, exactly as
-			// an insertion claim needs.
-			need = ModeIX
+			// Interval: IS or IX, whichever the statement declared.
 		default:
 			if component.Mode == ModeX || component.Mode == ModeInsertIntention {
 				need = ModeIX

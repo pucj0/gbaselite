@@ -197,8 +197,46 @@ func (t *txn) NewCurrentIterator(ctx context.Context, scope uint64, request stor
 	return it, nil
 }
 
-// ownerID reports the root lock owner this transaction's grants belong to.
-func (t *txn) ownerID() string { return t.inner.LockOwnerID() }
+// KeysAround returns the published neighbours of one key in a namespace.
+//
+// Both lookups are one-key probes over the latest published state plus this transaction's own overlay
+// (`mvcc.Tx.ScanLatestRange`), and each stops at its first row: the view of a page is released before
+// the consumer sees a key, so no storage view outlives the call and none is held across a wait. A
+// neighbour another transaction committed after this transaction's snapshot still counts, because the
+// index the gap has to bound is the current index, not the statement's view of it.
+func (t *txn) KeysAround(ctx context.Context, space string, key []byte) ([]byte, []byte, error) {
+	if _, ok := t.LockingTxn(); !ok {
+		return nil, nil, storageengine.ErrUnsupported
+	}
+	if space == "" || len(key) == 0 {
+		return nil, nil, storageengine.ErrUnsupported
+	}
+	next, err := t.probeKey(ctx, space, storageengine.KeyRange{Lower: key})
+	if err != nil {
+		return nil, nil, neutralLockError(err)
+	}
+	previous, err := t.probeKey(ctx, space, storageengine.KeyRange{Upper: key, Reverse: true})
+	if err != nil {
+		return nil, nil, neutralLockError(err)
+	}
+	return previous, next, nil
+}
+
+// probeKey returns the first key one bounded probe yields, or nil when it yields none.
+func (t *txn) probeKey(ctx context.Context, space string, bounds storageengine.KeyRange) ([]byte, error) {
+	var found []byte
+	err := t.inner.ScanLatestRange(ctx, space, bounds, func(k, v []byte) error {
+		found = append([]byte(nil), k...)
+		return errStopNeighbourProbe
+	})
+	if err != nil && err != errStopNeighbourProbe {
+		return nil, err
+	}
+	return found, nil
+}
+
+// errStopNeighbourProbe ends a one-key probe after its first row. It never escapes the adapter.
+var errStopNeighbourProbe = errors.New("neighbour probe complete")
 
 // grant converts one lock-manager grant into the neutral capability.
 //

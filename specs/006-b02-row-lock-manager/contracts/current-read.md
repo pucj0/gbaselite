@@ -10,6 +10,29 @@ storageengine新增可选LockingTxn，原Txn/Engine最小接口保持。
 - `NewCurrentIterator(ctx, scope, scanRequest, lockPlan)`：只接受已证明bounds或显式fallback，
   每visited entry加锁后再current reread；Iterator须Close、borrowed bytes规则不变。
 
+### 第十二轮修正（P1/P2：共享范围读的表意向、缺席键 Gap 边界、Statement Scope 生命周期）
+
+- **P1 表意向与 interval**：带 TableID 标签的 interval 需要**声明**表意向，而**共享（IS）即可**——
+  interval 锁的是插入位置而不是行本身，`FOR SHARE` 范围读按合同声明 IS、`FOR UPDATE` 声明 IX，两者都是
+  合法声明（IX 在 pinned-mode 记账里已满足 IS）。原先要求 IX 会让**每一个 `FOR SHARE` 范围读被拒绝**
+  （"record lock requires a table intention in the same bundle"）；完全不带意向的 bundle 仍被拒绝。
+  验证：`TestP1ForShareRangeReadIsAccepted`、`TestP1TwoForShareRangeReadsCoexist`（两个共享范围读互不排斥）、
+  `TestP1ForShareRangeReadConflictsWithWriters`（区间内 INSERT/UPDATE 等待、区间外 UPDATE 完成）。
+- **P2a 缺席键的 Gap 边界**：`LockingTxn.KeysAround(ctx, space, key)`（新增中立能力，adapter 用
+  `ScanLatestRange` 做两次单键探测）返回该键的**前驱与后继**已发布键；点路径与唯一索引路径都用它们把
+  Gap 限定为 `(前驱, 后继)`（无前驱/后继则相应一侧无界）。旧实现依赖一个永不成立的类型断言，退化成
+  `[key, +∞)`，会把**所有** ≥ key 的插入都挡掉；现在表内 10/100 时对缺席 42 的保护是 `(10,100)`，
+  插入 150 不被阻塞，而插入 42/50 仍等待 ✓（与 next-key gap lock 同形）。
+  验证：`TestP2AbsentKeyGapDoesNotBlockDistantInserts`、`TestP2AbsentKeyGapBoundaries`（最小键之下、
+  最大键之上、空表）。
+- **P2b Statement Scope 生命周期**：scope 改为在 **Operator `Open` 内**创建（而不是在绑定期），
+  `Open` 失败即关闭；`lockedSource` 在 EOF/Close/LIMIT/取消时关闭 scope；关闭 scope **只撤回本语句的
+  pending 请求、绝不释放 root grants**（显式事务继续持锁至 COMMIT/ROLLBACK）。
+  验证：`TestP2bLockingReadScopeLifecycle` 七种终态（绑定失败、Open 失败、范围取锁超时、迭代中取消、
+  LIMIT 提前结束、正常 EOF、显式事务继续后续语句）+ `TestP2bRefusedPlanStillLeavesNothingBehind`。
+- **同时修正**：范围扫描**逐行 claim** 的错误现在也经 `neutralLockError` 映射，超时等错误不再把
+  lock-manager sentinel 泄漏到中立边界（此前 `errors.Is(err, storageengine.ErrLockWaitTimeout)` 为 false）。
+
 ### Locking scan 的实施补充（T032，本轮）
 `CurrentScanRequest` 增加显式 **`Mode`（S/X）**：它描述迭代器为每个访问到的键取得的**记录**claim，
 而 `Plan.Components` 描述的是**访问区间**（Gap/插入声明/whole-domain 回退）。空模式或区间模式一律拒绝
