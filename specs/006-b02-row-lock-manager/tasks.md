@@ -755,6 +755,35 @@ Task 的 test 标记不等于测试已执行；勾选项均附真实命令输出
 本轮未改 WAL、Raft Command、存储格式，也未进入其他 Phase。
 
 
+### 第四轮（共享等待请求的终态广播与取消隔离）证据与任务口径
+
+证据文件 `.tmp/b02r4-fix-report.md`：两条缺陷的复现（修复前失败）→ 根因 → 修复 → 修复后通过、
+不变量核对、命令与退出码、race 工具链不可用的原始报错，以及继续 B02 Phase 3 的条件判断。
+辅助原始输出：`.tmp/b02r4-before.txt`（问题一复现）、`.tmp/b02r4-before-problem2.txt`（问题二复现）、
+`.tmp/b02r4-lockmanager-count10.txt`、`.tmp/b02r4-affected.txt`、`.tmp/b02r4-gotest-all.txt`、
+`.tmp/b02r4-race.txt`。
+
+新增测试：`lockmanager/shared_wait_test.go`（两个等待者同时阻塞后同时获授、十个等待者共享同一请求、
+加入者 context 结束不影响原请求、创建者 context 结束撤销共享请求并唤醒全部等待者、加入者 `Cancel`
+无操作、grant/cancel/timeout/deadlock victim/epoch reset 全部唤醒全部等待者、终态可重复观察不被消费、
+创建者 scope 关闭 / 加入者 scope 关闭 / root 终态三种生命周期）。
+改写的既有测试/夹具：`lockmanager/handle_state_test.go` 的 `requireOneNotification` →
+`requireSettledStatus`（广播语义），`lockmanager/test_helpers_test.go` 的 `waitReady`/`expectNoStatus`
+与 `testBroker` 改用 settled channel；`lockmanager/types.go` 移除 `LockRequest.Result` 与 `Notify`
+（单接收者机制的载体），改用 request 自带广播。
+
+任务口径（**不勾选任何未完整达成的任务**）：
+- **T017 得到补强**（已勾选，不新增勾选）：公平队列/等待终态的通知从"单次 channel 发送"改为
+  "终态广播 + 每请求唯一 decision"，并明确创建者/加入者的取消所有权。
+- **T047/T051 得到补强**（已勾选，不新增勾选）：child/statement scope 关闭只撤销该 scope 发起的
+  request（加入者的 scope 关闭不影响它未创建的 request），root 终态与 epoch reset 撤销全部并广播。
+- **T018 不受影响**（仍不勾选）：本轮未改 adapter 的 grant 映射，仅其依赖的等待语义被加强。
+- **T067（race）保持未勾选**：本机无 C 工具链，`-race` 无法运行，**不伪报 race 通过**。
+
+契约同步（随代码一起修订，先改契约再改实现）：`contracts/lock-manager.md` 新增
+§共享等待：终态广播与取消所有权；`data-model.md` 的 LockRequest 字段改为"终态广播 + origin 标记"。
+本轮未改 WAL、Raft Command、存储格式，未进入其他 Phase，未部署。
+
 ### 本轮证据文件
 | 文件 | 内容 |
 |---|---|

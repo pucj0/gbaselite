@@ -24,9 +24,15 @@ II 使用 exact insertion key，检测 interval.contains(key)；Gap 不依赖当
 
 ## LockRequest / LockGrant
 Request 字段：ID、OwnerRootID、ScopeID、Components、EnqueueOrdinal、RequestedAt、Deadline、
-State、Blockers、ResultChannel（单次通知）、ReservedBudget。
+State、Blockers、ReservedBudget、**终态广播**（settled channel）、**origin 标记**（该 handle 是否属于
+创建该 request 的调用者）。
 转换：NEW → GRANTED 或 WAITING；WAITING → GRANTED/TIMED_OUT/CANCELED/
 DEADLOCK_VICTIM/INVALIDATED/RESOURCE_REJECTED。所有终态唯一、不可重新 WAITING。
+**一个 request 可有多个等待者**（创建者 + 加入者）：终态确定时关闭 settled channel 广播给全部等待者，
+每个等待者从同一 decision 读取同一 status/grant；不设"单次通知 channel"（它只能唤醒一个等待者，
+其余会为已决定的结果继续阻塞）。只有 origin handle 拥有撤销权：加入者的 context 结束只结束它自己的
+等待，`Cancel`/scope 关闭对加入者无操作；创建者的 context 结束/scope 关闭/root 终态/epoch reset
+撤销整个 request 并唤醒全部等待者。详见 contracts/lock-manager.md §共享等待。
 Grant 字段：GrantID、OwnerRootID、OriginScopeID、Generation/Term、Components、GrantedAt。
 Grant 身份属于**产生它的那个 request**：GrantID 是该 request 完成时的 id（重入请求为 0）、
 OriginScopeID 是该 request 的 scope（不是 RequestID）、Components 恰好是该 request 取得或 adopt 的

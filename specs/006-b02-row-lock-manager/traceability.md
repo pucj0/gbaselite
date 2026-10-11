@@ -334,3 +334,12 @@ Phase 3（US1）的前置条件已就绪：
 | `grantForHandle`「从 owner 的 granted resources 重建 Grant」 | **已更正**：等待获授的 grant 现在从该 request 自己记录的终态能力读出（`GrantID`/`OriginScopeID`/`Components`/`OwnerID`/`Generation`/`Term` 全部属于该 request），不再拼接同一 root 的其他锁、不再用 RequestID 充当 OriginScopeID；owner 结束或被 epoch 替换后 fail closed。见 `lockmanager/manager.go`（`requestState.recordGrant`、`completeBundleLocked`、`grantForHandle`）与 `storageengine/mvccadapter/locking.go`。中立 `LockGrant` 顺带移除了从未被读取、且被填成"发放时刻"的 `Deadline` 字段（data-model 的 Grant 字段列表本就没有它）。 |
 | `TestB02ReentrantUpgradeWhileWaitingAdoptsThePendingClaim` | **改写为** `TestB02RepeatUpgradeWhileWaitingJoinsTheQueuedRequest`：旧断言（重复升级返回 REENTRANT）正是本轮修复的缺陷，现断言返回 WAIT 且加入同一请求，同时保留"只产生一个请求、两次 release 后交给下一个 owner"的原有约束。 |
 
+## A9. 第四轮修订（共享等待请求的终态广播与取消隔离）
+
+| 上一版结论 | 现状（`.tmp/b02r4-fix-report.md`） |
+|---|---|
+| `LockHandle.result`（容量 1 的 channel）+ `LockRequest.Notify` 单次发送 | **已移除**：一个 request 可有多个等待者，单值 channel 只能唤醒其中一个，其余会为已决定的结果继续阻塞（复现：两个等待者同时阻塞后只有创建者返回，加入者 5s 看门狗超时）。现终态由 request 自带的 `requestState` 广播：状态写入后关闭 settled channel，**全部**等待者被唤醒并各自读取同一 status/grant；`Status`/`Wait`/`WaitStatus`/`WaitForGrant` 可重复读取且一致。见 `lockmanager/manager.go`（`requestState.settled`/`wait`）、`queue.go`（`setStatus`）、`types.go`（删除 `Result`/`Notify`）。 |
+| `waitWithDeadline` 在 context 结束时无条件 `withdrawOnContextEnd` | **已更正**：只有 **origin handle**（创建该 request 的调用者）的 context 结束才撤销共享 request；加入者的 context 结束只结束它自己的等待并返回其 ctx 错误。`Cancel` 对加入者 handle 无操作（返回 request 当前状态），加入者 scope 关闭不影响它未创建的 request。复现（守卫关闭时）：加入者取消导致共享 request 变为 `CONTEXT_CANCELED`。见 `contracts/lock-manager.md` §共享等待。 |
+| 「多次等待同一 handle 由 ctx 取消兜底」 | 该兜底已不再需要：`TestB02HandleWaitAndStatusAgreeUnderConcurrency` 的注释与断言随之更新为广播语义（grant 与 ctx 同时到达时仍必须报告 GRANTED）。 |
+| 新建测试 | `lockmanager/shared_wait_test.go`：2/10 个等待者同时获授、加入者取消隔离、创建者取消撤销、加入者 `Cancel` 无操作、五种终态（grant/cancel/timeout/deadlock/epoch）全部唤醒全部等待者、终态不被消费、三种 scope/root 生命周期；每个用例都断言无 goroutine 遗留（全部 outcome 被接收）与无锁资源/预算残留。 |
+

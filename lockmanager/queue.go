@@ -115,21 +115,25 @@ type requestBundle struct {
 // complete reports whether every component of the bundle is held.
 func (b *requestBundle) complete() bool { return b.held >= len(b.entries) }
 
-// setStatus records the single terminal outcome and notifies the waiting caller once.
+// setStatus records the single terminal outcome.
 //
 // It is the only writer of the terminal status, so "granted" and "cancelled" can never both
-// be observed, and reading the status is idempotent because it is stored before the
-// notification is sent. The stored value is the synchronized decision's own winner, so a
-// later attempt (a cancel that lost to a grant) delivers the winner instead of its own
-// status, and LockRequest.Status — which is only ever written here and only ever read under
-// the manager mutex — is kept equal to the decision.
+// be observed, and reading the status is idempotent because it is stored before anything is
+// woken. The stored value is the synchronized decision's own winner, so a later attempt (a cancel
+// that lost to a grant) delivers the winner instead of its own status, and LockRequest.Status —
+// which is only ever written here and only ever read under the manager mutex — is kept equal to
+// the decision.
+//
+// The wake-up is the decision's own broadcast: storing the terminal status closes a channel that
+// every waiting caller selects on, so all of them — the caller that queued the request and every
+// caller that joined it — are woken and each reads the same recorded status. A single value handed
+// to one receiver could not do that.
 func (b *requestBundle) setStatus(status RequestStatus) {
 	recorded := status
 	if b.decision != nil {
 		recorded = b.decision.record(status)
 	}
 	b.req.Status = recorded
-	b.req.Notify(recorded)
 }
 
 // setGrant records the capability this bundle's request was granted.

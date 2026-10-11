@@ -110,7 +110,6 @@ func (b *testBroker) Enqueue(ownerID string, scopeID uint64, deadline time.Time)
 		RequestedAt:    testEpoch,
 		Deadline:       deadline,
 		Status:         RequestPending,
-		Result:         make(chan RequestStatus, 1),
 	}
 	b.waiting[request.ID] = request
 	return request
@@ -143,7 +142,6 @@ func (b *testBroker) resolve(requestID uint64, status RequestStatus) bool {
 	delete(b.waiting, requestID)
 	b.resolved[requestID] = status
 	b.mu.Unlock()
-	request.Notify(status)
 	b.cond.Broadcast()
 	return true
 }
@@ -189,8 +187,8 @@ func TestB02DeterministicHarnessUsesNoSleeps(t *testing.T) {
 		if broker.Cancel(request.ID) {
 			t.Fatalf("iteration %d: a second cancel decided the same request twice", iteration)
 		}
-		if got := <-request.Result; got != RequestCanceled {
-			t.Fatalf("iteration %d: notification = %q", iteration, got)
+		if got := broker.Wait(request.ID); got != RequestCanceled {
+			t.Fatalf("iteration %d: resolved status = %q", iteration, got)
 		}
 		if broker.Pending() != 0 {
 			t.Fatalf("iteration %d: %d requests still pending", iteration, broker.Pending())
@@ -388,28 +386,28 @@ func (f *lockFixture) expectStatus(handle *LockHandle, want RequestStatus) {
 
 // waitReady reads the status a request already reached, without waiting: every test in
 // this package drives the manager deterministically, so a status that has not been
-// delivered is a bug rather than a scheduling delay.
+// settled is a bug rather than a scheduling delay.
 func (f *lockFixture) waitReady(handle *LockHandle) RequestStatus {
 	f.t.Helper()
 	if handle == nil {
 		f.t.Fatal("no handle to inspect")
 	}
 	select {
-	case status := <-handle.result:
-		return status
+	case <-handle.settled():
+		return handle.Status()
 	default:
 		pending := f.manager.PendingRequests(f.rootID)
-		f.t.Fatalf("%s: request %d has no delivered status yet (pending=%d)", f.rootID, handle.RequestID, pending)
+		f.t.Fatalf("%s: request %d has no terminal status yet (pending=%d)", f.rootID, handle.RequestID, pending)
 		return RequestCanceled
 	}
 }
 
-// expectNoStatus asserts that a request has not reached a status yet.
+// expectNoStatus asserts that a request has not reached a terminal status yet.
 func (f *lockFixture) expectNoStatus(handle *LockHandle) {
 	f.t.Helper()
 	select {
-	case status := <-handle.result:
-		f.t.Fatalf("%s: request %d unexpectedly reached %s", f.rootID, handle.RequestID, status)
+	case <-handle.settled():
+		f.t.Fatalf("%s: request %d unexpectedly reached %s", f.rootID, handle.RequestID, handle.Status())
 	default:
 	}
 }

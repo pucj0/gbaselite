@@ -89,6 +89,35 @@ graph revision变化须重新验证环与victim；检测预算超限报告 ErrLo
 request 的锁拼进本次 grant。能力在 request 终态确定时记录一次，同一 request 的每个调用者读到同一身份，
 每次读取返回独立的组件副本。
 
+### 共享等待：终态广播与取消所有权（本轮补齐）
+
+一个 request 可以由同一 root 的多个调用者等待：**创建者**（`Acquire` 返回 WAIT 的那个调用，origin
+handle）以及所有**加入者**（`origin=false`，见上文"重复申请加入该请求"）。由此确定两条规则：
+
+**终态广播**：request 的终态是**广播**，不是交给单个接收者的值。
+
+- 终态确定时关闭该 request 的 settled channel（在状态写入之后关闭，只关闭一次）。所有等待者同时被
+  唤醒，然后各自从同一 decision 读取**同一个** status 与**同一个** grant（`GrantID` 相同）。
+- 禁止用"容量为 1 的 channel + 一次发送"承载终态：它只能唤醒一个等待者，其余等待者会为一个已经
+  决定的结果继续阻塞。
+- 终态可被任意次重复读取：`Status`、`Wait`、`WaitStatus`、`WaitForGrantResult`/`WaitForGrant`
+  对同一 handle 必须给出一致答案，不存在"已被消费"的终态，也不存在第二份通知。
+- 唤醒来源与终态一一对应：grant、显式 cancel、等待期限、deadlock victim、epoch reset、root 终态、
+  scope 关闭都必须唤醒**全部**等待者。
+
+**取消所有权**：只有创建该 request 的调用者拥有撤销权。
+
+| 事件 | 对共享 request 的影响 |
+|---|---|
+| 创建者 context 结束 / `Cancel(root, origin handle)` | **撤销整个 request**，全部等待者（含加入者）被同一终态唤醒 |
+| 创建者 scope 关闭 | 撤销该 request（scope 只撤销自己发起的请求），全部等待者被唤醒 |
+| 加入者 context 结束 | 只结束**它自己**的等待并返回它自己的 ctx 错误；request 保持排队，创建者与其他加入者不受影响 |
+| 加入者 `Cancel(root, joined handle)` | 无操作，返回 request 当前状态（加入者没有自己的 request 可撤销） |
+| 加入者 scope 关闭 | 不影响它未创建的 request |
+| root 终态 / epoch reset / deadlock victim | 撤销该 root（或该 epoch 的）全部 request，全部等待者被唤醒 |
+
+加入不产生第二份 claim，也不重复扣预算：加入路径在 `Reserve` 之前返回，且不创建 request。
+
 ## Deadline and errors
 等待期限是会话lock期限与ctx期限的较早者；未来可注入clock，生产使用monotonic elapsed time。
 Acquire返回：ErrLockWaitTimeout、ErrDeadlock、ErrLockResourceLimit、ErrClosed/ErrNotLeader/

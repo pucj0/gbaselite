@@ -157,8 +157,13 @@ type AcquireResult struct {
 //
 // It is a value, but its decision field is shared by every copy: the manager records the
 // single terminal status there through requestState.record, so asking for the status is
-// idempotent and never consumes the notification. That is what lets a caller learn whether
-// a grant beat its cancellation without racing the channel.
+// idempotent and never consumes anything. That is what lets a caller learn whether a grant
+// beat its cancellation without racing a notification.
+//
+// Several handles can refer to one request: the caller that queued it and every caller that
+// joined it. They all observe the same decision through the same broadcast, which is why the
+// request can be shared safely — a wake-up is not a value handed to one receiver but a channel
+// closed for all of them.
 //
 // Synchronization: the shared decision guards itself with its own small mutex, so Status
 // is safe to call from any number of goroutines at the very moment the manager decides the
@@ -173,9 +178,11 @@ type LockHandle struct {
 	EnqueueOrdinal uint64
 
 	decision *requestState
-	// result is the notification channel, kept so Wait can block on it. Nothing but Wait
-	// should consume it.
-	result chan RequestStatus
+	// origin reports whether this handle belongs to the caller that created the request, as
+	// opposed to one that joined it. Only the origin caller owns the wait: its context ending
+	// withdraws the shared request, while a joiner's context ending stops its own wait and leaves
+	// the request to the callers still waiting for it.
+	origin bool
 }
 
 // requestState is the shared decision of one queued request.
@@ -206,6 +213,16 @@ type requestState struct {
 	// RequestStatus.Terminal reports "anything but PENDING": an unwritten status must never
 	// be mistaken for a decided one, or a fresh decision would reject its own first grant.
 	decided bool
+	// settled is closed exactly once, when the first terminal status is stored. It is the
+	// request's broadcast: every caller waiting for the request selects on it, so any number of
+	// callers wake up together and each of them reads the same recorded status afterwards.
+	//
+	// A channel that carried the status itself could only be received once, which is precisely
+	// what a shared request must not do: one of several waiting callers would wake and the rest
+	// would stay blocked for an outcome that had already been decided. Closing a channel is the
+	// broadcast primitive; the status is read from this state under the same mutex, so the two can
+	// never disagree.
+	settled chan struct{}
 	// grant is the capability this request was granted, recorded at the same moment as the
 	// terminal status. It is stored with the request rather than rebuilt later because only this
 	// request's own bundle knows what the request actually acquired or legitimately adopted: the
@@ -219,9 +236,10 @@ type requestState struct {
 // newRequestState returns the shared, still-pending decision of one queued request.
 //
 // It is the only constructor, so no requestState can be created with a zero status that
-// the accessors would have to reinterpret.
+// the accessors would have to reinterpret, and every decision owns the broadcast channel its
+// waiters select on.
 func newRequestState() *requestState {
-	return &requestState{status: RequestPending}
+	return &requestState{status: RequestPending, settled: make(chan struct{})}
 }
 
 // record stores the first terminal status and never lets a later write replace it.
@@ -241,9 +259,18 @@ func (s *requestState) record(status RequestStatus) RequestStatus {
 	s.status = status
 	if status.Terminal() {
 		s.decided = true
+		// The broadcast happens while the state mutex is held, after the status is stored: a
+		// waiter woken by the close cannot observe a pending status, and a second terminal write
+		// can never close the channel twice.
+		close(s.settled)
 	}
 	return s.status
 }
+
+// wait returns the channel that is closed when the request reaches its terminal status.
+//
+// It never blocks and can be selected on by any number of callers.
+func (s *requestState) wait() <-chan struct{} { return s.settled }
 
 // current reads the recorded status.
 //
@@ -313,24 +340,46 @@ func (h *LockHandle) resolvedGrant() (LockGrant, bool) {
 // newHandle returns the caller-side view of one queued request.
 //
 // Every path that hands a caller a queued request goes through here, so a request that a caller
-// started and a request it joined are the same handle: same request id, same decision, same single
-// notification.
-func newHandle(bundle *requestBundle) *LockHandle {
+// started and a request it joined are the same handle: same request id, same decision, same
+// broadcast. origin records which of the two roles this caller has, because only the caller that
+// created the request may withdraw it.
+func newHandle(bundle *requestBundle, origin bool) *LockHandle {
 	return &LockHandle{
 		RequestID:      bundle.req.ID,
 		EnqueueOrdinal: bundle.req.EnqueueOrdinal,
 		decision:       bundle.decision,
-		result:         bundle.req.Result,
+		origin:         origin,
 	}
 }
 
+// settled returns the broadcast channel this handle's request closes when it ends.
+//
+// A nil handle or a decision-less handle reports a channel that is already closed, so a caller
+// selecting on it wakes immediately instead of blocking for ever on a handle it cannot use.
+func (h *LockHandle) settled() <-chan struct{} {
+	if h == nil || h.decision == nil {
+		return closedWait
+	}
+	return h.decision.wait()
+}
+
+// closedWait is the already-closed channel an unusable handle reports.
+var closedWait = func() <-chan struct{} {
+	closed := make(chan struct{})
+	close(closed)
+	return closed
+}()
+
 // Wait blocks until the request reaches a terminal status and returns it.
 //
-// It reports only the status; the caller resolves a GRANTED status into its grant through
-// the AcquireResult it already holds. It never blocks after a terminal status, because the
-// result channel carries exactly one value.
+// It reports only the status; the caller resolves a GRANTED status into its grant through the
+// AcquireResult it already holds, or through WaitForGrantResult. It never blocks after a terminal
+// status, because the terminal status closes the broadcast every waiter selects on.
+//
+// Any number of callers may wait on one request: the broadcast wakes all of them and each one then
+// reads the same recorded status, so no caller can consume another caller's outcome.
 func (h *LockHandle) Wait(ctx context.Context) (RequestStatus, error) {
-	if h == nil || h.result == nil {
+	if h == nil || h.decision == nil {
 		return RequestCanceled, ErrScopeUnknown
 	}
 	// A request that already reached a terminal status is reported immediately. Without this the
@@ -339,9 +388,10 @@ func (h *LockHandle) Wait(ctx context.Context) (RequestStatus, error) {
 	if status := h.Status(); status.Terminal() {
 		return status, nil
 	}
+	parkWaiter(h)
 	select {
-	case status := <-h.result:
-		return status, nil
+	case <-h.settled():
+		return h.Status(), nil
 	case <-ctx.Done():
 		// The context ended, but a grant may have been decided at the same moment. Consult
 		// the recorded decision before reporting the cancellation: reporting a cancel for a
@@ -554,6 +604,26 @@ func (m *Manager) WaitForGrant(ctx context.Context, rootID string, handle *LockH
 	return result.Grant, nil
 }
 
+// waitHook, when non-nil, is consulted by the blocking wait after the caller has established that
+// the request is still unsettled and immediately before it blocks on the request's decision.
+//
+// It is the deterministic synchronization point of the "several callers wait for one request"
+// tests: a hook that blocks parks every caller at exactly the moment before the outcome is
+// awaited, so a test can decide the outcome — grant, cancel, timeout, deadlock victim, epoch reset
+// — and then release the callers, and observe which of them learns it. Parking inside the blocking
+// path (and not before it) is what makes the test meaningful: a caller parked earlier would take
+// the "already decided" fast path instead of exercising the wake-up under test.
+//
+// It is nil in production, so the default path carries no callback and no coordination state.
+var waitHook func(handle *LockHandle)
+
+// parkWaiter consults the test hook, if one is installed. It is a no-op in production.
+func parkWaiter(handle *LockHandle) {
+	if hook := waitHook; hook != nil {
+		hook(handle)
+	}
+}
+
 // WaitForGrantResult blocks for the outcome of a queued request.
 //
 // It returns a result carrying the grant when the request was granted, or an error that
@@ -625,16 +695,28 @@ func (m *Manager) waitWithDeadline(ctx context.Context, rootID string, handle *L
 	// clock that is an ordinary timer; with the virtual clock a test decides when the deadline is
 	// reached, so "the timeout fired before the grant" is a fact rather than a race.
 	expired := m.inner.clock.After(deadline)
+	parkWaiter(handle)
 	select {
-	case status := <-handle.result:
-		return status, nil
+	case <-handle.settled():
+		// The broadcast is closed for every waiter at once; the status is read from the recorded
+		// decision, so two waiters cannot observe different outcomes and none of them consumes
+		// another's.
+		return handle.Status(), nil
 	case <-ctx.Done():
 		if status := handle.Status(); status.Terminal() {
 			return status, nil
 		}
-		// The caller's context ended while the request was still queued. The request is withdrawn
-		// from its queues under the manager's lock, because a queued entry whose caller has gone
-		// away would keep blocking every later request on that resource while nobody waits for it.
+		if !handle.origin {
+			// The caller joined a request that belongs to another caller of the same root. Its
+			// own context ending stops *its* wait and nothing else: withdrawing the shared
+			// request would cancel protection the owning caller and every other joiner is still
+			// waiting for. There is no request of its own to clean up.
+			return RequestCanceled, ctx.Err()
+		}
+		// The owning caller's context ended while the request was still queued. The request is
+		// withdrawn from its queues under the manager's lock, because a queued entry whose caller
+		// has gone away would keep blocking every later request on that resource while nobody
+		// waits for it. Every joiner is woken by the recorded terminal status.
 		m.withdrawOnContextEnd(rootID, handle)
 		if status := handle.Status(); status.Terminal() {
 			return status, ctx.Err()
@@ -1180,7 +1262,7 @@ func (m *manager) AcquireWith(ctx context.Context, rootID string, scopeID uint64
 			// the fail-fast answer; reporting the queued request as held would be a lie.
 			return AcquireResult{}, ErrConflict
 		}
-		return AcquireResult{Op: LockOpWait, Wait: newHandle(queued)}, nil
+		return AcquireResult{Op: LockOpWait, Wait: newHandle(queued, false)}, nil
 	}
 
 	reservation, err := m.ledger.Reserve(rootID, deduped, true)
@@ -1228,7 +1310,7 @@ func (m *manager) AcquireWith(ctx context.Context, rootID string, scopeID uint64
 		if request.complete() {
 			return AcquireResult{Op: LockOpGranted, Grant: m.grantOfLocked(request)}, nil
 		}
-		return AcquireResult{Op: LockOpWait, Wait: newHandle(request)}, nil
+		return AcquireResult{Op: LockOpWait, Wait: newHandle(request, true)}, nil
 	}
 
 	// Nothing blocks the bundle, so it is granted as a whole in this critical section.
@@ -1396,7 +1478,6 @@ func (m *manager) newRequestLocked(rootID string, scopeID uint64, deduped []Reso
 		EnqueueOrdinal: m.nextEnqueueOrdinal,
 		RequestedAt:    now,
 		Status:         RequestPending,
-		Result:         make(chan RequestStatus, 1),
 		ReservedBytes:  reservation.Bytes(),
 		ShouldWait:     mayWait,
 		Deadline:       m.requestDeadlineLocked(scopeID),
@@ -2042,9 +2123,18 @@ func (m *manager) WaitStatus(rootID string, handle *LockHandle) RequestStatus {
 // that status is GRANTED and the grant is kept: the contract requires that a
 // cancellation racing a grant cannot silently drop a held lock, so the caller learns it
 // must release the grant instead.
+//
+// Only the caller that created the request owns it. A handle from a caller that joined the request
+// has nothing of its own to withdraw, so cancelling through it reports the request's current
+// status and leaves the request queued for its owner and for every other caller: one participant
+// of a shared wait cannot destroy protection the others are still waiting for. A joiner stops
+// waiting through its own context instead.
 func (m *manager) Cancel(rootID string, handle *LockHandle) RequestStatus {
 	if handle == nil {
 		return RequestCanceled
+	}
+	if !handle.origin {
+		return handle.Status()
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()

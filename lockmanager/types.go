@@ -393,31 +393,28 @@ type LockRequest struct {
 	// origin of the reported wait duration and is set once, from the manager's clock, so the
 	// duration a diagnostics page reports is derived from the same clock that decides timeouts.
 	BlockedAt time.Time
-	Status    RequestStatus
+	// Status is the request's lifecycle status. The authoritative copy lives in the request's
+	// shared decision (requestState), which is what waiters observe; this field is kept for
+	// diagnostics and is only ever written under the manager mutex.
+	Status RequestStatus
 	// ShouldWait is consulted once for a conflict with another owner. It is never
 	// consulted for a conflict inside the same owner, because an ancestor or child
 	// of one root always re-enters compatibly.
 	ShouldWait    func() bool
 	BlockerIDs    []string
-	Result        chan RequestStatus
 	ReservedBytes int64
 	// ReservationToken identifies the budget reservation that currently owns this
 	// request's accounting. Zero means nothing is reserved.
 	ReservationToken uint64
 }
 
-// Notify delivers the single terminal status exactly once. It never blocks: the
-// result channel is buffered, so a late notification cannot strand a waiter and a
-// duplicate notification cannot panic.
-func (r *LockRequest) Notify(status RequestStatus) {
-	if r.Result == nil {
-		return
-	}
-	select {
-	case r.Result <- status:
-	default:
-	}
-}
+// There is deliberately no per-request result channel here.
+//
+// A request can have several waiting callers (the one that queued it and every caller that joined
+// it), and a channel can hand its single value to exactly one receiver: the others would stay
+// blocked for an outcome that was already decided. Wake-up is therefore a broadcast owned by the
+// request's shared decision — a channel that is closed once, when the terminal status is stored —
+// and every caller reads the same status and the same grant from that decision afterwards.
 
 // MayWait reports whether the request is allowed to queue.
 //

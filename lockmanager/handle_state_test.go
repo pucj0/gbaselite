@@ -101,24 +101,22 @@ func (f *handleRaceFixture) requireHoldsNothing(rootID string, situation string)
 	}
 }
 
-// requireOneNotification asserts that the handle carries exactly one notification and that it
-// is the recorded terminal status. It consumes the notification, so it is only called once the
-// test is finished with the channel.
-func (f *handleRaceFixture) requireOneNotification() RequestStatus {
+// requireSettledStatus asserts that the handle's request has reached its terminal status and
+// returns it. The broadcast makes the check repeatable: nothing is consumed, so it may be called
+// as often as a test likes.
+func (f *handleRaceFixture) requireSettledStatus() RequestStatus {
 	f.t.Helper()
-	var delivered RequestStatus
 	select {
-	case delivered = <-f.handle.result:
+	case <-f.handle.settled():
 	default:
-		f.t.Fatal("the handle has no delivered notification")
+		f.t.Fatal("the handle was not settled")
 		return RequestCanceled
 	}
-	select {
-	case extra := <-f.handle.result:
-		f.t.Fatalf("a second notification %s was delivered after %s", extra, delivered)
-	default:
+	status := f.handle.Status()
+	if !status.Terminal() {
+		f.t.Fatalf("the settled handle reports %s, want a terminal status", status)
 	}
-	return delivered
+	return status
 }
 
 // TestB02HandleGrantRacingCancelPicksOneWinner is scenario (a): one goroutine cancels while
@@ -169,7 +167,7 @@ func TestB02HandleGrantRacingCancelPicksOneWinner(t *testing.T) {
 		if cancelStatus != status {
 			t.Fatalf("round %d: Cancel reported %s but the handle records %s", round, cancelStatus, status)
 		}
-		if delivered := f.requireOneNotification(); delivered != status {
+		if delivered := f.requireSettledStatus(); delivered != status {
 			t.Fatalf("round %d: the delivered notification %s disagrees with the recorded status %s", round, delivered, status)
 		}
 
@@ -271,7 +269,7 @@ func TestB02HandleGrantRacingDeadlineProducesOneOutcome(t *testing.T) {
 			default:
 				t.Fatalf("round %d: status = %s after a release and a deadline, want exactly GRANTED or TIMED_OUT", round, status)
 			}
-			if delivered := f.requireOneNotification(); delivered != status {
+			if delivered := f.requireSettledStatus(); delivered != status {
 				t.Fatalf("round %d: the delivered notification %s disagrees with the recorded status %s", round, delivered, status)
 			}
 
@@ -352,12 +350,11 @@ func TestB02HandleReleaseWakesTheWaiterExactlyOnce(t *testing.T) {
 	}
 	f.requireHoldsBundle(f.waiter.rootID, "waiter woken by the release")
 
-	// Wait consumed the one notification; nothing else must have been sent, and a second Wait on
-	// the same handle must report the recorded grant immediately instead of blocking.
-	select {
-	case extra := <-f.handle.result:
-		t.Fatalf("a duplicate notification %s was delivered", extra)
-	default:
+	// The terminal status is a broadcast rather than a value handed to one receiver: reading it
+	// again returns the same status, and a second Wait on the same handle reports the recorded
+	// grant immediately instead of blocking.
+	if status := f.requireSettledStatus(); status != RequestGranted {
+		t.Fatalf("the settled handle reports %s, want GRANTED", status)
 	}
 	status, err := f.handle.Wait(ctx)
 	if err != nil || status != RequestGranted {
@@ -477,7 +474,7 @@ func TestB02HandleStatusIsSafeUnderConcurrentPolling(t *testing.T) {
 		t.Fatalf("the pollers observed %d distinct terminal statuses: %v", len(seen), seen)
 	}
 	// Polling is a read: the one notification is still queued for the real waiter.
-	if delivered := f.requireOneNotification(); delivered != terminal {
+	if delivered := f.requireSettledStatus(); delivered != terminal {
 		t.Fatalf("the notification %s disagrees with the recorded status %s", delivered, terminal)
 	}
 }
@@ -581,10 +578,10 @@ func TestB02HandleStatusNeverChangesAfterItBecomesTerminal(t *testing.T) {
 // TestB02HandleWaitAndStatusAgreeUnderConcurrency is scenario (f): several goroutines call Wait
 // on the same handle while the status is settled, and a concurrent poller reads Status.
 //
-// Only one waiter can receive the single notification; the others are woken by their own
-// context ending. The contract says Wait re-checks the recorded decision before reporting a
-// cancellation, so every one of them must report the same GRANTED status: a caller whose
-// context ended in the same instant as the grant must not be told the lock was cancelled.
+// Every waiter is woken by the request's own broadcast, and the contexts end in the same instant
+// as the grant. The contract says Wait re-checks the recorded decision before reporting a
+// cancellation, so every one of them must report the same GRANTED status: a caller whose context
+// ended in the same instant as the grant must not be told the lock was cancelled.
 func TestB02HandleWaitAndStatusAgreeUnderConcurrency(t *testing.T) {
 	const waiters = 8
 	f := newHandleRaceFixture(t, "root-holder", "root-waiter")
@@ -647,11 +644,12 @@ func TestB02HandleWaitAndStatusAgreeUnderConcurrency(t *testing.T) {
 	if status := f.handle.Status(); status != RequestGranted {
 		t.Fatalf("Status = %s, want GRANTED", status)
 	}
-	// Exactly one notification was ever sent, and the Wait that consumed it did not leave a
-	// duplicate behind for another caller.
-	select {
-	case extra := <-f.handle.result:
-		t.Fatalf("a duplicate notification %s was delivered", extra)
-	default:
+	// The outcome is a broadcast every waiter reads from the decision, so no caller can consume
+	// another caller's wake-up or leave one behind.
+	if status := f.requireSettledStatus(); status != RequestGranted {
+		t.Fatalf("the settled handle reports %s, want GRANTED", status)
+	}
+	if _, err := f.handle.Wait(context.Background()); err != nil {
+		t.Fatalf("a later Wait on the settled handle returned %v, want the recorded grant", err)
 	}
 }
