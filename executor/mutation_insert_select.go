@@ -27,7 +27,7 @@ type insertTarget struct {
 // SELECT scans, so the source can never re-read its own output. Any row-level
 // failure returns an error and the caller rolls the child transaction back, so no
 // partially inserted rows survive.
-func (e *Engine) insertSelectSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Insert) (*Result, error) {
+func (e *Engine) insertSelectSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Insert, locks *dmlLockScope) (*Result, error) {
 	target, err := e.bindInsertTarget(write, session, statement)
 	if err != nil {
 		return nil, err
@@ -49,6 +49,7 @@ func (e *Engine) insertSelectSQL(ctx context.Context, read, write storageengine.
 		Engine:  e,
 		Session: session,
 		Mode:    insertStatementMode(statement),
+		Locks:   locks,
 	}
 	if err = operator.Run(ctx); err != nil {
 		return nil, err

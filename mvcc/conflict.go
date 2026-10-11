@@ -76,16 +76,49 @@ func newGroupChangeLookup(base committedChangeLookup, accepted map[string]uint64
 type conflictValidator struct {
 	readTS uint64
 	latest committedChangeLookup
+	// baseline reports the version one key was observed at under its covering lock. It is nil for
+	// every transaction that never took a locked current read, in which case the validator behaves
+	// exactly as it always has.
+	//
+	// This is the B02 reconciliation of a locked current read with INV-005: the rule stays
+	// "latest committed change must not be newer than what this transaction observed", but for a
+	// key read under lock the observation is the version the reader actually saw rather than a
+	// timestamp that may predate it. The lock guarantees nothing changed between the observation
+	// and the commit, so the check remains a true lost-update signal.
+	baseline func(logicalKey []byte) (uint64, bool)
 }
 
 func newConflictValidator(readTS uint64, latest committedChangeLookup) conflictValidator {
 	return conflictValidator{readTS: readTS, latest: latest}
 }
 
-// validateKey reports ErrConflict when the newest committed change of one
-// dependency is newer than the transaction's read timestamp.
+// withBaseline returns a validator that consults a per-key observation baseline.
+//
+// A key with no recorded baseline is validated against readTS exactly as before, so attaching a
+// baseline can only ever make a locked, observed write succeed; it never changes the verdict for a
+// key the transaction did not read under lock.
+func (v conflictValidator) withBaseline(baseline func(logicalKey []byte) (uint64, bool)) conflictValidator {
+	v.baseline = baseline
+	return v
+}
+
+// validateKey reports ErrConflict when the newest committed change of one dependency is newer
+// than what this transaction is entitled to build on: the version it observed under lock when it
+// has one, and its read timestamp otherwise.
 func (v conflictValidator) validateKey(logicalKey []byte) error {
-	if v.latest(logicalKey) > v.readTS {
+	latest := v.latest(logicalKey)
+	if v.baseline != nil {
+		if observed, ok := v.baseline(logicalKey); ok {
+			// The key was read under its covering lock, so this transaction may write the version
+			// it observed. Anything newer means the lock was lost or the row changed underneath it,
+			// which is still a conflict.
+			if latest > observed {
+				return ErrConflict
+			}
+			return nil
+		}
+	}
+	if latest > v.readTS {
 		return ErrConflict
 	}
 	return nil

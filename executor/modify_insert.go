@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"gbaselite/physical"
+	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 )
@@ -151,6 +152,10 @@ type InsertOperator struct {
 	Engine *Engine
 	// Session supplies defaults, CURRENT_TIMESTAMP and the statement's conflict mode.
 	Session *Session
+	// Locks is the statement's lock scope. Every inserted row takes its record lock through it
+	// before the write, so a concurrent duplicate waits on the same resource and is rejected by a
+	// re-check afterwards instead of both rows being written.
+	Locks *dmlLockScope
 	// Mode is the statement's duplicate-key policy. The zero value is the plain
 	// INSERT policy.
 	Mode insertMode
@@ -196,6 +201,11 @@ func (o *InsertOperator) apply(ctx context.Context, candidate InsertCandidate) e
 	if err != nil {
 		return err
 	}
+	// The record lock is taken before the write, never after: a lock acquired afterwards would
+	// leave a window in which two transactions both believe the key is free.
+	if err := o.lockCandidate(candidate); err != nil {
+		return err
+	}
 	outcome, err := writeInsertedRow(ctx, o.Write, o.Session, o.Target, o.Mode, candidate.Values, candidate.Ordinal)
 	if err != nil {
 		return err
@@ -205,6 +215,70 @@ func (o *InsertOperator) apply(ctx context.Context, candidate InsertCandidate) e
 		o.Result.recordGenerated(generated, true)
 	}
 	return nil
+}
+
+// lockCandidate takes the exclusive row lock one inserted row needs.
+//
+// The identity is derived from the candidate's own values, so it matches exactly what the write
+// path will install. A candidate whose primary key cannot be derived is refused rather than
+// written unprotected.
+func (o *InsertOperator) lockCandidate(candidate InsertCandidate) error {
+	if o.Locks == nil {
+		return nil
+	}
+	table := o.Target.definition
+	row := candidate.Values
+	key, ok := primaryKeyBytes(table, row)
+	if !ok {
+		// A table with no primary key is written under the heap identity the insert path
+		// synthesises from this statement's ordinal, so that is the identity to lock.
+		key = heapKey(o.Write, candidate.Ordinal)
+		if len(key) == 0 {
+			return errLockIdentityUnavailable
+		}
+	}
+	extra, err := indexEntryLocks(table, key, row)
+	if err != nil {
+		return err
+	}
+	return o.Locks.acquireRowLocksForKey(table, key, extra)
+}
+
+// indexEntryLocks builds the exclusive locks of a row's unique and secondary index entries.
+//
+// The entries are built with the same helper the write path uses, so the lock and the write share
+// one encoding. Without these an INSERT and an UPDATE that collide on a unique index would only
+// meet at commit time, which is the late-conflict behaviour this integration removes.
+// owner must be the row's primary-key bytes, because that is what the writer uses as the index
+// entry's sub-key. Passing anything else would compute a lock key the writer never touches, which
+// would either miss a real conflict or invent one between unrelated rows.
+func indexEntryLocks(table versionedTable, owner []byte, row storage.Row) ([]storageengine.LockComponent, error) {
+	if row == nil || len(owner) == 0 {
+		return nil, nil
+	}
+	var components []storageengine.LockComponent
+	for _, index := range table.Definition.Indexes {
+		if index.Primary {
+			continue
+		}
+		positions, ok := secondaryColumns(table, index)
+		if !ok {
+			// An index whose columns cannot be resolved is not locked here. Its conflict is still
+			// caught by the commit validator, so the omission cannot lose a duplicate; it only
+			// means the loser learns at commit rather than while waiting.
+			continue
+		}
+		entryKey, _, err := secondaryEntry(table, positions, owner, row)
+		if err != nil {
+			return nil, err
+		}
+		space := sqllayout.SecondaryIndex(table.ID, index.Name)
+		if index.Unique {
+			space = sqllayout.UniqueIndex(table.ID, index.Name)
+		}
+		components = append(components, indexEntryComponent(space, table.ID, index.Name, entryKey))
+	}
+	return components, nil
 }
 
 // initCounters creates the statement-local counter state on first use. A statement

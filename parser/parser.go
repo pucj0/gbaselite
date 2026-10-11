@@ -1008,14 +1008,23 @@ selectItems:
 		}
 	}
 	if p.accept("FOR") {
-		if err := p.expect("UPDATE"); err != nil {
-			return nil, err
-		}
-		statement.Locking = true
-		if !p.accept("NOWAIT") && p.accept("SKIP") {
-			if err := p.expect("LOCKED"); err != nil {
+		switch {
+		case p.accept("UPDATE"):
+			statement.Locking = true
+			statement.LockMode = LockModeUpdate
+			if err := p.refuseLockingOption("FOR UPDATE"); err != nil {
 				return nil, err
 			}
+		case p.accept("SHARE"):
+			statement.Locking = true
+			statement.LockMode = LockModeShare
+			if err := p.refuseLockingOption("FOR SHARE"); err != nil {
+				return nil, err
+			}
+		default:
+			// FOR NO KEY UPDATE / FOR KEY SHARE and anything else are outside this release and
+			// must be named rather than parsed as a plain read.
+			return nil, p.errorf("unsupported locking clause %q", p.current().Text)
 		}
 	} else if p.accept("LOCK") {
 		if err := p.expect("IN"); err != nil {
@@ -1028,8 +1037,27 @@ selectItems:
 			return nil, err
 		}
 		statement.Locking = true
+		statement.LockMode = LockModeShare
+		statement.LockingAlias = "LOCK IN SHARE MODE"
+		if err := p.refuseLockingOption("LOCK IN SHARE MODE"); err != nil {
+			return nil, err
+		}
 	}
 	return statement, nil
+}
+
+// refuseLockingOption rejects the locking options this release does not implement.
+//
+// It is called for both locking forms so neither can acquire the options by accident, and it is
+// called during parsing so the error precedes any side effect.
+func (p *Parser) refuseLockingOption(clause string) error {
+	switch {
+	case p.accept("NOWAIT"):
+		return p.errorf("%s NOWAIT is not supported", clause)
+	case p.is("SKIP"):
+		return p.errorf("%s SKIP LOCKED is not supported", clause)
+	}
+	return nil
 }
 
 func (p *Parser) isSelectClauseStart() bool {

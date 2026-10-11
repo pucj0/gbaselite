@@ -43,7 +43,7 @@ func (t *Tx) commitLocalStream(ctx context.Context) (index uint64, err error) {
 	// commit rule, using the encoded keys of the frozen stage. Nothing is installed
 	// yet on this path, so the view is the only change source.
 	err = s.db.View(func(dbtx *bolt.Tx) error {
-		validator := newConflictValidator(t.Snapshot, newViewChangeLookup(dbtx))
+		validator := newConflictValidator(t.Snapshot, newViewChangeLookup(dbtx)).withBaseline(t.baselineLookup())
 		return t.stage.View(func(stageTx *bolt.Tx) error {
 			return stageTx.Bucket([]byte("writes")).ForEach(func(k, encoded []byte) error {
 				if err := ctx.Err(); err != nil {

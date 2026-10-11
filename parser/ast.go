@@ -187,7 +187,31 @@ type Select struct {
 	Limit, Offset int
 	HasLimit      bool
 	Locking       bool
+	// LockMode is the explicit row lock a locking read requests. It is meaningful only when
+	// Locking is true.
+	//
+	// The mode is stored rather than derived from Locking because FOR UPDATE and FOR SHARE take
+	// different locks: a boolean cannot say which one the statement asked for, and a reader that
+	// guessed would silently upgrade a shared read to an exclusive one.
+	LockMode LockMode
+	// LockingAlias records that the statement used LOCK IN SHARE MODE rather than FOR SHARE, so
+	// diagnostics and EXPLAIN can report what the user actually wrote.
+	LockingAlias string
 }
+
+// LockMode is the row lock a locking read requests.
+type LockMode string
+
+const (
+	// LockModeUpdate is FOR UPDATE: an exclusive row lock.
+	LockModeUpdate LockMode = "UPDATE"
+	// LockModeShare is FOR SHARE and its LOCK IN SHARE MODE alias: a shared row lock.
+	LockModeShare LockMode = "SHARE"
+)
+
+// Valid reports whether the mode is one this parser produces.
+func (m LockMode) Valid() bool { return m == LockModeUpdate || m == LockModeShare }
+
 type Union struct {
 	Queries       []Select
 	All           []bool

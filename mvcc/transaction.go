@@ -50,6 +50,29 @@ type Tx struct {
 	// counters is shared with the registry entry, so diagnostics can read it without
 	// locking the commit path.
 	counters *transactionCounters
+
+	// lockOwnerID is the root lock owner every grant of this transaction belongs to. A child
+	// inherits its parent's, so a grant taken by a savepoint layer is owned by the root.
+	lockOwnerID string
+	// lockScopeID is this transaction's own lock scope: a statement scope for a root, a child
+	// scope for a child. It is a request origin only and never owns a grant.
+	lockScopeID uint64
+	// lockDeadline bounds how long a request from this transaction may wait. Zero means the
+	// manager's session default.
+	lockDeadline time.Time
+
+	// writeBaseline records, per logical key, the version this transaction observed under the
+	// covering lock. It is what reconciles a locked current read with the commit rule: a write to
+	// a key with a recorded baseline is validated against the version that was actually observed,
+	// while every other key keeps the transaction's readTS comparison.
+	//
+	// It is bounded by the lock budget, because a baseline is only recorded for a key this
+	// transaction successfully locked, and it is released with the transaction.
+	writeBaseline map[string]uint64
+	// baselineRejections counts observations dropped because the baseline bound was reached. It
+	// is a counter rather than another collection, so a transaction that read more locked keys
+	// than the bound costs a fixed amount of state.
+	baselineRejections uint64
 }
 
 func randomID() string {
@@ -75,9 +98,9 @@ func (s *Store) Begin(ctx context.Context, p Proposer) (*Tx, error) {
 	// Registering while Store.views is held ties the new root transaction to the
 	// generation it actually observed: Store.Restore bumps the generation and
 	// purges the registry under the same lock.
-	return s.newTx(p, snapshot, nil)
+	return s.newTx(ctx, p, snapshot, nil)
 }
-func (s *Store) newTx(p Proposer, snapshot uint64, parent *Tx) (*Tx, error) {
+func (s *Store) newTx(ctx context.Context, p Proposer, snapshot uint64, parent *Tx) (*Tx, error) {
 	id := randomID()
 	path := filepath.Join(filepath.Dir(s.path), "transactions", id+".tmp")
 	var term uint64
@@ -105,7 +128,20 @@ func (s *Store) newTx(p Proposer, snapshot uint64, parent *Tx) (*Tx, error) {
 		}
 		counters = registered
 	}
-	return &Tx{generation: generation, term: term, store: s, proposer: p, parent: parent, Snapshot: snapshot, ID: id, path: path, startedAt: startedAt, state: TransactionActive, counters: counters}, nil
+	tx := &Tx{generation: generation, term: term, store: s, proposer: p, parent: parent, Snapshot: snapshot, ID: id, path: path, startedAt: startedAt, state: TransactionActive, counters: counters}
+	// The lock owner and the transaction's own scope are created here, while the transaction is
+	// still being built and before any caller can use it. A failure leaves no half-registered
+	// transaction behind: the registry entry is removed and the owner is released.
+	if err := s.beginLockOwner(tx); err != nil {
+		s.txns.Unregister(id)
+		return nil, err
+	}
+	if err := s.beginTransactionScope(tx); err != nil {
+		tx.closeTransactionLocks()
+		s.txns.Unregister(id)
+		return nil, err
+	}
+	return tx, nil
 }
 func (t *Tx) ensureStage() error {
 	if t.stage != nil {
@@ -126,11 +162,21 @@ func (t *Tx) ensureStage() error {
 	t.stage = db
 	return nil
 }
-func (t *Tx) Child() (*Tx, error) {
+func (t *Tx) Child() (*Tx, error) { return t.ChildContext(context.Background()) }
+
+// ChildContext creates a child transaction.
+//
+// A child inherits the root's lock owner, so every grant it takes is attributed to the root and
+// survives the child's merge. No grant is ever owned by a child, which is why a child commit
+// cannot release the root's record X even in principle.
+func (t *Tx) ChildContext(ctx context.Context) (*Tx, error) {
 	if t.closed || t.generation != t.store.generation.Load() {
 		return nil, ErrClosed
 	}
-	return t.store.newTx(t.proposer, t.Snapshot, t)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return t.store.newTx(ctx, t.proposer, t.Snapshot, t)
 }
 func (t *Tx) readOp(space string, rowKey []byte) (Op, bool, error) {
 	if t.stage == nil && len(t.buffered) == 0 {
@@ -369,6 +415,12 @@ func (t *Tx) Commit(ctx context.Context) (uint64, error) {
 // after a merge that succeeded.
 func (t *Tx) commitChild(ctx context.Context) (uint64, error) {
 	defer t.finishIncomplete()
+	// A chosen deadlock victim cannot merge: the merge would publish its writes into a root that
+	// is about to be aborted, and the contract forbids a victim from continuing to write.
+	if err := t.canStillCommit(); err != nil {
+		t.finish(TransactionAborted, TransitionOptions{Reason: abortReason(err)})
+		return t.Snapshot, err
+	}
 	if err := t.mergeParent(ctx); err != nil {
 		// The merge failed, so the child's writes were discarded. mergeParent has
 		// already aborted the parent when it could not complete.
@@ -387,6 +439,13 @@ func (t *Tx) commitChild(ctx context.Context) (uint64, error) {
 // the head, exactly as before.
 func (t *Tx) commitRoot(ctx context.Context) (uint64, error) {
 	defer t.finishIncomplete()
+	// The victim check is the first thing a commit does, before the empty-root shortcut and before
+	// the COMMITTING transition. A victim may therefore not publish even an empty transaction:
+	// "cannot continue to commit" is about the outcome, not about whether there was work to do.
+	if err := t.canStillCommit(); err != nil {
+		t.finish(TransactionAborted, TransitionOptions{Reason: abortReason(err)})
+		return 0, err
+	}
 	if !t.hasWriteSet() {
 		// Read-only or empty: no sequence is allocated, no version is installed and
 		// the publication marker is untouched.
@@ -521,8 +580,19 @@ func (t *Tx) finish(state TransactionState, options TransitionOptions) error {
 	if t.closed {
 		return nil
 	}
+	// The order is the contract's and each step depends on the previous one:
+	//
+	//  1. the semantic outcome is recorded while the registry entry still exists;
+	//  2. the write set becomes unusable, so no later step can still publish from it;
+	//  3. the lock participation ends: a child withdraws its scope, a root releases its owner;
+	//  4. the registry entry is dropped.
+	//
+	// Releasing locks after step 2 is what makes "a root release happens only after the write set
+	// can no longer be used" true for the success and the failure path alike, and doing it after
+	// step 1 is what forbids a release from rewriting COMMITTED into ABORTED.
 	t.applyTransition(state, options)
 	err := t.cleanup()
+	t.closeTransactionLocks()
 	if t.generation == t.store.generation.Load() {
 		t.store.txns.Unregister(t.ID)
 	}

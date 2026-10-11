@@ -248,7 +248,12 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		}
 		return &Result{AffectedRows: uint64(len(value.Names))}, nil
 	case parser.Insert:
-		return e.insertSQL(ctx, read, write, session, value)
+		locks, lockErr := beginDMLLockScope(ctx, write)
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		defer locks.close()
+		return e.insertSQL(ctx, read, write, session, value, locks)
 	case parser.Update:
 		if len(value.Joins) > 0 {
 			return e.joinUpdateSQL(ctx, read, write, session, value)
@@ -278,6 +283,14 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		if value.HasLimit {
 			limit = value.Limit
 		}
+		// The statement's lock scope is opened here, per statement, so closing it withdraws only
+		// this statement's pending requests and keeps every grant the root already holds. A
+		// transaction that runs several statements therefore keeps all of their locks until it ends.
+		locks, lockErr := beginDMLLockScope(ctx, write)
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		defer locks.close()
 		operator := &UpdateOperator{
 			Input:       updateCandidates(mutationScan(ctx, read, definition, schema, session, value.Where, limit), definition),
 			Target:      definition,
@@ -285,6 +298,7 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 			Assignments: assignments,
 			Write:       write,
 			Session:     session,
+			Locks:       locks,
 		}
 		if err = operator.Run(ctx); err != nil {
 			return nil, err
@@ -292,7 +306,12 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		return &Result{AffectedRows: operator.Result.AffectedRows}, nil
 	case parser.Delete:
 		if len(value.Joins) > 0 || len(value.Targets) > 0 {
-			return e.multiTableDeleteSQL(ctx, read, write, session, value)
+			locks, lockErr := beginDMLLockScope(ctx, write)
+			if lockErr != nil {
+				return nil, lockErr
+			}
+			defer locks.close()
+			return e.multiTableDeleteSQL(ctx, read, write, session, value, locks)
 		}
 		definition, schema, k, err := loadVersionedTable(read, session, value.Table)
 		if err != nil {
@@ -316,11 +335,17 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		if value.HasLimit {
 			limit = value.Limit
 		}
+		locks, lockErr := beginDMLLockScope(ctx, write)
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		defer locks.close()
 		operator := &DeleteOperator{
 			Input:   deleteCandidates(mutationScan(ctx, read, definition, schema, session, value.Where, limit), definition),
 			Target:  definition,
 			Write:   write,
 			Session: session,
+			Locks:   locks,
 		}
 		if err = operator.Run(ctx); err != nil {
 			return nil, err
@@ -330,12 +355,12 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		return nil, fmt.Errorf("storage engine does not support statement %T", statement)
 	}
 }
-func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Insert) (*Result, error) {
+func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Insert, locks *dmlLockScope) (*Result, error) {
 	if len(statement.SetValues) > 0 {
 		statement = insertSetStatement(statement)
 	}
 	if statement.Select != nil {
-		return e.insertSelectSQL(ctx, read, write, session, statement)
+		return e.insertSelectSQL(ctx, read, write, session, statement, locks)
 	}
 	definition, schema, catalogKey, err := loadVersionedTable(write, session, statement.Table)
 	if err != nil {
@@ -377,6 +402,7 @@ func (e *Engine) insertSQL(ctx context.Context, read, write storageengine.Txn, s
 		Session: session,
 		Mode:    insertStatementMode(statement),
 		Rows:    uint64(len(statement.Values)),
+		Locks:   locks,
 	}
 	if err = operator.Run(ctx); err != nil {
 		return nil, err

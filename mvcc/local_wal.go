@@ -326,7 +326,7 @@ func (s *Store) commitLocalWALGroup(group []*localCommitRequest) {
 			if r.err = r.ctx.Err(); r.err != nil {
 				continue
 			}
-			validator := newConflictValidator(r.snapshot, newGroupChangeLookup(base, acceptedChanges))
+			validator := newConflictValidator(r.snapshot, newGroupChangeLookup(base, acceptedChanges)).withBaseline(r.baseline)
 			if err := validator.validateOps(r.ops); err != nil {
 				r.err = err
 				continue

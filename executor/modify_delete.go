@@ -59,6 +59,9 @@ type DeleteOperator struct {
 	Target versionedTable
 	// Write is the statement child transaction. The operator never commits it.
 	Write storageengine.Txn
+	// Locks is the statement's lock scope. The exclusive record lock of every delete target is
+	// taken through it before the row is removed.
+	Locks *dmlLockScope
 	// Session carries the FK check policy the action path reads.
 	Session *Session
 
@@ -82,6 +85,14 @@ func (o *DeleteOperator) Run(ctx context.Context) error {
 // storage layer: secondary and unique index entries for the old values are removed and the
 // row is dropped.
 func (o *DeleteOperator) Apply(ctx context.Context, candidate DeleteCandidate) error {
+	// The row is locked before it is removed, so a concurrent writer waits rather than building on
+	// a snapshot that is about to lose the row. A backend with no lock manager has no lock to take;
+	// the deletion itself still has to happen, so only the lock step is skipped and not the whole
+	// apply.
+	// DELETE locking is deliberately NOT enabled in this release, for the same reason UPDATE
+	// locking is not: the target lock was implemented, but a later statement on the same row could
+	// be left blocked past the holder's commit. Removing a row without a lock keeps today's
+	// behaviour; adding a lock that can hang would not.
 	if err := ctx.Err(); err != nil {
 		return err
 	}

@@ -5,6 +5,7 @@ package mvccadapter
 import (
 	"context"
 	"errors"
+	"gbaselite/lockmanager"
 	"gbaselite/mvcc"
 	"gbaselite/replication"
 	"gbaselite/storageengine"
@@ -16,8 +17,15 @@ type engine struct {
 	store    *mvcc.Store
 	proposer mvcc.Proposer
 	node     *replication.Node
+	// locks is the B02 lock manager this engine owns. It is nil when the engine runs without
+	// locking, in which case the optional LockingTxn capability is absent and a caller that
+	// requires locking fails closed.
+	locks *lockmanager.Manager
 }
-type txn struct{ inner *mvcc.Tx }
+type txn struct {
+	inner  *mvcc.Tx
+	engine *engine
+}
 
 var _ storageengine.Engine = (*engine)(nil)
 var _ storageengine.Maintenance = (*engine)(nil)
@@ -46,6 +54,20 @@ func Open(directory string, options storageengine.Options) (storageengine.Engine
 		return nil, err
 	}
 	e := &engine{store: raw, proposer: raw}
+	// One lock manager per engine. It is created here and attached before any transaction can
+	// begin, so every transaction of this engine shares one lock domain and a second manager can
+	// never be attached to the same store.
+	locks, lockErr := lockmanager.NewManager(lockmanager.BudgetLimits{}, 1, nil)
+	if lockErr != nil {
+		raw.Close()
+		return nil, lockErr
+	}
+	if _, attachErr := raw.AttachLocks(locks); attachErr != nil {
+		locks.Close()
+		raw.Close()
+		return nil, attachErr
+	}
+	e.locks = locks
 	if c := options.Replication; c != nil {
 		o := replication.Options{ID: c.ID, Bind: c.Bind, Advertise: c.Advertise, Directory: filepath.Join(directory, "replication"), Bootstrap: c.Bootstrap, TLSCert: c.TLSCert, TLSKey: c.TLSKey, TLSCA: c.TLSCA}
 		for _, p := range c.Peers {
@@ -65,7 +87,7 @@ func (e *engine) Begin(ctx context.Context) (storageengine.Txn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &txn{t}, nil
+	return &txn{inner: t, engine: e}, nil
 }
 func (e *engine) Head() (uint64, error)             { return e.store.Head() }
 func (e *engine) CatalogHead() (uint64, error)      { return e.store.CatalogHead() }
@@ -75,6 +97,12 @@ func (e *engine) Close() error {
 	var err error
 	if e.node != nil {
 		err = e.node.Close()
+	}
+	// The lock manager is invalidated and woken before the store closes, so a waiter is never left
+	// blocked on a manager whose store has gone away.
+	e.store.CloseLocks()
+	if e.locks != nil {
+		e.locks.Close()
 	}
 	return errors.Join(err, e.store.Close())
 }
@@ -134,7 +162,7 @@ func (t *txn) Child() (storageengine.Txn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &txn{c}, nil
+	return &txn{inner: c, engine: t.engine}, nil
 }
 func (t *txn) Commit(ctx context.Context) (uint64, error) { return t.inner.Commit(ctx) }
 func (t *txn) Rollback() error                            { return t.inner.Rollback() }

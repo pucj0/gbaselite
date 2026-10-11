@@ -44,6 +44,17 @@ JDBC、Go MySQL 驱动等客户端提供服务。
 [SQL 教程](docs/使用文档/SQL使用教程.md)与[旧兼容参考](docs/使用文档/SQL兼容性参考.md)
 包含历史功能，使用前需核对当前矩阵。旧实例请先阅读[旧数据迁移](#旧数据迁移)。
 
+开发规划使用官方 Spec Kit `1.1.3`，项目已安装 Codex skills 到
+`.agents/skills/speckit-*`，工作流配置和脚本位于 `.specify/`；技能在新的 Codex 会话/轮次加载。
+本地 CLI 位于 `.tmp/spec-kit-venv/Scripts/specify.exe`。B02 行锁管理器目前仅完成
+[需求与设计规划](specs/006-b02-row-lock-manager/spec.md)，相关
+[技术方案](specs/006-b02-row-lock-manager/plan.md)、
+[任务清单](specs/006-b02-row-lock-manager/tasks.md) 和
+[追踪矩阵](specs/006-b02-row-lock-manager/traceability.md) 不代表功能已经实现。
+当前锁定读仍按下方兼容矩阵的快照语义运行；B02 规划的 Current Read、行/区间锁、等待和诊断
+尚不可用。规划明确保留固定 readTS 与提交冲突规则、A05 parent-read/child-write，
+不改变持久化格式或 WAL/Raft 协议，也不宣称完整 InnoDB 兼容。
+
 ## 项目定位
 
 GBaseLite 面向以下场景：

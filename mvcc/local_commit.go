@@ -13,6 +13,14 @@ var errLocalBatchFull = errors.New("local atomic batch full")
 // Raft retains the persistent staged path for replay.
 func (t *Tx) tryLocalCommit(ctx context.Context) (uint64, bool, error) {
 	if t.proposer != t.store {
+		// The replicated apply path validates from the Command alone, which carries no lock
+		// observation baseline. A transaction that took a locked current read therefore cannot be
+		// published through it without either changing the replicated command format or skipping
+		// the observation check, and both are forbidden. Failing closed is the only honest answer:
+		// the alternative is to accept a write whose authorization the durable path cannot verify.
+		if t.HasWriteBaseline() {
+			return 0, true, errBaselineNeedsLocalValidation
+		}
 		return 0, false, nil
 	}
 	var ops []Op
@@ -37,7 +45,7 @@ func (t *Tx) tryLocalCommit(ctx context.Context) (uint64, bool, error) {
 	if len(ops) == 0 {
 		return t.Snapshot, true, nil
 	}
-	n, err := t.store.commitLocal(ctx, t.generation, t.Snapshot, t.ID, ops)
+	n, err := t.store.commitLocalFromTx(t, ctx, ops)
 	return n, true, err
 }
 func publishCommit(tx *bolt.Tx, id string, index uint64, catalogChanged bool) error {

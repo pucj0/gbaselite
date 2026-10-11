@@ -70,7 +70,7 @@ func (t multiDeleteTarget) key(row storage.Row) ([]byte, bool) {
 // deduplicated through TargetRowDedup so one physical row is deleted once, staged so they can be
 // ordered children-first for RESTRICT/NO ACTION foreign keys, and finally removed by DeleteOperator
 // through the statement child transaction — so a failure anywhere rolls the whole statement back.
-func (e *Engine) multiTableDeleteSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Delete) (*Result, error) {
+func (e *Engine) multiTableDeleteSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Delete, locks *dmlLockScope) (*Result, error) {
 	if statement.HasLimit {
 		return nil, errors.New("LIMIT is not supported for multi-table DELETE")
 	}
@@ -91,7 +91,7 @@ func (e *Engine) multiTableDeleteSQL(ctx context.Context, read, write storageeng
 	if err != nil {
 		return nil, err
 	}
-	staged, err := plan.delete(ctx, write, session)
+	staged, err := plan.delete(ctx, write, session, locks)
 	if err != nil {
 		return nil, err
 	}

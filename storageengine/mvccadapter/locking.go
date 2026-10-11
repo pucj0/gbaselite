@@ -1,0 +1,263 @@
+package mvccadapter
+
+import (
+	"context"
+	"errors"
+
+	"gbaselite/lockmanager"
+	"gbaselite/mvcc"
+	"gbaselite/storageengine"
+)
+
+// locking.go implements the neutral storageengine.LockingTxn capability over the B02 lock
+// manager.
+//
+// This is the layer that keeps the SQL executor free of both bbolt and the concrete lock
+// manager: the executor speaks storageengine.LockComponent, and this file is the only place that
+// knows how a neutral component becomes a lockmanager.ResourceRef. The architecture test forbids
+// storageengine itself from importing lockmanager, so the conversion has to live here.
+//
+// Identity rule: Space, Key and the bounds are passed through untouched, because they are already
+// the encoded bytes the write path uses. TableID and IndexID travel as opaque labels. Nothing in
+// this file parses, re-encodes or normalises a key.
+
+var _ storageengine.LockingTxn = (*txn)(nil)
+
+// LockingTxn reports the neutral locking capability of this transaction, if the engine has one.
+//
+// The capability is optional by contract: a backend without a lock manager returns false and a
+// caller that requires locking must then fail closed rather than run unprotected.
+func (t *txn) LockingTxn() (storageengine.LockingTxn, bool) {
+	if t.lockManager() == nil {
+		return nil, false
+	}
+	return t, true
+}
+
+// lockManager returns the engine's lock manager, or nil when the engine runs without locking.
+func (t *txn) lockManager() *lockmanager.Manager {
+	if t.engine == nil {
+		return nil
+	}
+	return t.engine.locks
+}
+
+// BeginLockScope opens one request scope owned by this transaction's root.
+func (t *txn) BeginLockScope(ctx context.Context, kind storageengine.LockScopeKind) (uint64, error) {
+	if _, ok := t.LockingTxn(); !ok {
+		return 0, storageengine.ErrUnsupported
+	}
+	return t.inner.BeginLockScope(ctx, mvcc.LockScopeOptions{Kind: kind})
+}
+
+// CloseLockScope cancels this scope's pending requests and keeps every grant.
+func (t *txn) CloseLockScope(ctx context.Context, scope uint64) error {
+	if _, ok := t.LockingTxn(); !ok {
+		return storageengine.ErrUnsupported
+	}
+	_, err := t.inner.CloseLockScope(ctx, scope)
+	return err
+}
+
+// Acquire requests one atomic bundle and returns the opaque grant.
+//
+// The bundle is granted as a whole or becomes exactly one pending request. A request that has to
+// wait is waited for here, in the caller's goroutine, and the terminal status is mapped to the
+// neutral error set so the executor never sees a lock-manager type.
+func (t *txn) Acquire(ctx context.Context, scope uint64, request storageengine.LockRequest) (storageengine.LockGrant, error) {
+	manager := t.lockManager()
+	if manager == nil {
+		return storageengine.LockGrant{}, storageengine.ErrUnsupported
+	}
+	components, err := lockComponents(request.Components)
+	if err != nil {
+		return storageengine.LockGrant{}, err
+	}
+	shouldWait := func() bool { return true }
+	if request.ShouldWait != nil {
+		// The neutral decision takes a context; the manager consults it once, without a context
+		// of its own, so it is bound to the call's context here.
+		decision := request.ShouldWait
+		shouldWait = func() bool { return decision(ctx) }
+	}
+	grant, op, wait, err := t.inner.AcquireLock(ctx, scope, components, shouldWait)
+	if err != nil {
+		return storageengine.LockGrant{}, neutralLockError(err)
+	}
+	switch op {
+	case lockmanager.LockOpGranted:
+		return t.grant(grant), nil
+	case lockmanager.LockOpReentrant:
+		// A re-entrant acquisition took no new lock, so there is no fresh grant identity. The
+		// caller already holds the protection, which is what the returned capability records.
+		return storageengine.LockGrant{
+			OwnerID: t.ownerID(),
+			ScopeID: scope,
+			Granted: manager.Clock().Now(),
+		}, nil
+	case lockmanager.LockOpWait:
+		if wait == nil {
+			return storageengine.LockGrant{}, storageengine.ErrConflict
+		}
+		outcome, waitErr := t.inner.WaitForLock(ctx, wait)
+		if waitErr != nil {
+			return storageengine.LockGrant{}, neutralLockError(waitErr)
+		}
+		return t.grant(outcome), nil
+	default:
+		return storageengine.LockGrant{}, storageengine.ErrConflict
+	}
+}
+
+// ReadCurrent returns the latest published state for one key after the caller holds a covering
+// grant.
+//
+// The read revalidates the grant, so a value observed from a generation that ended mid-read is
+// discarded rather than returned as current.
+func (t *txn) ReadCurrent(ctx context.Context, grant storageengine.LockGrant, space string, key []byte) (storageengine.CurrentObservation, error) {
+	if _, ok := t.LockingTxn(); !ok {
+		return storageengine.CurrentObservation{}, storageengine.ErrUnsupported
+	}
+	observation, err := t.inner.ReadCurrentLockedForOwner(ctx, space, key, grant.OwnerID)
+	if err != nil {
+		return storageengine.CurrentObservation{}, neutralLockError(err)
+	}
+	return neutralObservation(observation), nil
+}
+
+// NewCurrentIterator opens a bounded locked scan.
+//
+// It is not implemented in this release, and it reports that instead of falling back to an
+// unlocked snapshot: a caller that asked for a locked scan and silently received an unlocked one
+// would take a decision on data nothing protected.
+func (t *txn) NewCurrentIterator(ctx context.Context, scope uint64, request storageengine.CurrentScanRequest) (storageengine.Iterator, error) {
+	if _, ok := t.LockingTxn(); !ok {
+		return nil, storageengine.ErrUnsupported
+	}
+	return nil, errors.New("locked current scan is not implemented in this release")
+}
+
+// ownerID reports the root lock owner this transaction's grants belong to.
+func (t *txn) ownerID() string { return t.inner.LockOwnerID() }
+
+// grant converts one lock-manager grant into the neutral capability.
+func (t *txn) grant(g lockmanager.LockGrant) storageengine.LockGrant {
+	return storageengine.LockGrant{
+		ID:       g.GrantID,
+		OwnerID:  g.OwnerID,
+		ScopeID:  g.OriginScopeID,
+		Granted:  g.GrantedAt,
+		Deadline: g.GrantedAt,
+	}
+}
+
+// lockComponents converts a neutral bundle.
+func lockComponents(components []storageengine.LockComponent) ([]lockmanager.ResourceRef, error) {
+	out := make([]lockmanager.ResourceRef, 0, len(components))
+	for _, component := range components {
+		kind, err := lockKind(component.Kind)
+		if err != nil {
+			return nil, err
+		}
+		mode, err := lockMode(component.Mode)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, lockmanager.ResourceRef{Identity: lockmanager.Identity{
+			Kind:           kind,
+			Mode:           mode,
+			Space:          component.Space,
+			TableID:        component.TableID,
+			IndexID:        component.IndexID,
+			Key:            component.Key,
+			Lower:          component.Lower,
+			Upper:          component.Upper,
+			LowerInclusive: component.LowerInclusive,
+			UpperInclusive: component.UpperInclusive,
+		}})
+	}
+	return out, nil
+}
+
+// lockKind maps one neutral component kind.
+func lockKind(kind storageengine.LockComponentKind) (lockmanager.ResourceKind, error) {
+	switch kind {
+	case storageengine.LockComponentTableIntent:
+		return lockmanager.KindTableIntent, nil
+	case storageengine.LockComponentRecord:
+		return lockmanager.KindRecord, nil
+	case storageengine.LockComponentInterval:
+		return lockmanager.KindInterval, nil
+	default:
+		return "", storageengine.ErrUnsupported
+	}
+}
+
+// lockMode maps one neutral lock mode.
+func lockMode(mode storageengine.LockMode) (lockmanager.Mode, error) {
+	switch mode {
+	case storageengine.LockModeIS:
+		return lockmanager.ModeIS, nil
+	case storageengine.LockModeIX:
+		return lockmanager.ModeIX, nil
+	case storageengine.LockModeS:
+		return lockmanager.ModeS, nil
+	case storageengine.LockModeX:
+		return lockmanager.ModeX, nil
+	case storageengine.LockModeGap:
+		return lockmanager.ModeGap, nil
+	case storageengine.LockModeInsertIntention:
+		return lockmanager.ModeInsertIntention, nil
+	default:
+		return "", storageengine.ErrUnsupported
+	}
+}
+
+// neutralLockError maps a lock-manager error onto the neutral set.
+//
+// The mapping is what makes the executor backend-agnostic: it reacts to ErrDeadlock,
+// ErrLockWaitTimeout and ErrConflict without knowing which lock manager produced them.
+func neutralLockError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, lockmanager.ErrDeadlock):
+		return storageengine.ErrDeadlock
+	case errors.Is(err, lockmanager.ErrLockWaitTimeout):
+		return storageengine.ErrLockWaitTimeout
+	case errors.Is(err, lockmanager.ErrLockResourceLimit):
+		return storageengine.ErrLockResourceLimit
+	case errors.Is(err, lockmanager.ErrLockInvalidated), errors.Is(err, lockmanager.ErrOwnerUnknown):
+		return storageengine.ErrLockInvalidated
+	case errors.Is(err, lockmanager.ErrUnsupportedMode):
+		return storageengine.ErrUnsupported
+	case errors.Is(err, lockmanager.ErrOwnerEnding):
+		return storageengine.ErrConflict
+	default:
+		return err
+	}
+}
+
+// neutralObservation maps one current observation.
+func neutralObservation(o mvcc.CurrentObservation) storageengine.CurrentObservation {
+	return storageengine.CurrentObservation{
+		Value:     o.Value,
+		Exists:    o.Exists,
+		ChangeTS:  o.ChangeTS,
+		HasChange: o.HasChange,
+		Source:    neutralObservationSource(o.Source),
+		Tombstone: o.Tombstone,
+	}
+}
+
+// neutralObservationSource maps where one observation came from.
+func neutralObservationSource(source mvcc.CurrentObservationSource) storageengine.CurrentObservationSource {
+	switch source {
+	case mvcc.CurrentCommitted:
+		return storageengine.CurrentSourceCommitted
+	case mvcc.CurrentOwnOverlay:
+		return storageengine.CurrentSourceOverlay
+	default:
+		return storageengine.CurrentSourceAbsent
+	}
+}

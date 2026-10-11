@@ -523,15 +523,30 @@ func requireBoundedDiagnosticsState(t *testing.T) {
 			}
 		}
 	}
-	// The only collection a transaction may hold is its bounded write buffer.
+	// A transaction may hold only collections that are bounded by an explicit budget, and each
+	// one must name its bound here. The rule this enforces is the one that matters: per-key state
+	// must not be able to grow with the number of keys a transaction merely *read*, because a
+	// large SELECT would then grow memory without bound.
+	//
+	// B02 added the second entry. A locked current read must remember the version it observed
+	// under the covering lock, because that observation is what authorises a later write to that
+	// key (see mvcc/current_read.go and contracts/current-read.md). The set is not a read set: it
+	// only ever holds keys this transaction successfully *locked*, so it is bounded by the lock
+	// budget as well as by maxObservationBaselines, and it is released with the transaction.
+	boundedCollections := map[string]string{
+		// bounded by writeBufferBytes
+		"buffered": "the bounded write buffer",
+		// bounded by maxObservationBaselines and by the lock budget
+		"writeBaseline": "the bounded locked-read observation baseline",
+	}
 	for i := 0; i < reflect.TypeOf(Tx{}).NumField(); i++ {
 		field := reflect.TypeOf(Tx{}).Field(i)
 		switch field.Type.Kind() {
 		case reflect.Map, reflect.Slice:
-			if field.Name == "buffered" {
-				continue // bounded by writeBufferBytes
+			if _, ok := boundedCollections[field.Name]; ok {
+				continue
 			}
-			t.Fatalf("Tx.%s is %s: the bounded write buffer must be the only per-transaction collection", field.Name, field.Type)
+			t.Fatalf("Tx.%s is %s: a per-transaction collection must be declared with its bound in boundedCollections", field.Name, field.Type)
 		}
 	}
 }

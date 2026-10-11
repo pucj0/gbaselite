@@ -14,15 +14,37 @@ type localCommitRequest struct {
 	index                uint64
 	err                  error
 	done                 chan struct{}
+	// baseline reports the version the request's transaction observed under lock for one logical
+	// key. It is nil when the transaction never took a locked current read, which is the common
+	// case and keeps the validation identical to the pre-B02 behaviour.
+	baseline func(logicalKey []byte) (uint64, bool)
 }
 
 // A lone caller commits immediately on its own goroutine. Arrivals during that
 // sync may share the next physical transaction, with no batching timer.
 func (s *Store) commitLocal(ctx context.Context, generation, snapshot uint64, id string, ops []Op) (uint64, error) {
+	return s.commitLocalWith(ctx, generation, snapshot, id, ops, nil)
+}
+
+// commitLocalFromTx commits one transaction's write set on the bounded local path, carrying the
+// transaction's locked-read observation baseline into the validator.
+//
+// A baseline has to reach the validator, and the validator runs inside the shared commit path, so
+// the request carries the lookup rather than the validator reaching back into the transaction.
+func (s *Store) commitLocalFromTx(t *Tx, ctx context.Context, ops []Op) (uint64, error) {
+	return s.commitLocalWith(ctx, t.generation, t.Snapshot, t.ID, ops, t.baselineLookup())
+}
+
+// commitLocalWith is the single bounded-local commit entry point.
+func (s *Store) commitLocalWith(ctx context.Context, generation, snapshot uint64, id string, ops []Op, baseline func([]byte) (uint64, bool)) (uint64, error) {
 	if err := validateCommand(Command{ID: id, Ops: ops}); err != nil {
 		return 0, err
 	}
-	r := &localCommitRequest{ctx: ctx, generation: generation, snapshot: snapshot, id: id, ops: ops, done: make(chan struct{})}
+	r := &localCommitRequest{
+		ctx: ctx, generation: generation, snapshot: snapshot, id: id, ops: ops,
+		done:     make(chan struct{}),
+		baseline: baseline,
+	}
 	for _, op := range ops {
 		r.bytes += len(op.Space) + len(op.Key) + len(op.Value) + 64
 	}
@@ -113,7 +135,7 @@ func (s *Store) commitLocalGroup(group []*localCommitRequest) {
 			// A fresh lookup per request observes the markers published by earlier
 			// requests in this same physical transaction, so within a group the group
 			// is serialized in selection order.
-			validator := newConflictValidator(r.snapshot, newViewChangeLookup(tx))
+			validator := newConflictValidator(r.snapshot, newViewChangeLookup(tx)).withBaseline(r.baseline)
 			if err := validator.validateOps(r.ops); err != nil {
 				r.err = err
 				continue

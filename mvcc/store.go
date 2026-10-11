@@ -25,6 +25,11 @@ const MaxValueBytes = storageengine.MaxValueBytes
 var ErrConflict = storageengine.ErrConflict
 var ErrClosed = storageengine.ErrClosed
 
+// ErrLocksAttached reports an attempt to attach a second, different lock manager to one store.
+// Two managers over one store would put the same key on two resources, which loses mutual
+// exclusion silently, so it is refused rather than merged.
+var ErrLocksAttached = errors.New("store already has a different lock manager attached")
+
 // ErrSequenceExhausted reports that no further commit sequence can be allocated.
 //
 // The last legal sequence is math.MaxUint64, and it is refused rather than wrapped
@@ -80,19 +85,23 @@ type Proposer interface {
 	Barrier(context.Context) error
 }
 type Store struct {
-	failure       sync.Mutex
-	fatal         error
-	generation    atomic.Uint64
-	gate          sync.RWMutex
-	db            *bolt.DB
-	path          string
-	groupMu       sync.Mutex
-	groupRunning  bool
-	groupQueue    []*localCommitRequest
-	groupBytes    int
-	apply         sync.Mutex
-	views         sync.Mutex
-	txns          *TransactionManager
+	failure      sync.Mutex
+	fatal        error
+	generation   atomic.Uint64
+	gate         sync.RWMutex
+	db           *bolt.DB
+	path         string
+	groupMu      sync.Mutex
+	groupRunning bool
+	groupQueue   []*localCommitRequest
+	groupBytes   int
+	apply        sync.Mutex
+	views        sync.Mutex
+	txns         *TransactionManager
+	// locks binds this store's transactions to the B02 lock manager. It is nil unless a caller
+	// attached one, which is the B01-only configuration: with no binding the store runs exactly
+	// as it did before, with no locking at all.
+	locks         *LockBinding
 	localSeq      uint64
 	localWAL      bool
 	writeSetLimit int64

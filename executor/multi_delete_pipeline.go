@@ -276,7 +276,7 @@ func (s orderedStage) Close() error { return s.values.Close() }
 //
 // Every operator writes through the statement child transaction, while the join above read the
 // parent statement snapshot.
-func (p multiDeletePlan) delete(ctx context.Context, write storageengine.Txn, session *Session) (uint64, error) {
+func (p multiDeletePlan) delete(ctx context.Context, write storageengine.Txn, session *Session, locks *dmlLockScope) (uint64, error) {
 	order, err := multiDeleteOrder(p.targets)
 	if err != nil {
 		return 0, err
@@ -289,6 +289,7 @@ func (p multiDeletePlan) delete(ctx context.Context, write storageengine.Txn, se
 				Target:  p.targets[target].definition,
 				Write:   write,
 				Session: session,
+				Locks:   locks,
 			}
 			operator.Input = physical.Source[DeleteCandidate](func(_ context.Context, yield physical.Yield[DeleteCandidate]) error {
 				return staged.forTarget(target, func(candidate multiDeleteCandidate) error {

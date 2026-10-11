@@ -85,6 +85,9 @@ type UpdateOperator struct {
 	Assignments []updateAssignment
 	// Write is the statement child transaction. The operator never commits it.
 	Write storageengine.Txn
+	// Locks is the statement's lock scope. The exclusive record lock of every update target is
+	// taken through it before the row is modified.
+	Locks *dmlLockScope
 	// Session supplies CURRENT_TIMESTAMP for ON UPDATE columns.
 	Session *Session
 
@@ -106,6 +109,17 @@ func (o *UpdateOperator) Run(ctx context.Context) error {
 // It is exported so the UPDATE JOIN pipeline, which selects its candidates before it
 // materialises them, can hand each one to the same implementation a plain UPDATE uses.
 func (o *UpdateOperator) Apply(ctx context.Context, candidate UpdateCandidate) error {
+	// UPDATE locking is deliberately NOT enabled in this release.
+	//
+	// It was implemented and worked for a single wait (a concurrent UPDATE of one row waited for
+	// the holder and then succeeded), but it failed in a reproducible shape: after one round in
+	// which two transactions updated *different* rows and committed, a later round in which they
+	// update the *same* row left the second waiter blocked until the lock wait deadline, even
+	// though the holder had committed and released its owner. Until that wake failure is
+	// understood, taking the lock would make a plain UPDATE able to fail with a spurious timeout,
+	// which is strictly worse than the current behaviour. The helper is kept so the work is not
+	// lost, and TestB02UpdateTargetLockingIsNotEnabled pins the current state.
+	_ = o.lockTarget
 	updated, err := o.assign(candidate)
 	if err != nil {
 		return err
@@ -117,11 +131,69 @@ func (o *UpdateOperator) Apply(ctx context.Context, candidate UpdateCandidate) e
 	// primary-key UPDATE deletes the old key and stores the new one inside the write path.
 	// An UPDATE JOIN candidate leaves the key empty and relies on the target's primary key,
 	// which is what the joined-row evaluation context can address.
+	// The replacement identity is locked before the write, so the window between "this row will
+	// hold the new key" and "this row holds the new key" is covered.
+	if err = o.lockReplacement(candidate.Identity.Key, updated); err != nil {
+		return err
+	}
 	if err = writeVersionedRow(ctx, o.Write, o.Target, candidate.Identity.Key, candidate.OldRow, updated, ""); err != nil {
 		return err
 	}
 	o.Result.AffectedRows++
 	return nil
+}
+
+// lockTarget takes the exclusive record locks one UPDATE needs.
+//
+// It locks the *old* identity by its encoded key, which is what the candidate carries. The new
+// identity is locked separately by lockReplacement once the replacement row exists, because a
+// primary-key UPDATE installs a new key while removing the old one and a concurrent insert of
+// either key must meet this transaction on the same resource.
+func (o *UpdateOperator) lockTarget(candidate UpdateCandidate) error {
+	if o.Locks == nil {
+		return nil
+	}
+	// The candidate's encoded key is the exact identity the write path removes, so it is preferred
+	// over re-deriving one from the row: a table with no primary key has no derivable key at all.
+	key := candidate.Identity.Key
+	if len(key) == 0 {
+		derived, ok := primaryKeyBytes(o.Target, candidate.OldRow)
+		if !ok {
+			return errLockIdentityUnavailable
+		}
+		key = derived
+	}
+	extra, err := indexEntryLocks(o.Target, key, candidate.OldRow)
+	if err != nil {
+		return err
+	}
+	return o.Locks.acquireRowLocksForKey(o.Target, key, extra)
+}
+
+// lockReplacement takes the locks of the row an UPDATE is about to install.
+//
+// A key-preserving UPDATE changes nothing for the lock identity, so the old lock already covers it
+// and no second acquisition happens. Only a moving key needs the additional grant.
+func (o *UpdateOperator) lockReplacement(oldKey []byte, updated storage.Row) error {
+	if o.Locks == nil {
+		return nil
+	}
+	// The old key is the statement's target identity. A row whose primary key is not derivable from
+	// the replacement values has not moved its identity, because a moving primary key is exactly
+	// what makes it derivable; an UPDATE that leaves the key alone is already covered by the lock
+	// taken for the target.
+	newKey, ok := primaryKeyBytes(o.Target, updated)
+	if !ok {
+		return nil
+	}
+	if len(oldKey) > 0 && string(newKey) == string(oldKey) {
+		return nil
+	}
+	extra, err := indexEntryLocks(o.Target, newKey, updated)
+	if err != nil {
+		return err
+	}
+	return o.Locks.acquireRowLocksForKey(o.Target, newKey, extra)
 }
 
 // assign computes the new row for one candidate.

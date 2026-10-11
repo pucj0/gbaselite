@@ -8,6 +8,13 @@ import (
 	"os"
 )
 
+// currentTerm reports the store's leader term, used to fence a replaced generation.
+//
+// The store does not own a term: the replication layer does. A local store therefore reports
+// zero, which the lock manager records as "no leader term was observed", and a replicated
+// engine calls ResetLockEpoch with its own term instead of going through Restore.
+func (s *Store) currentTerm() uint64 { return 0 }
+
 // Snapshot holds a consistent disk view. Payload is streamed, never buffered as
 // a whole database. Writes may wait for a bbolt mapping growth until Close.
 type Snapshot struct {
@@ -76,6 +83,12 @@ func (s *Store) Restore(reader io.Reader) error {
 	// replaced generation are invalid and must not keep pinning history for the
 	// new one.
 	s.txns.Reset()
+	// The lock manager moves to the same generation in the same step as the registry, so the two
+	// cannot disagree about which transactions are still live. It wakes every pending waiter with
+	// one definite status and drops owners the registry just discarded, which is what keeps a
+	// replaced generation from leaving a grant behind that nobody will release and a waiter
+	// blocked on a transaction that no longer exists.
+	s.ResetLockEpoch(s.currentTerm())
 	if err = s.db.Close(); err != nil {
 		return err
 	}
