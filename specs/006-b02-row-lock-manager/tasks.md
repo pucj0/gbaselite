@@ -278,7 +278,14 @@ gap/new-key写和完整SQL发布仍依赖后续phase，不能将US1当作完整B
       Gap 阻止范围内插入、Gap 不阻止范围外插入（双向）、同间隙不同位置并发、
       II/II 兼容、相邻与重叠 7 例（含四种端点相接组合与单点重叠，并断言**对称性**）、
       空区间与零长度、空表/最小键之前/最大键之后/supremum、跨表跨索引身份隔离。
-- [ ] T021 [P] [US2] 在 `lockmanager/insert_intention_test.go`（新）测试II/II、Gap/II双方有向冲突、samekey X reservation及原子Next-Key；验收：不同位置并行、同key互斥；FR-004/005/006/007。
+- [x] T021 [P] [US2] 在 `lockmanager/insert_intention_test.go`（新）测试II/II、Gap/II双方有向冲突、samekey X reservation及原子Next-Key；验收：不同位置并行、同key互斥；FR-004/005/006/007。
+      **已完成（第六轮）**：`lockmanager/insert_intention_test.go`（11 个顶层测试 / 40 个子测试）覆盖
+      II/II 对角（同键与不同键）、Gap/II 双向 7 组端点、同键 X reservation（X↔II 双向、REENTRANT 无自等）、
+      空索引 / 全域 Gap / 无界区间 / supremum、端点开闭与相邻 Gap、同一 Gap 内并发插入（无 Gap 时并行、
+      有 Gap 时按 FIFO）、被保护区间内插入必须等待（WAIT + pending 索引 + 图 + Stats）、
+      队列 / 超时（FakeClock）/ Cancel / 死锁图与 victim 撤销、原子 bundle 与 namespace 隔离。
+      说明：同键 II/II"都获授"在 manager 层**不应可达**——插入声明必然含 record X，两个 X 同键互斥，
+      因此该对角只在纯 `componentsConflict` 层断言；这是"II 必须与其 record X 同 bundle"成为结构约束后的正确语义。
 
 ### Implementation
 - [x] T022 [US2] 实现有界interval overlap/membership索引在 `lockmanager/interval.go`（新）；依赖T020；验收：不按相同bounds哈希冒充重叠，删除邻居不丢grant；FR-003/006/027。
@@ -293,10 +300,39 @@ gap/new-key写和完整SQL发布仍依赖后续phase，不能将US1当作完整B
       公平队列与死锁图走同一 `componentsConflict`，因此边界感知规则自动进入加边与检测
       （`lockmanager` 全部测试含死锁/公平性测试全绿）。
       **未做**：Next-Key 的显式组合构造器（目前靠 bundle 原子性把 record 与 gap 组合）与专属测试。
-- [ ] T024 [US2] 在 `mvcc/locking.go`、`mvcc/transaction.go` 对真正missing/tombstone后的Put自动获取II+X；验收：raw插入遵守区间，overlay delete/reinsert分类正确，stage/apply不等锁；FR-005/014/026/029。
-- [ ] T025 [US2] 建立lock access plan/proof/fallback在 `executor/lock_plan.go`（新）、`executor/access_plan.go`、`executor/range_access.go`；验收：完整uniquehit record-only、missinggap、partialkey range、legacywhole-domain，EXPLAIN标注；FR-015/027/028。
-- [ ] T026 [US2] 在 `executor/lock_plan.go`、`executor/secondary_index.go` 复用PK/UNIQUE/secondary字节编码与共同row identity；验收：NULL不reservation、collation等值同resource、覆盖读也锁row；FR-015/016/026/027。
-- [ ] T027 [US2] 在 `storageengine/mvccadapter/locking_range_test.go`、`executor/lock_plan_test.go`（新）验证SQL计划与rawnamespace同域及旧/新编码fallback；验收：无访问路径绕过，全部gapfixtures通过；FR-003..006/015/016/026/027，SC-001。
+- [x] T024 [US2] 在 `mvcc/locking.go`、`mvcc/transaction.go` 对真正missing/tombstone后的Put自动获取II+X；验收：raw插入遵守区间，overlay delete/reinsert分类正确，stage/apply不等锁；FR-005/014/026/029。
+      **已完成（第六轮）**：`Tx.AcquireRawWriteLock` 先按**本事务自身视图**（`read`，含 staged 与祖先 overlay）
+      判定：键存在 → 仅 Record X；缺失/tombstone（含本事务 Delete 后重插）→ **II + 同键 Record X 同 bundle**。
+      取锁在 `bufferWrite` 之前（等待期间不持有 bbolt 写事务），等待返回后 `checkOpen` 重校验根事务存活，
+      失效事务不再暂存。测试：`mvcc/raw_locking_test.go`（区间内插入等待、区间外不等待、已存在键只取记录锁、
+      Delete 后重插按插入分类、缺失键 Delete 同声明、组件成对、generation 变化后拒绝暂存且无 staged 残留）；
+      SQL 侧见 T025/T027。
+- [x] T025 [US2] 建立lock access plan/proof/fallback在 `executor/lock_plan.go`（新）、`executor/access_plan.go`、`executor/range_access.go`；验收：完整uniquehit record-only、missinggap、partialkey range、legacywhole-domain，EXPLAIN标注；FR-015/027/028。
+      **已完成（第六轮，计划层）**：`executor/lock_plan.go` 只从 planner 已选访问路径分类
+      （`none`/`record-only`/`insertion`/`range`/`whole-domain`/`refused`），`rangeIsProven` 拒绝
+      "无 bounds 的 ordered"冒充 range，无法分类时返回 `ErrLockPlanUnavailable`（拒绝而非静默不加锁），
+      whole-domain 给出双 unbounded Gap；`EXPLAIN Extra` 追加 `Locks: <kind> (<reason>)`，锁定读标注
+      "not executed yet"（锁定读执行属 Phase 5）；INSERT/REPLACE/ODKU 的新 row/新 index entry 已实际
+      申请插入声明（missing-gap 的生产者）。测试：`executor/lock_plan_test.go`
+      （8 个分类用例 + 组件构造 + 模式映射 + 真实 SQL 区间内/外插入端到端）。
+      **未做**：DML 范围候选按 proven interval 加锁、锁定读（FOR UPDATE/SHARE）执行——前者属后续 US3/DML
+      范围接线，后者属 Phase 5；本任务的验收（计划分类 + EXPLAIN 标注）已满足，但**不得**据此宣称
+      "SQL 范围查询已加 gap 锁"。
+- [x] T026 [US2] 在 `executor/lock_plan.go`、`executor/secondary_index.go` 复用PK/UNIQUE/secondary字节编码与共同row identity；验收：NULL不reservation、collation等值同resource、覆盖读也锁row；FR-015/016/026/027。
+      **已完成（第六轮）**：复用既有编码器（未新建第二套）：PK row = `sqllayout.Rows(id)` + `sqlPrimaryKey`；
+      unique = `sqllayout.UniqueIndex` + `storage.IndexValueKey`（**无 owner 后缀**，NULL 不 reservation，
+      collation 等值同键）；secondary = `sqllayout.SecondaryIndex` + `secondaryEntry`（**有 owner 后缀**）。
+      证据：`executor/lock_identity_test.go`、`storageengine/mvccadapter/locking_identity_test.go`
+      （8 项，含字节级比对 + 变更对照：给期望键加一字节会令 6 个用例失败，证明断言有效；
+      两行同 unique 值不同主键在**同一资源**上相遇；raw 写与 SQL 身份互不绕过）。
+- [x] T027 [US2] 在 `storageengine/mvccadapter/locking_range_test.go`、`executor/lock_plan_test.go`（新）验证SQL计划与rawnamespace同域及旧/新编码fallback；验收：无访问路径绕过，全部gapfixtures通过；FR-003..006/015/016/026/027，SC-001。
+      **已完成（第六轮）**：`storageengine/mvccadapter/locking_range_test.go`（区间只挡区间内插入、
+      同一区间内不同键插入并行、Next-Key bundle 原子无部分授予、被取消的区间等待零残留且不释放持有者区间）
+      与 `executor/lock_plan_test.go` 的真实 SQL 端到端（区间内 INSERT 等待并被释放唤醒、区间外不咨询
+      等待决策），加上 `mvcc/raw_locking_test.go` 的 raw 侧与 `mvcc/locking_lifecycle_test.go` 的
+      "scope 关闭后写入被拒且无 staged 残留"。用户提出的 8 项逐条覆盖见 §第六轮；
+      **未做**：旧/新编码 fallback 的端到端 fixture（计划层按 `whole-domain` 分类与拒绝已测，
+      但"legacy 编码表上的真实 SQL 加锁"没有生产者，故不宣称）。
 
 ## Phase 5: US3 锁定Current Read SQL (T028–T036, P1)
 **Goal**: 新读能力与普通snapshot分离；独立两session读取可验收。
@@ -880,6 +916,63 @@ absent 的 baseline=0 与"锁授权的正是它观察到的事实"）、`mvcc/lo
 `CGO_ENABLED=1` 时 `cgo: C compiler "gcc" not found`；gcc/clang/zig/cl 均不存在、无网络安装）。
 本轮**不伪报 race 通过**，并把 `./lockmanager` 加入 `.github/workflows/test.yml` 的 Linux race 步骤
 （新增 "Lock manager race regression"），由 CI 在 Ubuntu runner 上提供真实 race 证据。
+
+### 第六轮（US2 区间与插入保护：T021/T024/T025/T026/T027）证据与任务口径
+
+证据文件 `.tmp/b02r6-fix-report.md`：本轮发现的关键缺陷（区间身份不可达）、语义决定、五项任务逐条
+验收、命令与退出码、race 限制、遗留缺陷与 Phase 5 判断。辅助原始输出：`.tmp/b02r6-lockmanager.txt`、
+`.tmp/b02r6-mvcc.txt`、`.tmp/b02r6-executor.txt`、`.tmp/b02r6-adapter.txt`、`.tmp/b02r6-affected.txt`、
+`.tmp/b02r6-gotest-all.txt`、`.tmp/b02r6-acceptance.txt`、`.tmp/b02r6-race.txt`。
+
+**1. 本轮发现的最重要缺陷：区间规则在 manager 层不可达（已修复）**。
+`componentsConflict`/`gapBlocksInsertion` 是纯函数，而 `lockTable` 以 `Identity.ResourceKey()` 为键、
+`inspectLocked` 只查请求组件自身的表项；`ResourceKey` 当时把 bounds 编入 key，于是 `(a,z)` 的 Gap 与
+"在 m 插入"的 II 落在**两个不同表项**，manager 永远不会比较它们 ⇒ FR-003/FR-004/FR-005 在生产路径上
+**完全无效**（T020/T021 风格测试之所以"通过"，是因为它们直接调用纯函数）。修复：interval 型身份
+（`Mode.Interval()`：Gap 与 II）的 `ResourceKey` 改为 `(Generation, Space)` 域键（bounds/插入键不进 key），
+同一 namespace 的 Gap/II 共用一个队列，逐 claim 用 bounds/插入键判定包含。修复后
+`TestZZ…`（临时探针，已删除）与 T021 的 40 个子测试都证实 Gap↔II 双向可达。身份描述同步进
+`contracts/lock-manager.md §Identity and atomicity` 与 `data-model.md`，并新增
+`resource_test.go: TestB02InsertionBundleKeepsBothHalves` 锁定"II 与 X 是两个资源、dedupe 不得合并"。
+
+**2. 插入声明成为结构约束（而不是约定）**。由于 II 以域为身份、record X 以精确键为身份，bare II 与
+bare X 不会相遇；FR-005 规定同键竞争由 record X / 唯一值 reservation 决定。因此 `ValidateBundle`
+拒绝未与同键 Record X 同 bundle 的 II（新增 `ErrInsertIntentionRequiresRecord` 与导出
+`MissingRowClaims`），任何调用者都无法只取一半：只取 record 会穿过区间，只取 II 不会与同键写者互斥。
+`contracts/lock-manager.md §Interval / insertion` 与 `contracts/sql-locking.md` 已同步。
+
+**3. 五项任务验收**：
+- **T021**（已完成）：`lockmanager/insert_intention_test.go` 11 个顶层测试 / 40 个子测试，覆盖 II/II、
+  Gap/II 双向端点、同键 X reservation、空索引/全域/supremum/无界/相邻区间、同 Gap 内并发插入、
+  被保护区间内必须等待、队列/超时/Cancel/死锁图。
+- **T024**（已完成）：raw `Put`/`Delete` 按本事务视图分类取 II+X；存在键只取 X；Delete 后重插按插入；
+  取锁先于暂存；等待后重校验事务存活。
+- **T025**（已完成，计划层）：`executor/lock_plan.go` 六类计划 + `rangeIsProven` + 拒绝而非静默不加锁 +
+  whole-domain 显式 fallback + `EXPLAIN Extra` 标注（含"not executed yet"）；INSERT 侧实际申请插入声明。
+  **未做**：DML 范围候选与锁定读执行（后者 Phase 5）。
+- **T026**（已完成）：PK/UNIQUE/secondary/composite/NULL/collation 身份与写路径字节一致，唯一值
+  reservation 无 owner 后缀、secondary entry 有 owner 后缀；两行同值不同主键在同一资源相遇；
+  raw 与 SQL 身份互不绕过；变更对照证明字节断言有效。
+- **T027**（已完成）：用户列出的 8 项逐条证据——
+  ① 区间内插入等待、区间外不等待（`TestT025SQLInsertRespectsAProtectedRange`，真实 SQL session）；
+  ② Gap/Next-Key 与 II 真实冲突（`TestT027RangeBlocksInsertionsInsideItOnly`、`TestT027RangeBundleIsAtomic`）；
+  ③ 同 Gap 内不同键插入并行（`TestT027InsertionsAtDifferentKeysInsideOneRangeDoNotSerialise`）；
+  ④ raw 与 SQL 锁定路径同资源（T026 的 adapter/executor 双向用例）；
+  ⑤ 主键/唯一/二级索引访问路径正确（T026 的身份用例 + T025 的计划分类用例）；
+  ⑥ Rollback/Timeout/Cancel/Epoch Reset 无泄漏（`TestT027CancelledRangeWaitLeavesNothingBehind`、
+  `mvcc/raw_locking_test.go` 的 `requireIdle`、T018 的 epoch 用例）；
+  ⑦ 等待期间 root 终止不得继续暂存（`TestB02RawWaitRefusesToStageAfterTheGenerationMoved`）；
+  ⑧ scope 关闭与 grant 竞争时失效语句不得继续（`TestB02JoinerScopeCloseEndsOnlyTheJoinersWait`、
+  `TestB02ClosingAnEnclosingScopeCancelsAChildsQueuedRequest` 的"关闭后写入被拒且无 staged 残留"）。
+  **未做**：legacy/旧编码表上的真实 SQL 加锁 fixture（无生产者）。
+
+**4. 既有测试的同步（断言对象随更正确的语义变化）**：`lockmanager/resource_test.go` 的隔离用例改为
+"标签不改变身份"；T026 的捕获夹具 `t026Pick` 改为按"非 II 的等值组件"计数并**新增**
+`t026RequirePairedIntentions`（比忽略 II 更强）；`resource_test.go` 新增插入 bundle 的 dedupe 用例。
+
+**5. race**：本机仍无 C 工具链（`-race requires cgo`；`cgo: C compiler "gcc" not found`），
+**不伪报 race 通过**；`.github/workflows/test.yml` 的 Linux race 步骤（含上一轮加入的 `./lockmanager`）
+是本轮 race 证据的唯一来源，CI 未执行前不得写成通过。
 
 ### 本轮证据文件
 | 文件 | 内容 |

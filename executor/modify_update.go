@@ -155,7 +155,8 @@ func (o *UpdateOperator) lockTarget(candidate UpdateCandidate) error {
 		}
 		key = derived
 	}
-	extra, err := indexEntryLocks(o.Target, key, candidate.OldRow)
+	// The old row's entries are being removed, not created, so this half takes no insertion claim.
+	extra, err := indexEntryLocks(o.Target, key, candidate.OldRow, false)
 	if err != nil {
 		return err
 	}
@@ -185,7 +186,9 @@ func (o *UpdateOperator) lockReplacement(oldKey []byte, updated storage.Row) err
 	if len(newKey) == 0 {
 		return nil
 	}
-	extra, err := indexEntryLocks(o.Target, newKey, updated)
+	// The entry the replacement installs is a new key in its index, so this half carries the
+	// insertion claim: a range another transaction protects over that index must block it.
+	extra, err := indexEntryLocks(o.Target, newKey, updated, true)
 	if err != nil {
 		return err
 	}

@@ -325,6 +325,59 @@ func TestB02DedupeUsesStrongestModeAndCanonicalOrder(t *testing.T) {
 	}
 }
 
+// TestB02InsertionBundleKeepsBothHalves pins the identity rule that makes an insertion claim atomic.
+//
+// An insert intention and the exclusive record lock of its own key are two different resources even
+// though they name the same key and namespace: the intention is keyed by the interval domain (its
+// conflict is decided by containment against a Gap) and the record lock by the exact record key
+// (its conflict is decided by the record matrix). Dedupe must therefore keep both. If it collapsed
+// them into one stronger mode, the intention would vanish before it ever reached the lock table and
+// a held Gap would block nothing — the exact bypass FR-003/FR-005 forbid — while the bundle would
+// still look valid.
+func TestB02InsertionBundleKeepsBothHalves(t *testing.T) {
+	intention := ResourceRef{Identity: Identity{Kind: KindRecord, Mode: ModeInsertIntention, Space: "index/t1/u1", Key: []byte("m")}}
+	record := ResourceRef{Identity: Identity{Kind: KindRecord, Mode: ModeX, Space: "index/t1/u1", Key: []byte("m")}}
+	if intention.ResourceKey() == record.ResourceKey() {
+		t.Fatal("the insertion intention and the record lock share one resource key; one of the two claims would be dropped by dedupe")
+	}
+	deduped := DedupeResourceRefs([]ResourceRef{intention, record})
+	if len(deduped) != 2 {
+		t.Fatalf("dedupe kept %d components of an insertion bundle, want 2: %+v", len(deduped), deduped)
+	}
+	var modes []Mode
+	for _, component := range deduped {
+		modes = append(modes, component.Mode)
+	}
+	if !containsMode(modes, ModeInsertIntention) || !containsMode(modes, ModeX) {
+		t.Fatalf("an insertion bundle lost a claim: modes = %v", modes)
+	}
+
+	// The intention is keyed by the interval domain, so it meets every Gap of its namespace: the
+	// gap decides by containment, and the same domain key is what puts them in one queue.
+	gap := ResourceRef{Identity: Identity{Kind: KindInterval, Mode: ModeGap, Space: "index/t1/u1", Lower: []byte("a"), Upper: []byte("z")}}
+	otherGap := ResourceRef{Identity: Identity{Kind: KindInterval, Mode: ModeGap, Space: "index/t1/u1", Lower: []byte("b"), Upper: []byte("y"), LowerInclusive: true, UpperInclusive: true}}
+	if intention.ResourceKey() != gap.ResourceKey() || gap.ResourceKey() != otherGap.ResourceKey() {
+		t.Fatal("interval-type claims of one namespace must share the interval domain key")
+	}
+	if !componentsConflict(intention, gap) || !componentsConflict(gap, intention) {
+		t.Fatal("an intention inside a gap must conflict in both directions")
+	}
+	outside := ResourceRef{Identity: Identity{Kind: KindRecord, Mode: ModeInsertIntention, Space: "index/t1/u1", Key: []byte("zz")}}
+	if componentsConflict(outside, gap) || componentsConflict(gap, outside) {
+		t.Fatal("an intention outside a gap must be compatible in both directions")
+	}
+}
+
+// containsMode reports whether one mode appears in a list.
+func containsMode(modes []Mode, want Mode) bool {
+	for _, mode := range modes {
+		if mode == want {
+			return true
+		}
+	}
+	return false
+}
+
 // TestB02RefBytesAccountingIsExact pins the accounting unit: copied identity bytes plus
 // one fixed constant per reference.
 func TestB02RefBytesAccountingIsExact(t *testing.T) {

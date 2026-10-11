@@ -118,11 +118,32 @@ func (id Identity) Clone() Identity {
 // FR-026 forbids. The labels still travel on the identity for the table-intent
 // prerequisite, the namespace bindings and diagnostics; they are labels, not identity.
 //
-// Mode is deliberately excluded too: a mode is a request, not part of the identity.
+// An interval-type identity — a Gap or an Insert Intention — is keyed by its DOMAIN:
+// (Generation, Space), with no bounds and no insertion key in the key. Whether a gap blocks an
+// insertion is a question about the actual bounds and the actual insertion point, so it cannot be
+// answered by comparing keys: two components that have to meet (a gap over `(a,z)` and an
+// intention to insert `m`) have completely different bounds, and putting them in different keys
+// would put them in different tables, where the manager never compares them at all and the gap
+// would block nothing. Keying the whole interval domain together is what makes
+// componentsConflict's containment rule reachable, and it is why two gaps with different bounds
+// are two claims in one queue rather than two resources. Record identity stays exact: a record
+// request is still (Generation, Record, Space, Key), so an interval domain and the rows beside it
+// never collide.
+//
+// Mode is deliberately excluded too: a mode is a request, not part of the identity. That is what
+// lets one entry hold both gap claims and insertion-intention claims and decide between them by
+// containment.
 func (id Identity) ResourceKey() string {
 	var b bytes.Buffer
 	b.Grow(len(id.Space) + len(id.Key) + len(id.Lower) + len(id.Upper) + 64)
 	writeUint64(&b, id.Generation)
+	if id.Mode.Interval() {
+		// The interval domain: generation, the interval kind code and the namespace. No bounds, no
+		// key.
+		b.WriteByte(kindCode(KindInterval))
+		writeField(&b, id.Space)
+		return b.String()
+	}
 	b.WriteByte(kindCode(id.Kind))
 	writeField(&b, id.Space)
 	writeField(&b, string(id.Key))

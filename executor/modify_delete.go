@@ -126,7 +126,9 @@ func (o *DeleteOperator) lockTarget(candidate DeleteCandidate) error {
 		}
 		key = derived
 	}
-	extra, err := indexEntryLocks(o.Target, key, candidate.OldRow)
+	// A DELETE removes entries; it never creates one. Passing false therefore keeps the removal
+	// free of insertion claims: an interval that only blocks new keys must not hold up a delete.
+	extra, err := indexEntryLocks(o.Target, key, candidate.OldRow, false)
 	if err != nil {
 		return err
 	}

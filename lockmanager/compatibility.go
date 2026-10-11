@@ -93,13 +93,21 @@ func ValidateComponent(ref ResourceRef) error {
 }
 
 // ValidateBundle checks every component of one atomic bundle and the bundle-level
-// intention prerequisite.
+// prerequisites.
 //
-// The bundle is validated as a whole because the prerequisite is a property of the
-// bundle, not of a component: a record X component is legal exactly when the same
-// bundle pins an IX on the same table, or a namespace binding supplies that table. A
-// caller therefore cannot acquire a record lock and only afterwards remember its table
-// intention, which is what keeps the table intention part of the same atomic grant.
+// The bundle is validated as a whole because the prerequisites are properties of the bundle,
+// not of a component:
+//
+//   - a record X component is legal exactly when the same bundle pins an IX on the same table,
+//     or a namespace binding supplies that table. A caller therefore cannot acquire a record lock
+//     and only afterwards remember its table intention, which is what keeps the table intention
+//     part of the same atomic grant;
+//   - an Insert Intention component is legal exactly when the same bundle also takes the record
+//     lock of its own key. The intention is the claim on an insertion *position* and is what a
+//     covering Gap blocks; the record lock is the row claim and, per FR-005, it is what decides
+//     same-key contention. Requiring both in one bundle is what makes "an insertion claim" a single
+//     indivisible request: a bare intention could otherwise be granted past a row another owner
+//     already holds, and a bare record lock could walk through another owner's gap.
 //
 // A record component with no table identity at all has no table to intend and is
 // therefore exempt: an unbound raw namespace reaches this package before the adapter
@@ -117,7 +125,42 @@ func ValidateBundle(components []ResourceRef, bindings *Bindings) error {
 	if len(MissingTableIntents(components, bindings)) > 0 {
 		return ErrTableIntentRequired
 	}
+	if len(MissingRowClaims(components)) > 0 {
+		return ErrInsertIntentionRequiresRecord
+	}
 	return nil
+}
+
+// MissingRowClaims reports the insertion keys whose record lock is absent from the bundle.
+//
+// It is the second bundle-level prerequisite: every Insert Intention must be accompanied by the
+// exclusive record lock of the same key in the same namespace. The pairing is what keeps the two
+// answers of an insertion in one atomic request — the intention answers "may I insert here at all"
+// and the record lock answers "is this key already claimed" — so a caller cannot request only the
+// half it finds convenient. The returned keys are the insertion keys, in bundle order, so a caller
+// can name what is missing.
+func MissingRowClaims(components []ResourceRef) [][]byte {
+	claimed := make(map[string]bool, len(components))
+	for _, component := range components {
+		if component.Kind != KindRecord || component.Mode != ModeX {
+			continue
+		}
+		claimed[component.Space+"\x00"+string(component.Key)] = true
+	}
+	var missing [][]byte
+	seen := make(map[string]bool, len(components))
+	for _, component := range components {
+		if component.Kind != KindRecord || component.Mode != ModeInsertIntention {
+			continue
+		}
+		match := component.Space + "\x00" + string(component.Key)
+		if claimed[match] || seen[match] {
+			continue
+		}
+		seen[match] = true
+		missing = append(missing, component.Key)
+	}
+	return missing
 }
 
 // MissingTableIntents reports the table IDs whose required intention is absent from

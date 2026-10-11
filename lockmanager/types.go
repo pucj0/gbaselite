@@ -55,6 +55,12 @@ var (
 	// ErrInvalidResource because the component itself can be well formed: what is
 	// missing is the containing bundle's intention.
 	ErrTableIntentRequired = errors.New("record lock requires a table intention in the same bundle")
+	// ErrInsertIntentionRequiresRecord reports an Insert Intention whose bundle does not also
+	// take the exclusive record lock of the same key. The two are one insertion claim: the
+	// intention is what a covering Gap blocks and the record lock is what decides same-key
+	// contention, so a bundle carrying only half of it is refused rather than granted with a
+	// bypass.
+	ErrInsertIntentionRequiresRecord = errors.New("insert intention requires the record lock of its own key in the same bundle")
 	// ErrUnsupportedMode reports a mode outside the B02 set, such as a table S/X or
 	// SIX. It fails closed instead of being approximated by an intention lock.
 	ErrUnsupportedMode = errors.New("lock mode is not supported by B02")

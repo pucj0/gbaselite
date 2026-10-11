@@ -36,8 +36,15 @@ DEADLOCK_VICTIM/INVALIDATED/RESOURCE_REJECTED。所有终态唯一、不可重�
 创建者的 context 结束/scope 关闭/root 终态/epoch reset 撤销整个 request 并唤醒全部等待者。
 详见 contracts/lock-manager.md §共享等待。
 身份：record = `(Generation, Space, Key)`，interval domain = `(Generation, Space)`；SQL 的 TableID/IndexID
-是标签，不参与身份（否则 raw 写与 SQL 锁会成为两个资源）。原始写入口（`Txn.Put`/`Delete`）在暂存前取该
-key 的 Record X，`Get` 仍是快照读；缺失 key 的 Gap/Insert Intention 属 Phase 4/T024。
+是标签，不参与身份（否则 raw 写与 SQL 锁会成为两个资源）。**interval 型身份（Gap 与 Insert Intention）
+以 domain 为 `ResourceKey`**：同一 namespace 的所有 Gap/II 共用一个队列，逐 claim 按 bounds/插入键判定
+包含关系；bounds 若进 key，Gap 与它要挡的 II 会落在两个表项而永不比较（FR-003/005 不可达）。
+**插入声明 = II + 同键 record X，必须同 bundle**（`ErrInsertIntentionRequiresRecord`/`MissingRowClaims`）：
+II 回答"插入位置是否被 Gap 保护"，record X 回答"键是否已被占用"（FR-005）。
+原始写入口（`Txn.Put`/`Delete`）在暂存前取该 key 的声明：键存在时只取 Record X，键缺失/tombstone
+（含本事务自身 Delete 后重插）取 II + Record X；等待返回后重新校验事务存活，失效事务不再暂存。
+SQL 侧 INSERT/UPDATE 的新 row/新 entry 同样取 II + Record X（`executor/lock_plan.go` 的分类与
+`insertionIntention`）。`Get` 仍是快照读。
 Grant 字段：GrantID、OwnerRootID、OriginScopeID、Generation/Term、Components、GrantedAt。
 Grant 身份属于**产生它的那个 request**：GrantID 是该 request 完成时的 id（重入请求为 0）、
 OriginScopeID 是该 request 的 scope（不是 RequestID）、Components 恰好是该 request 取得或 adopt 的

@@ -34,6 +34,25 @@ SET SESSION innodb_lock_wait_timeout = 50;
 ORDER/LIMIT只规定结果，实际examined records和access interval可能锁得更宽。反向扫描不改变
 interval成员。通过EXPLAIN/diagnostics可辨别record-only、range与fallback。
 
+### 已实现的计划分类（`executor/lock_plan.go`，本轮）
+计划**只从 planner 已选择的访问路径**推导（`sqlAccessPlan` 的 kind/index/bounds/covering），
+绝不从 WHERE 文本猜区间；分类为：
+
+| kind | 触发 | 语义 |
+|---|---|---|
+| `none` | 无锁定子句 | 普通快照读，不取锁 |
+| `record-only` | `const`/`unique` 完整等值命中 | 行（及索引 entry 与共同 row）本身就是全部保护；目标缺失时另取插入声明 |
+| `insertion` | 语句可能创建键（INSERT/REPLACE/ODKU 的 row 与每个新 index entry） | II + 同键 record X，同 bundle |
+| `range` | 已证明 bounds 的 ordered/nonunique/partial prefix | proven interval + 访问到的每个 key |
+| `whole-domain` | ALL、无 bounds 的 ordered、legacy/不完整编码 | **显式 fallback**：整个 namespace 的 Gap + 访问到的 records |
+| `refused` | 访问类型无法分类 | 返回 `ErrLockPlanUnavailable`，**拒绝**而不是静默不加锁 |
+
+`EXPLAIN` 在 `Extra` 追加 `Locks: <kind> (<reason>)`；fallback 会写明"whole namespace protected"，
+锁定读的计划会额外标注"not executed yet: the statement still reads its snapshot"——锁定读本身仍是
+Phase 5 范围，标注不得被读成"引擎已经这样加锁"。`rangeIsProven` 拒绝"无 bounds 的 ordered"伪装成
+range；`intervalComponent` 对 whole-domain 给出双 unbounded 的 Gap，使"保护全部"与"不保护"在
+组件层面可区分。
+
 ## DML behavior
 INSERT VALUES/SET/SELECT均经InsertOperator；INSERT SELECT source仍parent snapshot。
 目标heap/PK、新unique/secondaryentries先获II+X再检查latest/overlay约束。UNIQUE含NULL不reservation，

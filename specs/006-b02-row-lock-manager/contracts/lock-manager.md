@@ -5,6 +5,14 @@
 
 ## Identity and atomicity
 Record identity = `(Generation, Space, Key)`；interval conflict domain = `(Generation, Space)`。
+**interval 型身份（Gap 与 Insert Intention）以 domain 作为 `ResourceKey`**：不含 bounds、不含 II 的
+插入键。理由不是省空间而是可达性——"这个 Gap 是否挡住这次插入"取决于实际 bounds 与实际插入点，
+只能由区间包含判定回答；若把 bounds 编入 key，一个 `(a,z)` 的 Gap 与一次插入 `m` 会落在**两个不同的
+资源表项**里，manager 永远不会比较它们，Gap 就什么也挡不住（实现与一致性由
+`lockmanager/resource_test.go: TestB02InsertionBundleKeepsBothHalves` 断言）。因此同一 namespace 的
+所有 Gap/II 共用一个队列，逐 claim 用 bounds 判定；同一 namespace 内两个不同 bounds 的 Gap 是同一
+表项上的两条 claim，而不是两个资源（与 `IntervalKey` 的语义一致）。Gap/Gap 仍兼容，Gap 与 record
+仍相互独立（Gap 不挡 record），record 身份保持精确的三元组，所以 interval domain 不会与旁边的行冲突。
 Table intent identity = `(Generation, immutable TableID)`。SQL TableID/IndexID 标签来自现有 metadata，
 是**标签而不是身份**：manager 不解析 SQL key，`ResourceKey` 也不把它们编入 record/interval 身份。
 namespace（`row/<table>`、`index/<table>/<name>`、`secondary/<table>/<name>`）本身就是 table/index 的
@@ -13,6 +21,14 @@ namespace（`row/<table>`、`index/<table>/<name>`、`secondary/<table>/<name>`�
 `mvcc/raw_locking_test.go` 断言）。标签仍随身份传递，用于 intent 前置条件、namespace binding 与诊断。
 未绑定的 raw namespace 使用 namespace intent，绑定的 row/index namespace沿用 TableID；中立
 NamespaceBinding 在 adapter 发布/验证，冲突绑定报错误，计入预算，generation reset时清理。
+
+**插入声明（insertion claim）= II + 同键 record X，必须同 bundle**。`ValidateBundle` 对没有配对
+record X 的 II 返回 `ErrInsertIntentionRequiresRecord`（`MissingRowClaims` 列出缺配对的键）。
+两半回答两个不同问题：II 回答"这个插入位置是否被别人的 Gap 保护"（FR-003/FR-005），record X 回答
+"这个键是否已被占用"（FR-005：同键竞争由 record X / 唯一键 reservation 决定）。因为 II 以 domain 为
+身份、record X 以精确 key 为身份，bare II 与 bare X 落在不同表项；把配对设为结构约束后，任何调用者
+都不可能只取一半：只取 record 会穿过区间，只取 II 不会与同键写者互斥。`MissingRowClaims` 与
+`ErrInsertIntentionRequiresRecord` 是这条规则的单点实现。
 
 Acquire 接收 root handle、scope、多个 LockComponents、ctx；返回 GrantToken 或中立错误。
 NewOwner 绑定 B01 rootID/readTS/epoch；NewScope/CloseScope 管理请求来源。ReleaseRoot 仅由 owner
@@ -44,6 +60,9 @@ Table S/X、SIX、自动 table escalation 不在 B02；不能由此表宣称支�
 | Insert Intention | N 若持有区间含插入点；否则 Y | Y |
 
 II 同位置也兼容；实际同键 INSERT 必须再申请 record X reservation，不能仅凭 II 插入。
+**实现方式（本轮确定）**：II 与 record X 必须在同一 bundle（`ValidateBundle` 拒绝未配对的 II），
+因此"仅凭 II 插入"在结构上不可能；矩阵中 II↔X 的 N 由 bundle 里那半 record X 落实。bare II 与
+bare X 因身份不同而不会相遇，这正是把配对设为约束的原因。
 Gap 与已存在 row Record S/X 兼容：Gap 抑制创建 key，不保护现有值。缺失 key 的 X reservation
 要创建 key 时必须 II；不允许通过 `Put` 先拿 X 再绕过 Gap。
 Next-Key S/X 的 record 部分遵守 Record matrix，gap 部分遵守 interval matrix，整体按最严格结果。

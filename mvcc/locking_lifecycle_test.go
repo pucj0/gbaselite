@@ -223,6 +223,17 @@ func TestB02ClosingAnEnclosingScopeCancelsAChildsQueuedRequest(t *testing.T) {
 	if pending := f.pendingOf(parent.ID); pending != 0 {
 		t.Fatalf("%d requests survived the enclosing scope's close", pending)
 	}
+	// A discarded statement must not be able to keep working either: every write entry point takes
+	// its claim from the transaction's own scope, so with the scope closed the write is refused and
+	// nothing can be staged for a statement that no longer exists. Without this the statement could
+	// write unprotected and only be stopped later, which is the "an invalid statement must not keep
+	// executing" half of the lifecycle contract.
+	if err := child.Put("index/PRIMARY", []byte("after-close"), []byte("value")); !errors.Is(err, lockmanager.ErrScopeUnknown) {
+		t.Fatalf("a write through a closed scope returned %v, want ErrScopeUnknown", err)
+	}
+	if _, found, err := child.readOp("index/PRIMARY", []byte("after-close")); err != nil || found {
+		t.Fatalf("a refused write left staged state: found=%v err=%v", found, err)
+	}
 	_ = child.Rollback()
 	_ = parent.Rollback()
 	_ = blocker.Rollback()

@@ -182,6 +182,15 @@ func executeSQLExplain(tx storageengine.Txn, session *Session, query parser.Quer
 	if s.HasLimit && s.Limit == 0 {
 		extra = append(extra, "Zero limit")
 	}
+	// The locking half of the plan is reported next to the access half, and it is derived from the
+	// same access plan the statement will execute — never from the text of the WHERE clause. A plan
+	// that had to fall back to a whole namespace says so here, which is what keeps a conservative
+	// fallback visible instead of silent.
+	if lockPlan, planErr := planSQLLocking(p, planSQLLockingMode(s.Locking, s.LockMode)); planErr != nil {
+		extra = append(extra, "Locks: unavailable ("+planErr.Error()+")")
+	} else if lockPlan.kind != lockPlanNone {
+		extra = append(extra, lockPlan.Annotation(false))
+	}
 	if p.kind == sqlAccessPoint || p.kind == sqlAccessUnique {
 		access = "const"
 		rows = int64(1)

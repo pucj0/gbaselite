@@ -353,3 +353,13 @@ Phase 3（US1）的前置条件已就绪：
 | `ResetEpoch` 归零 owner/图/请求 | **发现并修复**：它从不退还 ledger 计费（退款只在 `ReleaseOwner`），epoch 变更后仍计着已释放组件；现对每个 ended owner 调 `ledger.ReleaseOwner`（解锁后调用，避免嵌套 registry 锁）。 |
 | 既有测试只覆盖"无锁 raw 写" | 四处既有测试的**断言对象**随新语义更新（不是放宽）：absent/tombstone 的 current read、`TestB02LockingDoesNotChangeConflictDetection`、diagnostics 冲突计数、`testkit` `WriteAndPointGuards`；提交期乐观冲突的断言全部保留，只是现在发生在等待之后。 |
 
+## A11. 第六轮修订（US2 区间与插入保护：T021/T024/T025/T026/T027）
+
+| 上一版结论 | 现状（`.tmp/b02r6-fix-report.md`） |
+|---|---|
+| 「Gap/II 兼容模型已实现（T023 已完成）」 | **实现与契约不符（已修复）**：`componentsConflict` 只是纯函数；`lockTable` 以 `ResourceKey` 为键且该键包含 bounds，`inspectLocked` 只查请求自身的表项，因此一个 `(a,z)` 的 Gap 与"在 m 插入"的 II 落在两个表项、**永不比较** ⇒ FR-003/004/005 在生产路径上无效。修复：interval 型身份（Gap 与 II）以 `(Generation, Space)` 域为 `ResourceKey`，同 namespace 的 Gap/II 共用队列、逐 claim 按 bounds 判定包含。 |
+| 「II 是 KindRecord+ModeII 的独立组件」 | **插入声明改为结构约束**：II 必须与同键 record X 同 bundle（`ErrInsertIntentionRequiresRecord`/`MissingRowClaims`）。II 答"插入位置是否被 Gap 保护"，record X 答"键是否被占用"（FR-005）。 |
+| T024 未执行（raw 只取精确键记录锁） | **已完成**：键缺失/tombstone（含本事务 Delete 后重插）取 II+X；存在键只取 X；取锁先于暂存、等待后重校验存活（generation 变化即拒绝暂存且无 staged 残留）。 |
+| T025/T026/T027 未执行 | **T025**：`executor/lock_plan.go` 六类访问计划（record-only/insertion/range/whole-domain/refused/none）+ `rangeIsProven` + 拒绝而非静默不加锁 + `EXPLAIN Extra` 标注；INSERT 侧实际申请插入声明。**T026**：PK/UNIQUE/secondary/复合/NULL/collation 身份与写路径字节一致（unique 无 owner 后缀、secondary 有 owner 后缀）。**T027**：8 项逐条覆盖（见 tasks.md §第六轮），含真实 SQL 的区间内等待/区间外不等待、Next-Key 原子 bundle、并行插入、取消零残留、失效事务不再暂存、失效 scope 写入被拒。 |
+| 未实现范围（README） | 已同步：说明插入声明与 EXPLAIN 标注**已生效**；同时明确**没有任何 SQL 语句会申请 Gap/Next-Key**（锁定读属 Phase 5，DML 范围候选仍只锁实际改动的行），EXPLAIN 对锁定读只标注计划并注明尚未执行。 |
+

@@ -338,19 +338,33 @@ func (t *Tx) WaitForLock(ctx context.Context, handle *lockmanager.LockHandle) (l
 	return result.Grant, nil
 }
 
-// AcquireRawWriteLock takes the exclusive record lock one raw write to one key needs.
+// AcquireRawWriteLock takes the locks one raw write to one key needs.
 //
 // It exists so the raw client cannot bypass SQL and SQL cannot bypass the raw client: the raw
-// write entry points (`Tx.Put`, `Tx.Delete`) take the same resource a SQL write of the same
+// write entry points (`Tx.Put`, `Tx.Delete`) take the same resources a SQL write of the same
 // namespace and key takes, because the identity is the one the storage write path uses — the
 // encoded namespace and the key bytes travel unchanged, and the manager never re-encodes them.
 // Record identity is (Generation, Space, Key), so the SQL layer's table and index labels do not
 // split the resource: a raw client that has never heard of a table label addresses the same row.
 //
-// Scope of this round: the lock is an exact-key record X. Gap, missing-key and insert-intention
-// protection for a raw write is Phase 4 (T024); until then a raw write to a key that does not exist
-// reserves only that key and does not protect the interval around it, and this function must not
-// pretend otherwise.
+// Two cases, and both halves of an insertion are one request:
+//
+//   - the key exists in this transaction's own view: the exclusive record lock of that key, which
+//     is what decides contention with another writer of the same row;
+//   - the key is missing or is a tombstone in this transaction's own view (including a key this
+//     transaction deleted earlier and is now re-inserting): an insert intention at the insertion
+//     position **and** the same exclusive record lock, in one bundle. The intention is what a
+//     covering Gap of another root blocks (FR-003/FR-005) — a gap deliberately does not conflict
+//     with a plain record lock, because the interval rule is independent of the record rule, so
+//     without the intention a raw insert would walk straight through another transaction's gap
+//     protection. The record lock is what decides same-key contention (FR-005), and the manager
+//     refuses an intention that is not paired with it (`ErrInsertIntentionRequiresRecord`).
+//
+// The existence test is this transaction's own view, not the published state: `read` already layers
+// the transaction's own staged writes and its parent's, so a key this transaction deleted and is
+// re-inserting is classified as an insertion, and a key another transaction committed after this
+// snapshot is classified as missing (which is what makes our insert conflict with whatever that
+// transaction is holding).
 //
 // The raw path has no per-statement context — neither `storageengine.Txn.Put` nor `mvcc.Tx.Put`
 // carries one — so the wait is bounded by the manager's own wait deadline (the session default,
@@ -359,7 +373,9 @@ func (t *Tx) WaitForLock(ctx context.Context, handle *lockmanager.LockHandle) (l
 // context.
 //
 // It must be called before anything is staged: no bbolt write transaction may be open while a
-// caller waits, which is why `Tx.write` acquires here and only then buffers the op.
+// caller waits, which is why `Tx.write` acquires here and only then buffers the op. The existence
+// probe above is a read (a snapshot read plus this transaction's own overlay), never a write, and it
+// finishes before the wait starts.
 func (t *Tx) AcquireRawWriteLock(op Op) error {
 	if op.Check {
 		// A guard is an optimistic dependency, not a write: it protects nothing and takes no lock.
@@ -381,14 +397,13 @@ func (t *Tx) AcquireRawWriteLock(op Op) error {
 		// while a manager is attached, so this is a closed or partially built transaction.
 		return ErrClosed
 	}
-	components := []lockmanager.ResourceRef{{
-		Identity: lockmanager.Identity{
-			Kind:  lockmanager.KindRecord,
-			Mode:  lockmanager.ModeX,
-			Space: op.Space,
-			Key:   op.Key,
-		},
-	}}
+	if err := t.checkOpen(); err != nil {
+		return err
+	}
+	components, err := t.rawWriteLockComponents(op)
+	if err != nil {
+		return err
+	}
 	// context.Background is deliberate: Put/Delete carry no context, and inventing one would
 	// silently drop the caller's deadline. The manager bounds the wait itself.
 	_, acquired, wait, err := t.AcquireLock(context.Background(), t.lockScopeID, components, nil)
@@ -406,8 +421,45 @@ func (t *Tx) AcquireRawWriteLock(op Op) error {
 		if _, err := t.WaitForLock(context.Background(), wait); err != nil {
 			return err
 		}
+		// The wait is where a root can end under us: the transaction may have been closed, or the
+		// generation may have moved on, while this caller was queued. Staging the write anyway would
+		// let an invalidated transaction keep writing, so the liveness of the transaction is
+		// re-established after the wait and before the op is buffered.
+		if err := t.checkOpen(); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// rawWriteLockComponents builds the components one raw write needs.
+//
+// The classification comes from this transaction's own view of the key (`read`, which layers the
+// transaction's staged writes and its ancestors over the snapshot), so "missing" means missing for
+// the caller that is about to write, not for the publication.
+func (t *Tx) rawWriteLockComponents(op Op) ([]lockmanager.ResourceRef, error) {
+	_, found, err := t.read(op.Space, op.Key)
+	if err != nil {
+		return nil, err
+	}
+	record := lockmanager.ResourceRef{Identity: lockmanager.Identity{
+		Kind:  lockmanager.KindRecord,
+		Mode:  lockmanager.ModeX,
+		Space: op.Space,
+		Key:   op.Key,
+	}}
+	if found {
+		return []lockmanager.ResourceRef{record}, nil
+	}
+	intention := lockmanager.ResourceRef{Identity: lockmanager.Identity{
+		Kind:  lockmanager.KindRecord,
+		Mode:  lockmanager.ModeInsertIntention,
+		Space: op.Space,
+		Key:   op.Key,
+	}}
+	// The pair travels as one atomic request: the manager refuses an intention without its record
+	// lock, so the two answers of an insertion can never be taken separately.
+	return []lockmanager.ResourceRef{intention, record}, nil
 }
 
 // AbortRequested reports whether a detector asked this transaction's root to stop.

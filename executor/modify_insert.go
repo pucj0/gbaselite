@@ -249,11 +249,42 @@ func (o *InsertOperator) lockCandidate(candidate InsertCandidate) (storageengine
 			return storageengine.LockGrant{}, errLockIdentityUnavailable
 		}
 	}
-	extra, err := indexEntryLocks(table, key, row)
+	extra, err := indexEntryLocks(table, key, row, true)
 	if err != nil {
 		return storageengine.LockGrant{}, err
 	}
+	// The row itself is being created, so its claim carries the insertion half as well: the insert
+	// intention at the row's key is what a Gap over that range blocks. Its pair — the record lock of
+	// the same key — is already in the bundle (`acquireRowLocksForKey` adds the primary row
+	// component), and the lock manager refuses an intention that is not paired, so adding a second
+	// record component here would only duplicate the same claim.
+	extra = append(extra, insertionIntention(sqllayout.Rows(table.ID), table.ID, "", key)...)
 	return o.Locks.acquireRowLocksForKey(table, key, extra)
+}
+
+// insertionIntention builds the intention half of a claim on one key.
+//
+// It is deliberately only half: every caller adds it beside the record lock of the same key that
+// the bundle already carries (the primary row component, the unique value reservation, or the
+// secondary entry). The manager validates the pairing (`MissingRowClaims`) and refuses an unpaired
+// intention, so the two halves cannot drift apart — while building them once keeps a key from being
+// claimed twice and a diagnostics view from reporting the same resource as two.
+//
+// The two halves answer different questions, which is why both exist: the intention is what a
+// covering Gap blocks (FR-003/FR-005), and the record lock is what decides same-key contention
+// (FR-005: "同键竞争由 record X/唯一键 reservation 决定").
+func insertionIntention(space, tableID, indexID string, key []byte) []storageengine.LockComponent {
+	if len(key) == 0 {
+		return nil
+	}
+	return []storageengine.LockComponent{{
+		Mode:    storageengine.LockModeInsertIntention,
+		Kind:    storageengine.LockComponentRecord,
+		Space:   space,
+		TableID: tableID,
+		IndexID: indexID,
+		Key:     key,
+	}}
 }
 
 // indexEntryLocks builds the exclusive locks of a row's unique and secondary index entries.
@@ -274,7 +305,12 @@ func (o *InsertOperator) lockCandidate(candidate InsertCandidate) (storageengine
 // NULL and composite semantics with it: a NULL-containing key is not constrained and therefore
 // reserves nothing, collation-equal values produce one key, and a composite index reserves its
 // whole value. Re-implementing any of that here would let the lock and the write disagree.
-func indexEntryLocks(table versionedTable, owner []byte, row storage.Row) ([]storageengine.LockComponent, error) {
+//
+// `inserting` adds the insertion half of each claim: the index entries of a row that is being
+// created are new keys, so a range another transaction protects over that index has to block them.
+// A removal (the DELETE path, which locks the entries it takes away) passes false: taking an entry
+// away is not an insertion and must not be held up by an interval that only blocks new keys.
+func indexEntryLocks(table versionedTable, owner []byte, row storage.Row, inserting bool) ([]storageengine.LockComponent, error) {
 	if row == nil || len(owner) == 0 {
 		return nil, nil
 	}
@@ -290,7 +326,11 @@ func indexEntryLocks(table versionedTable, owner []byte, row storage.Row) ([]sto
 				// reserves nothing, exactly as it constrains nothing.
 				continue
 			}
-			components = append(components, uniqueValueReservationComponent(sqllayout.UniqueIndex(table.ID, index.Name), table.ID, index.Name, []byte(valueKey)))
+			space := sqllayout.UniqueIndex(table.ID, index.Name)
+			if inserting {
+				components = append(components, insertionIntention(space, table.ID, index.Name, []byte(valueKey))...)
+			}
+			components = append(components, uniqueValueReservationComponent(space, table.ID, index.Name, []byte(valueKey)))
 			continue
 		}
 		positions, ok := secondaryColumns(table, index)
@@ -304,7 +344,11 @@ func indexEntryLocks(table versionedTable, owner []byte, row storage.Row) ([]sto
 		if err != nil {
 			return nil, err
 		}
-		components = append(components, indexEntryComponent(sqllayout.SecondaryIndex(table.ID, index.Name), table.ID, index.Name, entryKey))
+		space := sqllayout.SecondaryIndex(table.ID, index.Name)
+		if inserting {
+			components = append(components, insertionIntention(space, table.ID, index.Name, entryKey)...)
+		}
+		components = append(components, indexEntryComponent(space, table.ID, index.Name, entryKey))
 	}
 	return components, nil
 }

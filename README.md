@@ -66,12 +66,20 @@ JDBC、Go MySQL 驱动等客户端提供服务。
   epoch 失效），且只有发起该请求的调用者能撤销它：加入者的等待取消或加入者语句作用域被回滚，
   只结束它自己的等待，不会破坏仍在等待的其他调用者；
 - 原始 `Txn.Put`/`Delete`（raw client）与 SQL 写入参与同一资源协调：写入前取得该 key 的排他记录锁，
-  两个事务写同一 namespace 与 key 时后到者等待而不是相互绕过，`Txn.Get` 仍是快照读（不取锁、不等待）。
+  两个事务写同一 namespace 与 key 时后到者等待而不是相互绕过，`Txn.Get` 仍是快照读（不取锁、不等待）；
+- 写入一个**不存在**的键（或本事务刚删除、正要重插的键）时，除记录锁外还取得该插入位置的
+  **插入意图**；SQL 的 `INSERT`/`REPLACE`/`ON DUPLICATE KEY UPDATE` 对新行键与每个新索引项
+  同样如此。因此别人持有的区间保护会挡住落在区间内的插入，而区间外的插入不受影响：Gap 只在
+  携带插入意图时生效，同键竞争仍由记录锁/唯一值 reservation 决定；
+- `EXPLAIN` 在 `Extra` 中标注该语句的加锁计划（`record-only` / `range` / `whole-domain` 回退等），
+  计划由 planner 实际选择的访问路径推导，回退会明确写出"保护整个 namespace"。
 
 **仍未实现**：`SELECT ... FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE` 仍按快照读执行
-（解析器识别，执行器未接线），Current Read 只是存储层能力；Gap / Next-Key / Insert Intention
-没有任何 SQL 路径会申请，raw `Txn.Put/Delete` 目前也只取**精确 key** 的记录锁（不保护缺失 key 周围的
-区间，也不登记表意向）；死锁检测没有后台驱动方，因此两个会话互相等待同一批行时各自等到
+（解析器识别，执行器未接线），Current Read 只是存储层能力；EXPLAIN 对锁定读只标注**计划**并注明
+尚未执行。**没有任何 SQL 语句会申请 Gap/Next-Key**（锁定读属后续阶段），所以区间保护目前只在
+另一方可直接申请区间时生效——测试与中立锁定能力可以申请，SQL 的 `UPDATE`/`DELETE` 范围候选仍
+只锁它实际改动/删除的行，不锁整个范围；raw 写也不登记表意向。死锁检测没有后台驱动方，因此两个
+会话互相等待同一批行时各自等到
 50 秒锁等待期限（**不会**被立即选为死锁受害者回滚）；`innodb_lock_wait_timeout` 会话变量、
 1205/1213 的 SQL 错误映射与锁诊断的 SQL 入口都不可用；同一主键的并发插入会正确等待，但失败方拿到的是可重试的行版本冲突而不是
 duplicate-key。规划明确保留固定 readTS 与提交冲突规则、A05 parent-read/child-write，
