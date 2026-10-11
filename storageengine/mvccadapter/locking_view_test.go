@@ -40,8 +40,39 @@ func t032Seed(t *testing.T, e *engine, key, value string) {
 	}
 }
 
-// t032Scan opens one locked scan over the whole namespace through the neutral capability.
+// t032Scan opens one locked scan over the given range through the neutral capability.
+//
+// It builds the lock plan the same way the SQL planner does: an unbounded range is the explicit
+// whole-domain fallback, and a bounded one is a proven interval equal to the range. A caller that
+// supplied no plan at all would be refused, which is itself asserted by a dedicated test.
 func t032Scan(t *testing.T, ctx context.Context, tx storageengine.Txn, mode storageengine.LockMode, r storageengine.KeyRange, limit int) storageengine.Iterator {
+	t.Helper()
+	return t032ScanWithPlan(t, ctx, tx, mode, r, limit, t032PlanFor(r))
+}
+
+// t032PlanFor builds the plan a SQL planner would hand the iterator for one range.
+func t032PlanFor(r storageengine.KeyRange) storageengine.LockPlan {
+	if r.Lower == nil && r.Upper == nil {
+		return storageengine.LockPlan{
+			Kind:   "whole-domain",
+			Proven: false,
+			Components: []storageengine.LockComponent{{
+				Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: t032Space,
+			}},
+		}
+	}
+	return storageengine.LockPlan{
+		Kind:   "range",
+		Proven: true,
+		Components: []storageengine.LockComponent{{
+			Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: t032Space,
+			Lower: r.Lower, Upper: r.Upper, LowerInclusive: r.LowerInclusive, UpperInclusive: r.UpperInclusive,
+		}},
+	}
+}
+
+// t032ScanWithPlan opens one locked scan with an explicit plan, so a test can hand it a malformed one.
+func t032ScanWithPlan(t *testing.T, ctx context.Context, tx storageengine.Txn, mode storageengine.LockMode, r storageengine.KeyRange, limit int, plan storageengine.LockPlan) storageengine.Iterator {
 	t.Helper()
 	locking, err := storageengine.LockingTxnOf(tx)
 	if err != nil {
@@ -56,12 +87,29 @@ func t032Scan(t *testing.T, ctx context.Context, tx storageengine.Txn, mode stor
 		Range: r,
 		Limit: limit,
 		Mode:  mode,
+		Plan:  plan,
 	})
 	if err != nil {
 		t.Fatalf("new current iterator: %v", err)
 	}
 	t.Cleanup(func() { it.Close() })
 	return it
+}
+
+// t032OpenScan opens a locked scan without failing, so a validation test can inspect the error.
+func t032OpenScan(t *testing.T, ctx context.Context, tx storageengine.Txn, mode storageengine.LockMode, r storageengine.KeyRange, plan storageengine.LockPlan) (storageengine.Iterator, error) {
+	t.Helper()
+	locking, err := storageengine.LockingTxnOf(tx)
+	if err != nil {
+		return nil, err
+	}
+	scope, err := locking.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		return nil, err
+	}
+	return locking.NewCurrentIterator(ctx, scope, storageengine.CurrentScanRequest{
+		Space: t032Space, Range: r, Mode: mode, Plan: plan,
+	})
 }
 
 // t032Collect drains one iterator into a key鈫抳alue map.
@@ -94,7 +142,14 @@ func TestT032CurrentScanPagesWithoutHoldingAView(t *testing.T) {
 	}
 
 	scanner := t018Begin(t, e)
-	it := t032Scan(t, ctx, scanner, storageengine.LockModeS, storageengine.KeyRange{}, 0)
+	// The scan protects exactly the seeded range, so a key beyond it is genuinely outside the plan's
+	// interval: the "outside" write below is then a property of the plan, not of a scan that protects
+	// nothing at all.
+	seedRange := storageengine.KeyRange{
+		Lower: []byte(fmt.Sprintf("k%03d", 0)), Upper: []byte(fmt.Sprintf("k%03d", currentScanPageSize+4)),
+		LowerInclusive: true, UpperInclusive: true,
+	}
+	it := t032Scan(t, ctx, scanner, storageengine.LockModeS, seedRange, 0)
 
 	if !it.Next() {
 		t.Fatalf("the first page yielded no row: %v", it.Err())
@@ -540,6 +595,244 @@ func TestT035ScopeDeadlineReachesTheLockManager(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := plain.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	t018RequireNoResidue(t, e)
+}
+
+// TestT032CurrentScanDiscoversAKeyCommittedAfterTheSnapshot is the semantic blocker this round fixes.
+//
+// A snapshot range read resolves its keys at a fixed read timestamp, so a key another transaction
+// commits afterwards is invisible to it — and a locked scan built on that listing would silently omit
+// a row that exists. The scenario is the one the task states: the scanner takes its snapshot, another
+// transaction inserts a key inside the range and commits, and only then does the scan run. The scan
+// must find the new key; the plain snapshot read of the same range must not, because its own
+// semantics were not changed.
+func TestT032CurrentScanDiscoversAKeyCommittedAfterTheSnapshot(t *testing.T) {
+	e := t018OpenEngine(t)
+	ctx := context.Background()
+
+	t032Seed(t, e, "a", "one")
+	t032Seed(t, e, "m", "middle")
+
+	// T1 begins and takes its snapshot here, before T2's insert.
+	scanner := t018Begin(t, e)
+
+	// T2 inserts a new key inside the range and commits it.
+	t032Seed(t, e, "f", "inserted-later")
+
+	// The plain snapshot read of the same transaction still does not see it: B01 visibility is intact.
+	plainKeys := map[string]bool{}
+	if err := scanner.Scan(ctx, t032Space, func(k, v []byte) error {
+		plainKeys[string(k)] = true
+		return nil
+	}); err != nil {
+		t.Fatalf("plain scan: %v", err)
+	}
+	if plainKeys["f"] {
+		t.Fatal("a plain snapshot scan saw a key committed after its snapshot")
+	}
+
+	// The locked current scan must see it.
+	it := t032Scan(t, ctx, scanner, storageengine.LockModeS, storageengine.KeyRange{}, 0)
+	seen := t032Collect(t, it)
+	if _, ok := seen["f"]; !ok {
+		t.Fatalf("the locked scan did not discover the key committed after its snapshot: %v", seen)
+	}
+	if seen["f"] != "inserted-later" {
+		t.Fatalf("the discovered key read %q, want its committed value", seen["f"])
+	}
+	if len(seen) != 3 {
+		t.Fatalf("the locked scan saw %d keys, want a, f and m: %v", len(seen), seen)
+	}
+	if err := scanner.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	t018RequireNoResidue(t, e)
+}
+
+// TestT032CurrentScanRequiresAUsableLockPlan proves an absent or malformed plan is refused.
+//
+// A range scan protects insertion positions it has not visited, so it must say how far that
+// protection reaches. Treating an empty plan as "everything is protected" would run an unprotected
+// scan while the caller believed otherwise, and treating a record-only plan as a range plan would do
+// the same, so both fail closed.
+func TestT032CurrentScanRequiresAUsableLockPlan(t *testing.T) {
+	e := t018OpenEngine(t)
+	ctx := context.Background()
+	t032Seed(t, e, "m", "middle")
+	scanner := t018Begin(t, e)
+
+	unbounded := storageengine.LockPlan{
+		Kind: "whole-domain",
+		Components: []storageengine.LockComponent{{
+			Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: t032Space,
+		}},
+	}
+	proven := storageengine.LockPlan{
+		Kind: "range", Proven: true,
+		Components: []storageengine.LockComponent{{
+			Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: t032Space,
+			Lower: []byte("a"), Upper: []byte("z"), LowerInclusive: true, UpperInclusive: true,
+		}},
+	}
+	rangeAZ := storageengine.KeyRange{Lower: []byte("a"), Upper: []byte("z"), LowerInclusive: true, UpperInclusive: true}
+
+	cases := []struct {
+		name string
+		r    storageengine.KeyRange
+		plan storageengine.LockPlan
+	}{
+		{"no plan at all", storageengine.KeyRange{}, storageengine.LockPlan{}},
+		{"unknown plan kind", storageengine.KeyRange{}, storageengine.LockPlan{Kind: "guessed", Components: unbounded.Components}},
+		{"record-only plan for a scan", storageengine.KeyRange{}, storageengine.LockPlan{
+			Kind: "record-only", Proven: true,
+			Components: []storageengine.LockComponent{{
+				Mode: storageengine.LockModeX, Kind: storageengine.LockComponentRecord, Space: t032Space, Key: []byte("m"),
+			}},
+		}},
+		{"whole-domain plan carrying bounds", storageengine.KeyRange{}, storageengine.LockPlan{
+			Kind: "whole-domain",
+			Components: []storageengine.LockComponent{{
+				Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: t032Space,
+				Lower: []byte("a"), Upper: []byte("z"),
+			}},
+		}},
+		{"range plan that is not proven", rangeAZ, storageengine.LockPlan{
+			Kind: "range", Proven: false, Components: proven.Components,
+		}},
+		{"range plan for another namespace", rangeAZ, storageengine.LockPlan{
+			Kind: "range", Proven: true,
+			Components: []storageengine.LockComponent{{
+				Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: "rows/other",
+				Lower: []byte("a"), Upper: []byte("z"), LowerInclusive: true, UpperInclusive: true,
+			}},
+		}},
+		{"interval that does not contain the scanned range", rangeAZ, storageengine.LockPlan{
+			Kind: "range", Proven: true,
+			Components: []storageengine.LockComponent{{
+				Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: t032Space,
+				Lower: []byte("m"), Upper: []byte("z"), LowerInclusive: true, UpperInclusive: true,
+			}},
+		}},
+		{"interval carrying a record mode", storageengine.KeyRange{}, storageengine.LockPlan{
+			Kind: "whole-domain",
+			Components: []storageengine.LockComponent{{
+				Mode: storageengine.LockModeS, Kind: storageengine.LockComponentInterval, Space: t032Space,
+			}},
+		}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			it, err := t032OpenScan(t, ctx, scanner, storageengine.LockModeS, testCase.r, testCase.plan)
+			if err == nil {
+				it.Close()
+				t.Fatalf("a locked scan accepted %s", testCase.name)
+			}
+		})
+	}
+
+	// A labelled interval needs the table intention the manager requires in the same bundle, and the
+	// refusal must reach the caller rather than being swallowed: the labelled plan is otherwise legal.
+	labelled := storageengine.LockPlan{
+		Kind: "whole-domain",
+		Components: []storageengine.LockComponent{{
+			Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: t032Space, TableID: "t032",
+		}},
+	}
+	if it, err := t032OpenScan(t, ctx, scanner, storageengine.LockModeS, storageengine.KeyRange{}, labelled); err == nil {
+		it.Close()
+		t.Fatal("a locked scan accepted a labelled interval without its table intention")
+	}
+	// The same plan with the intention is accepted, so the refusal above is about the missing
+	// intention and not about the label.
+	labelledWithIntent := storageengine.LockPlan{
+		Kind: "whole-domain",
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: t032Space, TableID: "t032"},
+			{Mode: storageengine.LockModeIX, Kind: storageengine.LockComponentTableIntent, Space: t032Space, TableID: "t032"},
+		},
+	}
+	it, err := t032OpenScan(t, ctx, scanner, storageengine.LockModeS, storageengine.KeyRange{}, labelledWithIntent)
+	if err != nil {
+		t.Fatalf("a labelled interval with its table intention was refused: %v", err)
+	}
+	if err := it.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := scanner.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	t018RequireNoResidue(t, e)
+}
+
+// TestT032CurrentScanProtectsItsRangeAgainstInsertions proves the interval the scan takes really
+// blocks insertions inside it, while an insertion outside it proceeds — the two halves of the
+// contract's range rule, checked against the engine's own lock state rather than by timing.
+func TestT032CurrentScanProtectsItsRangeAgainstInsertions(t *testing.T) {
+	e := t018OpenEngine(t)
+	ctx := context.Background()
+
+	t032Seed(t, e, "d", "inside")
+	t032Seed(t, e, "t", "outside")
+
+	scanner := t018Begin(t, e)
+	// A proven interval over [a, f): "c" is inside it and "z" is not.
+	it := t032Scan(t, ctx, scanner, storageengine.LockModeX, storageengine.KeyRange{
+		Lower: []byte("a"), Upper: []byte("f"), LowerInclusive: true,
+	}, 0)
+	if !it.Next() {
+		t.Fatalf("the scan yielded no row: %v", it.Err())
+	}
+
+	// Another transaction inserting inside the protected range must be refused (fail-fast, so the
+	// test observes the conflict itself rather than a wait it would have to time).
+	inside := t018Begin(t, e)
+	insideLocking, err := storageengine.LockingTxnOf(inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insideScope, err := insideLocking.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insideLocking.Acquire(ctx, insideScope, storageengine.LockRequest{
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeInsertIntention, Kind: storageengine.LockComponentRecord, Space: t032Space, Key: []byte("c")},
+			{Mode: storageengine.LockModeX, Kind: storageengine.LockComponentRecord, Space: t032Space, Key: []byte("c")},
+		},
+		ShouldWait: func(context.Context) bool { return false },
+	}); err == nil {
+		t.Fatal("an insertion inside the scan's protected range was allowed")
+	}
+
+	// An insertion outside it is granted and committed while the scan still holds its interval.
+	outside := t018Begin(t, e)
+	outsideLocking, err := storageengine.LockingTxnOf(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outsideScope, err := outsideLocking.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outsideLocking.Acquire(ctx, outsideScope, storageengine.LockRequest{
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeInsertIntention, Kind: storageengine.LockComponentRecord, Space: t032Space, Key: []byte("z")},
+			{Mode: storageengine.LockModeX, Kind: storageengine.LockComponentRecord, Space: t032Space, Key: []byte("z")},
+		},
+	}); err != nil {
+		t.Fatalf("an insertion outside the protected range was refused: %v", err)
+	}
+	if err := outside.Put(t032Space, []byte("z"), []byte("outside-value")); err != nil {
+		t.Fatalf("an insertion outside the protected range was blocked by the scan: %v", err)
+	}
+	if _, err := outside.Commit(ctx); err != nil {
+		t.Fatalf("an insertion outside the protected range could not commit: %v", err)
+	}
+
+	_ = inside.Rollback()
+	if err := scanner.Rollback(); err != nil {
 		t.Fatal(err)
 	}
 	t018RequireNoResidue(t, e)

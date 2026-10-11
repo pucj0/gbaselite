@@ -192,7 +192,12 @@ func MissingTableIntents(components []ResourceRef, bindings *Bindings) []string 
 	checked := make(map[string]bool, len(components))
 	var missing []string
 	for _, component := range components {
-		if component.Kind != KindRecord {
+		// A labelled interval component needs the same table intention a record lock needs. A range
+		// lock protects keys of one table's index, and every real next-key bundle carries that
+		// intention with it; an interval that names a table but does not declare the intention is a
+		// malformed bundle, not a lock without a table. An *unlabelled* interval stays exempt for the
+		// same reason an unlabelled record does: a raw namespace has no table to intend.
+		if component.Kind != KindRecord && component.Kind != KindInterval {
 			continue
 		}
 		tableID := component.TableID
@@ -206,8 +211,15 @@ func MissingTableIntents(components []ResourceRef, bindings *Bindings) []string 
 			continue
 		}
 		need := ModeIS
-		if component.Mode == ModeX || component.Mode == ModeInsertIntention {
+		switch component.Kind {
+		case KindInterval:
+			// A gap locks insert positions, which is a write intention on the table: IX, exactly as
+			// an insertion claim needs.
 			need = ModeIX
+		default:
+			if component.Mode == ModeX || component.Mode == ModeInsertIntention {
+				need = ModeIX
+			}
 		}
 		key := tableID + "\x00" + string(need)
 		if checked[key] {

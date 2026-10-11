@@ -78,7 +78,15 @@ JDBC、Go MySQL 驱动等客户端提供服务。
   不会影响另一个；一个请求同时申请多个区间时它们同批授予或同批等待；
 - 中立层已提供**锁定当前读**能力：`ReadCurrent`（在仍持有覆盖锁时校验 owner/generation/覆盖资源并
   读取最新已发布版本 + 本事务 overlay），以及 **lock-aware 有限页迭代器**（先保护访问区间，再按页
-  取锁并逐键重读；等待期间不持有任何存储 view）。它目前**尚未**被 SQL 语句使用（见下）。
+  取锁并逐键重读；等待期间不持有任何存储 view）。迭代器的键列表取自**最新已发布状态 + 本事务/祖先
+  overlay**，因此能发现本事务快照之后别的事务已提交的键；普通 `Get`/`Scan` 仍严格保持 B01 快照语义
+  （同一事务的普通范围读看不到那些键）。它目前**尚未**被 SQL 语句使用（见下）。
+  - 锁定扫描必须携带可用的锁计划：已证明的范围（`range` + `Proven`）或显式 whole-domain 回退；
+    空计划、record-only 计划、跨 namespace 或不覆盖扫描范围的范围一律**拒绝**。
+  - 带 TableID 标签的 interval（Gap/Next-Key）与 record 一样，必须在同一 bundle 内提供表意向（IX）。
+  - **已知限制**：`innodb_lock_wait_timeout` 当前按**语句级**期限生效（executor 把会话预算编码为语句
+    scope 的 context deadline），而合同要求它是**每次锁等待**的期限；会话值本身（默认 50s、1..86400、
+    GLOBAL 拒绝）与 1..86400 的双向生效都可用，但一条语句内多次等待会被前一次已耗时间提前结束。
 
 **仍未实现**：`SELECT ... FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE` 仍按快照读执行
 （解析器识别，执行器未接线），Current Read 只是存储层能力；EXPLAIN 对锁定读只标注**计划**并注明

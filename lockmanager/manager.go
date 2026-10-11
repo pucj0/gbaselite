@@ -1361,7 +1361,19 @@ func (m *manager) AcquireWith(ctx context.Context, rootID string, scopeID uint64
 
 	if len(blocked) > 0 {
 		if !request.req.MayWait() {
+			// A caller that refuses to wait gets a definite refusal and leaves nothing behind.
+			// Inspecting the bundle created one lock-table entry per requested resource, and a
+			// bundle that was refused never records a claim on them, so those entries have to be
+			// dropped here: an entry with neither claim nor waiter is exactly the "no lock resource
+			// survived" condition the contract's cleanup rules check, and leaving them would make a
+			// refused request look like a held lock to every later diagnostics read.
 			m.ledger.Release(reservation)
+			for _, entry := range request.entries {
+				key := entry.ref.ResourceKey()
+				if lockEntry, ok := m.locks.get(key); ok {
+					m.locks.release(key, lockEntry)
+				}
+			}
 			return AcquireResult{}, ErrConflict
 		}
 		// A queued bundle may repeat protection its owner already holds. Those components are

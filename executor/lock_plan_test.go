@@ -271,7 +271,16 @@ func TestT025SQLInsertRespectsAProtectedRange(t *testing.T) {
 		Upper:          upper.Key,
 		LowerInclusive: true,
 	}
-	if _, err := guardLocking.Acquire(context.Background(), scope, storageengine.LockRequest{Components: []storageengine.LockComponent{interval}}); err != nil {
+	// A labelled interval needs the same table intention a labelled record does: an interval that names
+	// a table without declaring its intention is a malformed bundle and the manager refuses it. A real
+	// locking read always carries this intention alongside its index locks.
+	tableIntent := storageengine.LockComponent{
+		Mode:    storageengine.LockModeIX,
+		Kind:    storageengine.LockComponentTableIntent,
+		Space:   lower.Space,
+		TableID: lower.TableID,
+	}
+	if _, err := guardLocking.Acquire(context.Background(), scope, storageengine.LockRequest{Components: []storageengine.LockComponent{interval, tableIntent}}); err != nil {
 		t.Fatalf("acquire the protecting range: %v", err)
 	}
 

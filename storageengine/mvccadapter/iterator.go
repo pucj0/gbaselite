@@ -1,6 +1,7 @@
 package mvccadapter
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -104,7 +105,7 @@ var errCurrentPageFull = errors.New("current scan page is full")
 // No storage view is held across a wait: the page listing releases its bbolt read transaction
 // before the consumer sees a key (mvcc's range scan pages that way), and the iterator takes its
 // record locks after the listing returned, one key at a time. A caller that stops between two
-// Next() calls therefore holds no view, no cursor and no gate 鈥?only the lock claims it asked for.
+// Next() calls therefore holds no view, no cursor and no gate 閳?only the lock claims it asked for.
 type currentIterator struct {
 	ctx    context.Context
 	tx     *mvcc.Tx
@@ -146,26 +147,27 @@ func newCurrentIterator(ctx context.Context, tx *mvcc.Tx, scope uint64, request 
 	if err != nil {
 		return nil, err
 	}
-	if len(request.Plan.Components) > 0 {
-		// The access interval first. This may wait, which is exactly why it happens before the
-		// first page is read: nothing of the storage is held while the lock manager decides.
-		components, err := lockComponents(request.Plan.Components)
-		if err != nil {
-			return nil, err
+	if err := validateCurrentScanPlan(request); err != nil {
+		return nil, err
+	}
+	// The access interval first. This may wait, which is exactly why it happens before the
+	// first page is read: nothing of the storage is held while the lock manager decides.
+	components, err := lockComponents(request.Plan.Components)
+	if err != nil {
+		return nil, err
+	}
+	_, op, wait, err := tx.AcquireLock(ctx, scope, components, nil)
+	if err != nil {
+		return nil, err
+	}
+	if op == lockmanager.LockOpWait {
+		// A conflicting interval acquisition is not a grant: the scan must wait for it exactly
+		// like a record claim, and it must do so before reading anything.
+		if wait == nil {
+			return nil, storageengine.ErrConflict
 		}
-		_, op, wait, err := tx.AcquireLock(ctx, scope, components, nil)
-		if err != nil {
+		if _, err := tx.WaitForLock(ctx, wait); err != nil {
 			return nil, err
-		}
-		if op == lockmanager.LockOpWait {
-			// A conflicting interval acquisition is not a grant: the scan must wait for it exactly
-			// like a record claim, and it must do so before reading anything.
-			if wait == nil {
-				return nil, storageengine.ErrConflict
-			}
-			if _, err := tx.WaitForLock(ctx, wait); err != nil {
-				return nil, err
-			}
 		}
 	}
 	return &currentIterator{
@@ -177,6 +179,104 @@ func newCurrentIterator(ctx context.Context, tx *mvcc.Tx, scope uint64, request 
 		mode:   mode,
 		limit:  request.Limit,
 	}, nil
+}
+
+// validateCurrentScanPlan checks that a locked scan carries the protection the contract requires.
+//
+// A range scan protects insert positions it has not visited yet, so it must say how far that
+// protection reaches. The plan is the caller's proof of it, and the three shapes that are legal are
+// exactly the three the SQL lock planner produces:
+//
+//   - a proven range: an interval component for the scanned namespace whose bounds contain the
+//     requested range, with `Proven` set. The planner proved the bounds match the stored byte order,
+//     which is what makes the interval a real protection rather than a guess;
+//   - an explicit whole-domain fallback: the unbounded interval component for the namespace, with
+//     `Proven` false. It protects everything, and saying so is mandatory 鈥?an empty plan is *not*
+//     "everything", it is nothing;
+//   - nothing else. A record-only or insertion plan belongs to the point path, which proves its key
+//     and reads it through ReadCurrent; using it for a scan would leave the range unprotected while
+//     the caller believed otherwise, so it is refused rather than widened into a scan.
+//
+// A namespace mismatch between the plan and the scan is refused for the same reason: an interval over
+// another namespace protects none of the keys this scan will touch.
+func validateCurrentScanPlan(request storageengine.CurrentScanRequest) error {
+	switch request.Plan.Kind {
+	case "range":
+		if !request.Plan.Proven {
+			return fmt.Errorf("a range lock plan must be proven; a guessed interval protects nothing")
+		}
+		interval, ok := currentScanInterval(request.Plan.Components, request.Space)
+		if !ok {
+			return fmt.Errorf("a range lock plan needs exactly one interval component over namespace %q", request.Space)
+		}
+		if !intervalCoversRange(interval, request.Range) {
+			return fmt.Errorf("the lock plan's interval does not contain the scanned range of namespace %q", request.Space)
+		}
+		return nil
+	case "whole-domain":
+		interval, ok := currentScanInterval(request.Plan.Components, request.Space)
+		if !ok {
+			return fmt.Errorf("a whole-domain fallback needs the unbounded interval component over namespace %q", request.Space)
+		}
+		if interval.Lower != nil || interval.Upper != nil {
+			return fmt.Errorf("a whole-domain fallback must carry the unbounded interval, not a bounded one")
+		}
+		return nil
+	default:
+		return fmt.Errorf("a locked scan requires a proven range plan or an explicit whole-domain fallback, got %q", request.Plan.Kind)
+	}
+}
+
+// currentScanInterval returns the single interval component of a plan for one namespace.
+//
+// Exactly one is required: two intervals would leave the scan's coverage ambiguous, and a plan with
+// none protects no insert position at all.
+func currentScanInterval(components []storageengine.LockComponent, space string) (storageengine.LockComponent, bool) {
+	var found []storageengine.LockComponent
+	for _, component := range components {
+		if component.Kind != storageengine.LockComponentInterval {
+			continue
+		}
+		if component.Space != space || component.Mode != storageengine.LockModeGap {
+			continue
+		}
+		found = append(found, component)
+	}
+	if len(found) != 1 {
+		return storageengine.LockComponent{}, false
+	}
+	return found[0], true
+}
+
+// intervalCoversRange reports whether every key of one range lies inside one interval.
+//
+// A nil bound means infinity on that side, so an interval that is unbounded exactly where the range
+// is unbounded covers it, while an interval with a bound the range does not have does not. The
+// inclusivity flags decide the endpoints, and the scan's direction never changes membership.
+func intervalCoversRange(interval storageengine.LockComponent, r storageengine.KeyRange) bool {
+	if interval.Lower != nil {
+		if r.Lower == nil {
+			return false
+		}
+		switch compare := bytes.Compare(interval.Lower, r.Lower); {
+		case compare > 0:
+			return false
+		case compare == 0 && !interval.LowerInclusive && r.LowerInclusive:
+			return false
+		}
+	}
+	if interval.Upper != nil {
+		if r.Upper == nil {
+			return false
+		}
+		switch compare := bytes.Compare(interval.Upper, r.Upper); {
+		case compare < 0:
+			return false
+		case compare == 0 && !interval.UpperInclusive && r.UpperInclusive:
+			return false
+		}
+	}
+	return true
 }
 
 // currentScanRecordMode maps the neutral record mode of a locked scan onto the manager's.
@@ -308,7 +408,7 @@ func (i *currentIterator) pageKeys() ([][]byte, bool, error) {
 	}
 	var keys [][]byte
 	bytes := 0
-	err := i.tx.ScanRange(i.ctx, i.space, bounds, func(k, v []byte) error {
+	err := i.tx.ScanLatestRange(i.ctx, i.space, bounds, func(k, v []byte) error {
 		keys = append(keys, append([]byte(nil), k...))
 		// The resume point is the last key the *listing* produced, not the last row the caller
 		// consumed: every listed key is claimed before the next page is read, so resuming after the

@@ -221,7 +221,48 @@ func (it *rangeIterator) peek() (*rangeEntry, error) {
 // ScanRange merges committed keys and every transaction overlay in key order.
 // Newest non-guard writes win. Deletes suppress older entries; guards fall
 // through. Memory is bounded by one page per transaction layer, never the table.
-func (t *Tx) ScanRange(ctx context.Context, space string, r KeyRange, yield func([]byte, []byte) error) (err error) {
+func (t *Tx) ScanRange(ctx context.Context, space string, r KeyRange, yield func([]byte, []byte) error) error {
+	// The ordinary range read is a *snapshot* read: it resolves the store layer at the transaction's
+	// fixed read timestamp and records the range dependency the commit validator uses. The current
+	// read below deliberately does neither.
+	return t.scanRangeAt(ctx, space, r, t.Snapshot, true, yield)
+}
+
+// ScanLatestRange lists the keys of one namespace as of the latest published state, merged with this
+// transaction's own and its ancestors' staged writes.
+//
+// It exists for the locked current read, which must be able to discover a key another transaction
+// committed *after* this transaction's snapshot: a snapshot range read can never see such a row, and a
+// current read that only re-read the keys its snapshot listed would silently miss it. It is a
+// different operation from ScanRange, not a flag on it:
+//
+//   - the store layer is resolved at the store's current head instead of the fixed readTS, so the
+//     caller's snapshot is untouched (readTS, GC horizon and Command.Snapshot are all unchanged);
+//   - no range dependency is recorded, because a current read is not evidence about the snapshot: the
+//     protection it relies on is the lock it holds, and recording a dependency would make an
+//     unrelated commit conflict with a statement that never read that version;
+//   - the staged layers are still merged in the same order and with the same visibility rules as a
+//     snapshot scan, so a child sees its own and its ancestors' writes and never a sibling's, and a
+//     value the transaction itself deleted stays deleted.
+//
+// The single key a caller asks about still goes through ReadCurrent/ReadCurrentLocked, which proves
+// the covering grant: the enumeration is only a *key listing*, and every key it returns is claimed and
+// re-read under its claim by the caller before a value is ever handed back.
+func (t *Tx) ScanLatestRange(ctx context.Context, space string, r KeyRange, yield func([]byte, []byte) error) error {
+	head, err := t.store.Head()
+	if err != nil {
+		return err
+	}
+	return t.scanRangeAt(ctx, space, r, head, false, yield)
+}
+
+// scanRangeAt merges the staged layers of the transaction chain with one store snapshot.
+//
+// storeSnapshot selects the published side (the transaction's readTS for a snapshot read, the store
+// head for a current read) and recordObservation decides whether the call contributes a range
+// dependency. Everything else — the merge, the deduplication, the direction and the bounds — is the
+// one implementation both reads share, so a fix to the merge cannot reach only one of them.
+func (t *Tx) scanRangeAt(ctx context.Context, space string, r KeyRange, storeSnapshot uint64, recordObservation bool, yield func([]byte, []byte) error) (err error) {
 	defer func() {
 		if t.generation != t.store.generation.Load() {
 			err = ErrConflict
@@ -231,12 +272,15 @@ func (t *Tx) ScanRange(ctx context.Context, space string, r KeyRange, yield func
 		return ErrClosed
 	}
 	var observation transactionObservation
-	wrapped := func(k, v []byte) error {
-		observation.add(k, v)
-		return yield(k, v)
+	wrapped := yield
+	if recordObservation {
+		wrapped = func(k, v []byte) error {
+			observation.add(k, v)
+			return yield(k, v)
+		}
+		// Range reads are recorded once per call, even when the consumer stops early.
+		defer func() { t.observeRangeRead(observation) }()
 	}
-	// Range reads are recorded once per call, even when the consumer stops early.
-	defer func() { t.observeRangeRead(observation) }()
 	prefix, err := key(space, nil)
 	if err != nil {
 		return err
@@ -260,7 +304,7 @@ func (t *Tx) ScanRange(ctx context.Context, space string, r KeyRange, yield func
 			iters = append(iters, &rangeIterator{read: func(after []byte) (rangePage, error) { return current.stageRangePage(ctx, prefix, r, after) }})
 		}
 	}
-	iters = append(iters, &rangeIterator{read: func(after []byte) (rangePage, error) { return t.store.rangePage(ctx, t.Snapshot, prefix, r, after) }})
+	iters = append(iters, &rangeIterator{read: func(after []byte) (rangePage, error) { return t.store.rangePage(ctx, storeSnapshot, prefix, r, after) }})
 	heads := make([]*rangeEntry, len(iters))
 	for {
 		if err = ctx.Err(); err != nil {

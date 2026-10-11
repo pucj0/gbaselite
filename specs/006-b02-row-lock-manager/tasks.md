@@ -1056,6 +1056,39 @@ T1 回滚后 T2 被唤醒，最后校验数据（50/300 都在）、被释放的
   adapter 1 组（scope 真的带上 300s deadline）。
 - [ ] **T036**（**未完成**）：A–L 双 session 验收依赖 T034 的 SQL 可见性，本轮未开始。
 
+### 第九轮（CurrentIterator 语义阻断项 + 锁计划覆盖校验）证据与任务口径
+
+证据文件 `.tmp/b09-phase5-report.md`；原始输出 `.tmp/b09-acceptance.txt`、`.tmp/b09-gotest-all.txt`。
+新增/扩展测试：`storageengine/mvccadapter/locking_view_test.go`（新增键发现、锁计划校验 8+1 例、
+区间插入保护）、`lockmanager/lock_wait_budget_scope_test.go`（等待预算粒度，含**跳过的偏差记录**）。
+
+1. **CurrentIterator 旧快照枚举键（已修复）**：新增 `mvcc.Tx.ScanLatestRange`——以 store head 解析
+   发布层并合并本事务/祖先 stage，**不记录 range dependency**，与 `ScanRange` 是两条路径（B01 快照读
+   逐字节不变，测试同时断言"普通 scan 看不到 readTS 之后提交的键"而"锁定扫描必须看到"）。
+   迭代器的键列表改用该方法；`readTS`/GC horizon/`Command.Snapshot` 未动。
+   视图纪律保持：底页 range scan 每次 yield 前释放 bbolt 读事务，取锁在列表返回之后逐键进行。
+2. **锁计划覆盖校验（已修复）**：`validateCurrentScanPlan` 要求
+   `Plan.Kind ∈ {range, whole-domain}`：`range` 必须 `Proven` 且携带**唯一**一个覆盖扫描范围的同
+   namespace Gap；`whole-domain` 必须携带双无界 Gap；其余（空计划/未知 kind/record-only/带 bounds 的
+   whole-domain/未证明 range/错误 namespace/不覆盖的 interval/记录模式的 interval）一律拒绝。
+   另外 `MissingTableIntents` 现在也要求**带 TableID 标签的 interval** 在 bundle 内提供 IX（真实
+   next-key bundle 本就如此），并在 `neutralLockError` 之外由管理器拒绝——专项测试覆盖。
+3. **锁等待预算的粒度（发现偏差，已记录，未半修）**：`TestB09LockWaitBudgetAppliesToEachWaitNotToTheStatement`
+   以虚拟时钟证明当前实现把会话预算当作**语句级绝对期限**（第二次 0.6s 等待被第一次已耗的 0.6s 拖超），
+   而合同要求它是**每次等待**的期限（更早的 query ctx 仍更早结束）。该测试以 `t.Skip` 保留为证据，
+   注释给出精确修复面（scope 携带 duration 预算 + `requestDeadlineLocked` 取
+   `min(now+budget, scope ctx deadline)` + 中立能力携带预算 + executor 传预算），并说明为何不半修
+   （只改管理器不会改变 SQL 可见行为）。
+4. **T034/T036 仍未完成**（见报告 §5 的接入点分析）。
+
+- [x] **T028**（本轮复验通过，勾选）：`go test ./storageengine/mvccadapter/ -run TestT028 -count=5` 通过。
+- [x] **T032**（本轮修复后复验通过，勾选）：新增 latest-published 枚举、键发现用例、锁计划校验用例、
+   区间插入保护用例；`-run TestT032 -count=1` 全通过；普通 ScanRange 语义不变。
+- [ ] **T034**（未完成，不勾选）。
+- [ ] **T035**（**不勾选**）：会话值/范围校验/1205/服务端 SET/@变量 + 期限双向生效（1..86400）已验证；但**预算粒度是语句级而非每次等待**（第 3 点实测偏差），违反合同"等待期限=会话 lock 期限与 ctx 期限的较早者"（会话值为 duration ⇒ 每次等待各算一次），修正并复验前不勾选。
+   **遗留**：预算粒度是语句级而非每等待（第 3 点），故 T035 的"严格遵守超时语义"一条**未完全满足**。
+- [ ] **T036**（未完成，不勾选）。
+
 ### 本轮证据文件
 | 文件 | 内容 |
 |---|---|
