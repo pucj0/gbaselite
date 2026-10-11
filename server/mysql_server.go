@@ -671,6 +671,11 @@ func mysqlExecutionErrorCode(err error) uint16 {
 		return 1290
 	case errors.Is(err, storageengine.ErrConflict):
 		return 1213
+	case errors.Is(err, storageengine.ErrLockWaitTimeout):
+		// A lock wait that ran out its bound is the MySQL lock-wait timeout, not a generic error:
+		// 1205 is what a client retries on, and the default would report it as 1064 — telling the
+		// caller its statement was malformed.
+		return 1205
 	case errors.Is(err, executor.ErrPersistenceUnavailable):
 		return 1030
 	case errors.Is(err, storage.ErrDuplicateKey):

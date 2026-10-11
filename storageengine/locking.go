@@ -230,6 +230,13 @@ type CurrentScanRequest struct {
 	Space string
 	Range KeyRange
 	Limit int
+	// Mode is the record mode the iterator takes for every key it visits: X for a locking read
+	// that may write the row (FOR UPDATE), S for one that only reads it (FOR SHARE). It is
+	// explicit rather than derived from the plan because the plan's components describe the
+	// *access interval* (gaps, insertion claims) while this is the per-record claim the iterator
+	// acquires as it walks. An empty mode is refused instead of guessed: a locked scan whose
+	// strength is unknown would either exclude too much or protect too little.
+	Mode LockMode
 	// Plan is an opaque, caller-owned description of the intended lock coverage.
 	// The neutral layer carries it unchanged so a backend or adapter can interpret
 	// it without this package depending on SQL planning types.

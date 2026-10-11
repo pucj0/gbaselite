@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -109,6 +110,25 @@ func executeSessionSet(session *executor.Session, query string) (*executor.Resul
 				continue
 			}
 			if err := updated.SetCharacterSet(variable, value); err != nil {
+				return nil, err
+			}
+			changed = true
+		case "innodb_lock_wait_timeout":
+			// The lock-wait bound is session state, not a user variable, so it is validated and
+			// stored through the session setter. The value is an integer number of seconds in
+			// 1..86400; the executor owns that range so the same rule applies whether the setting
+			// arrives through SQL or through the embedded API.
+			if global {
+				return nil, fmt.Errorf("SET GLOBAL innodb_lock_wait_timeout is not supported; set it per session")
+			}
+			if strings.EqualFold(strings.TrimSpace(right), "DEFAULT") {
+				value = strconv.FormatInt(int64(executor.DefaultLockWaitTimeout/time.Second), 10)
+			}
+			seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("innodb_lock_wait_timeout requires an integer number of seconds in 1..86400")
+			}
+			if err := updated.SetLockWaitTimeout(seconds); err != nil {
 				return nil, err
 			}
 			changed = true
@@ -299,6 +319,8 @@ func sessionVariableValues(session *executor.Session, global bool) [][]any {
 	if !global && session.ForeignKeyChecksDisabled {
 		foreignChecks = "0"
 	}
+	// The lock-wait bound is reported in whole seconds, which is the unit the SQL variable uses.
+	lockWait := strconv.FormatInt(int64(session.LockWaitTimeout()/time.Second), 10)
 	return [][]any{
 		{"foreign_key_checks", foreignChecks},
 		{"autocommit", autocommit},
@@ -310,6 +332,7 @@ func sessionVariableValues(session *executor.Session, global bool) [][]any {
 		{"collation_connection", session.CollationConnection},
 		{"collation_database", executor.DefaultCollation},
 		{"collation_server", executor.DefaultCollation},
+		{"innodb_lock_wait_timeout", lockWait},
 		{"lower_case_table_names", "1"},
 		{"system_time_zone", time.Local.String()},
 		{"time_zone", timeZone},

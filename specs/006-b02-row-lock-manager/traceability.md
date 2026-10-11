@@ -373,3 +373,13 @@ Phase 3（US1）的前置条件已就绪：
 | （本轮第三个缺陷）同 bundle 兄弟被当作 older waiter | **已修复**：`waitersAhead`/`olderBlockers` 会把同一 bundle 的 `Gap(a,m)` 当作 `II(b)` 的 older waiter（包含判定为真），使"同域两组件"的请求永久排队且图上无边；现按 `sameBundleRequest` 跳过自身兄弟。 |
 | 证据 | 新增 `lockmanager/claim_identity_test.go`（A–H 八项）与 `resource_test.go: TestB07ClaimIdentityIsExactInsideOneDomain`；**修复前 6/8 失败**（`.tmp/b07-before.txt`），**修复后全部通过**（`.tmp/b07-after.txt`）。`executor/lock_plan_test.go: TestT025SQLInsertRespectsAProtectedRange` 按用户要求重写为"T1 持锁期间 T3 必须完成"，替换原先在释放后才跑范围外插入的时序。T021–T027 的既有验收在修复后仍全部通过，完成标记保持。 |
 
+## A13. 第八轮（Phase 5/US3：T028、T032、T035 完成；T034、T036 未完成）
+
+| 上一版结论 | 现状（`.tmp/b08-phase5-report.md`） |
+|---|---|
+| `NewCurrentIterator` 返回 "not implemented"（fail-closed） | **已实现（T032）**：lock-aware 有限页迭代器——先取访问区间，再分页列键（底层 range scan 每次 yield 前释放 bbolt 读事务），逐键取 record claim 后重读最新有效版本；列表后被删除的键跳过；进度按上次列出的键排他续扫；Close/cancel/epoch 无残留。中立层新增 `CurrentScanRequest.Mode`（S/X，空或区间模式拒绝）。已知限制：键列表取自本事务快照，快照之后提交的新键不会被枚举（受保护范围内的插入仍被区间 claim 阻止）。 |
+| Current Read 适配器契约无独立验收 | **T028 完成**：`current_read_contract_test.go` 9 个黑盒用例覆盖 7 项要求（身份/伪造 grant/父子 overlay/普通读不取锁/能力缺失/observation meta+baseline/epoch 失效）。 |
+| 「1205 已在协议层映射」 | **此前不存在**（会落到 1064 兜底）：本轮在 `server/mysql_server.go` 增加 `ErrLockWaitTimeout` → **1205**。 |
+| 「会话锁期限可在 1..86400 生效」 | **此前只能缩短到 ≤50s**（`requestDeadlineLocked` 把 scope deadline 夹到默认值）：本轮取消夹取，`mvccadapter.BeginLockScope` 传入 ctx deadline ⇒ 1..86400 双向生效；服务端 `SET SESSION innodb_lock_wait_timeout` 与 `@@innodb_lock_wait_timeout` 也已接线（此前仅 executor 路径）。 |
+| SELECT FOR UPDATE/SHARE | **仍未接入（T034 未完成）**：接入点与所需改动见报告 §5；不做半接线（避免"旧快照候选直接返回旧结果"或降低既有可用行为）。T036 的 A–L 依赖它，同样未开始。 |
+

@@ -9,6 +9,21 @@ storageengine新增可选LockingTxn，原Txn/Engine最小接口保持。
 - `ReadCurrent(ctx, grant, space, key)`：验证token覆盖record及epoch，返回CurrentObservation。
 - `NewCurrentIterator(ctx, scope, scanRequest, lockPlan)`：只接受已证明bounds或显式fallback，
   每visited entry加锁后再current reread；Iterator须Close、borrowed bytes规则不变。
+
+### Locking scan 的实施补充（T032，本轮）
+`CurrentScanRequest` 增加显式 **`Mode`（S/X）**：它描述迭代器为每个访问到的键取得的**记录**claim，
+而 `Plan.Components` 描述的是**访问区间**（Gap/插入声明/whole-domain 回退）。空模式或区间模式一律拒绝
+（不猜强度）。迭代器的实现纪律：
+1. 先用 `Plan.Components` 取得区间（可能等待，`LockOpWait` 必须等句柄），此刻不持有任何 storage view；
+2. 分页列键（≤64 行/1MiB）：底层 `ScanRange` 在每次 yield 前释放 bbolt 读事务，因此"等待期间不持有
+   view/cursor/gate"是结构性保证；
+3. 逐键按访问顺序取 record claim（可能等待），获锁后 `ReadCurrent` 读取**最新有效版本**并记录 baseline；
+   观察为 absent 的键**跳过**，绝不返回列表时的旧值；
+4. 进度稳定：下一页严格从上一个已消费键之后继续（正向 Lower 排他、反向 Upper 排他），删除/改写不重复输出；
+5. Close/ctx cancel/epoch reset 均以定义好的终态结束且无锁资源残留。
+6. **已知限制（明示）**：键列表取自本事务快照（含自身 overlay），快照之后别的事务提交的新键不会被枚举；
+   受保护范围内这类插入仍被区间 claim 阻止，且被枚举的键一定重读。要发布这类行需要一个
+   "最新已发布键枚举"的 mvcc API，本 release 未提供（SQL 侧锁定读尚未接线，无用户可见影响）。
 - `CloseLockScope(scope)`：取消pending，不解root grants。
 上述名称为接口契约候选，实施只能一致调整所有设计/任务，不能偷偷把语义塞入Get。
 Current read receiver就是read layer；child可读自己的overlay与ancestor，parent不能读未merge child。

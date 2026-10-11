@@ -1977,19 +1977,22 @@ const defaultLockWaitTimeout = 50 * time.Second
 //
 // The comparison uses the injected clock, so a test with a virtual clock drives the deadline
 // deterministically and no assertion depends on wall-clock elapsed time.
+// requestDeadlineLocked returns the wait deadline of a request issued from one scope.
+//
+// The scope's own deadline *is* the session's lock-wait bound when one was configured: a scope is
+// opened with `now + innodb_lock_wait_timeout`, and the caller may legitimately ask for more than the
+// contract default (the SQL variable accepts up to 86400 seconds). It is therefore not clamped to the
+// default — clamping would silently cut a 300-second session off at 50 seconds, which is exactly the
+// kind of hidden limit a configuration surface must not have. A caller whose query context ends
+// earlier still stops waiting earlier, because the waiting caller observes its own context
+// separately and a cancelled context withdraws the request.
 func (m *manager) requestDeadlineLocked(scopeID uint64) time.Time {
-	now := m.clock.Now()
-	deadline := now.Add(defaultLockWaitTimeout)
-	for rootID, scopes := range m.scopes {
-		_ = rootID
+	for _, scopes := range m.scopes {
 		if scope, ok := scopes.Get(scopeID); ok && !scope.ContextDeadline.IsZero() {
-			if scope.ContextDeadline.Before(deadline) {
-				deadline = scope.ContextDeadline
-			}
-			break
+			return scope.ContextDeadline
 		}
 	}
-	return deadline
+	return m.clock.Now().Add(defaultLockWaitTimeout)
 }
 
 // DetectDeadlock searches the wait-for graph for a cycle and, when it finds one, chooses the

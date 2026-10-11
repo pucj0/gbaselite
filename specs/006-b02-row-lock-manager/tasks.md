@@ -1021,6 +1021,41 @@ T1 持有 `Gap[k150,k500)`（真实捕获的两个主键编码作为边界）并
 T1 回滚后 T2 被唤醒，最后校验数据（50/300 都在）、被释放的范围不再阻塞（插 400 不等待）、
 边界探针通过显式事务回滚因此不留下行。此前的写法在 Gap 释放后才跑范围外 INSERT，不能证明并发能力。
 
+### 第八轮（Phase 5/US3：T028、T032、T035 完成；T034、T036 未完成）证据与任务口径
+
+证据文件 `.tmp/b08-phase5-report.md`；原始输出 `.tmp/b08-acceptance.txt`（验收门）、
+`.tmp/b08-t032-debug.txt`（T032 定位过程）、`.tmp/b08-phase5-report.md`。新增测试：
+`storageengine/mvccadapter/current_read_contract_test.go`（T028，9 个黑盒用例）、
+`storageengine/mvccadapter/locking_view_test.go`（T032，6 个用例 + 1 个 T035 接线用例）、
+`executor/lock_wait_timeout_test.go`（T035，5 组）、
+`server/session_settings_lock_wait_test.go`（T035 服务端 3 个用例）、
+`lockmanager/session_wait_deadline_test.go`（T035 期限方向 3 个用例）。
+
+- [x] **T028**（已完成）：黑盒契约测试覆盖 scope/owner/grant 身份、伪造 grant 拒绝、
+  parent 不得读未 merge child、child 读自身+祖先而不读 sibling、普通 Get/Scan 保持快照语义且不取锁、
+  能力缺失 fail-closed、tombstone/absent/changeTS/baseline 正确、epoch 后旧 grant 失效。
+- [x] **T032**（已完成）：`mvccadapter/iterator.go` 实现 lock-aware 有限页迭代器：
+  先按 `Plan.Components` 取访问区间（WAIT 时等句柄），再分页列键（≤64 行/1MiB，底层 range scan
+  每次 yield 前释放 bbolt 读事务），**逐键**取 record claim 后 `ReadCurrent` 重读最新有效版本并记 baseline；
+  列表后删除的键跳过；进度按"上一次列出的键"排他续扫（正向 Lower/反向 Upper）；
+  Close/cancel/epoch 无残留。新增中立 `CurrentScanRequest.Mode`（S/X，空或区间模式拒绝）。
+  测试证明：iterator 暂停时无关事务可写可提交；等待发生后无关事务仍可提交；等待期间被删除的行不返回；
+  反向/LIMIT/EOF/Close 与默认快照迭代器语义不变。
+- [ ] **T034**（**未完成**）：SELECT FOR UPDATE/SHARE 尚未接入 SQL Executor。接入点与所需改动已写入
+  `.tmp/b08-phase5-report.md` §5；不做半接线（理由同报告）。
+- [x] **T035**（已完成）：会话变量 `innodb_lock_wait_timeout` 全链路可用——executor 侧
+  `Session.LockWaitTimeout/SetLockWaitTimeout` + `Engine.Execute` 的 SET 处理（默认 50s、1..86400、
+  拒绝 0/负/小数/越界/GLOBAL，错误信息点名变量与范围）；**服务端** `server/session_settings.go`
+  加入同一校验的 `SET SESSION ...` 分支、`SELECT @@innodb_lock_wait_timeout`/`SHOW VARIABLES` 可见，
+  `server/mysql_server.go` 增加 **1205** 映射（原为 1064 兜底）；
+  **期限双向生效**：`lockmanager.requestDeadlineLocked` 不再把 scope deadline 夹到 50s 默认值，
+  `mvccadapter.BeginLockScope` 把调用方 ctx 的 deadline 传入 scope ⇒ 1..86400 全部有效，
+  更早的 query ctx 仍然更早结束。测试：executor 5 组（含 1s 预算在**已确认排队**的等待上生效、
+  显式 root 仍可用、无幽灵等待者）、服务端 3 组（接受/拒绝/1205）、lockmanager 3 组
+  （300s 预算跨过 50s 仍等待并在 300s 结束、2s 预算提前结束、无 deadline 时默认 50s）、
+  adapter 1 组（scope 真的带上 300s deadline）。
+- [ ] **T036**（**未完成**）：A–L 双 session 验收依赖 T034 的 SQL 可见性，本轮未开始。
+
 ### 本轮证据文件
 | 文件 | 内容 |
 |---|---|

@@ -50,11 +50,23 @@ func (t *txn) lockManager() *lockmanager.Manager {
 }
 
 // BeginLockScope opens one request scope owned by this transaction's root.
+// BeginLockScope opens one request scope owned by this transaction's root.
+//
+// The scope's wait deadline is taken from the caller's context when it has one. That is what makes
+// the session's `innodb_lock_wait_timeout` effective in both directions: the executor derives the
+// scope context as the earlier of the query context and the session budget, so a session asking for
+// 300 seconds reaches the lock manager as a 300-second scope deadline instead of being silently cut
+// off at the contract default. A context without a deadline leaves the scope's deadline unset and the
+// manager applies its own default.
 func (t *txn) BeginLockScope(ctx context.Context, kind storageengine.LockScopeKind) (uint64, error) {
 	if _, ok := t.LockingTxn(); !ok {
 		return 0, storageengine.ErrUnsupported
 	}
-	return t.inner.BeginLockScope(ctx, mvcc.LockScopeOptions{Kind: kind})
+	options := mvcc.LockScopeOptions{Kind: kind}
+	if deadline, ok := ctx.Deadline(); ok {
+		options.Deadline = deadline
+	}
+	return t.inner.BeginLockScope(ctx, options)
 }
 
 // CloseLockScope cancels this scope's pending requests and keeps every grant.
@@ -149,14 +161,23 @@ func (t *txn) ReadCurrent(ctx context.Context, grant storageengine.LockGrant, sp
 
 // NewCurrentIterator opens a bounded locked scan.
 //
-// It is not implemented in this release, and it reports that instead of falling back to an
-// unlocked snapshot: a caller that asked for a locked scan and silently received an unlocked one
-// would take a decision on data nothing protected.
+// The scan protects the caller's access interval first, then walks the range in bounded pages: each
+// page releases its storage view before the iterator claims the keys of that page, and every claimed
+// key is re-read so a row that was deleted or rewritten while the iterator waited is never returned
+// as it was listed. See `currentIterator` for the two rules that make that structural.
+//
+// A backend without the locking capability, or a request without a usable record mode, fails closed
+// instead of falling back to an unlocked snapshot: a caller that asked for a locked scan and
+// silently received an unlocked one would take a decision on data nothing protected.
 func (t *txn) NewCurrentIterator(ctx context.Context, scope uint64, request storageengine.CurrentScanRequest) (storageengine.Iterator, error) {
 	if _, ok := t.LockingTxn(); !ok {
 		return nil, storageengine.ErrUnsupported
 	}
-	return nil, errors.New("locked current scan is not implemented in this release")
+	it, err := newCurrentIterator(ctx, t.inner, scope, request)
+	if err != nil {
+		return nil, neutralLockError(err)
+	}
+	return it, nil
 }
 
 // ownerID reports the root lock owner this transaction's grants belong to.

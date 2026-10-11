@@ -91,6 +91,12 @@ type Session struct {
 	subqueries        *subqueryRunner
 	savepoints        []savepointLayer
 	timeLocation      *time.Location
+
+	// lockWaitTimeout is the session's `innodb_lock_wait_timeout` budget. The zero
+	// value means "not set", so a fresh or reset session reports and uses the
+	// contract default; read it through LockWaitTimeout and write it through
+	// SetLockWaitTimeout so every validation rule lives in one place.
+	lockWaitTimeout time.Duration
 }
 
 type navicatCopySource struct {
@@ -151,6 +157,15 @@ func (e *Engine) Execute(session *Session, sql string) (*Result, error) {
 		return nil, err
 	}
 	query := strings.TrimSpace(expanded)
+	// `SET SESSION innodb_lock_wait_timeout = N` is a session setting, but the parser's
+	// SET form is the account PASSWORD statement, so the variable is recognised from
+	// the statement text here — the same place the session's other compatibility SET
+	// statements are recognised at the protocol boundary. Only this one variable is
+	// handled; every other statement, including `SET PASSWORD` and every SQL
+	// statement, falls through to the parser exactly as before.
+	if result, handled, err := handleSessionLockWaitTimeoutSet(session, query); handled {
+		return result, err
+	}
 	if cached, ok := e.parseCache.Load(query); ok {
 		return e.executeStatement(session, cached.(parser.Statement), query)
 	}
