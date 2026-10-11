@@ -59,7 +59,9 @@ JDBC、Go MySQL 驱动等客户端提供服务。
   后到者被阻塞，持锁方结束后被唤醒，并在仍持锁时按最新已发布索引重新判重：普通 `INSERT`
   得到 duplicate-key，`REPLACE`/`ON DUPLICATE KEY UPDATE` 在冲突行晚于本语句快照时报可重试冲突
   而不是覆盖它；
-- 锁等待有界（进程内默认 50 秒）；锁状态只存在于内存，不进入持久化、WAL、Raft 命令或备份。
+- 锁等待有界（进程内默认 50 秒）；锁状态只存在于内存，不进入持久化、WAL、Raft 命令或备份；
+- 同一事务重复申请它**已经排队**的保护时会加入那个已有请求并继续等待，而不是被答复"已持有"：
+  只有真正取得的锁才算持有，重复申请不会产生第二把锁，也不会让事务在无保护的情况下继续写入。
 
 **仍未实现**：`SELECT ... FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE` 仍按快照读执行
 （解析器识别，执行器未接线），Current Read 只是存储层能力；Gap / Next-Key / Insert Intention

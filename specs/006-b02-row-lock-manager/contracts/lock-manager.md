@@ -61,6 +61,34 @@ Gap 区间可有显式开闭端点，普通 Next-Key=(prev,key)Gap+Record(key)�
 graph revision变化须重新验证环与victim；检测预算超限报告 ErrLockResourceLimit并移除新请求，
 不得报告虚假死锁。Victim收到 ErrDeadlock并在自身调用栈终止整个root，检测线程不调用Txn方法。
 
+## Claim state and grant identity（本轮补齐的两条契约）
+
+**Applied vs Pending**：claim 有两种状态——**applied**（属于已 GRANTED 的 request）与 **pending**
+（属于仍 WAITING 的 request）。只有 applied claim 代表"已持有"：
+
+- 重入判定（`LockOpReentrant`）只看 applied claim。pending claim **绝不**产生 REENTRANT/GRANTED：
+  一个已持有 S 并在排队升级 X 的 owner，重复申请 X 时必须继续等待，而不能被告知"你已经有了"。
+- 对同一 owner 已排队保护的重复申请**加入该请求**：返回 `LockOpWait` 且 `RequestID` 与原请求相同，
+  两个调用者共享同一终态与同一次通知；不创建第二个 request、不产生第二份 claim、不重复计费。
+  拒绝等待的调用（`TryAcquire`）在此情况返回 `ErrConflict`，不得返回 REENTRANT。
+- 公平队列的"同 owner 较早请求"规则只在较早 claim 已 applied 时才 adopt，且 adopt 时必须撤销本请求
+  排队时登记的那条 claim（否则会留下幽灵 claim，导致释放真正持有的锁后资源仍被占）。
+  较早请求仍在排队时，本 entry 继续等待——它保留自己的 claim，因此不受较早请求被取消的影响。
+- 只有排在**本 entry 之前**的队列项参与该判定（FIFO 顺序）：较年轻的同 owner 请求不得阻挡较年长者。
+
+**Grant identity**：等待获授后返回的 `LockGrant` 必须是**该 request 自己的**能力：
+
+| 字段 | 取值 |
+|---|---|
+| `GrantID` | 该 request 完成时分配的 grant id；重入请求为 0（它没有取得新锁） |
+| `OriginScopeID` | 该 request 的 origin scope（**不是** RequestID） |
+| `Components` | 该 request 取得或合法 adopt 的组件，恰好是它的 bundle 内容 |
+| `OwnerID` / `Generation` / `Term` | 该 owner 的登记值；owner 结束或被 epoch 替换后该能力失效 |
+
+禁止用"同一 root 的全量锁清单"（如 `ledger.GrantedResources`）重建 grant：那会把该 root 其他
+request 的锁拼进本次 grant。能力在 request 终态确定时记录一次，同一 request 的每个调用者读到同一身份，
+每次读取返回独立的组件副本。
+
 ## Deadline and errors
 等待期限是会话lock期限与ctx期限的较早者；未来可注入clock，生产使用monotonic elapsed time。
 Acquire返回：ErrLockWaitTimeout、ErrDeadlock、ErrLockResourceLimit、ErrClosed/ErrNotLeader/

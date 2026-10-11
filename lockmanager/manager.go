@@ -206,6 +206,14 @@ type requestState struct {
 	// RequestStatus.Terminal reports "anything but PENDING": an unwritten status must never
 	// be mistaken for a decided one, or a fresh decision would reject its own first grant.
 	decided bool
+	// grant is the capability this request was granted, recorded at the same moment as the
+	// terminal status. It is stored with the request rather than rebuilt later because only this
+	// request's own bundle knows what the request actually acquired or legitimately adopted: the
+	// owner's resource registry also contains everything its *other* requests hold, so rebuilding
+	// a grant from that registry would answer a waiter with locks its root happened to take
+	// elsewhere. See grantForHandle.
+	grant    LockGrant
+	hasGrant bool
 }
 
 // newRequestState returns the shared, still-pending decision of one queued request.
@@ -253,6 +261,31 @@ func (s *requestState) current() RequestStatus {
 	return s.status
 }
 
+// recordGrant stores the capability this request was granted.
+//
+// It is called before the terminal status is recorded, so a caller that observes GRANTED always
+// finds the capability that answers it, and a request that already settled keeps the outcome it
+// has: a late record cannot rewrite a decided request's identity.
+func (s *requestState) recordGrant(grant LockGrant) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.decided {
+		return
+	}
+	s.grant = grant
+	s.hasGrant = true
+}
+
+// resolvedGrant returns the recorded capability of a granted request.
+func (s *requestState) resolvedGrant() (LockGrant, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.hasGrant {
+		return LockGrant{}, false
+	}
+	return s.grant, true
+}
+
 // Status reports the current status of the request.
 //
 // A status is PENDING until the manager decides the single outcome, and terminal
@@ -264,6 +297,31 @@ func (h *LockHandle) Status() RequestStatus {
 		return RequestCanceled
 	}
 	return h.decision.current()
+}
+
+// resolvedGrant returns the capability recorded for this handle's request.
+//
+// It is the grant *of that request*: its own identity, its own origin scope and exactly the
+// components it acquired or legitimately adopted. It is never the root's whole lock inventory.
+func (h *LockHandle) resolvedGrant() (LockGrant, bool) {
+	if h == nil || h.decision == nil {
+		return LockGrant{}, false
+	}
+	return h.decision.resolvedGrant()
+}
+
+// newHandle returns the caller-side view of one queued request.
+//
+// Every path that hands a caller a queued request goes through here, so a request that a caller
+// started and a request it joined are the same handle: same request id, same decision, same single
+// notification.
+func newHandle(bundle *requestBundle) *LockHandle {
+	return &LockHandle{
+		RequestID:      bundle.req.ID,
+		EnqueueOrdinal: bundle.req.EnqueueOrdinal,
+		decision:       bundle.decision,
+		result:         bundle.req.Result,
+	}
 }
 
 // Wait blocks until the request reaches a terminal status and returns it.
@@ -624,28 +682,42 @@ func (m *Manager) handleDeadline(rootID string, handle *LockHandle) (time.Time, 
 	return bundle.req.Deadline, true
 }
 
-// grantForHandle reconstructs the grant a completed queued request produced.
+// grantForHandle returns the capability of the request behind one settled handle.
+//
+// The grant is read from the request's own recorded decision, never rebuilt from the owner's
+// registry. The registry lists every resource the root holds — including locks taken by its other,
+// unrelated requests — so rebuilding a grant from it would answer a waiter with components its
+// request never acquired, lose the grant identity, and put the request id where the origin scope
+// belongs. Reading it back also keeps the answer stable: two callers that wait on one request get
+// one identity, not two reconstructions that drift apart.
+//
+// The owner must still be live, and it must still be the same generation and leader term the grant
+// was issued under: a handle from an owner whose root ended, or from a replaced epoch, is a stale
+// capability rather than a grant.
 func (m *Manager) grantForHandle(rootID string, handle *LockHandle) (LockGrant, error) {
 	m.inner.mu.Lock()
-	defer m.inner.mu.Unlock()
-	owner, ok := m.inner.owners[rootID]
-	if !ok {
+	owner, live := m.inner.owners[rootID]
+	var generation, term uint64
+	if live {
+		generation, term = owner.Generation, owner.Term
+	}
+	m.inner.mu.Unlock()
+	if !live {
 		return LockGrant{}, ErrOwnerUnknown
 	}
-	resources := m.inner.ledger.GrantedResources(rootID)
-	components := make([]ResourceRef, 0, len(resources))
-	for _, resource := range resources {
-		components = append(components, resource)
+	resolved, ok := handle.resolvedGrant()
+	if !ok {
+		// A GRANTED request with no recorded capability would be an internal inconsistency.
+		// Failing closed is the only safe answer: inventing a grant here is exactly the defect this
+		// path used to have.
+		return LockGrant{}, ErrConflict
 	}
-	SortResourceRefs(components)
-	return LockGrant{
-		OwnerID:       rootID,
-		OriginScopeID: handle.RequestID,
-		Generation:    owner.Generation,
-		Term:          owner.Term,
-		Components:    components,
-		GrantedAt:     m.inner.clock.Now(),
-	}, nil
+	if resolved.Generation != generation || resolved.Term != term {
+		return LockGrant{}, ErrLockInvalidated
+	}
+	out := resolved
+	out.Components = CloneResourceRefs(resolved.Components)
+	return out, nil
 }
 
 // Release drops one owner's grant on one resource.
@@ -1068,21 +1140,19 @@ func (m *manager) AcquireWith(ctx context.Context, rootID string, scopeID uint64
 		return AcquireResult{}, err
 	}
 	deduped := DedupeResourceRefs(components)
-	held := m.ledger.GrantedResources(rootID)
 
-	// Re-entrancy: the owner already holds every component at an equal or stronger mode, so
+	// Re-entrancy: the owner already *holds* every component at an equal or stronger mode, so
 	// there is nothing to take and nothing to charge for.
 	//
-	// A component already *queued* by this owner is re-entrant in the same sense: the claim
-	// exists and already protects the resource, so asking again must adopt it rather than
-	// enqueue a second identical request. Without that, a transaction that repeats an
-	// upgrade would hold two claims and need two releases to retract them.
+	// "Holds" means an applied claim and nothing else. A claim that belongs to a request which is
+	// still queued is protection the owner has *asked* for, not protection it was given: treating
+	// it as held would answer an upgrade with LockOpReentrant while the owner still holds only the
+	// shared lock it started with, and every later decision based on that answer would be wrong.
 	allHeld := true
 	for _, component := range deduped {
-		if m.claimSatisfiesOrQueued(rootID, component) {
+		if m.claimSatisfiedByOwner(rootID, component) {
 			continue
 		}
-		_ = held
 		allHeld = false
 		break
 	}
@@ -1097,6 +1167,20 @@ func (m *manager) AcquireWith(ctx context.Context, rootID string, scopeID uint64
 			Components:    CloneResourceRefs(deduped),
 			GrantedAt:     m.clock.Now(),
 		}}, nil
+	}
+
+	// A component this owner has already queued is not held, but it is also not a new need:
+	// starting a second request for it would take a second claim for one protection and give the
+	// caller a second terminal status to reconcile. When one of the owner's queued requests
+	// already covers this whole request, the acquisition joins it, so both callers wait for the
+	// same request and observe its single outcome.
+	if queued := m.joinableRequestLocked(rootID, deduped); queued != nil {
+		if mayWait != nil && !mayWait() {
+			// A caller that refuses to wait cannot join a request that has not settled. Refusing is
+			// the fail-fast answer; reporting the queued request as held would be a lie.
+			return AcquireResult{}, ErrConflict
+		}
+		return AcquireResult{Op: LockOpWait, Wait: newHandle(queued)}, nil
 	}
 
 	reservation, err := m.ledger.Reserve(rootID, deduped, true)
@@ -1142,14 +1226,9 @@ func (m *manager) AcquireWith(ctx context.Context, rootID string, scopeID uint64
 		request.req.BlockerIDs = blockers
 		m.advanceLocked(request)
 		if request.complete() {
-			return AcquireResult{Op: LockOpGranted, Grant: m.buildGrant(request)}, nil
+			return AcquireResult{Op: LockOpGranted, Grant: m.grantOfLocked(request)}, nil
 		}
-		return AcquireResult{Op: LockOpWait, Wait: &LockHandle{
-			RequestID:      request.req.ID,
-			EnqueueOrdinal: request.req.EnqueueOrdinal,
-			decision:       request.decision,
-			result:         request.req.Result,
-		}}, nil
+		return AcquireResult{Op: LockOpWait, Wait: newHandle(request)}, nil
 	}
 
 	// Nothing blocks the bundle, so it is granted as a whole in this critical section.
@@ -1161,23 +1240,39 @@ func (m *manager) AcquireWith(ctx context.Context, rootID string, scopeID uint64
 		m.ledger.Release(reservation)
 		return AcquireResult{}, ErrBudgetMemory
 	}
-	return AcquireResult{Op: LockOpGranted, Grant: m.buildGrant(request)}, nil
+	return AcquireResult{Op: LockOpGranted, Grant: m.grantOfLocked(request)}, nil
 }
 
-// claimSatisfiedByOwner reports whether this owner already holds a claim on one component
-// strong enough for the requested mode, counting both applied grants and the claims of its
-// own queued requests.
+// grantOfLocked returns the capability of a bundle that has completed.
 //
-// The queued half is what makes a repeated request a no-op: the claim is already there and
-// already counts against other owners, so a second request for the same mode would add a
-// duplicate that only a second release could retract. A request for a *stronger* mode is
-// deliberately not satisfied — that is an upgrade, which must be taken.
+// The bundle recorded its grant when it completed, so this is the same value every other caller of
+// the same request resolves. The fallback exists only for a bundle that completed before it could
+// record one, which would be an internal inconsistency rather than a normal path.
+func (m *manager) grantOfLocked(bundle *requestBundle) LockGrant {
+	if grant, ok := bundle.recordedGrant(); ok {
+		grant.Components = CloneResourceRefs(grant.Components)
+		return grant
+	}
+	return m.buildGrant(bundle)
+}
+
+// claimSatisfiedByOwner reports whether this owner already *holds* one component at a mode equal
+// to or stronger than the one requested.
+//
+// Only an applied claim counts. A claim recorded by a request that is still queued is not a grant:
+// the owner has asked for that mode, it has not been given it, and another owner's incompatible
+// grant may still be standing in the way. Re-entrancy answers "you already have this", so
+// answering it from a queued claim would report protection that does not exist. A request for a
+// *stronger* mode is deliberately not satisfied either — that is an upgrade, which must be taken.
 func (m *manager) claimSatisfiedByOwner(rootID string, component ResourceRef) bool {
 	entry, ok := m.locks.get(component.ResourceKey())
 	if !ok {
 		return false
 	}
 	for _, claim := range entry.claims[rootID] {
+		if claim.pending {
+			continue
+		}
 		if !upgradeNeeded(component.Mode, claim.mode) {
 			return true
 		}
@@ -1185,26 +1280,54 @@ func (m *manager) claimSatisfiedByOwner(rootID string, component ResourceRef) bo
 	return false
 }
 
-// claimSatisfiesOrQueued reports whether a request for this component needs no new claim,
-// either because the owner has already been granted a covering mode or because the owner
-// already has a request waiting for a mode that would cover this one.
+// joinableRequestLocked returns one of the owner's queued requests that already covers every
+// component of a new request, or nil when there is none.
 //
-// The queued half makes a repeated request idempotent. It requires the queued claim to cover
-// the request rather than merely exist: an upgrade queued with a *stronger* mode does not
-// satisfy a request for the weaker one, which must still be taken if the owner does not hold
-// it yet.
-func (m *manager) claimSatisfiesOrQueued(rootID string, component ResourceRef) bool {
-	entry, ok := m.locks.get(component.ResourceKey())
-	if !ok {
-		return false
-	}
-	for _, claim := range entry.claims[rootID] {
-		if upgradeNeeded(component.Mode, claim.mode) {
+// It is how a repeated acquisition is kept idempotent without lying about what is held. The
+// earliest such request wins, so the queue position and the terminal status the caller observes do
+// not depend on map iteration order. A request that has already settled is skipped: its outcome is
+// final, and joining it would not deliver the protection the caller is asking for.
+func (m *manager) joinableRequestLocked(rootID string, components []ResourceRef) *requestBundle {
+	var best *requestBundle
+	for entry := range m.pending[rootID] {
+		bundle := entry.bundle
+		if bundle == nil || bundle.req.Status.Terminal() {
 			continue
 		}
-		return true
+		if best != nil && bundle.req.EnqueueOrdinal >= best.req.EnqueueOrdinal {
+			continue
+		}
+		if !bundleCoversRequest(bundle, components) {
+			continue
+		}
+		best = bundle
 	}
-	return false
+	return best
+}
+
+// bundleCoversRequest reports whether one queued request asked for every component of a bundle, at
+// a mode that covers the requested one.
+//
+// The component is matched by its canonical resource key, which is what makes the match
+// independent of the order the caller listed its components in.
+func bundleCoversRequest(bundle *requestBundle, components []ResourceRef) bool {
+	for _, component := range components {
+		covered := false
+		for _, entry := range bundle.entries {
+			if entry.ref.ResourceKey() != component.ResourceKey() {
+				continue
+			}
+			if upgradeNeeded(component.Mode, entry.ref.Mode) {
+				continue
+			}
+			covered = true
+			break
+		}
+		if !covered {
+			return false
+		}
+	}
+	return true
 }
 
 // adoptedClaims maps a bundle component to the request whose claim already covers it.
@@ -1608,8 +1731,13 @@ func (m *manager) grantLocked(bundle *requestBundle) {
 		case entryHeld:
 			continue
 		case entryAdopted:
-			// The owner already holds a claim here, so this component is satisfied without
-			// taking a second claim.
+			// An earlier request of the same owner already *applied* the claim this component
+			// needs, so this bundle is satisfied without a second one. The claim this bundle
+			// recorded for the component when it was queued must be retracted: leaving it behind
+			// would keep the resource held by a claim whose request is already settled, so
+			// releasing the lock the owner really took would not release it. The claim is pending
+			// (it was never applied for this request), so there is no grant to refund.
+			lockEntry.dropClaim(entry.req)
 			entry.state = entryHeld
 			bundle.held++
 			lockEntry.remove(entry)
@@ -1650,6 +1778,10 @@ func (m *manager) completeBundleLocked(bundle *requestBundle) {
 		m.nextGrantID++
 		bundle.grantID = m.nextGrantID
 	}
+	// The capability is recorded with the request before its terminal status is published, so
+	// every caller of this request — the one that started it and every caller that joined it —
+	// resolves the same identity, the same origin scope and the same component list.
+	bundle.setGrant(m.buildGrant(bundle))
 	bundle.setStatus(RequestGranted)
 }
 
@@ -1863,6 +1995,10 @@ func (m *manager) Deadlocks(limit int) ([]DeadlockSummary, bool) {
 }
 
 // buildGrant assembles the grant view a caller receives for one bundle.
+//
+// It is the single description of a granted request: the bundle's own grant id, its own origin
+// scope, and exactly the components the bundle asked for. `completeBundleLocked` records it with
+// the request so a waiter gets the same value the inline path returns.
 func (m *manager) buildGrant(bundle *requestBundle) LockGrant {
 	owner := m.owners[bundle.req.OwnerID]
 	grant := LockGrant{

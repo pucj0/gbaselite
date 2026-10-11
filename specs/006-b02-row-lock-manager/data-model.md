@@ -28,6 +28,11 @@ State、Blockers、ResultChannel（单次通知）、ReservedBudget。
 转换：NEW → GRANTED 或 WAITING；WAITING → GRANTED/TIMED_OUT/CANCELED/
 DEADLOCK_VICTIM/INVALIDATED/RESOURCE_REJECTED。所有终态唯一、不可重新 WAITING。
 Grant 字段：GrantID、OwnerRootID、OriginScopeID、Generation/Term、Components、GrantedAt。
+Grant 身份属于**产生它的那个 request**：GrantID 是该 request 完成时的 id（重入请求为 0）、
+OriginScopeID 是该 request 的 scope（不是 RequestID）、Components 恰好是该 request 取得或 adopt 的
+组件（不得拼接同一 root 其他 request 的锁）；能力在终态确定时记录一次，同一 request 的所有调用者一致。
+Request 的 claim 状态分 applied（属于 GRANTED 的 request）与 pending（属于 WAITING 的 request），
+只有 applied claim 构成"已持有"，重入/adopt 判定见 contracts/lock-manager.md §Claim state and grant identity。
 Next-Key/bundle 要么全部有效，要么没有新 grant；已有 S 的升级等待不能临时删除 S。
 GrantToken 为 opaque handles，不是 durable version receipt；root 结束/epoch失效立即不可用。
 

@@ -656,11 +656,16 @@ func TestB02ReleaseRetractsOnlyItsOwnClaim(t *testing.T) {
 	}
 }
 
-// TestB02ReentrantUpgradeWhileWaitingAdoptsThePendingClaim proves that asking again for the
-// very same upgrade while it is already queued is a no-op rather than a second claim: a
-// duplicate claim would need two releases to retract and would keep the row blocked for one
-// release too long.
-func TestB02ReentrantUpgradeWhileWaitingAdoptsThePendingClaim(t *testing.T) {
+// TestB02RepeatUpgradeWhileWaitingJoinsTheQueuedRequest proves that asking again for the very same
+// upgrade while it is already queued is a no-op rather than a second claim, *without* pretending
+// the upgrade is held.
+//
+// The earlier version of this test asserted LockOpReentrant here. That expectation was wrong: the
+// owner holds S and has only *asked* for X, so answering "you already have it" reported a mode the
+// owner had never been granted, and a caller that trusted the answer would act on protection that
+// did not exist. The repeat now joins the queued request — one request, one queue position, one
+// terminal status — and the claim accounting the test pins is unchanged.
+func TestB02RepeatUpgradeWhileWaitingJoinsTheQueuedRequest(t *testing.T) {
 	ctx := context.Background()
 	m, _ := newPublicManager(t, BudgetLimits{})
 	a := newPublicOwner(t, m, "root-a")
@@ -673,11 +678,18 @@ func TestB02ReentrantUpgradeWhileWaitingAdoptsThePendingClaim(t *testing.T) {
 	b.grant(ctx, sharedBundle("t1", "PRIMARY", key)...)
 	first := a.wait(ctx, rowBundle(row)...)
 
-	// The same request again is a no-op: the protection is already queued, so the transaction
-	// still owns exactly one exclusive claim and no second request is created.
+	// The same request again joins the queued upgrade: the transaction still owns exactly one
+	// queued request, no second claim is taken, and no grant is reported for a mode it does not
+	// hold yet.
 	second := a.acquire(ctx, rowBundle(row)...)
-	if second.Op != LockOpReentrant {
-		t.Fatalf("duplicate upgrade op = %s, want REENTRANT because the upgrade is already queued", second.Op)
+	if second.Op != LockOpWait {
+		t.Fatalf("duplicate upgrade op = %s, want WAIT: the upgrade is queued, not held", second.Op)
+	}
+	if second.Wait.RequestID != first.Wait.RequestID {
+		t.Fatalf("duplicate upgrade joined request %d, want the queued request %d", second.Wait.RequestID, first.Wait.RequestID)
+	}
+	if mode, ok := m.HeldMode("root-a", row); !ok || mode != ModeS {
+		t.Fatalf("root-a holds %v/%v while the upgrade waits, want S", mode, ok)
 	}
 	if got := m.PendingRequests("root-a"); got != 1 {
 		t.Fatalf("root-a pending = %d, want the single upgrade", got)
@@ -689,11 +701,14 @@ func TestB02ReentrantUpgradeWhileWaitingAdoptsThePendingClaim(t *testing.T) {
 	if _, err := m.WaitForGrant(ctx, "root-a", first.Wait); err != nil {
 		t.Fatalf("original upgrade wait: %v", err)
 	}
+	if status := second.Wait.Status(); status != RequestGranted {
+		t.Fatalf("the joined handle reports %s, want GRANTED", status)
+	}
 	if mode, ok := m.HeldMode("root-a", row); !ok || mode != ModeX {
 		t.Fatalf("root-a holds %v/%v, want X", mode, ok)
 	}
 	// The row is handed to the next owner once root-a's claims are gone. root-a holds one
-	// shared claim and one exclusive claim, so both are released; a duplicate upgrade would
+	// shared claim and one exclusive claim, so both are released; a duplicate request would
 	// have added a third.
 	waiting := c.wait(ctx, rowBundle(row)...)
 	if _, err := m.Release("root-a", row); err != nil {

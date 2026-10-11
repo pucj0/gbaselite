@@ -325,3 +325,12 @@ Phase 3（US1）的前置条件已就绪：
 | `LockHandle` 的状态读取 | **已同步化**：`requestState` 用自带 mutex + compare-and-set 保证唯一终态、无回退、并发查询安全（`lockmanager/handle_state_test.go`）。**真实 `-race` 证据仍缺失**（本机无 C 工具链），T067 未勾选。 |
 | 「queue advance 遗漏导致等待后不唤醒」（第一轮记录） | **更正为测试串行假象**：释放 holder 的 COMMIT 与阻塞的 UPDATE 在同一个 goroutine，`ReleaseOwner` 从未执行。trace 与确定性用例见报告 §4。 |
 
+## A8. 第三轮修订（Lock Manager 两条契约缺陷）
+
+| 上一版结论 | 现状（`.tmp/b02r3-fix-report.md`） |
+|---|---|
+| `claimSatisfiedByOwner`/`claimSatisfiesOrQueued`「计数 applied grants 与自身排队请求的 claim」 | **已更正**：重入/已持有只看 **applied** claim；排队中的 claim 不再是"已持有"。重复申请同一排队保护改为**加入该 request**（WAIT、同 RequestID、同一终态），不再返回 REENTRANT；`TryAcquire` 在该情况返回 `ErrConflict`。见 `lockmanager/manager.go`（`claimSatisfiedByOwner`、`joinableRequestLocked`、`bundleCoversRequest`）与 `contracts/lock-manager.md` §Claim state and grant identity。 |
+| 公平队列 `waitsBehindOwner`「同 owner 较早的相同 mode 排队即 adopt」 | **已更正**：只在较早 claim 已 applied 时 adopt；较早请求仍在排队时本 entry 继续等待（保留自身 claim，故不受其取消影响），且 adopt 时撤销本请求排队登记的 claim（消除幽灵 claim）。判定只看本 entry **之前**的队列项。见 `lockmanager/queue.go`（`adoptableOwnClaim`、`claimAppliedFor`）与 `grantLocked` 的 adopted 分支。 |
+| `grantForHandle`「从 owner 的 granted resources 重建 Grant」 | **已更正**：等待获授的 grant 现在从该 request 自己记录的终态能力读出（`GrantID`/`OriginScopeID`/`Components`/`OwnerID`/`Generation`/`Term` 全部属于该 request），不再拼接同一 root 的其他锁、不再用 RequestID 充当 OriginScopeID；owner 结束或被 epoch 替换后 fail closed。见 `lockmanager/manager.go`（`requestState.recordGrant`、`completeBundleLocked`、`grantForHandle`）与 `storageengine/mvccadapter/locking.go`。中立 `LockGrant` 顺带移除了从未被读取、且被填成"发放时刻"的 `Deadline` 字段（data-model 的 Grant 字段列表本就没有它）。 |
+| `TestB02ReentrantUpgradeWhileWaitingAdoptsThePendingClaim` | **改写为** `TestB02RepeatUpgradeWhileWaitingJoinsTheQueuedRequest`：旧断言（重复升级返回 REENTRANT）正是本轮修复的缺陷，现断言返回 WAIT 且加入同一请求，同时保留"只产生一个请求、两次 release 后交给下一个 owner"的原有约束。 |
+

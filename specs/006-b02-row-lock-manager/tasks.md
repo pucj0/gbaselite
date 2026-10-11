@@ -726,6 +726,35 @@ Task 的 test 标记不等于测试已执行；勾选项均附真实命令输出
 `contracts/current-read.md` 新增 **Grant verification** 一节（四项校验与"pending 不是锁"）；
 `contracts/sql-locking.md` 的 DML 一节新增**唯一值 reservation 与物理 index entry 的资源表**、
 等待后重校验的三种结论，以及 UPDATE 每个候选都取新旧索引项的规则。
+### 第三轮（Lock Manager 契约缺陷修复）证据与任务口径
+
+证据文件 `.tmp/b02r3-fix-report.md`：两条缺陷的"复现（修复前失败）→ 根因 → 修复 → 修复后通过"、
+不变量核对、`go test ./...` 退出码、race 工具链不可用的原始报错，以及本轮发现的其他问题。
+辅助原始输出：`.tmp/b02r3-before.txt`（修复前 6 个失败）、`.tmp/b02r3-after.txt`、
+`.tmp/b02r3-lockmanager-all.txt`、`.tmp/b02r3-gotest-all.txt`、`.tmp/b02r3-race.txt`。
+
+新增测试：`lockmanager/grant_contract_test.go`（pending 不等于已授予、加入排队请求、TryAcquire 拒绝、
+等待获授的 grant 身份、多资源 bundle、多次读取一致、重入与 adopt 保持、owner 结束后失效、取消不产生 grant）、
+`storageengine/mvccadapter/locking_grant_test.go`（中立层跨等待的 grant 身份）。
+改写的既有测试：`lockmanager/lock_acquisition_test.go` 的
+`TestB02ReentrantUpgradeWhileWaitingAdoptsThePendingClaim` → `TestB02RepeatUpgradeWhileWaitingJoinsTheQueuedRequest`
+（旧断言正是本轮缺陷）。
+
+任务口径（**不勾选任何未完整达成的任务**）：
+- **T016/T017 得到补强**（已勾选，不新增勾选）：US1 内核的 acquire/公平队列新增"pending≠applied"与
+  "重复申请加入原请求"两条规则，并新增 grant 身份记录；`TryAcquire` 语义明确为 `ErrConflict`。
+- **T018 得到补强**（继续未勾选）：`mvccadapter.grant()` 逐字段映射 `GrantID`/`OriginScopeID`/`Components`/
+  `Generation`/`Term` 并移除误导性的 `Deadline`，新增中立层跨等待身份测试；engine 级装配与 namespace
+  标签仍未验收。
+- **T048/T050 不受影响**（死锁图/检测未改），但队列诚实性判定的变化已由 lockmanager 全套回归覆盖。
+- **T067（race）保持未勾选**：本机无 C 工具链（`-race requires cgo`，且无任何 gcc/clang/zig），
+  `go test -race ./lockmanager/...` 无法运行，**不伪报 race 通过**。
+
+契约同步（随代码一起修订）：`contracts/lock-manager.md` 新增 §Claim state and grant identity；
+`data-model.md` 的 LockRequest/LockGrant 一节补充 claim 状态与"grant 身份属于该 request"。
+本轮未改 WAL、Raft Command、存储格式，也未进入其他 Phase。
+
+
 ### 本轮证据文件
 | 文件 | 内容 |
 |---|---|

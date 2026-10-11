@@ -76,9 +76,11 @@ type lockRequest struct {
 	// retract only the claims it really holds, and a component that was already granted when
 	// the rest of the bundle blocked must not be mistaken for one that was never queued.
 	state entryState
-	// adopted is the earlier request whose claim already covers this component, when the
-	// owner held it before this bundle was queued. An adopted component adds no claim, and
-	// this request is then already complete for it.
+	// adopted is the earlier request whose applied claim covers this component, recorded by either
+	// adoption path: the snapshot taken when this bundle was queued (markAdoptedLocked) or the fair
+	// pass deciding that an earlier request of the same owner already holds it (adoptableOwnClaim).
+	// An adopted component adds no claim of its own, so this request is already complete for it and
+	// its release must not retract the earlier request's protection.
 	adopted *LockRequest
 	// blocked records whether this component is held back by a holder or by an older waiter.
 	blocked bool
@@ -128,6 +130,25 @@ func (b *requestBundle) setStatus(status RequestStatus) {
 	}
 	b.req.Status = recorded
 	b.req.Notify(recorded)
+}
+
+// setGrant records the capability this bundle's request was granted.
+//
+// It is called before setStatus, so the capability a caller resolves out of a GRANTED request is
+// always the request's own: its grant id, its origin scope and its components.
+func (b *requestBundle) setGrant(grant LockGrant) {
+	if b.decision == nil {
+		return
+	}
+	b.decision.recordGrant(grant)
+}
+
+// recordedGrant returns the capability this bundle's request was granted.
+func (b *requestBundle) recordedGrant() (LockGrant, bool) {
+	if b.decision == nil {
+		return LockGrant{}, false
+	}
+	return b.decision.resolvedGrant()
 }
 
 // untrack removes every entry of this bundle from a per-root pending index.
@@ -543,7 +564,8 @@ func (e *lockEntry) appendBlockingClaims(dst []string, entry *lockRequest) []str
 			if ownerID == entry.req.OwnerID {
 				// The requesting owner never blocks itself. Its own granted claims are what it
 				// already holds, and an upgrade converts one of them rather than conflicting with
-				// it; an earlier waiting request of the same owner is handled by waitsBehindOwner.
+				// it; an earlier waiting request of the same owner is handled by
+				// adoptableOwnClaim, which settles an entry only against an applied claim.
 				continue
 			}
 			if e.ownerBlocksWith(ownerID, mode, entry) {
@@ -643,27 +665,64 @@ func (e *lockEntry) immediateConflict(candidate *lockRequest) bool {
 		e.waitersAhead(candidate, candidate.ref)
 }
 
-// waitsBehindOwner reports whether the requesting owner already has an earlier waiting
-// request with an incompatible claim here.
+// adoptableOwnClaim reports whether an earlier queued request of the same owner already provides
+// the protection this entry needs, and settles the entry when it really does.
 //
-// A repeated request must wait behind the owner's own queued request rather than be granted
-// alongside it: granting it would let one transaction hold two claims for one protection and
-// would report success while the earlier request is still blocked. It is checked by the fair
-// pass, which is where a request that has already recorded its own claim is evaluated.
-func (e *lockEntry) waitsBehindOwner(entry *lockRequest) bool {
+// It is the fair pass's third rule, and it deliberately separates an applied claim from a queued
+// one:
+//
+//   - The earlier request's claim is applied: the owner genuinely holds that protection, so this
+//     entry is adopted. It records no claim of its own — one protection, one claim, retracted once.
+//   - The earlier request is still queued: the owner has asked for that mode, it has not been
+//     given it. Settling this entry against it would report a grant for protection that does not
+//     exist yet, and the protection this entry relied on would vanish if that earlier request were
+//     cancelled. The entry is simply not grantable yet; it keeps its own claim, so it can still be
+//     granted on its own once nothing else blocks it.
+//
+// The return value is "this entry may not be granted now" either way, which is what the caller
+// asks. Whether the entry was also settled is visible in entry.state.
+//
+// Only requests that appear *before* this one in the FIFO order count: the question is whether the
+// owner already queued this protection, and a request that arrived later has not. Scanning past
+// the entry itself would let a younger request of the same owner hold back an older one, which is
+// the opposite of the fairness order the queue exists for.
+func (e *lockEntry) adoptableOwnClaim(entry *lockRequest) bool {
 	for _, earlier := range e.waiting {
-		if earlier == nil || earlier.dead || earlier == entry {
+		if earlier == entry {
+			return false
+		}
+		if earlier == nil || earlier.dead {
 			continue
 		}
 		if earlier.req.OwnerID != entry.req.OwnerID {
 			continue
 		}
-		if earlier.ref.Mode == entry.ref.Mode {
-			// The same protection is already queued: this request is a duplicate of one the
-			// owner is already waiting for, so it is adopted rather than taken again.
-			entry.state = entryAdopted
+		if upgradeNeeded(entry.ref.Mode, earlier.ref.Mode) {
+			// The earlier request asked for a weaker mode, so it is not the protection this entry
+			// needs.
+			continue
+		}
+		if !e.claimAppliedFor(earlier.req) {
 			return true
 		}
+		entry.state = entryAdopted
+		entry.adopted = earlier.req
+		return true
+	}
+	return false
+}
+
+// claimAppliedFor reports whether one request holds an *applied* claim on this resource.
+//
+// A request that adopted its component records no claim here, so "not applied" is the safe answer:
+// an entry that waits for it stays queued rather than being granted on protection that another
+// request might retract.
+func (e *lockEntry) claimAppliedFor(request *LockRequest) bool {
+	for _, claim := range e.claims[request.OwnerID] {
+		if claim.request != request {
+			continue
+		}
+		return !claim.pending
 	}
 	return false
 }
@@ -727,7 +786,7 @@ func (e *lockEntry) grantable(candidate *lockRequest) bool {
 		candidate.bundle.blockedByOlderWaiter = true
 		return false
 	}
-	if e.waitsBehindOwner(candidate) {
+	if e.adoptableOwnClaim(candidate) {
 		return false
 	}
 	return true

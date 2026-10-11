@@ -158,8 +158,10 @@ func (t *txn) ownerID() string { return t.inner.LockOwnerID() }
 // grant converts one lock-manager grant into the neutral capability.
 //
 // Every field of the capability is mapped, because the neutral grant is what a later
-// ReadCurrent re-validates: dropping the components, the generation or the term would leave the
-// caller with a capability that can only be trusted, never checked.
+// ReadCurrent re-validates and what a caller relies on to know what it acquired: dropping the
+// components, the generation or the term would leave the caller with a capability that can only be
+// trusted, never checked, and mapping the scope or the id to something else would name a request
+// that is not this one.
 func (t *txn) grant(g lockmanager.LockGrant) storageengine.LockGrant {
 	return storageengine.LockGrant{
 		ID:         g.GrantID,
@@ -169,7 +171,6 @@ func (t *txn) grant(g lockmanager.LockGrant) storageengine.LockGrant {
 		Term:       g.Term,
 		Components: neutralComponents(g.Components),
 		Granted:    g.GrantedAt,
-		Deadline:   g.GrantedAt,
 	}
 }
 

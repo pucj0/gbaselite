@@ -167,12 +167,16 @@ type LockRequest struct {
 // would let a caller authorise a current read of a row it never locked, and the
 // observation that read records would then become that transaction's write
 // baseline. A caller must therefore pass back the grant it received, unchanged.
+//
+// It carries no expiry of its own: the wait bound belongs to the request and its
+// scope (see the lock manager's diagnostics), and a grant lives until its owner
+// root ends. An earlier revision of this DTO carried a Deadline that was filled
+// with the instant of granting, which read as an expiry that had already passed.
 type LockGrant struct {
-	ID       uint64
-	OwnerID  string
-	ScopeID  uint64
-	Granted  time.Time
-	Deadline time.Time
+	ID      uint64
+	OwnerID string
+	ScopeID uint64
+	Granted time.Time
 	// Generation is the engine generation the grant was issued under. A grant from
 	// an ended generation is refused rather than honoured.
 	Generation uint64
