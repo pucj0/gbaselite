@@ -162,7 +162,7 @@ type AcquireResult struct {
 //
 // Several handles can refer to one request: the caller that queued it and every caller that
 // joined it. They all observe the same decision through the same broadcast, which is why the
-// request can be shared safely — a wake-up is not a value handed to one receiver but a channel
+// request can be shared safely 鈥?a wake-up is not a value handed to one receiver but a channel
 // closed for all of them.
 //
 // Synchronization: the shared decision guards itself with its own small mutex, so Status
@@ -539,7 +539,7 @@ func (m *Manager) Deadlocks(limit int) ([]DeadlockSummary, bool) {
 	return m.inner.Deadlocks(limit)
 }
 
-// Manager is the exported façade of one engine's lock manager.
+// Manager is the exported fa莽ade of one engine's lock manager.
 //
 // It exists so the backend adapter has one documented entry point and tests have one type
 // to hold. It deliberately exposes no way to observe or mutate a transaction: the adapter
@@ -639,8 +639,8 @@ func (m *Manager) WaitForGrant(ctx context.Context, rootID string, handle *LockH
 //
 // It is the deterministic synchronization point of the "several callers wait for one request"
 // tests: a hook that blocks parks every caller at exactly the moment before the outcome is
-// awaited, so a test can decide the outcome — grant, cancel, timeout, deadlock victim, epoch reset
-// — and then release the callers, and observe which of them learns it. Parking inside the blocking
+// awaited, so a test can decide the outcome 鈥?grant, cancel, timeout, deadlock victim, epoch reset
+// 鈥?and then release the callers, and observe which of them learns it. Parking inside the blocking
 // path (and not before it) is what makes the test meaningful: a caller parked earlier would take
 // the "already decided" fast path instead of exercising the wake-up under test.
 //
@@ -805,8 +805,8 @@ func (m *Manager) handleDeadline(rootID string, handle *LockHandle) (time.Time, 
 // grantForHandle returns the capability of the request behind one settled handle.
 //
 // The grant is read from the request's own recorded decision, never rebuilt from the owner's
-// registry. The registry lists every resource the root holds — including locks taken by its other,
-// unrelated requests — so rebuilding a grant from it would answer a waiter with components its
+// registry. The registry lists every resource the root holds 鈥?including locks taken by its other,
+// unrelated requests 鈥?so rebuilding a grant from it would answer a waiter with components its
 // request never acquired, lose the grant identity, and put the request id where the origin scope
 // belongs. Reading it back also keeps the answer stable: two callers that wait on one request get
 // one identity, not two reconstructions that drift apart.
@@ -1138,8 +1138,8 @@ func (m *manager) CloseScope(rootID string, scopeID uint64) ([]uint64, error) {
 // A join is a caller waiting for a request it did not create, so discarding the scope the join came
 // from has to end that caller's wait: a closed statement scope must not keep blocking, and it must
 // never be handed a grant for a statement that no longer exists. The request itself is deliberately
-// untouched — it belongs to the scope that created it, to the root and to every other caller still
-// waiting for it — which is why this is not part of cancelRequestsLocked.
+// untouched 鈥?it belongs to the scope that created it, to the root and to every other caller still
+// waiting for it 鈥?which is why this is not part of cancelRequestsLocked.
 //
 // The scan runs over the queued requests, which are bounded by the waiter budget, and each scope's
 // join record is removed as it is closed, so a repeated scope close finds nothing left to do.
@@ -1426,7 +1426,13 @@ func (m *manager) grantOfLocked(bundle *requestBundle) LockGrant {
 // the owner has asked for that mode, it has not been given it, and another owner's incompatible
 // grant may still be standing in the way. Re-entrancy answers "you already have this", so
 // answering it from a queued claim would report protection that does not exist. A request for a
-// *stronger* mode is deliberately not satisfied either — that is an upgrade, which must be taken.
+// *stronger* mode is deliberately not satisfied either 鈥?that is an upgrade, which must be taken.
+//
+// The claim must be the *same lock*, not merely a claim of the same conflict domain. Two gaps of
+// one namespace live in one entry because they have to be compared with each other, and holding
+// `Gap(a,m)` says nothing about a request for `Gap(n,z)`: that is a second protection, and
+// answering it with REENTRANT would leave the second range unprotected while telling the caller it
+// holds it. Same for two insertion positions.
 func (m *manager) claimSatisfiedByOwner(rootID string, component ResourceRef) bool {
 	entry, ok := m.locks.get(component.ResourceKey())
 	if !ok {
@@ -1434,6 +1440,9 @@ func (m *manager) claimSatisfiedByOwner(rootID string, component ResourceRef) bo
 	}
 	for _, claim := range entry.claims[rootID] {
 		if claim.pending {
+			continue
+		}
+		if !SameClaim(claim.ref, component) {
 			continue
 		}
 		if !upgradeNeeded(component.Mode, claim.mode) {
@@ -1471,13 +1480,16 @@ func (m *manager) joinableRequestLocked(rootID string, components []ResourceRef)
 // bundleCoversRequest reports whether one queued request asked for every component of a bundle, at
 // a mode that covers the requested one.
 //
-// The component is matched by its canonical resource key, which is what makes the match
-// independent of the order the caller listed its components in.
+// The component is matched by its exact claim identity (`ClaimKey`), which is what makes the match
+// independent of the order the caller listed its components in 鈥?and what keeps a queued
+// `Gap(a,m)` from being treated as already covering a new request for `Gap(n,z)`. Sharing a
+// conflict domain is not covering: the two gaps are different ranges, so joining the queued request
+// would leave the new range protected only by accident.
 func bundleCoversRequest(bundle *requestBundle, components []ResourceRef) bool {
 	for _, component := range components {
 		covered := false
 		for _, entry := range bundle.entries {
-			if entry.ref.ResourceKey() != component.ResourceKey() {
+			if !SameClaim(entry.ref, component) {
 				continue
 			}
 			if upgradeNeeded(component.Mode, entry.ref.Mode) {
@@ -1503,6 +1515,9 @@ func bundleCoversRequest(bundle *requestBundle, components []ResourceRef) bool {
 // component is satisfied without a second claim. A pending claim belongs to a request that is
 // still waiting and must not be adopted, because that would report a grant for a mode the
 // owner does not hold yet.
+//
+// Adoption matches the exact claim identity for the same reason re-entrancy does: an applied
+// `Gap(a,m)` is not the protection a request for `Gap(n,z)` asked for.
 func (m *manager) adoptedClaims(rootID string, components []ResourceRef) map[string]*LockRequest {
 	adopted := make(map[string]*LockRequest, len(components))
 	for _, component := range components {
@@ -1517,10 +1532,13 @@ func (m *manager) adoptedClaims(rootID string, components []ResourceRef) map[str
 				// the owner does not hold yet.
 				continue
 			}
+			if !SameClaim(claim.ref, component) {
+				continue
+			}
 			if upgradeNeeded(component.Mode, claim.mode) {
 				continue
 			}
-			adopted[component.ResourceKey()] = claim.request
+			adopted[component.ClaimKey()] = claim.request
 			break
 		}
 	}
@@ -1533,7 +1551,7 @@ func (m *manager) adoptedClaims(rootID string, components []ResourceRef) map[str
 // adoption cannot match the request's own pending claims and mark every component adopted.
 func (m *manager) markAdoptedLocked(bundle *requestBundle, adopted map[string]*LockRequest) {
 	for _, entry := range bundle.entries {
-		if _, ok := adopted[entry.ref.ResourceKey()]; ok {
+		if _, ok := adopted[entry.ref.ClaimKey()]; ok {
 			entry.state = entryAdopted
 		}
 	}
@@ -1566,7 +1584,7 @@ func (m *manager) newRequestLocked(rootID string, scopeID uint64, deduped []Reso
 	bundle := &requestBundle{req: request, reservation: reservation, decision: newRequestState()}
 	bundle.entries = make([]*lockRequest, 0, len(deduped))
 	for _, component := range deduped {
-		bundle.entries = append(bundle.entries, &lockRequest{req: request, ref: component, bundle: bundle, adopted: adopted[component.ResourceKey()]})
+		bundle.entries = append(bundle.entries, &lockRequest{req: request, ref: component, bundle: bundle, adopted: adopted[component.ClaimKey()]})
 	}
 	return bundle, nil
 }
@@ -1592,7 +1610,7 @@ func (m *manager) inspectLocked(bundle *requestBundle) ([]*lockRequest, []string
 		lockEntry := m.locks.entryFor(entry.ref)
 		conflict := false
 		// The mode that matters is *this* component's mode. A bundle carries components of
-		// different kinds — a table intention beside a record lock — so testing every component
+		// different kinds 鈥?a table intention beside a record lock 鈥?so testing every component
 		// with one mode would let a record mode be compared against a table intention and the
 		// conflict would be missed or invented.
 		for _, holder := range lockEntry.conflictingHolders(entry.ref, entry.req.OwnerID) {
@@ -1645,8 +1663,8 @@ func (m *manager) enqueueLocked(bundle *requestBundle, blocking []*lockRequest) 
 		lockEntry := m.locks.entryFor(entry.ref)
 		if entry.state != entryAdopted {
 			// A queued component records its claim as *pending*: the claim is real and must count
-			// against other owners — that is what makes a waiting upgrade protect the row and what
-			// lets a repeated request be recognised as covered — but it does not yet apply to the
+			// against other owners 鈥?that is what makes a waiting upgrade protect the row and what
+			// lets a repeated request be recognised as covered 鈥?but it does not yet apply to the
 			// owner's granted mode. An adopted component already has the owner's claim and records
 			// nothing.
 			lockEntry.addClaim(entry.req, entry.ref, true)
@@ -1831,8 +1849,8 @@ func dedupeEdges(edges []LockEdge) []LockEdge {
 // retryWaitingLocked grants every queued bundle whose components are all grantable now.
 //
 // A bundle is granted as a whole or not at all. A per-component grant would make a partially
-// granted bundle observable — its owner would appear to hold the record but not the table
-// intention — and would let an unrelated queue pass complete a bundle on the wrong trigger.
+// granted bundle observable 鈥?its owner would appear to hold the record but not the table
+// intention 鈥?and would let an unrelated queue pass complete a bundle on the wrong trigger.
 // Checking readiness for the whole bundle and then applying it keeps the grant atomic.
 //
 // The pass repeats until it makes no progress, because completing one bundle changes the
@@ -1899,13 +1917,13 @@ func (m *manager) grantLocked(bundle *requestBundle) {
 			// would keep the resource held by a claim whose request is already settled, so
 			// releasing the lock the owner really took would not release it. The claim is pending
 			// (it was never applied for this request), so there is no grant to refund.
-			lockEntry.dropClaim(entry.req)
+			lockEntry.dropClaim(entry.req, entry.ref)
 			entry.state = entryHeld
 			bundle.held++
 			lockEntry.remove(entry)
 			continue
 		}
-		if !lockEntry.applyClaim(entry.req) {
+		if !lockEntry.applyClaim(entry.req, entry.ref) {
 			lockEntry.addClaim(entry.req, entry.ref, false)
 		}
 		entry.state = entryHeld
@@ -1941,8 +1959,7 @@ func (m *manager) completeBundleLocked(bundle *requestBundle) {
 		bundle.grantID = m.nextGrantID
 	}
 	// The capability is recorded with the request before its terminal status is published, so
-	// every caller of this request — the one that started it and every caller that joined it —
-	// resolves the same identity, the same origin scope and the same component list.
+	// every caller of this request 鈥?the one that started it and every caller that joined it 鈥?	// resolves the same identity, the same origin scope and the same component list.
 	bundle.setGrant(m.buildGrant(bundle))
 	bundle.setStatus(RequestGranted)
 }
@@ -2303,10 +2320,13 @@ func (m *manager) Release(rootID string, resource ResourceRef) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	if !entry.dropClaimForOwner(rootID) {
+	// The claim is retracted by its exact identity and refunded under the same identity: releasing
+	// one gap of a namespace must not drop the other gaps that share its conflict domain, and the
+	// ledger must not refund a charge that belongs to a different lock.
+	if !entry.dropClaimForOwner(rootID, resource) {
 		return false, nil
 	}
-	m.ledger.ReleaseGrant(rootID, key)
+	m.ledger.ReleaseGrant(rootID, resource.ClaimKey())
 	m.advanceEntryLocked(entry)
 	m.locks.release(key, entry)
 	return true, nil
@@ -2378,8 +2398,8 @@ func (m *manager) finishRequestLocked(bundle *requestBundle, status RequestStatu
 		// Retract exactly this request's claim, whether it was applied or still pending. A
 		// pending claim is real protection offered to other owners, so leaving it behind would
 		// keep blocking them after the request that made it is gone.
-		if lockEntry.dropClaim(entry.req) && entry.state == entryHeld {
-			m.ledger.ReleaseGrant(entry.req.OwnerID, entry.ref.ResourceKey())
+		if lockEntry.dropClaim(entry.req, entry.ref) && entry.state == entryHeld {
+			m.ledger.ReleaseGrant(entry.req.OwnerID, entry.ref.ClaimKey())
 		}
 		lockEntry.remove(entry)
 		m.pruneEntryLocked(lockEntry)
@@ -2490,6 +2510,10 @@ func (m *manager) LockStateFor(resource ResourceRef) LockState {
 //
 // It counts applied claims only, so a transaction that is waiting to upgrade still reports the
 // shared lock it holds.
+//
+// The answer is about the resource the caller named, not about its conflict domain: the domain
+// entry holds every gap and intention of one namespace, so a domain-only lookup would report a
+// `Gap(a,m)` as held when the caller asked whether it holds `Gap(n,z)`.
 func (m *manager) HeldMode(rootID string, resource ResourceRef) (Mode, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2497,7 +2521,7 @@ func (m *manager) HeldMode(rootID string, resource ResourceRef) (Mode, bool) {
 	if !ok {
 		return "", false
 	}
-	return entry.heldMode(rootID)
+	return entry.heldModeOf(rootID, resource)
 }
 
 // offeredModeFor reports the offered mode for the test helpers, which work on the unexported
@@ -2509,7 +2533,7 @@ func (m *manager) offeredModeFor(rootID string, resource ResourceRef) (Mode, boo
 	if !ok {
 		return "", false
 	}
-	return entry.offeredMode(rootID)
+	return entry.offeredModeOf(rootID, resource)
 }
 
 // It counts applied claims only, so a transaction that is waiting to upgrade still reports the
@@ -2589,7 +2613,7 @@ func (m *manager) ResetEpoch(generation, term uint64) int {
 
 	// The ledger has its own lock, so the manager mutex is released first, exactly as ReleaseOwner
 	// does: the two registries are independent and are never nested here. The refund is not
-	// optional bookkeeping — the owners were deleted above, so a charge left behind would account a
+	// optional bookkeeping 鈥?the owners were deleted above, so a charge left behind would account a
 	// lock that no owner holds and no generation can release, which is the "epoch change leaves no
 	// lock resource behind" half of the contract.
 	for _, rootID := range ended {

@@ -974,6 +974,53 @@ bare X 不会相遇；FR-005 规定同键竞争由 record X / 唯一值 reservat
 **不伪报 race 通过**；`.github/workflows/test.yml` 的 Linux race 步骤（含上一轮加入的 `./lockmanager`）
 是本轮 race 证据的唯一来源，CI 未执行前不得写成通过。
 
+### 第七轮（Gap / Insert Intention 的资源身份、去重、重入、请求合并）证据与任务口径
+
+证据文件 `.tmp/b07-fix-report.md`；原始输出 `.tmp/b07-before.txt`（**修复前失败**，6/8 用例）、
+`.tmp/b07-after.txt`（修复后全绿）、`.tmp/b07-acceptance.txt`（本轮验收门）、`.tmp/b07-vet.txt`、
+`.tmp/b07-lockmanager.txt`。新增测试：`lockmanager/claim_identity_test.go`（8 个用例 A–H）与
+`lockmanager/resource_test.go: TestB07ClaimIdentityIsExactInsideOneDomain`。
+
+**1. 缺陷：冲突域身份被当成 Claim 身份**。上一轮把 interval 型（Gap/II）的 `ResourceKey` 收敛为
+`(Generation, Space)` 域键，使 Gap↔II 的包含判定可达（正确且必须保留）。但同一批代码把该域键**同时**
+用作"这是不是同一把锁"，于是同域的不同锁被合并：
+- `DedupeResourceRefs` 按域键去重并按 modeRank 取强者 ⇒ 一个 bundle 里的两个 Gap 合并成一个；
+  `[Gap(a,m), II(b), X(b)]` 因 II(rank3) > Gap(rank2) **静默丢掉 Gap**；
+- `claimSatisfiedByOwner` 只比 mode ⇒ 持有 `Gap(a,m)` 后申请 `Gap(n,z)` 被答 REENTRANT；
+  持有 `II(b)` 后申请 `II(y)` 同样；
+- `bundleCoversRequest`/`adoptedClaims`/`adoptableOwnClaim` 按域键 ⇒ 排队的 `Gap(a,m)` "覆盖"新申请
+  `Gap(n,z)`（错误 Join）并被 adoption；
+- `Release`/`dropClaimForOwner`/ledger 计费键按域键 ⇒ 释放一个 Gap 会把同域其它 Gap 一起释放、
+  并错误退款；
+- `HeldMode`/`OfferedMode` 按域查 ⇒ 无法回答"是否持有这一把"。
+
+**2. 修复：三层身份分离**（详见 `contracts/lock-manager.md §Identity and atomicity`）：
+- **Conflict Domain**（`ResourceKey`，锁表键，不变）：interval 型 = `(Generation, Space)`；
+- **Claim Identity**（新增 `Identity.ClaimKey` / `ResourceRef.ClaimKey` / `SameClaim`）：record/table 与
+  域键相同；interval 型追加 mode 与 bounds/插入键 ⇒ `Gap(a,m) ≠ Gap(n,z)`、`II(b) ≠ II(y)`、
+  `Gap(a,m) ≠ II(a)`。去重、重入、请求合并、adoption、单资源释放、`HeldMode`/`OfferedMode`、
+  ledger 计费键全部改用 ClaimKey；
+- **Coverage** = 同一 ClaimKey 且 `upgradeNeeded(request, held) == false`；兼容性仍由
+  `componentsConflict` 按 bounds 逐 claim 判定（兼容 ≠ 覆盖）。
+
+**3. 修复过程中由新测试暴露的第二个缺陷（同一 request 在域内有两个 claim）**：
+`lockEntry.applyClaim`/`dropClaim`/`claimAppliedFor` 只按 request 指针配对，`grantLocked` 依赖它 ⇒
+一个 request 在同一域表项里的第二个组件**永远拿不到 applied claim**（grant 组件列表里有它，
+`HeldMode` 却是 false；排队路径上第二个 claim 永远 pending、request 却报 GRANTED，且
+`Release` 因跳过 pending claim 而漏退款）。修复：按 **(request, 精确 ref)** 配对。
+同批修正：`waitersAhead`/`olderBlockers` 会把**同一 bundle 的兄弟组件**当成 older waiter
+（`componentsConflict(II(b), Gap(a,m))` 为真），导致"同域两组件"的请求永远排队且图上无边；
+现按 `sameBundleRequest` 跳过自身兄弟（与"自家 owner 的 claim 不阻塞自己"同一原则）。
+
+**4. 验收**：A–H 八项（`lockmanager/claim_identity_test.go`）修复前 6 项失败、修复后全部通过；
+T021–T027 的既有验收（40 个 II 子测试、raw/SQL/适配器/真实 SQL session 用例）在修复后仍全部通过，
+故 **T021–T027 的完成标记保持**。SQL 范围时序测试
+（`executor/lock_plan_test.go: TestT025SQLInsertRespectsAProtectedRange`）按用户要求重写：
+T1 持有 `Gap[k150,k500)`（真实捕获的两个主键编码作为边界）并保持开启，T2 插 300 等待
+（`ShouldWait` 屏障确定性观测，且 T3 运行期间仍排队），T3 插 50 **在 T1 仍持锁时完成**且从不咨询等待决策，
+T1 回滚后 T2 被唤醒，最后校验数据（50/300 都在）、被释放的范围不再阻塞（插 400 不等待）、
+边界探针通过显式事务回滚因此不留下行。此前的写法在 Gap 释放后才跑范围外 INSERT，不能证明并发能力。
+
 ### 本轮证据文件
 | 文件 | 内容 |
 |---|---|

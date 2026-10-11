@@ -35,10 +35,20 @@ DEADLOCK_VICTIM/INVALIDATED/RESOURCE_REJECTED。所有终态唯一、不可重�
 等待，`Cancel` 对加入者无操作；**加入者 scope 关闭也只结束该 scope 的加入者**（错误映射为可重试冲突），
 创建者的 context 结束/scope 关闭/root 终态/epoch reset 撤销整个 request 并唤醒全部等待者。
 详见 contracts/lock-manager.md §共享等待。
-身份：record = `(Generation, Space, Key)`，interval domain = `(Generation, Space)`；SQL 的 TableID/IndexID
-是标签，不参与身份（否则 raw 写与 SQL 锁会成为两个资源）。**interval 型身份（Gap 与 Insert Intention）
-以 domain 为 `ResourceKey`**：同一 namespace 的所有 Gap/II 共用一个队列，逐 claim 按 bounds/插入键判定
-包含关系；bounds 若进 key，Gap 与它要挡的 II 会落在两个表项而永不比较（FR-003/005 不可达）。
+身份分三层，不得混用：
+**Conflict Domain Identity**（`Identity.ResourceKey`，锁表键 / 决定哪些 claim 互相比较）：
+record = `(Generation, Space, Key)`，table intent = `(Generation, TableID)`，
+**interval 型（Gap 与 II）= `(Generation, Space)`**（不含 bounds/插入键；否则 Gap 与其要挡的 II
+会落在两个表项而永不比较，FR-003/005 不可达）。
+**Claim Identity**（`Identity.ClaimKey` / `SameClaim`，判断"是不是同一把锁"）：record/table 与 domain
+相同；interval 型追加 mode 与 bounds/插入键 ⇒ `Gap(a,m) ≠ Gap(n,z)`、`II(b) ≠ II(y)`、
+`Gap(a,m) ≠ II(a)`。去重、重入、请求合并、adoption、单资源释放、`HeldMode`/`OfferedMode`、
+ledger 计费键全部使用 `ClaimKey`。
+**Coverage**：同一 `ClaimKey` 且 `upgradeNeeded(request, held) == false`；兼容性（谁能与谁并存）
+仍由 `componentsConflict` 按 bounds 逐 claim 判定——兼容不等于覆盖。
+锁表结构：一个 domain 表项持有该域所有 claim（每条 claim 带自己的精确 `ref` 与 mode），
+因此 `Snapshot()`/`HolderCount` 仍是 domain 级诊断视图，而 `HeldMode(owner, ref)` 是精确的
+claim 级查询（本轮修正）。
 **插入声明 = II + 同键 record X，必须同 bundle**（`ErrInsertIntentionRequiresRecord`/`MissingRowClaims`）：
 II 回答"插入位置是否被 Gap 保护"，record X 回答"键是否已被占用"（FR-005）。
 原始写入口（`Txn.Put`/`Delete`）在暂存前取该 key 的声明：键存在时只取 Record X，键缺失/tombstone

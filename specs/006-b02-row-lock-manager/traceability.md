@@ -363,3 +363,13 @@ Phase 3（US1）的前置条件已就绪：
 | T025/T026/T027 未执行 | **T025**：`executor/lock_plan.go` 六类访问计划（record-only/insertion/range/whole-domain/refused/none）+ `rangeIsProven` + 拒绝而非静默不加锁 + `EXPLAIN Extra` 标注；INSERT 侧实际申请插入声明。**T026**：PK/UNIQUE/secondary/复合/NULL/collation 身份与写路径字节一致（unique 无 owner 后缀、secondary 有 owner 后缀）。**T027**：8 项逐条覆盖（见 tasks.md §第六轮），含真实 SQL 的区间内等待/区间外不等待、Next-Key 原子 bundle、并行插入、取消零残留、失效事务不再暂存、失效 scope 写入被拒。 |
 | 未实现范围（README） | 已同步：说明插入声明与 EXPLAIN 标注**已生效**；同时明确**没有任何 SQL 语句会申请 Gap/Next-Key**（锁定读属 Phase 5，DML 范围候选仍只锁实际改动的行），EXPLAIN 对锁定读只标注计划并注明尚未执行。 |
 
+## A12. 第七轮修订（Gap / II 的资源身份、去重、重入、请求合并）
+
+| 上一版结论 | 现状（`.tmp/b07-fix-report.md`） |
+|---|---|
+| 「interval 型以 domain 为 `ResourceKey`」（第六轮） | **方向对但混用了两种身份**：域键只应回答"哪些 claim 必须互相比较"，却被同时当作"这是不是同一把锁"。后果：两个不同 Gap 被去重成一把；`[Gap,II,X]` 因 modeRank 丢掉 Gap；持有 `Gap(a,m)` 后申请 `Gap(n,z)` 被答 REENTRANT；排队的 `Gap(a,m)` 被新申请 `Gap(n,z)` 错误 Join/adopt；`Release` 一个 Gap 释放整个域；`HeldMode` 无法回答单把锁。 |
+| （本轮新增）三层身份 | **已分离**：Conflict Domain（`ResourceKey`，锁表键，interval 型 = `(Generation, Space)`）／Claim Identity（`ClaimKey`/`SameClaim`，interval 型含 mode 与 bounds/键）／Coverage（同一 ClaimKey + `upgradeNeeded` 为假）。去重、重入、请求合并、adoption、单资源释放、`HeldMode`/`OfferedMode`、ledger 计费键统一改用 ClaimKey；兼容性仍由 `componentsConflict` 按 bounds 判定（兼容 ≠ 覆盖）。 |
+| （本轮第二个缺陷）同一 request 在域内两个 claim | **已修复**：`applyClaim`/`dropClaim`/`claimAppliedFor` 原本只按 request 指针配对，导致第二个组件永远 pending（grant 报成功但 `HeldMode` 为假；排队路径 request 报 GRANTED 而 claim 未应用；`Release` 漏退款）；现按 (request, 精确 ref) 配对。 |
+| （本轮第三个缺陷）同 bundle 兄弟被当作 older waiter | **已修复**：`waitersAhead`/`olderBlockers` 会把同一 bundle 的 `Gap(a,m)` 当作 `II(b)` 的 older waiter（包含判定为真），使"同域两组件"的请求永久排队且图上无边；现按 `sameBundleRequest` 跳过自身兄弟。 |
+| 证据 | 新增 `lockmanager/claim_identity_test.go`（A–H 八项）与 `resource_test.go: TestB07ClaimIdentityIsExactInsideOneDomain`；**修复前 6/8 失败**（`.tmp/b07-before.txt`），**修复后全部通过**（`.tmp/b07-after.txt`）。`executor/lock_plan_test.go: TestT025SQLInsertRespectsAProtectedRange` 按用户要求重写为"T1 持锁期间 T3 必须完成"，替换原先在释放后才跑范围外插入的时序。T021–T027 的既有验收在修复后仍全部通过，完成标记保持。 |
+

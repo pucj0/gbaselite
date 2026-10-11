@@ -4,21 +4,35 @@
 本文件定义未来接口语义，不是新增生产实现。
 
 ## Identity and atomicity
-Record identity = `(Generation, Space, Key)`；interval conflict domain = `(Generation, Space)`。
-**interval 型身份（Gap 与 Insert Intention）以 domain 作为 `ResourceKey`**：不含 bounds、不含 II 的
-插入键。理由不是省空间而是可达性——"这个 Gap 是否挡住这次插入"取决于实际 bounds 与实际插入点，
-只能由区间包含判定回答；若把 bounds 编入 key，一个 `(a,z)` 的 Gap 与一次插入 `m` 会落在**两个不同的
-资源表项**里，manager 永远不会比较它们，Gap 就什么也挡不住（实现与一致性由
-`lockmanager/resource_test.go: TestB02InsertionBundleKeepsBothHalves` 断言）。因此同一 namespace 的
-所有 Gap/II 共用一个队列，逐 claim 用 bounds 判定；同一 namespace 内两个不同 bounds 的 Gap 是同一
-表项上的两条 claim，而不是两个资源（与 `IntervalKey` 的语义一致）。Gap/Gap 仍兼容，Gap 与 record
-仍相互独立（Gap 不挡 record），record 身份保持精确的三元组，所以 interval domain 不会与旁边的行冲突。
-Table intent identity = `(Generation, immutable TableID)`。SQL TableID/IndexID 标签来自现有 metadata，
+
+身份必须区分三个概念，混用会让"同一冲突域"被误当成"同一把锁"：
+
+1. **Conflict Domain Identity**（`ResourceKey`）：决定**哪些 claim 必须互相比较**，也是锁表的键。
+   record = `(Generation, Space, Key)`；table intent = `(Generation, immutable TableID)`；
+   **interval 型（Gap 与 Insert Intention）= `(Generation, Space)`**，不含 bounds、不含插入键。
+   后者是可达性要求：一个 `(a,z)` 的 Gap 与"在 m 插入"的 II 必须能相遇并做包含判定；若把 bounds
+   编入 key，两者会落在不同表项而永不比较，Gap 就什么也挡不住（FR-003/005 失效）。
+2. **Claim Identity**（`ClaimKey`/`SameClaim`）：决定**这是不是同一把锁**。record/table intent 的
+   domain key 已经精确，故 `ClaimKey == ResourceKey`（同一行的 S 与 X 是同一资源，强度由
+   `upgradeNeeded` 单独比较）；**interval 型**的 `ClaimKey` 追加 mode 与 bounds/插入键，因此
+   `Gap(a,m) ≠ Gap(n,z)`、`II(b) ≠ II(y)`、`Gap(a,m) ≠ II(a)`。去重（`DedupeResourceRefs`）、
+   重入（`claimSatisfiedByOwner`）、请求合并（`bundleCoversRequest`）、adoption
+   （`adoptedClaims`/`adoptableOwnClaim`）、单资源释放（`Release`/`dropClaimForOwner`）、
+   `HeldMode`/`OfferedMode` 与 ledger 计费键都用 `ClaimKey`。
+3. **Coverage**：判断已有锁是否**真正覆盖**新申请 = 同一 `ClaimKey` 且
+   `upgradeNeeded(request.Mode, held.Mode) == false`。区间兼容性（谁能与谁并存）仍由
+   `componentsConflict` 按 bounds 逐 claim 判定；**"覆盖"不等于"兼容"**：两个不相交 Gap 兼容，
+   但互不覆盖，第二个必须作为独立 claim 取得。
+
+同一 namespace 的两个不同 Gap 因此是同一 domain 上的两条 claim，而不是一把锁：第二次申请
+`Gap(n,z)` 必须 GRANTED（不是 REENTRANT），释放 `Gap(a,m)` 不得动 `Gap(n,z)`，一个 bundle 里的
+两个 Gap 必须都保留。SQL TableID/IndexID 标签来自现有 metadata，
 是**标签而不是身份**：manager 不解析 SQL key，`ResourceKey` 也不把它们编入 record/interval 身份。
 namespace（`row/<table>`、`index/<table>/<name>`、`secondary/<table>/<name>`）本身就是 table/index 的
 区分，所以两个 table 不会共用身份；反过来，若把标签编入身份，一个不认识标签的 raw 写就会与 SQL 锁成为
-两个资源，正是 FR-026 禁止的绕过（实现与本条一致性由 `lockmanager/resource_test.go` 与
-`mvcc/raw_locking_test.go` 断言）。标签仍随身份传递，用于 intent 前置条件、namespace binding 与诊断。
+两个资源，正是 FR-026 禁止的绕过（实现与本条一致性由 `lockmanager/resource_test.go`、
+`lockmanager/claim_identity_test.go` 与 `mvcc/raw_locking_test.go` 断言）。标签仍随身份传递，用于
+intent 前置条件、namespace binding 与诊断。
 未绑定的 raw namespace 使用 namespace intent，绑定的 row/index namespace沿用 TableID；中立
 NamespaceBinding 在 adapter 发布/验证，冲突绑定报错误，计入预算，generation reset时清理。
 
@@ -63,6 +77,9 @@ II 同位置也兼容；实际同键 INSERT 必须再申请 record X reservation
 **实现方式（本轮确定）**：II 与 record X 必须在同一 bundle（`ValidateBundle` 拒绝未配对的 II），
 因此"仅凭 II 插入"在结构上不可能；矩阵中 II↔X 的 N 由 bundle 里那半 record X 落实。bare II 与
 bare X 因身份不同而不会相遇，这正是把配对设为约束的原因。
+**两个相同 bounds 的 Gap 兼容且各自成 claim**：Gap/Gap 永远相容（都表示"此处不许插入"），但
+`Gap(a,m)` 与 `Gap(n,z)` 是两条 claim：兼容不等于覆盖，第二条申请必须作为独立 claim 取得，
+释放其一不得影响其二（见 §Identity and atomicity 的三层区分）。
 Gap 与已存在 row Record S/X 兼容：Gap 抑制创建 key，不保护现有值。缺失 key 的 X reservation
 要创建 key 时必须 II；不允许通过 `Put` 先拿 X 再绕过 Gap。
 Next-Key S/X 的 record 部分遵守 Record matrix，gap 部分遵守 interval matrix，整体按最严格结果。

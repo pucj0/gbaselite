@@ -378,6 +378,120 @@ func containsMode(modes []Mode, want Mode) bool {
 	return false
 }
 
+// TestB07ClaimIdentityIsExactInsideOneDomain pins the three-way split between the conflict domain,
+// the claim identity and coverage.
+//
+// The domain key answers "which claims must be compared with each other" and deliberately puts every
+// gap and every insertion intention of one namespace in one bucket, so the bounds-aware rules can
+// run. That is not the identity of a lock: two gaps with different bounds are two protections, two
+// insertion positions are two claims, and a gap is not an intention. Conflating them makes a second
+// range look already-held (REENTRANT), lets a queued request be joined by an unrelated one, lets a
+// release drop a lock it was not asked about, and — because modes are ranked for dedup — silently
+// drops a gap from a bundle that also carries an intention.
+func TestB07ClaimIdentityIsExactInsideOneDomain(t *testing.T) {
+	gapAM := ResourceRef{Identity: Identity{Kind: KindInterval, Mode: ModeGap, Space: "index/t/u", Lower: []byte("a"), Upper: []byte("m")}}
+	gapNZ := ResourceRef{Identity: Identity{Kind: KindInterval, Mode: ModeGap, Space: "index/t/u", Lower: []byte("n"), Upper: []byte("z")}}
+	gapAMOpen := ResourceRef{Identity: Identity{Kind: KindInterval, Mode: ModeGap, Space: "index/t/u", Lower: []byte("a"), Upper: []byte("m"), UpperInclusive: true}}
+	iiB := ResourceRef{Identity: Identity{Kind: KindRecord, Mode: ModeInsertIntention, Space: "index/t/u", Key: []byte("b")}}
+	iiY := ResourceRef{Identity: Identity{Kind: KindRecord, Mode: ModeInsertIntention, Space: "index/t/u", Key: []byte("y")}}
+	xB := ResourceRef{Identity: Identity{Kind: KindRecord, Mode: ModeX, Space: "index/t/u", Key: []byte("b")}}
+	otherSpaceGap := ResourceRef{Identity: Identity{Kind: KindInterval, Mode: ModeGap, Space: "index/t/v", Lower: []byte("a"), Upper: []byte("m")}}
+
+	// One domain: everything interval-type of one namespace must be comparable with each other.
+	for _, ref := range []ResourceRef{gapAM, gapNZ, iiB, iiY} {
+		if ref.ResourceKey() != gapAM.ResourceKey() {
+			t.Fatalf("%+v is not in the namespace's conflict domain", ref)
+		}
+	}
+	// Another namespace is another domain, and a record lock has its own exact key.
+	if otherSpaceGap.ResourceKey() == gapAM.ResourceKey() {
+		t.Fatal("two namespaces share one conflict domain")
+	}
+	if xB.ResourceKey() == iiB.ResourceKey() {
+		t.Fatal("a record lock and an insertion intention share one conflict domain; they would stop being compared with their own kind")
+	}
+
+	// Distinct claims inside one domain.
+	pairs := [][2]ResourceRef{
+		{gapAM, gapNZ},     // different ranges
+		{gapAM, gapAMOpen}, // same range, different endpoint inclusivity
+		{iiB, iiY},         // different insertion positions
+		{gapAM, iiB},       // an interval and an intention are different locks
+		{iiB, xB},          // the intention and the row claim are different locks
+		{xB, gapAM},        // a row claim and an interval are different locks
+	}
+	for _, pair := range pairs {
+		if SameClaim(pair[0], pair[1]) {
+			t.Fatalf("%+v and %+v were treated as the same claim", pair[0], pair[1])
+		}
+	}
+	// The same claim is recognised as itself, including through the identical request shape.
+	if !SameClaim(gapAM, gapAM) || !SameClaim(iiB, iiB) || !SameClaim(xB, xB) {
+		t.Fatal("a claim was not recognised as itself")
+	}
+	if !SameClaim(gapAM, ResourceRef{Identity: Identity{Kind: KindInterval, Mode: ModeGap, Space: "index/t/u", Lower: []byte("a"), Upper: []byte("m")}}) {
+		t.Fatal("two identical interval components were treated as different claims")
+	}
+	// The mode is not part of a record claim's identity: S and X name one row, and the strength is
+	// compared separately, which is what makes "X satisfies a request for S" work.
+	if !SameClaim(xB, ResourceRef{Identity: Identity{Kind: KindRecord, Mode: ModeS, Space: "index/t/u", Key: []byte("b")}}) {
+		t.Fatal("record S and record X were treated as different resources")
+	}
+
+	// Coverage is identity plus strength, not domain membership.
+	if upgradeNeeded(ModeX, ModeS) != true || upgradeNeeded(ModeS, ModeX) != false {
+		t.Fatal("record strength comparison changed")
+	}
+	// Two different gaps are compatible with each other, and compatibility is not coverage: the
+	// second still has to be taken as its own claim.
+	if componentsConflict(gapAM, gapNZ) || componentsConflict(gapNZ, gapAM) {
+		t.Fatal("two gaps became incompatible; FR-003 says a gap never conflicts with another gap")
+	}
+
+	// Dedupe works on claim identity: a bundle of two ranges and an intention keeps all three, in any
+	// order, while a component repeated verbatim collapses to one.
+	for _, bundle := range [][]ResourceRef{
+		{gapAM, gapNZ, iiB},
+		{iiB, gapNZ, gapAM},
+		{iiB, xB, gapAM},
+	} {
+		deduped := DedupeResourceRefs(append(append([]ResourceRef{}, bundle...), bundle...))
+		if len(deduped) != 3 {
+			t.Fatalf("dedupe of %d components kept %d, want 3: %+v", len(bundle)*2, len(deduped), deduped)
+		}
+		if !RefsInCanonicalOrder(deduped) {
+			t.Fatalf("dedupe result is not in canonical order: %+v", deduped)
+		}
+		// Every distinct claim of the input must still be present after dedup. The assertion is on
+		// claim identity, not on a list of modes: a mode list would also "pass" if a gap had been
+		// replaced by an intention of the same domain.
+		wantKeys := make(map[string]bool, len(bundle))
+		for _, component := range bundle {
+			wantKeys[component.ClaimKey()] = true
+		}
+		gotKeys := make(map[string]bool, len(deduped))
+		for _, component := range deduped {
+			gotKeys[component.ClaimKey()] = true
+		}
+		for key := range wantKeys {
+			if !gotKeys[key] {
+				t.Fatalf("a dedupe dropped a protection from %+v: %+v", bundle, deduped)
+			}
+		}
+	}
+	if deduped := DedupeResourceRefs([]ResourceRef{gapAM, gapAM, gapAM}); len(deduped) != 1 {
+		t.Fatalf("the same gap three times kept %d components, want 1", len(deduped))
+	}
+	// The stronger mode still wins for one identical claim.
+	upgraded := DedupeResourceRefs([]ResourceRef{
+		{Identity: Identity{Kind: KindRecord, Mode: ModeS, Space: "index/t/u", Key: []byte("b")}},
+		{Identity: Identity{Kind: KindRecord, Mode: ModeX, Space: "index/t/u", Key: []byte("b")}},
+	})
+	if len(upgraded) != 1 || upgraded[0].Mode != ModeX {
+		t.Fatalf("a repeated record claim kept %+v, want one X claim", upgraded)
+	}
+}
+
 // TestB02RefBytesAccountingIsExact pins the accounting unit: copied identity bytes plus
 // one fixed constant per reference.
 func TestB02RefBytesAccountingIsExact(t *testing.T) {

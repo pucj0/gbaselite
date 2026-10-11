@@ -97,7 +97,12 @@ func (id Identity) Clone() Identity {
 	return out
 }
 
-// ResourceKey is the canonical, collision-free identity key of a resource.
+// ResourceKey is the canonical key of the resource's **conflict domain**: the set of claims that
+// must be compared with each other.
+//
+// It is a table key, not the identity of one lock. The manager stores every claim of one domain in
+// one entry so the bounds-aware rules can run over all of them, and it looks a request's domain up
+// with this key. What the request actually protects is `ClaimKey`.
 //
 // Every variable-length field is length-prefixed, because joining fields with a plain
 // separator would let two different identities produce the same key; two identities
@@ -118,15 +123,15 @@ func (id Identity) Clone() Identity {
 // FR-026 forbids. The labels still travel on the identity for the table-intent
 // prerequisite, the namespace bindings and diagnostics; they are labels, not identity.
 //
-// An interval-type identity — a Gap or an Insert Intention — is keyed by its DOMAIN:
-// (Generation, Space), with no bounds and no insertion key in the key. Whether a gap blocks an
+// An interval-type identity — a Gap or an Insert Intention — has the whole domain
+// (Generation, Space) as its key, with no bounds and no insertion key. Whether a gap blocks an
 // insertion is a question about the actual bounds and the actual insertion point, so it cannot be
 // answered by comparing keys: two components that have to meet (a gap over `(a,z)` and an
 // intention to insert `m`) have completely different bounds, and putting them in different keys
 // would put them in different tables, where the manager never compares them at all and the gap
 // would block nothing. Keying the whole interval domain together is what makes
-// componentsConflict's containment rule reachable, and it is why two gaps with different bounds
-// are two claims in one queue rather than two resources. Record identity stays exact: a record
+// componentsConflict's containment rule reachable. Two gaps of one namespace are therefore two
+// *claims* in one domain — see ClaimKey — not one lock. Record identity stays exact: a record
 // request is still (Generation, Record, Space, Key), so an interval domain and the rows beside it
 // never collide.
 //
@@ -161,6 +166,61 @@ func (id Identity) ResourceKey() string {
 	}
 	return b.String()
 }
+
+// ClaimKey is the exact identity of the lock one claim protects: the conflict domain *plus* what
+// makes this claim different from its neighbours in that domain.
+//
+// The two questions are different and were once conflated, which made distinct locks look like one:
+//
+//   - ResourceKey answers "which claims must be compared with each other?" — a Gap and an Insert
+//     Intention of one namespace must be, so they share a domain.
+//   - ClaimKey answers "is this the same lock?" — two gaps with different bounds are two locks, two
+//     insertion positions are two locks, and neither may satisfy, join, adopt or release the other.
+//
+// For a record or table-intent identity the domain key is already exact, so ClaimKey is the same
+// string: record S and record X name one row, which is what makes "X satisfies a request for S" a
+// resource-level answer with the mode compared separately by upgradeNeeded.
+//
+// For an interval-type identity the exact key adds the mode and the bounds or insertion key, because
+// a Gap and an intention at the same position are different locks with different rules rather than
+// one lock at two strengths. The mode is part of the key there for the same reason: a Gap(a,m) and
+// an II(a) in one namespace must never collapse into each other, and neither may a Gap(a,m) and a
+// Gap(n,z).
+func (id Identity) ClaimKey() string {
+	if !id.Mode.Interval() {
+		return id.ResourceKey()
+	}
+	var b bytes.Buffer
+	b.Grow(len(id.Space) + len(id.Key) + len(id.Lower) + len(id.Upper) + 64)
+	writeUint64(&b, id.Generation)
+	b.WriteByte(kindCode(KindInterval))
+	writeField(&b, id.Space)
+	writeField(&b, string(id.Mode))
+	writeField(&b, string(id.Key))
+	writeField(&b, string(id.Lower))
+	writeField(&b, string(id.Upper))
+	if id.LowerInclusive {
+		b.WriteByte(1)
+	} else {
+		b.WriteByte(0)
+	}
+	if id.UpperInclusive {
+		b.WriteByte(1)
+	} else {
+		b.WriteByte(0)
+	}
+	return b.String()
+}
+
+// SameClaim reports whether two components name the very same lock.
+//
+// It is the equality test every claim-level decision uses — re-entrancy, coverage, adoption,
+// joining a queued request — because sharing a conflict domain is not sharing a lock: two gaps of
+// one namespace are compared with each other, and must still be two claims.
+func SameClaim(a, b ResourceRef) bool { return a.ClaimKey() == b.ClaimKey() }
+
+// ClaimKey is the identity of the lock this component's claim protects.
+func (r ResourceRef) ClaimKey() string { return r.Identity.ClaimKey() }
 
 // kindCode is the stable one-byte code of a resource kind. The codes are ordered so
 // the canonical key order lists an intention before the keys it protects.
@@ -334,7 +394,7 @@ func RefBytes(components []ResourceRef) int64 {
 func SortResourceRefs(components []ResourceRef) {
 	sort.SliceStable(components, func(i, j int) bool {
 		a, b := components[i].Identity, components[j].Identity
-		if left, right := a.ResourceKey(), b.ResourceKey(); left != right {
+		if left, right := a.ClaimKey(), b.ClaimKey(); left != right {
 			return left < right
 		}
 		return a.Mode < b.Mode
@@ -345,7 +405,7 @@ func SortResourceRefs(components []ResourceRef) {
 // order. It is the sortedness check the identity test asserts.
 func RefsInCanonicalOrder(components []ResourceRef) bool {
 	for i := 1; i < len(components); i++ {
-		if components[i-1].ResourceKey() > components[i].ResourceKey() {
+		if components[i-1].ClaimKey() > components[i].ClaimKey() {
 			return false
 		}
 	}
@@ -358,6 +418,12 @@ func RefsInCanonicalOrder(components []ResourceRef) bool {
 // It exists so a bundle that names the same row twice is charged once, and so the
 // caller's bundle size is not the accounting unit: a component count is not a
 // bundle count.
+//
+// Components are collapsed by ClaimKey, never by the conflict domain: two gaps with different
+// bounds are two locks, and an intention at one position never stands in for an intention at
+// another. Collapsing by the domain would silently drop a protection the caller asked for — and
+// because the mode rank orders an intention above a gap, a bundle carrying both would lose the
+// gap entirely while still validating.
 func DedupeResourceRefs(components []ResourceRef) []ResourceRef {
 	if len(components) == 0 {
 		return nil
@@ -371,7 +437,7 @@ func DedupeResourceRefs(components []ResourceRef) []ResourceRef {
 			out = append(out, ResourceRef{Identity: component.Identity.Clone()})
 			continue
 		}
-		key := component.ResourceKey()
+		key := component.ClaimKey()
 		if index, ok := byKey[key]; ok {
 			if modeRank(component.Mode) > modeRank(out[index].Mode) {
 				out[index].Mode = component.Mode

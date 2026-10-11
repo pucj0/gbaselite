@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -206,9 +207,8 @@ func TestT025LockPlanModeMapping(t *testing.T) {
 // TestT025SQLInsertRespectsAProtectedRange is the end-to-end half.
 //
 // One transaction protects the insertion range [k, +inf) of the table's row namespace through the
-// engine's own locking capability. A real SQL INSERT whose key falls inside that range must queue —
-// observed through the neutral `ShouldWait` decision, which is consulted exactly when the conflict
-// is decided, so "it waited" is a fact and not a delay — and must complete once the range is
+// engine's own locking capability. A real SQL INSERT whose key falls inside that range must queue 閳?// observed through the neutral `ShouldWait` decision, which is consulted exactly when the conflict
+// is decided, so "it waited" is a fact and not a delay 閳?and must complete once the range is
 // released. An INSERT whose key falls outside the range must not queue at all.
 //
 // The row component is captured from a real INSERT instead of being recomputed here, so the
@@ -232,10 +232,19 @@ func TestT025SQLInsertRespectsAProtectedRange(t *testing.T) {
 		}
 	}
 
-	// Capture the row component of one real INSERT: its space and key are the identity the range
-	// has to contain.
+	// Capture the row components of real INSERTs: their space and key bytes are the identity the
+	// range has to contain, and using two of them gives the range explicit bounds without this test
+	// re-deriving the key encoding. Each probe runs in an explicit transaction that is rolled back,
+	// so capturing a boundary never leaves a row behind.
 	probe := &Session{CurrentDatabase: "test"}
-	rowComponent := t025CapturedRowComponent(t, e, probe, "INSERT INTO t VALUES(200,2)")
+	lower := t025CapturedRowComponent(t, e, probe, "INSERT INTO t VALUES(150,1)")
+	upper := t025CapturedRowComponent(t, e, probe, "INSERT INTO t VALUES(500,5)")
+	if lower.Space != upper.Space {
+		t.Fatalf("the two probes used different namespaces: %q and %q", lower.Space, upper.Space)
+	}
+	if bytes.Compare(lower.Key, upper.Key) >= 0 {
+		t.Fatalf("the captured bounds are not ordered: %x >= %x", lower.Key, upper.Key)
+	}
 
 	// The protecting transaction is a raw neutral transaction, so the test drives the engine's
 	// locking capability directly rather than through a statement.
@@ -243,53 +252,87 @@ func TestT025SQLInsertRespectsAProtectedRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	locking, err := storageengine.LockingTxnOf(guard)
+	guardLocking, err := storageengine.LockingTxnOf(guard)
 	if err != nil {
 		t.Fatalf("the engine has no locking capability: %v", err)
 	}
-	scope, err := locking.BeginLockScope(context.Background(), storageengine.LockScopeStatement)
+	scope, err := guardLocking.BeginLockScope(context.Background(), storageengine.LockScopeStatement)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// [rowComponent.Key, +inf): everything at or after the captured key. A larger key is inside the
-	// protected range, a smaller one is outside it.
+	// The protected range is [key(150), key(500)): key(300) is inside it and key(50) is below its
+	// lower bound, which is what the two insertions below exercise.
 	interval := storageengine.LockComponent{
 		Mode:           storageengine.LockModeGap,
 		Kind:           storageengine.LockComponentInterval,
-		Space:          rowComponent.Space,
-		TableID:        rowComponent.TableID,
-		Lower:          rowComponent.Key,
+		Space:          lower.Space,
+		TableID:        lower.TableID,
+		Lower:          lower.Key,
+		Upper:          upper.Key,
 		LowerInclusive: true,
 	}
-	if _, err := locking.Acquire(context.Background(), scope, storageengine.LockRequest{Components: []storageengine.LockComponent{interval}}); err != nil {
-		t.Fatalf("acquire the protecting interval: %v", err)
+	if _, err := guardLocking.Acquire(context.Background(), scope, storageengine.LockRequest{Components: []storageengine.LockComponent{interval}}); err != nil {
+		t.Fatalf("acquire the protecting range: %v", err)
 	}
 
-	// An INSERT inside the range waits: the barrier is signalled while the conflict is decided.
+	// T2: an insertion inside the range waits. The barrier is signalled while the conflict is
+	// decided 閳?before the request can be released 閳?so "it waited" is an observed fact.
 	barrier := newDMLWaitBarrier()
 	barrier.arm(t)
 	inside := &Session{CurrentDatabase: "test"}
-	outcome := make(chan error, 1)
+	insideOutcome := make(chan error, 1)
 	go func() {
 		_, err := e.Execute(inside, "INSERT INTO t VALUES(300,3)")
-		outcome <- err
+		insideOutcome <- err
 	}()
 	barrier.wait(t, "the INSERT inside the protected range")
 	select {
-	case err := <-outcome:
+	case err := <-insideOutcome:
 		t.Fatalf("the INSERT inside the range returned (%v) instead of waiting", err)
 	default:
 	}
 
-	// Releasing the range is the only thing that may let it through.
-	if err := locking.CloseLockScope(context.Background(), scope); err != nil {
+	// T3: an insertion below the range completes **while T1 still holds it**. Running it here and
+	// waiting for its completion is the assertion: a range that blocked everything in its namespace
+	// would leave this channel empty. It must not consult the wait decision at all.
+	barrierOutside := newDMLWaitBarrier()
+	barrierOutside.arm(t)
+	outside := &Session{CurrentDatabase: "test"}
+	outsideOutcome := make(chan error, 1)
+	go func() {
+		_, err := e.Execute(outside, "INSERT INTO t VALUES(50,5)")
+		outsideOutcome <- err
+	}()
+	select {
+	case err := <-outsideOutcome:
+		if err != nil {
+			t.Fatalf("the INSERT outside the range failed while the range was held: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the INSERT outside the range waited behind a range that does not contain its key")
+	}
+	select {
+	case <-barrierOutside.ready:
+		t.Fatal("an INSERT outside the protected range consulted the wait decision")
+	default:
+	}
+	// The range is still held: the inside insertion is still queued, which is only possible while
+	// the protection stands, so the outside insertion completed because of where its key is.
+	select {
+	case err := <-insideOutcome:
+		t.Fatalf("the inside insertion returned (%v) before the range was released", err)
+	default:
+	}
+
+	// T1 rolls back: that is the only thing that may release T2.
+	if err := guardLocking.CloseLockScope(context.Background(), scope); err != nil {
 		t.Fatalf("close the protecting scope: %v", err)
 	}
 	if err := guard.Rollback(); err != nil {
 		t.Fatalf("release the range: %v", err)
 	}
 	select {
-	case err := <-outcome:
+	case err := <-insideOutcome:
 		if err != nil {
 			t.Fatalf("the woken INSERT failed: %v", err)
 		}
@@ -297,43 +340,51 @@ func TestT025SQLInsertRespectsAProtectedRange(t *testing.T) {
 		t.Fatal("the INSERT inside the protected range was never woken")
 	}
 
-	// The row really is there: the statement was not merely unblocked.
+	// The final data is what both statements said they would write, and the released range really is
+	// gone: a later insertion inside the old bounds completes without waiting.
 	check := &Session{CurrentDatabase: "test"}
-	result, err := e.Execute(check, "SELECT v FROM t WHERE id=300")
+	result, err := e.Execute(check, "SELECT id FROM t WHERE id IN (50,300) ORDER BY id")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Rows) != 1 {
-		t.Fatalf("the woken INSERT left %d rows, want the inserted row", len(result.Rows))
+	if len(result.Rows) != 2 {
+		t.Fatalf("the two insertions left %d rows, want both: %+v", len(result.Rows), result.Rows)
 	}
-
-	// An INSERT below the protected range would not have waited. The range is released by now, so
-	// the check is that it completes without the decision ever being consulted.
-	barrierArm := newDMLWaitBarrier()
-	barrierArm.arm(t)
-	outside := &Session{CurrentDatabase: "test"}
-	if _, err := e.Execute(outside, "INSERT INTO t VALUES(50,5)"); err != nil {
-		t.Fatalf("an INSERT outside the protected range failed: %v", err)
+	barrierAfter := newDMLWaitBarrier()
+	barrierAfter.arm(t)
+	after := &Session{CurrentDatabase: "test"}
+	if _, err := e.Execute(after, "INSERT INTO t VALUES(400,4)"); err != nil {
+		t.Fatalf("an insertion inside the released range failed: %v", err)
 	}
 	select {
-	case <-barrierArm.ready:
-		t.Fatal("an INSERT outside the protected range consulted the wait decision")
+	case <-barrierAfter.ready:
+		t.Fatal("an insertion inside the released range still waited")
 	default:
 	}
 }
 
 // t025CapturedRowComponent returns the primary-key record component of one real INSERT statement.
+//
+// The statement runs inside an explicit transaction that is rolled back, so capturing a boundary
+// key never leaves a row behind and the test's own data assertions stay exact.
 func t025CapturedRowComponent(t *testing.T, e *Engine, session *Session, insert string) storageengine.LockComponent {
 	t.Helper()
+	if _, err := e.Execute(session, "BEGIN"); err != nil {
+		t.Fatalf("begin the probe transaction: %v", err)
+	}
 	var captured []storageengine.LockComponent
 	previous := dmlLockRequestHook
 	dmlLockRequestHook = func(request storageengine.LockRequest) storageengine.LockRequest {
 		captured = append(captured, request.Components...)
 		return request
 	}
-	defer func() { dmlLockRequestHook = previous }()
-	if _, err := e.Execute(session, insert); err != nil {
-		t.Fatalf("%s: %v", insert, err)
+	_, executeErr := e.Execute(session, insert)
+	dmlLockRequestHook = previous
+	if _, err := e.Execute(session, "ROLLBACK"); err != nil {
+		t.Fatalf("roll back the probe transaction: %v", err)
+	}
+	if executeErr != nil {
+		t.Fatalf("%s: %v", insert, executeErr)
 	}
 	for _, component := range captured {
 		if component.Kind == storageengine.LockComponentRecord && component.Mode == storageengine.LockModeX && len(component.Key) > 0 {

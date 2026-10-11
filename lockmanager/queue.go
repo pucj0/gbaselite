@@ -299,6 +299,39 @@ func (e *lockEntry) heldMode(ownerID string) (Mode, bool) { return e.effectiveCl
 // its waiting requests.
 func (e *lockEntry) offeredMode(ownerID string) (Mode, bool) { return e.effectiveClaim(ownerID, true) }
 
+// heldModeOf reports the mode one owner holds on one *exact* resource of this domain.
+//
+// The domain entry keeps every gap and every insertion intention of one namespace together so the
+// bounds-aware rules can compare them, so a question about one of them must be answered from the
+// claims that name it. Answering from the entry would report `Gap(a,m)` as held when the caller
+// asked about `Gap(n,z)`.
+func (e *lockEntry) heldModeOf(ownerID string, resource ResourceRef) (Mode, bool) {
+	return e.effectiveClaimOf(ownerID, resource, false)
+}
+
+// offeredModeOf is heldModeOf with the waiting requests included.
+func (e *lockEntry) offeredModeOf(ownerID string, resource ResourceRef) (Mode, bool) {
+	return e.effectiveClaimOf(ownerID, resource, true)
+}
+
+// effectiveClaimOf reduces the claims that name one exact resource to the strongest mode.
+func (e *lockEntry) effectiveClaimOf(ownerID string, resource ResourceRef, includePending bool) (Mode, bool) {
+	var modes []Mode
+	for _, claim := range e.claims[ownerID] {
+		if claim.pending && !includePending {
+			continue
+		}
+		if !SameClaim(claim.ref, resource) {
+			continue
+		}
+		modes = append(modes, claim.mode)
+	}
+	if len(modes) == 0 {
+		return "", false
+	}
+	return effectiveMode(modes...), true
+}
+
 // hasAppliedClaim reports whether this owner already holds an applied claim whose mode
 // covers want, which is the re-entrancy case.
 func (e *lockEntry) hasAppliedClaim(ownerID string, want Mode) bool {
@@ -348,11 +381,18 @@ func (e *lockEntry) deindexClaim(ownerID string, mode Mode) {
 	}
 }
 
-// applyClaim marks the claim of one request as applied. It reports whether a claim was found.
-func (e *lockEntry) applyClaim(request *LockRequest) bool {
+// applyClaim marks the claim of one request on one exact resource as applied. It reports whether a
+// claim was found.
+//
+// The claim is matched by (request, exact resource), not by the request alone. One request can carry
+// two components that share a conflict domain — two gaps of one namespace, or a gap and an insertion
+// intention of one index — and matching by request would apply whichever of them happened to be
+// first and leave the other pending for ever: the request would report GRANTED while one of its
+// protections was never recorded, and its release would retract the wrong one.
+func (e *lockEntry) applyClaim(request *LockRequest, ref ResourceRef) bool {
 	claims := e.claims[request.OwnerID]
 	for i := range claims {
-		if claims[i].request != request {
+		if claims[i].request != request || !SameClaim(claims[i].ref, ref) {
 			continue
 		}
 		claims[i].pending = false
@@ -361,11 +401,12 @@ func (e *lockEntry) applyClaim(request *LockRequest) bool {
 	return false
 }
 
-// dropClaim retracts one request's claim. It reports whether a claim was removed.
-func (e *lockEntry) dropClaim(request *LockRequest) bool {
+// dropClaim retracts one request's claim on one exact resource. It reports whether a claim was
+// removed.
+func (e *lockEntry) dropClaim(request *LockRequest, ref ResourceRef) bool {
 	claims := e.claims[request.OwnerID]
 	for i := range claims {
-		if claims[i].request != request {
+		if claims[i].request != request || !SameClaim(claims[i].ref, ref) {
 			continue
 		}
 		mode := claims[i].mode
@@ -423,20 +464,25 @@ func (e *lockEntry) dropAllClaims(ownerID string) bool {
 // dropClaimForOwner retracts one claim of one owner on this resource and reports whether a
 // claim was removed.
 //
-// The caller supplies the owner rather than the request because the public release path
-// releases a *resource*, not a specific request: an owner that acquired one lock through
-// several re-entrant requests releases it once, and exactly one of its claims is dropped so
-// the owner's mode is reduced by one request's worth rather than cleared outright.
-func (e *lockEntry) dropClaimForOwner(ownerID string) bool {
+// The caller supplies the owner *and* the resource because the public release path releases one
+// resource, not a whole conflict domain: an owner that acquired one lock through several re-entrant
+// requests releases it once, and exactly one of its claims of that same resource is dropped so the
+// owner's mode is reduced by one request's worth rather than cleared outright. Releasing
+// `Gap(a,m)` must never retract `Gap(n,z)`, and both live in one domain entry.
+func (e *lockEntry) dropClaimForOwner(ownerID string, resource ResourceRef) bool {
 	claims := e.claims[ownerID]
 	if len(claims) == 0 {
 		return false
 	}
-	// Prefer to retract an applied, weakest claim: a pending claim belongs to a request that
-	// is still waiting, and retracting it would silently change what that request asked for.
+	// Prefer to retract an applied, weakest claim of the named resource: a pending claim belongs to
+	// a request that is still waiting, and retracting it would silently change what that request
+	// asked for. A claim of another resource in the same domain is not this release's business.
 	index := -1
 	for i, claim := range claims {
 		if claim.pending {
+			continue
+		}
+		if !SameClaim(claim.ref, resource) {
 			continue
 		}
 		if index == -1 || modeStrength(claim.mode) < modeStrength(claims[index].mode) {
@@ -444,7 +490,7 @@ func (e *lockEntry) dropClaimForOwner(ownerID string) bool {
 		}
 	}
 	if index == -1 {
-		index = 0
+		return false
 	}
 	mode := claims[index].mode
 	claims[index] = claims[len(claims)-1]
@@ -691,11 +737,30 @@ func (e *lockEntry) olderBlockers(self *lockRequest, request ResourceRef) []*loc
 		if candidate == nil || candidate.dead {
 			continue
 		}
+		if sameBundleRequest(candidate, self) {
+			// The same rule as waitersAhead: a bundle's own components are not older waiters, and
+			// the graph must not report a blocker that the queue itself ignores.
+			continue
+		}
 		if componentsConflict(request, candidate.ref) {
 			older = append(older, candidate)
 		}
 	}
 	return older
+}
+
+// sameBundleRequest reports whether two queued components belong to the same request.
+//
+// The two are compared by request first because that is the atomic unit, and by bundle as a
+// fallback for a component queued before its request record was attached.
+func sameBundleRequest(a, b *lockRequest) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a.req != nil && b.req != nil {
+		return a.req == b.req
+	}
+	return a.bundle != nil && a.bundle == b.bundle
 }
 
 // immediateConflict reports whether a *newly arrived* request conflicts with something other
@@ -742,12 +807,18 @@ func (e *lockEntry) adoptableOwnClaim(entry *lockRequest) bool {
 		if earlier.req.OwnerID != entry.req.OwnerID {
 			continue
 		}
+		if !SameClaim(earlier.ref, entry.ref) {
+			// Sharing the conflict domain is not sharing the protection: an earlier request for
+			// `Gap(a,m)` says nothing about this entry's `Gap(n,z)`, and adopting it would mark this
+			// entry satisfied while its own range stayed unprotected.
+			continue
+		}
 		if upgradeNeeded(entry.ref.Mode, earlier.ref.Mode) {
 			// The earlier request asked for a weaker mode, so it is not the protection this entry
 			// needs.
 			continue
 		}
-		if !e.claimAppliedFor(earlier.req) {
+		if !e.claimAppliedFor(earlier.req, earlier.ref) {
 			return true
 		}
 		entry.state = entryAdopted
@@ -757,14 +828,17 @@ func (e *lockEntry) adoptableOwnClaim(entry *lockRequest) bool {
 	return false
 }
 
-// claimAppliedFor reports whether one request holds an *applied* claim on this resource.
+// claimAppliedFor reports whether one request holds an *applied* claim on one exact resource.
 //
 // A request that adopted its component records no claim here, so "not applied" is the safe answer:
 // an entry that waits for it stays queued rather than being granted on protection that another
 // request might retract.
-func (e *lockEntry) claimAppliedFor(request *LockRequest) bool {
+//
+// The resource is part of the question because one request can hold two components in one conflict
+// domain: asking whether it holds *this* one must not be answered from its sibling's claim.
+func (e *lockEntry) claimAppliedFor(request *LockRequest, ref ResourceRef) bool {
 	for _, claim := range e.claims[request.OwnerID] {
-		if claim.request != request {
+		if claim.request != request || !SameClaim(claim.ref, ref) {
 			continue
 		}
 		return !claim.pending
@@ -804,6 +878,15 @@ func (e *lockEntry) waitersAhead(self *lockRequest, request ResourceRef) bool {
 			return false
 		}
 		if candidate == nil || candidate.dead {
+			continue
+		}
+		if sameBundleRequest(candidate, self) {
+			// A request never waits behind itself. Two components of one bundle can share a
+			// conflict domain and still conflict with each other by containment — a gap over
+			// (a,m) and an intention to insert b inside it — but the bundle is atomic: its own
+			// components must not block it, exactly as its own owner's claims do not. Treating a
+			// sibling as an older waiter would leave the request queued for ever with no edge to
+			// explain why.
 			continue
 		}
 		if componentsConflict(request, candidate.ref) {

@@ -156,7 +156,7 @@ func (l *Ledger) Reserve(ownerID string, components []ResourceRef, waiter bool) 
 	seen := make(map[string]bool, len(components))
 	for _, component := range components {
 		identity := component.Identity
-		key := identity.ResourceKey()
+		key := identity.ClaimKey()
 		if seen[key] {
 			continue
 		}
@@ -202,7 +202,7 @@ func (l *Ledger) Reserve(ownerID string, components []ResourceRef, waiter bool) 
 		return reservation, nil
 	}
 	for _, component := range introduced {
-		charge.resources[component.ResourceKey()] = component
+		charge.resources[component.ClaimKey()] = component
 	}
 	charge.resourceBytes += introducedBytes
 	l.owners[ownerID] = charge
@@ -242,7 +242,7 @@ func (l *Ledger) Commit(reservation *Reservation) error {
 	}
 	beforeGranted := charge.grantedBytes
 	for _, component := range reservation.newResources {
-		key := component.ResourceKey()
+		key := component.ClaimKey()
 		if charge.grantedSet[key] {
 			continue
 		}
@@ -281,7 +281,7 @@ func (l *Ledger) Release(reservation *Reservation) {
 	charge := l.owners[reservation.ownerID]
 	if charge != nil {
 		for _, component := range reservation.newResources {
-			key := component.ResourceKey()
+			key := component.ClaimKey()
 			if charge.grantedSet[key] {
 				// A committed identity is owned by the granted set, which a release of
 				// an uncommitted reservation can never hold.
@@ -538,7 +538,7 @@ func (l *Ledger) pendingExtraForLocked(ownerID string) int64 {
 			continue
 		}
 		for _, component := range reservation.resources {
-			key := component.ResourceKey()
+			key := component.ClaimKey()
 			if seen[key] {
 				continue
 			}

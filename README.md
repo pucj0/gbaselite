@@ -72,7 +72,10 @@ JDBC、Go MySQL 驱动等客户端提供服务。
   同样如此。因此别人持有的区间保护会挡住落在区间内的插入，而区间外的插入不受影响：Gap 只在
   携带插入意图时生效，同键竞争仍由记录锁/唯一值 reservation 决定；
 - `EXPLAIN` 在 `Extra` 中标注该语句的加锁计划（`record-only` / `range` / `whole-domain` 回退等），
-  计划由 planner 实际选择的访问路径推导，回退会明确写出"保护整个 namespace"。
+  计划由 planner 实际选择的访问路径推导，回退会明确写出"保护整个 namespace"；
+- 同一 namespace 内**不同范围、不同插入位置是各自独立的锁**：同一事务先后申请 `Gap(a,m)` 与
+  `Gap(n,z)`（或 `II(b)` 与 `II(y)`）是两次申请、两个 claim，第二次不会被误答"已持有"；释放其中一个
+  不会影响另一个；一个请求同时申请多个区间时它们同批授予或同批等待。
 
 **仍未实现**：`SELECT ... FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE` 仍按快照读执行
 （解析器识别，执行器未接线），Current Read 只是存储层能力；EXPLAIN 对锁定读只标注**计划**并注明
