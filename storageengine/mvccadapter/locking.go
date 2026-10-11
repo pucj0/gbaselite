@@ -88,13 +88,11 @@ func (t *txn) Acquire(ctx context.Context, scope uint64, request storageengine.L
 	case lockmanager.LockOpGranted:
 		return t.grant(grant), nil
 	case lockmanager.LockOpReentrant:
-		// A re-entrant acquisition took no new lock, so there is no fresh grant identity. The
-		// caller already holds the protection, which is what the returned capability records.
-		return storageengine.LockGrant{
-			OwnerID: t.ownerID(),
-			ScopeID: scope,
-			Granted: manager.Clock().Now(),
-		}, nil
+		// A re-entrant acquisition took no new lock, so the manager reports the owner's existing
+		// protection instead of a fresh grant identity. It is converted exactly like a new grant,
+		// components included: a locked current read must be able to prove that this capability
+		// covers the key being read, and a reduced owner-only grant would authorise nothing.
+		return t.grant(grant), nil
 	case lockmanager.LockOpWait:
 		if wait == nil {
 			return storageengine.LockGrant{}, storageengine.ErrConflict
@@ -112,13 +110,30 @@ func (t *txn) Acquire(ctx context.Context, scope uint64, request storageengine.L
 // ReadCurrent returns the latest published state for one key after the caller holds a covering
 // grant.
 //
-// The read revalidates the grant, so a value observed from a generation that ended mid-read is
-// discarded rather than returned as current.
+// The whole grant is forwarded, not just its owner identity: the read re-validates the owner, the
+// generation, the covering resource and the lock mode against the live lock registry, so a
+// fabricated or reduced capability fails closed instead of recording a write baseline for a row
+// nothing protected. A value observed from a generation that ended mid-read is discarded rather
+// than returned as current.
 func (t *txn) ReadCurrent(ctx context.Context, grant storageengine.LockGrant, space string, key []byte) (storageengine.CurrentObservation, error) {
 	if _, ok := t.LockingTxn(); !ok {
 		return storageengine.CurrentObservation{}, storageengine.ErrUnsupported
 	}
-	observation, err := t.inner.ReadCurrentLockedForOwner(ctx, space, key, grant.OwnerID)
+	components, err := lockComponents(grant.Components)
+	if err != nil {
+		// A capability whose components cannot be translated is not a capability this backend can
+		// honour: refusing is the only safe answer, because guessing the coverage would authorise
+		// a read of an unknown resource.
+		return storageengine.CurrentObservation{}, neutralLockError(err)
+	}
+	observation, err := t.inner.ReadCurrentLocked(ctx, space, key, lockmanager.LockGrant{
+		GrantID:       grant.ID,
+		OwnerID:       grant.OwnerID,
+		OriginScopeID: grant.ScopeID,
+		Generation:    grant.Generation,
+		Term:          grant.Term,
+		Components:    components,
+	})
 	if err != nil {
 		return storageengine.CurrentObservation{}, neutralLockError(err)
 	}
@@ -141,13 +156,77 @@ func (t *txn) NewCurrentIterator(ctx context.Context, scope uint64, request stor
 func (t *txn) ownerID() string { return t.inner.LockOwnerID() }
 
 // grant converts one lock-manager grant into the neutral capability.
+//
+// Every field of the capability is mapped, because the neutral grant is what a later
+// ReadCurrent re-validates: dropping the components, the generation or the term would leave the
+// caller with a capability that can only be trusted, never checked.
 func (t *txn) grant(g lockmanager.LockGrant) storageengine.LockGrant {
 	return storageengine.LockGrant{
-		ID:       g.GrantID,
-		OwnerID:  g.OwnerID,
-		ScopeID:  g.OriginScopeID,
-		Granted:  g.GrantedAt,
-		Deadline: g.GrantedAt,
+		ID:         g.GrantID,
+		OwnerID:    g.OwnerID,
+		ScopeID:    g.OriginScopeID,
+		Generation: g.Generation,
+		Term:       g.Term,
+		Components: neutralComponents(g.Components),
+		Granted:    g.GrantedAt,
+		Deadline:   g.GrantedAt,
+	}
+}
+
+// neutralComponents converts one granted component list into the neutral DTOs.
+func neutralComponents(components []lockmanager.ResourceRef) []storageengine.LockComponent {
+	if len(components) == 0 {
+		return nil
+	}
+	out := make([]storageengine.LockComponent, 0, len(components))
+	for _, component := range components {
+		out = append(out, storageengine.LockComponent{
+			Mode:           neutralLockMode(component.Mode),
+			Kind:           neutralLockKind(component.Kind),
+			Space:          component.Space,
+			Key:            component.Key,
+			Lower:          component.Lower,
+			Upper:          component.Upper,
+			LowerInclusive: component.LowerInclusive,
+			UpperInclusive: component.UpperInclusive,
+			TableID:        component.TableID,
+			IndexID:        component.IndexID,
+		})
+	}
+	return out
+}
+
+// neutralLockMode maps one lock-manager mode onto the neutral set.
+func neutralLockMode(mode lockmanager.Mode) storageengine.LockMode {
+	switch mode {
+	case lockmanager.ModeIS:
+		return storageengine.LockModeIS
+	case lockmanager.ModeIX:
+		return storageengine.LockModeIX
+	case lockmanager.ModeS:
+		return storageengine.LockModeS
+	case lockmanager.ModeX:
+		return storageengine.LockModeX
+	case lockmanager.ModeGap:
+		return storageengine.LockModeGap
+	case lockmanager.ModeInsertIntention:
+		return storageengine.LockModeInsertIntention
+	default:
+		return ""
+	}
+}
+
+// neutralLockKind maps one lock-manager resource kind onto the neutral set.
+func neutralLockKind(kind lockmanager.ResourceKind) storageengine.LockComponentKind {
+	switch kind {
+	case lockmanager.KindTableIntent:
+		return storageengine.LockComponentTableIntent
+	case lockmanager.KindRecord:
+		return storageengine.LockComponentRecord
+	case lockmanager.KindInterval:
+		return storageengine.LockComponentInterval
+	default:
+		return ""
 	}
 }
 
@@ -216,7 +295,9 @@ func lockMode(mode storageengine.LockMode) (lockmanager.Mode, error) {
 // neutralLockError maps a lock-manager error onto the neutral set.
 //
 // The mapping is what makes the executor backend-agnostic: it reacts to ErrDeadlock,
-// ErrLockWaitTimeout and ErrConflict without knowing which lock manager produced them.
+// ErrLockWaitTimeout and ErrConflict without knowing which lock manager produced them. A
+// conflict that is not mapped would leak a lock-manager type through the neutral boundary, so
+// every sentinel the manager can return for a refused request has an explicit answer here.
 func neutralLockError(err error) error {
 	switch {
 	case err == nil:
@@ -231,9 +312,12 @@ func neutralLockError(err error) error {
 		return storageengine.ErrLockInvalidated
 	case errors.Is(err, lockmanager.ErrUnsupportedMode):
 		return storageengine.ErrUnsupported
-	case errors.Is(err, lockmanager.ErrOwnerEnding):
+	case errors.Is(err, lockmanager.ErrOwnerEnding), errors.Is(err, lockmanager.ErrConflict):
 		return storageengine.ErrConflict
 	default:
+		// Anything else is a programming error (a malformed component, an unknown scope) or an
+		// error this adapter does not classify. Passing it through leaves it visible instead of
+		// disguising it as a retryable conflict, which would invite an endless retry loop.
 		return err
 	}
 }

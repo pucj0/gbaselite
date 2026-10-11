@@ -4,6 +4,7 @@ import (
 	"errors"
 	"gbaselite/storageengine"
 	"testing"
+	"time"
 )
 
 func TestMVCCSQLTransactionsAndReopen(t *testing.T) {
@@ -46,8 +47,27 @@ func TestMVCCSQLTransactionsAndReopen(t *testing.T) {
 	run(a, "BEGIN")
 	run(b, "BEGIN")
 	run(a, "UPDATE items SET v=5 WHERE id=10")
-	run(b, "UPDATE items SET v=6 WHERE id=10")
+	// B's conflicting UPDATE now takes the row lock, so it must wait for A and be woken by
+	// A's commit. The wait runs in another goroutine because A's COMMIT is what releases
+	// it, and the barrier proves B was queued before A ended (see locking_dml_wake_test.go)
+	// rather than assuming an ordering with a sleep.
+	barrier := newDMLWaitBarrier()
+	barrier.arm(t)
+	waited := make(chan error, 1)
+	go func() {
+		_, err := e.Execute(b, "UPDATE items SET v=6 WHERE id=10")
+		waited <- err
+	}()
+	barrier.wait(t, "the concurrent UPDATE")
 	run(a, "COMMIT")
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("the woken UPDATE failed: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the concurrent UPDATE was not woken by the holder's commit")
+	}
 	if _, err = e.Execute(b, "COMMIT"); !errors.Is(err, storageengine.ErrConflict) {
 		t.Fatalf("conflict: %v", err)
 	}

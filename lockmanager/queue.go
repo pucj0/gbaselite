@@ -117,13 +117,17 @@ func (b *requestBundle) complete() bool { return b.held >= len(b.entries) }
 //
 // It is the only writer of the terminal status, so "granted" and "cancelled" can never both
 // be observed, and reading the status is idempotent because it is stored before the
-// notification is sent.
+// notification is sent. The stored value is the synchronized decision's own winner, so a
+// later attempt (a cancel that lost to a grant) delivers the winner instead of its own
+// status, and LockRequest.Status — which is only ever written here and only ever read under
+// the manager mutex — is kept equal to the decision.
 func (b *requestBundle) setStatus(status RequestStatus) {
-	b.req.Status = status
+	recorded := status
 	if b.decision != nil {
-		b.decision.status = status
+		recorded = b.decision.record(status)
 	}
-	b.req.Notify(status)
+	b.req.Status = recorded
+	b.req.Notify(recorded)
 }
 
 // untrack removes every entry of this bundle from a per-root pending index.

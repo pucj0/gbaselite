@@ -156,9 +156,15 @@ type AcquireResult struct {
 // LockHandle is the caller-side view of a queued lock request.
 //
 // It is a value, but its decision field is shared by every copy: the manager records the
-// single terminal status there at the same moment it notifies the channel, so asking for
-// the status is idempotent and never consumes the notification. That is what lets a
-// caller learn whether a grant beat its cancellation without racing the channel.
+// single terminal status there through requestState.record, so asking for the status is
+// idempotent and never consumes the notification. That is what lets a caller learn whether
+// a grant beat its cancellation without racing the channel.
+//
+// Synchronization: the shared decision guards itself with its own small mutex, so Status
+// is safe to call from any number of goroutines at the very moment the manager decides the
+// outcome. Status deliberately does not take the manager mutex: a caller that only asks
+// what happened must never be able to block behind a manager that is waiting on something
+// else, and the handle must not become a latch held across a wait.
 type LockHandle struct {
 	// RequestID identifies the queued request.
 	RequestID uint64
@@ -173,19 +179,91 @@ type LockHandle struct {
 }
 
 // requestState is the shared decision of one queued request.
+//
+// It is the one place "grant", "cancel", "timeout", "deadlock victim", "invalidated" and
+// "resource rejected" are funnelled through, and it enforces the contract the handle
+// exists for: the first terminal status recorded is the only status ever observable, so a
+// grant racing a cancel or a deadline still yields exactly one outcome.
+//
+// Synchronization: one sync.Mutex guards the status together with the decided flag, because
+// recording the outcome is a compare-and-set rather than a plain store. The first writer
+// must win and every later writer must observe the winner instead of overwriting it; a
+// single atomic word would have to pack the status and the decided bit into one value and
+// update them in a CAS loop, which is harder to read and no faster here. A requestState is
+// written once, when the manager decides the outcome, and afterwards only read by a caller
+// polling its handle, so the mutex is effectively uncontended.
+//
+// Lock order: the manager mutex is always the outer lock. Every writer of the decision
+// (requestBundle.setStatus) is called from a *Locked path that already holds the manager
+// mutex, and takes the state mutex only for the store; a reader (Status, Wait) takes the
+// state mutex alone and never touches the manager mutex. There is therefore no inverted
+// order and no path on which a status read can wait for a manager critical section.
 type requestState struct {
+	mu     sync.Mutex
 	status RequestStatus
+	// decided records that the single terminal status has been stored. It is a separate
+	// field because the zero value of RequestStatus is not RequestPending and
+	// RequestStatus.Terminal reports "anything but PENDING": an unwritten status must never
+	// be mistaken for a decided one, or a fresh decision would reject its own first grant.
+	decided bool
+}
+
+// newRequestState returns the shared, still-pending decision of one queued request.
+//
+// It is the only constructor, so no requestState can be created with a zero status that
+// the accessors would have to reinterpret.
+func newRequestState() *requestState {
+	return &requestState{status: RequestPending}
+}
+
+// record stores the first terminal status and never lets a later write replace it.
+//
+// It returns the status that is recorded now, so a writer that lost the race can notify the
+// winner rather than its own attempt: a cancel that lost to a grant must deliver GRANTED,
+// not CANCELED, or a blocked waiter would be told to discard a lock it actually holds. A
+// non-terminal status is stored only while nothing terminal is recorded, which is what
+// makes "a terminal request never regresses to PENDING" structural instead of a rule the
+// callers have to remember.
+func (s *requestState) record(status RequestStatus) RequestStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.decided {
+		return s.status
+	}
+	s.status = status
+	if status.Terminal() {
+		s.decided = true
+	}
+	return s.status
+}
+
+// current reads the recorded status.
+//
+// It is non-blocking apart from the tiny state mutex and never touches the notification
+// channel, so polling a handle for diagnostics or for a test can neither block on the
+// manager nor consume the outcome some other waiter is entitled to receive.
+func (s *requestState) current() RequestStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.status == "" {
+		// An unwritten decision is still pending. Mapping the zero value to PENDING keeps a
+		// defensively constructed state from ever reporting an unknown status.
+		return RequestPending
+	}
+	return s.status
 }
 
 // Status reports the current status of the request.
 //
 // A status is PENDING until the manager decides the single outcome, and terminal
-// afterwards; the value never goes back to PENDING.
+// afterwards; the value never goes back to PENDING. It is safe to call concurrently from
+// any number of goroutines, including while the manager decides the outcome, and it never
+// consumes the notification channel.
 func (h *LockHandle) Status() RequestStatus {
 	if h == nil || h.decision == nil {
 		return RequestCanceled
 	}
-	return h.decision.status
+	return h.decision.current()
 }
 
 // Wait blocks until the request reaches a terminal status and returns it.
@@ -1045,8 +1123,13 @@ func (m *manager) AcquireWith(ctx context.Context, rootID string, scopeID uint64
 		//
 		// The snapshot is taken *before* the bundle records its own claims: adopting after that
 		// would match the request's own pending claims and mark every component as adopted,
-		// which would make the bundle look complete without holding anything.
+		// which would make the bundle look complete without holding anything. Marking the
+		// adopted entries must equally happen *before* the bundle is queued, because queueing
+		// is what records a claim: an adopted component marked afterwards would keep a pending
+		// claim that nothing ever retracts, so releasing the lock the owner actually took
+		// would leave the resource held by a ghost.
 		adopted := m.adoptedClaims(rootID, request.components())
+		m.markAdoptedLocked(request, adopted)
 		// The whole bundle is queued, including the components that are already grantable.
 		// Registering all of them is what keeps the bundle atomic: a component left out of its
 		// resource's queue would only be granted by a pass triggered from some *other*
@@ -1057,7 +1140,6 @@ func (m *manager) AcquireWith(ctx context.Context, rootID string, scopeID uint64
 		}
 		m.enqueueLocked(request, blocked)
 		request.req.BlockerIDs = blockers
-		m.markAdoptedLocked(request, adopted)
 		m.advanceLocked(request)
 		if request.complete() {
 			return AcquireResult{Op: LockOpGranted, Grant: m.buildGrant(request)}, nil
@@ -1196,7 +1278,7 @@ func (m *manager) newRequestLocked(rootID string, scopeID uint64, deduped []Reso
 		ShouldWait:     mayWait,
 		Deadline:       m.requestDeadlineLocked(scopeID),
 	}
-	bundle := &requestBundle{req: request, reservation: reservation, decision: &requestState{status: RequestPending}}
+	bundle := &requestBundle{req: request, reservation: reservation, decision: newRequestState()}
 	bundle.entries = make([]*lockRequest, 0, len(deduped))
 	for _, component := range deduped {
 		bundle.entries = append(bundle.entries, &lockRequest{req: request, ref: component, bundle: bundle, adopted: adopted[component.ResourceKey()]})

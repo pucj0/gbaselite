@@ -1,6 +1,7 @@
 package mvcc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 
@@ -85,31 +86,24 @@ type CurrentObservation struct {
 // ReadCurrentLocked reads the latest published state of one key while the caller holds the
 // covering lock, and records the observed version as this key's write baseline.
 //
-// It must only be called after a successful Acquire for this key. The lock is what makes the
-// recorded baseline sound, so a caller that observed without a lock would be recording a race.
+// It must only be called with a grant the lock manager really issued to this transaction's root
+// and that really covers this key. The lock is what makes the recorded baseline sound, so a caller
+// that observed without a covering lock would be recording a race — and, worse, a fabricated
+// owner identity would hand a transaction a write baseline for a row it never protected. Every
+// grant therefore has to pass verifyGrantForRead, which consults the live lock registry rather
+// than the caller's own description of what it holds.
 //
 // The read happens entirely through the store's snapshot API with an "everything published"
 // snapshot, so the locking read never needs its own visibility code path and cannot drift from
 // the ordinary read's rules about publication markers and tombstones.
 func (t *Tx) ReadCurrentLocked(ctx context.Context, space string, rowKey []byte, grant lockmanager.LockGrant) (CurrentObservation, error) {
-	return t.ReadCurrentLockedForOwner(ctx, space, rowKey, grant.OwnerID)
-}
-
-// ReadCurrentLockedForOwner is ReadCurrentLocked for a caller that holds the neutral capability
-// rather than a lock-manager grant.
-//
-// It exists so the adapter can validate a grant without fabricating a lock-manager value: the
-// only part of a grant this read needs is which root owns it, and that root is then checked
-// against the live registry.
-func (t *Tx) ReadCurrentLockedForOwner(ctx context.Context, space string, rowKey []byte, ownerID string) (CurrentObservation, error) {
 	if err := t.checkOpen(); err != nil {
 		return CurrentObservation{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return CurrentObservation{}, err
 	}
-	grant := lockmanager.LockGrant{OwnerID: ownerID}
-	if err := t.verifyGrantForRead(grant); err != nil {
+	if err := t.verifyGrantForRead(space, rowKey, grant); err != nil {
 		return CurrentObservation{}, err
 	}
 	// A read that waits must re-check the world after the wait, not before it. The context check
@@ -120,8 +114,9 @@ func (t *Tx) ReadCurrentLockedForOwner(ctx context.Context, space string, rowKey
 		return CurrentObservation{}, err
 	}
 	// The grant is verified again *after* the read, so a value read from a generation that ended
-	// mid-read is discarded rather than returned as current.
-	if err := t.verifyGrantForRead(grant); err != nil {
+	// mid-read, or under a lock that was released mid-read, is discarded rather than returned as
+	// current.
+	if err := t.verifyGrantForRead(space, rowKey, grant); err != nil {
 		return CurrentObservation{}, err
 	}
 	t.recordWriteBaseline(space, rowKey, observation)
@@ -314,25 +309,79 @@ func (t *Tx) WriteBaselineSize() int {
 	return len(t.writeBaseline)
 }
 
-// verifyGrantForRead re-validates one grant against this transaction and its owner.
+// verifyGrantForRead re-validates one grant against this transaction, the resource it is about to
+// read and the live lock registry.
 //
-// The check is deliberately about *this* transaction: a grant recorded for another owner must
-// never authorise a read on this one, because two roots share no write set. The lock manager
-// reports an unknown owner once the root has been released or its generation replaced, which is
-// what makes a stale grant fail closed instead of returning a value that is no longer current.
-func (t *Tx) verifyGrantForRead(grant lockmanager.LockGrant) error {
+// Four things have to hold, and only the last one is unforgeable:
+//
+//  1. The grant belongs to this transaction's root. A grant recorded for another owner must never
+//     authorise a read here, because two roots share no write set.
+//  2. The owner is still registered. The lock manager drops an owner when its root ends, so a
+//     released root's grant fails closed instead of returning a value that is no longer current.
+//  3. The grant was issued for the owner's current generation and leader term. A grant from an
+//     ended generation describes a database that no longer exists.
+//  4. The grant declares a read-covering record component for *exactly* the space and key being
+//     read, and the owner still holds an applied claim on that exact resource. This is the check
+//     that closes the forgery hole: an owner ID, a grant ID or a component list supplied by the
+//     caller proves nothing on its own, because the coverage answer comes from the manager's own
+//     table. A request that is still waiting holds no applied claim, so an ungranted row can never
+//     authorise a write baseline.
+//
+// The resource identity used for the registry lookup is the grant's own component, not one
+// re-derived from the space and key. The acquire path carries the table and index labels alongside
+// the key, and those labels are part of the resource identity, so re-deriving an identity here
+// would either miss the real entry or, worse, match a different table that happens to share a
+// namespace.
+func (t *Tx) verifyGrantForRead(space string, rowKey []byte, grant lockmanager.LockGrant) error {
 	manager, ok := t.LockManager()
 	if !ok {
 		return ErrClosed
 	}
 	ownerID := t.LockOwnerID()
-	if grant.OwnerID != ownerID {
+	if ownerID == "" || grant.OwnerID != ownerID {
 		return ErrConflict
 	}
-	if _, stillHeld := manager.Owner(ownerID); !stillHeld {
+	owner, live := manager.Owner(ownerID)
+	if !live {
+		return ErrConflict
+	}
+	if grant.Generation != owner.Generation || grant.Term != owner.Term {
+		return ErrConflict
+	}
+	component, covered := readCoveringComponent(grant, space, rowKey)
+	if !covered {
+		return ErrConflict
+	}
+	mode, held := manager.HeldMode(ownerID, component)
+	if !held || !readCoveringMode(mode) {
 		return ErrConflict
 	}
 	return nil
+}
+
+// readCoveringComponent reports the grant component that covers one record read, if the grant
+// declares one.
+//
+// The space and key bytes must match exactly, and the component must be a record lock at a mode
+// that protects a read. A table intention says the owner intends to lock rows of the table and
+// protects no key, so it never covers a read; an interval mode protects insertion points, not an
+// existing value.
+func readCoveringComponent(grant lockmanager.LockGrant, space string, rowKey []byte) (lockmanager.ResourceRef, bool) {
+	for _, component := range grant.Components {
+		if component.Kind != lockmanager.KindRecord || !readCoveringMode(component.Mode) {
+			continue
+		}
+		if component.Space != space || !bytes.Equal(component.Key, rowKey) {
+			continue
+		}
+		return component, true
+	}
+	return lockmanager.ResourceRef{}, false
+}
+
+// readCoveringMode reports whether a mode protects a record for reading.
+func readCoveringMode(mode lockmanager.Mode) bool {
+	return mode == lockmanager.ModeS || mode == lockmanager.ModeX
 }
 
 // ReadCurrentUnlocked reads the latest published state without recording a baseline.

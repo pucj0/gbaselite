@@ -130,7 +130,7 @@ func (e *Engine) createTableAsSQL(ctx context.Context, read, write storageengine
 			}
 			converted[index] = value
 		}
-		if err := writeVersionedRow(ctx, write, definition, nil, nil, converted, fmt.Sprintf("%s/%020d", write.ID(), ordinal)); err != nil {
+		if err := writeVersionedRow(ctx, write, definition, nil, nil, converted, heapKeyString(write.ID(), uint64(ordinal))); err != nil {
 			return nil, err
 		}
 	}

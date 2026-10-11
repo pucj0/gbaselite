@@ -312,3 +312,16 @@ Phase 3（US1）的前置条件已就绪：
 - 确定性时钟、屏障与无 sleep 的测试夹具可用（T012）；
 - 兼容矩阵与公平队列**尚未**实现，且必须保持「scope 不释放 grant」「预算 fail closed」
   「同 owner 重入不自阻塞」三条本轮已用测试锁定的规则。
+
+## A7. 第二轮修订（阻断缺陷修复）
+
+本节记录第二轮代码审查对既有追溯结论的更正，避免上面的"尚未使用"表述被继续引用：
+
+| 上一版结论 | 现状（`.tmp/b02r2-fix-report.md`） |
+|---|---|
+| A4 表：「UNIQUE NULL 不参与 unique reservation …B02 尚未使用，留待 US2/US4」 | **已部分落地**：唯一索引现在锁住 `UniqueIndex` 命名空间下 `IndexValueKey` 的**值本身**（不含 owner 后缀），非唯一二级索引锁 `SecondaryIndex` 命名空间下含 owner 后缀的物理 entry；NULL/复合/collation 语义直接复用写入方编码器。见 `executor/modify_insert.go:indexEntryLocks`、`executor/dml_locking.go`、`executor/dml_unique.go`、`executor/locking_unique_test.go`（覆盖）与 `contracts/sql-locking.md` §唯一值 reservation。 |
+| 「`ReadCurrent` 验证 grant、epoch」仅为规划 | **已实现且强于规划**：owner + epoch（Generation/Term 精确相等）+ grant 自带组件对 space/key 的覆盖 + manager 实时 applied S/X claim 四项校验，读前后各一次；裸 owner ID 入口 `ReadCurrentLockedForOwner` 已删除。见 `mvcc/current_read.go`、`storageengine/mvccadapter/locking.go`、`contracts/current-read.md` §Grant verification。 |
+| 「DML 不取行锁 / INSERT 不产生阻塞」 | **已变更**：UPDATE/DELETE 目标行 X 锁与 INSERT 的唯一值 reservation 均已启用，冲突语句等待并由 holder 终态唤醒（`executor/locking_dml_wake_test.go`、`executor/locking_unique_test.go`）。与此相关，两处**旧断言依赖"不阻塞"**的测试已按新语义改写：`executor/mvcc_engine_test.go`（第二个 UPDATE 改为并发驱动）与 `server/mvcc_autocommit_test.go`（同行并发 UPDATE 改为同表 DDL 触发提交冲突）。 |
+| `LockHandle` 的状态读取 | **已同步化**：`requestState` 用自带 mutex + compare-and-set 保证唯一终态、无回退、并发查询安全（`lockmanager/handle_state_test.go`）。**真实 `-race` 证据仍缺失**（本机无 C 工具链），T067 未勾选。 |
+| 「queue advance 遗漏导致等待后不唤醒」（第一轮记录） | **更正为测试串行假象**：释放 holder 的 COMMIT 与阻塞的 UPDATE 在同一个 goroutine，`ReleaseOwner` 从未执行。trace 与确定性用例见报告 §4。 |
+

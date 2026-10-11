@@ -594,18 +594,28 @@ A05candidate读域；若需要InnoDB式write rebase，另立feature，不在B02�
 
 > **最终验收结论（本轮）：B02 未完成。32/72 已勾选，40 项未执行。**
 >
-> 关键结论：`lockmanager` 是一个**完整且有测试的组件**，但在生产路径上**基本未被使用**。
-> - `SELECT ... FOR UPDATE` / `FOR SHARE`：**解析器识别，执行器不读取**，按普通快照读执行。
-> - `UPDATE` / `DELETE`：**不取行锁**（已实现但刻意为安全停用）。
-> - `INSERT`：取锁，但**不产生阻塞**；并发同唯一键由提交期 MVCC 版本校验兜住，
->   失败方得到可重试的冲突而非 duplicate-key。
+> 关键结论：`lockmanager` 是一个**完整且有测试的组件**，生产路径上的接入按下面分层，不能一句
+> "基本未被使用"概括：
+> - `INSERT`：取表意向 IX、主键行 X、**唯一值 reservation** 与非唯一二级索引 entry X，**会产生阻塞**；
+>   同唯一值的第二个事务等待、被 holder 的提交唤醒，然后在锁下按**最新已发布**索引重新判重并
+>   得到 duplicate-key（不是可重试的版本冲突）。
+> - `UPDATE` / `DELETE`：**已启用**目标行 X 锁（含移动主键的新旧身份与新旧索引项），冲突语句等待并由
+>   holder 的 COMMIT/ROLLBACK 唤醒。第二轮代码审查用 trace + 确定性用例确认：此前记录的
+>   "等待后不唤醒"是**串行测试假象**（释放 holder 的 COMMIT 与阻塞的 UPDATE 在同一 goroutine），
+>   lock manager 的 release/queue advance/notify 均正确；详见 `.tmp/b02r2-fix-report.md` §4。
+> - `SELECT ... FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE`：**解析器识别，执行器不读取**，
+>   仍按普通快照读执行；Current Read 只有存储层能力（且本轮补强了 grant 授权验证）。
 > - Gap / Next-Key / Insert Intention：`lockmanager` 支持齐备且已测试，
 >   但**没有任何 SQL 路径会申请它们**。
-> - 死锁检测**没有驱动方**；锁等待超时**无法从 SQL 到达**；锁诊断**没有 SQL 入口**。
+> - 死锁检测**没有驱动方**；锁等待超时无法从 SQL 配置（无 `innodb_lock_wait_timeout`），
+>   1205/1213 的 wire 映射与锁诊断 SQL 入口也都没有。
+> - FK 派生写（`applyForeignKeyActions`）不经过 DML 锁算子，属 T044 未做。
 >
 > 因此：`go test ./...` 全绿（22 包 / 0 FAIL）**不等于** B02 功能可用。
-> 完整验收记录见 `.tmp/b02-final-acceptance-review.md`。
-> `go test -race ./...` **未执行**（本机无 C 工具链），T067 保持未勾选。
+> 完整验收记录见 `.tmp/b02-final-acceptance-review.md`；第二轮修复见
+> `.tmp/b02r2-fix-report.md`。
+> `go test -race ./...` **未执行**（本机无 C 工具链：`-race requires cgo`，且无任何 gcc/clang/zig），
+> T067 保持未勾选，**不伪报 race 通过**。
 
 **已执行并勾选 32/72**：Phase 1 Setup 的 T001–T004、Phase 2 Foundational 的 T005–T012、
 Phase 3 US1 内核的 T013–T017、Phase 7 US5 的 T047/T048/T049/T050/T051/T053、Phase 8 US6 的 T058/T059。
@@ -680,6 +690,42 @@ Task 的 test 标记不等于测试已执行；勾选项均附真实命令输出
    调用方不能靠一个已取消的 context 保留排队位置。
 7. 未解决问题的完整清单见 `.tmp/b02-phase7-validation.md` §7 与 `.tmp/b02-phase3-validation.md` §7。
 
+### 第二轮（阻断缺陷修复 + 代码审查）证据与任务口径
+
+证据文件 `.tmp/b02r2-fix-report.md`（本轮唯一总证据）：5 项阻断缺陷的"修复前失败证据 → 定位 →
+修复 → 修复后通过"、临时 trace 与调用栈、不变量核对表、`go test ./...` 退出 0、race 工具链不可用
+的原始报错，以及本轮发现但不属这 5 项的遗留问题（同主键并发插入的错误类别、Windows
+`BACKUP MVCC TO '绝对路径'` 的字面量转义瑕疵、中性边界对"编程错误类"错误的透传）。
+辅助原始输出：`.tmp/b02r2-gotest-all2.txt`、`.tmp/b02r2-unique-before.txt`、
+`.tmp/b02r2-unique-after.txt`、`.tmp/b02r2-heapkey-before.txt`、`.tmp/b02r2-heapkey-after.txt`、
+`.tmp/b02r1-locktrace.txt`。
+
+新增/改写的测试与固定负向测试的处置（**不删除任何 B01/A05 回归测试**）：
+
+| 固定负向测试 | 处置 | 取代它的验收测试 |
+|---|---|---|
+| `TestB02ConcurrentInsertSameUniqueKeyIsStillAccepted` | 删除（断言的是缺陷本身） | `executor/locking_unique_test.go`（同值等待→唤醒→duplicate；NULL/不同值/复合/collation/UPDATE 占位） |
+| `TestB02UpdateTargetLockingIsNotEnabled` | 删除（钉住的是"锁被停用"） | `executor/locking_dml_wake_test.go`（真实 SQL Session 的阻塞与唤醒，UPDATE+DELETE） |
+
+任务口径（**不勾选任何未完整达成的任务**）：
+- **T038 仍不完整**（继续未勾选）：新增的 `executor/locking_unique_test.go` 覆盖了 UNIQUE/复合/NULL/
+  collation/等待后判重，但**同主键的 duplicate-key 错误类别**与 **IGNORE/REPLACE/upsert 的并发用例**
+  未实现（前者见 `.tmp/b02r2-fix-report.md` §8.1）。
+- **T041/T042/T043 仍不完整**（继续未勾选）：`modify_update.go`/`modify_delete.go`/`modify_insert.go`
+  已接入锁与锁后判重，多表 DELETE（经 `DeleteOperator`）与 INSERT SELECT（经 `InsertOperator`）随之覆盖；
+  但 FK 派生写（T044）与 `mutation_join_pipeline.go` 的独立验证仍未做。
+- **T029/T031 得到补强**（已勾选，不新增勾选）：`mvcc/current_read.go` 的 grant 授权验证从不完整
+  （只比 owner）改为"owner + epoch + 组件覆盖 + manager 实时 applied claim"四项，并新增
+  `mvcc/current_read_authorization_test.go` 与 `storageengine/mvccadapter/locking_current_read_test.go`。
+- **T018 得到部分实现**（继续未勾选）：`mvccadapter` 的 grant 现在完整映射并回传
+  Components/Generation/Term，reentrant 分支不再伪造降级能力，`ErrConflict` 也有了中立映射；
+  但 engine 级装配与更多 namespace 标签仍未验收。
+- **T067（race）保持未勾选**：本机无 C 工具链，`-race` 无法运行，已在 §7 与 tasks 顶部如实记录。
+
+契约同步（本轮随代码一起修订）：
+`contracts/current-read.md` 新增 **Grant verification** 一节（四项校验与"pending 不是锁"）；
+`contracts/sql-locking.md` 的 DML 一节新增**唯一值 reservation 与物理 index entry 的资源表**、
+等待后重校验的三种结论，以及 UPDATE 每个候选都取新旧索引项的规则。
 ### 本轮证据文件
 | 文件 | 内容 |
 |---|---|

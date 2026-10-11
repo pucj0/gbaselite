@@ -1,8 +1,10 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"gbaselite/executor"
+	"gbaselite/storageengine"
 	"testing"
 )
 
@@ -73,9 +75,14 @@ func TestMVCCAutocommitState(t *testing.T) {
 	}
 	run(writer, "SET autocommit=0")
 	run(writer, "UPDATE ac SET v=60 WHERE id=1")
-	run(reader, "UPDATE ac SET v=70 WHERE id=1")
-	if _, err = ExecuteCompatible(e, writer, "SET autocommit=1"); err == nil {
-		t.Fatal("expected conflict")
+	// The commit of the open transaction must be refused, and a refused commit must not change
+	// the autocommit mode. The conflicting change cannot come from another SQL statement touching
+	// row id=1: since B02 row locking, such a statement waits for this transaction's record lock
+	// instead of racing it (see executor/locking_dml_wake_test.go), so the transaction's own
+	// catalog guard is invalidated instead — a schema change to the very table it updated.
+	run(reader, "ALTER TABLE ac ADD COLUMN w INT")
+	if _, err = ExecuteCompatible(e, writer, "SET autocommit=1"); !errors.Is(err, storageengine.ErrConflict) {
+		t.Fatalf("expected a catalog conflict, got %v", err)
 	}
 	if !writer.AutocommitDisabled {
 		t.Fatal("failed commit changed mode")

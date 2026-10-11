@@ -56,12 +56,10 @@ func (f *currentReadFixture) rowLock(ctx context.Context, tx *Tx, key string, mo
 	if result.Op != lockmanager.LockOpGranted && result.Op != lockmanager.LockOpReentrant {
 		f.t.Fatalf("acquire %s op = %s, want GRANTED or REENTRANT", key, result.Op)
 	}
-	if result.Op == lockmanager.LockOpReentrant {
-		// A re-entrant acquisition returns the owner's existing protection, not a fresh grant
-		// token, so the grant this fixture returns is the zero value on purpose: the caller only
-		// needs it to prove it holds the lock.
-		return lockmanager.LockGrant{OwnerID: tx.LockOwnerID()}
-	}
+	// Both outcomes return the manager's own grant. A re-entrant acquisition reports the
+	// protection the owner already holds, components included, so the capability really does
+	// describe the resource it covers: the current read re-validates that coverage against the
+	// live registry rather than trusting an owner ID.
 	return result.Grant
 }
 

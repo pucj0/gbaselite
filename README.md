@@ -46,13 +46,28 @@ JDBC、Go MySQL 驱动等客户端提供服务。
 
 开发规划使用官方 Spec Kit `1.1.3`，项目已安装 Codex skills 到
 `.agents/skills/speckit-*`，工作流配置和脚本位于 `.specify/`；技能在新的 Codex 会话/轮次加载。
-本地 CLI 位于 `.tmp/spec-kit-venv/Scripts/specify.exe`。B02 行锁管理器目前仅完成
-[需求与设计规划](specs/006-b02-row-lock-manager/spec.md)，相关
+本地 CLI 位于 `.tmp/spec-kit-venv/Scripts/specify.exe`。B02 行锁管理器仍在实施中：
+[需求与设计规划](specs/006-b02-row-lock-manager/spec.md)、
 [技术方案](specs/006-b02-row-lock-manager/plan.md)、
 [任务清单](specs/006-b02-row-lock-manager/tasks.md) 和
-[追踪矩阵](specs/006-b02-row-lock-manager/traceability.md) 不代表功能已经实现。
-当前锁定读仍按下方兼容矩阵的快照语义运行；B02 规划的 Current Read、行/区间锁、等待和诊断
-尚不可用。规划明确保留固定 readTS 与提交冲突规则、A05 parent-read/child-write，
+[追踪矩阵](specs/006-b02-row-lock-manager/traceability.md) 描述的是完整目标，不等于全部已实现。
+**当前已实现并生效**的部分：
+
+- `INSERT` 在写入前取得表意向 IX、主键行 X、唯一值 reservation 与非唯一二级索引 entry X；
+- `UPDATE`/`DELETE` 在修改前取得目标行的 X 锁，包含移动主键的新旧身份与新旧索引项；
+- 相同非 NULL 唯一值（含复合唯一索引与 collation 等价值）的两个事务进入同一等待关系，
+  后到者被阻塞，持锁方结束后被唤醒，并在仍持锁时按最新已发布索引重新判重：普通 `INSERT`
+  得到 duplicate-key，`REPLACE`/`ON DUPLICATE KEY UPDATE` 在冲突行晚于本语句快照时报可重试冲突
+  而不是覆盖它；
+- 锁等待有界（进程内默认 50 秒）；锁状态只存在于内存，不进入持久化、WAL、Raft 命令或备份。
+
+**仍未实现**：`SELECT ... FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE` 仍按快照读执行
+（解析器识别，执行器未接线），Current Read 只是存储层能力；Gap / Next-Key / Insert Intention
+没有任何 SQL 路径会申请；死锁检测没有后台驱动方，因此两个会话互相等待同一批行时各自等到
+50 秒锁等待期限（**不会**被立即选为死锁受害者回滚）；`innodb_lock_wait_timeout` 会话变量、
+1205/1213 的 SQL 错误映射与锁诊断的 SQL 入口都不可用；原始 `Txn.Put/Delete`（raw client）路径
+不参与同资源协调；同一主键的并发插入会正确等待，但失败方拿到的是可重试的行版本冲突而不是
+duplicate-key。规划明确保留固定 readTS 与提交冲突规则、A05 parent-read/child-write，
 不改变持久化格式或 WAL/Raft 协议，也不宣称完整 InnoDB 兼容。
 
 ## 项目定位

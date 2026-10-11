@@ -159,12 +159,30 @@ type LockRequest struct {
 // root finishes or the engine generation or leader term changes. OwnerID is the
 // root that owns every grant in the bundle, and ScopeID records the scope the
 // request came from without transferring ownership to it.
+//
+// Components and the generation/term pair are part of the capability rather than
+// decoration. `ReadCurrent` must prove that the grant covers the key being read,
+// that it belongs to the reading transaction's root and that it was issued for the
+// generation the root still lives in; a reduced grant carrying only an owner ID
+// would let a caller authorise a current read of a row it never locked, and the
+// observation that read records would then become that transaction's write
+// baseline. A caller must therefore pass back the grant it received, unchanged.
 type LockGrant struct {
 	ID       uint64
 	OwnerID  string
 	ScopeID  uint64
 	Granted  time.Time
 	Deadline time.Time
+	// Generation is the engine generation the grant was issued under. A grant from
+	// an ended generation is refused rather than honoured.
+	Generation uint64
+	// Term is the leader term the grant was issued under, so a term change
+	// invalidates old grants instead of leaving them usable across leaders.
+	Term uint64
+	// Components are the resources the grant covers, each with the mode the owner
+	// holds on it. A locked current read succeeds only when one record component
+	// covers the exact space and key it is about to read.
+	Components []LockComponent
 }
 
 // CurrentObservation is one locked current read result.

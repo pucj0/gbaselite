@@ -118,11 +118,11 @@ func primaryRowComponent(table versionedTable, key []byte) storageengine.LockCom
 	}
 }
 
-// indexEntryComponent is the exclusive lock of one index entry.
+// indexEntryComponent is the exclusive lock of one *non-unique* index entry.
 //
-// Unique and secondary entries are locked with the index's own namespace and encoded entry bytes,
-// so an INSERT and an UPDATE that would collide on an index meet on one resource. That is what
-// lets a concurrent duplicate wait and then be rejected by a re-check instead of both writing.
+// The entry is named by the index's own namespace plus the value parts and the owner suffix, which
+// is byte-for-byte the key the write path installs. Two rows may legally share such a value, so the
+// owner suffix is what identifies one row's entry; it must never be dropped here.
 func indexEntryComponent(space, tableID, indexID string, key []byte) storageengine.LockComponent {
 	return storageengine.LockComponent{
 		Mode:    storageengine.LockModeX,
@@ -131,6 +131,24 @@ func indexEntryComponent(space, tableID, indexID string, key []byte) storageengi
 		TableID: tableID,
 		IndexID: indexID,
 		Key:     key,
+	}
+}
+
+// uniqueValueReservationComponent is the exclusive reservation of one logical unique value.
+//
+// Its key is the encoded unique value alone — no owner suffix — because that is the resource two
+// statements writing the same value must meet on, whatever primary keys they use. For a unique index
+// the write path stores the entry under exactly this key and keeps the owner as the entry's value,
+// so the reservation and the physical entry are the same resource; that is a property of unique
+// indexes, not an accident, and it is why the reservation may reuse the index namespace.
+func uniqueValueReservationComponent(space, tableID, indexID string, valueKey []byte) storageengine.LockComponent {
+	return storageengine.LockComponent{
+		Mode:    storageengine.LockModeX,
+		Kind:    storageengine.LockComponentRecord,
+		Space:   space,
+		TableID: tableID,
+		IndexID: indexID,
+		Key:     valueKey,
 	}
 }
 
@@ -152,78 +170,53 @@ func primaryKeyBytes(table versionedTable, row storage.Row) ([]byte, bool) {
 	return nil, false
 }
 
-// heapKey is the identity the write path synthesises for a table with no primary key.
-//
-// It is byte-for-byte the string writeVersionedRowUnchecked receives as its fallback, so a lock
-// taken on it and the row the write installs address the same resource. Using anything else would
-// protect a key the write never touches.
-func heapKey(write storageengine.Txn, ordinal uint64) []byte {
-	if write == nil {
-		return nil
-	}
-	return []byte(heapKeyString(write.ID(), ordinal))
-}
-
-// heapKeyString builds the heap identity exactly as the insert path does.
-func heapKeyString(txID string, ordinal uint64) string {
-	return txID + "/" + padOrdinal(ordinal)
-}
-
-// padOrdinal renders an ordinal with the same zero padding the write path uses.
-func padOrdinal(ordinal uint64) string {
-	const digits = 20
-	text := make([]byte, 0, digits)
-	for i := digits - 1; i >= 0; i-- {
-		text = append([]byte{byte('0' + (ordinal/uint64(pow10(i)))%10)}, text...)
-	}
-	return string(text)
-}
-
-// pow10 is a small integer power helper for the fixed-width ordinal rendering.
-func pow10(exp int) int {
-	result := 1
-	for i := 0; i < exp; i++ {
-		result *= 10
-	}
-	return result
-}
-
 // acquireRowLocks takes the table intention and the exclusive row locks of one mutation.
 //
 // The order is fixed — table intention first, then the primary row, then index entries — so two
 // transactions that touch the same rows in different statements still take the same locks in the
 // same order and are far less likely to deadlock. Real deadlocks remain possible and are still
 // detected: a cycle built from these grants goes into the same wait-for graph as any other.
-func (s *dmlLockScope) acquireRowLocks(table versionedTable, row storage.Row, extra []storageengine.LockComponent) error {
+func (s *dmlLockScope) acquireRowLocks(table versionedTable, row storage.Row, extra []storageengine.LockComponent) (storageengine.LockGrant, error) {
 	if s == nil {
-		return nil
+		return storageengine.LockGrant{}, nil
 	}
 	key, ok := primaryKeyBytes(table, row)
 	if !ok {
-		return errLockIdentityUnavailable
+		return storageengine.LockGrant{}, errLockIdentityUnavailable
 	}
-	components := make([]storageengine.LockComponent, 0, 2+len(extra))
-	components = append(components, tableIntentComponent(table))
-	components = append(components, primaryRowComponent(table, key))
-	components = append(components, extra...)
-	_, err := s.locks.Acquire(s.ctx, s.scope, storageengine.LockRequest{Components: components})
-	return err
+	return s.acquireRowLocksForKey(table, key, extra)
 }
 
 // acquireRowLocksForKey takes the same locks for a row identified by an already-encoded key.
-func (s *dmlLockScope) acquireRowLocksForKey(table versionedTable, key []byte, extra []storageengine.LockComponent) error {
+//
+// It returns the capability the lock manager issued, not just an error: a caller that has to
+// re-derive a decision it took before it waited (a unique-value check, for example) needs the
+// grant to read the latest published state under the same protection.
+func (s *dmlLockScope) acquireRowLocksForKey(table versionedTable, key []byte, extra []storageengine.LockComponent) (storageengine.LockGrant, error) {
 	if s == nil {
-		return nil
+		return storageengine.LockGrant{}, nil
 	}
 	if len(key) == 0 {
-		return errLockIdentityUnavailable
+		return storageengine.LockGrant{}, errLockIdentityUnavailable
 	}
 	components := make([]storageengine.LockComponent, 0, 2+len(extra))
 	components = append(components, tableIntentComponent(table))
 	components = append(components, primaryRowComponent(table, key))
 	components = append(components, extra...)
-	_, err := s.locks.Acquire(s.ctx, s.scope, storageengine.LockRequest{Components: components})
-	return err
+	return s.locks.Acquire(s.ctx, s.scope, dmlLockRequest(components))
+}
+
+// readLockedValue reads one key's latest published state under a grant this statement holds.
+//
+// It is the second half of the contract's "lock, then re-check": a decision taken before a wait is
+// not evidence after it, so the unique-value verification is re-run against the published index
+// while the reservation is still held. The read is refused by the backend unless the grant really
+// covers the key, so a caller cannot turn a statement into an unlocked current read.
+func (s *dmlLockScope) readLockedValue(ctx context.Context, grant storageengine.LockGrant, space string, key []byte) (storageengine.CurrentObservation, error) {
+	if s == nil {
+		return storageengine.CurrentObservation{}, errLockingUnavailable
+	}
+	return s.locks.ReadCurrent(ctx, grant, space, key)
 }
 
 // errLockIdentityUnavailable reports that a mutation's lock identity cannot be derived.
@@ -232,3 +225,20 @@ func (s *dmlLockScope) acquireRowLocksForKey(table versionedTable, key []byte, e
 // running it anyway would leave the promise "every row mutation holds its record lock" false
 // without any signal.
 var errLockIdentityUnavailable = errors.New("cannot derive the lock identity of a modified row")
+
+// dmlLockRequestHook, when non-nil, may adjust the neutral lock request a mutation is about to
+// issue. It exists so a concurrency acceptance test can install the neutral ShouldWait decision
+// and observe the exact moment a request is about to wait on another owner, which is what makes
+// "the waiter was queued before the holder released" a deterministic fact rather than a timing
+// assumption. It is nil in production and carries no behaviour of its own: the returned request is
+// the one the lock manager sees, and a hook that changes nothing preserves every rule.
+var dmlLockRequestHook func(request storageengine.LockRequest) storageengine.LockRequest
+
+// dmlLockRequest builds the neutral request one mutation issues.
+func dmlLockRequest(components []storageengine.LockComponent) storageengine.LockRequest {
+	request := storageengine.LockRequest{Components: components}
+	if dmlLockRequestHook != nil {
+		request = dmlLockRequestHook(request)
+	}
+	return request
+}

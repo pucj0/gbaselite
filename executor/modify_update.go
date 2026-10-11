@@ -109,17 +109,9 @@ func (o *UpdateOperator) Run(ctx context.Context) error {
 // It is exported so the UPDATE JOIN pipeline, which selects its candidates before it
 // materialises them, can hand each one to the same implementation a plain UPDATE uses.
 func (o *UpdateOperator) Apply(ctx context.Context, candidate UpdateCandidate) error {
-	// UPDATE locking is deliberately NOT enabled in this release.
-	//
-	// It was implemented and worked for a single wait (a concurrent UPDATE of one row waited for
-	// the holder and then succeeded), but it failed in a reproducible shape: after one round in
-	// which two transactions updated *different* rows and committed, a later round in which they
-	// update the *same* row left the second waiter blocked until the lock wait deadline, even
-	// though the holder had committed and released its owner. Until that wake failure is
-	// understood, taking the lock would make a plain UPDATE able to fail with a spurious timeout,
-	// which is strictly worse than the current behaviour. The helper is kept so the work is not
-	// lost, and TestB02UpdateTargetLockingIsNotEnabled pins the current state.
-	_ = o.lockTarget
+	if err := o.lockTarget(candidate); err != nil {
+		return err
+	}
 	updated, err := o.assign(candidate)
 	if err != nil {
 		return err
@@ -167,33 +159,38 @@ func (o *UpdateOperator) lockTarget(candidate UpdateCandidate) error {
 	if err != nil {
 		return err
 	}
-	return o.Locks.acquireRowLocksForKey(o.Target, key, extra)
+	_, err = o.Locks.acquireRowLocksForKey(o.Target, key, extra)
+	return err
 }
 
 // lockReplacement takes the locks of the row an UPDATE is about to install.
 //
-// A key-preserving UPDATE changes nothing for the lock identity, so the old lock already covers it
-// and no second acquisition happens. Only a moving key needs the additional grant.
+// It runs for every candidate, not only for one that moves its primary key, because the *index
+// values* it installs can change while the key stays put: an UPDATE that writes a unique value
+// another row already holds must meet that row's reservation, and an UPDATE that frees a value must
+// still hold the reservation it took so a concurrent insert cannot slip in. A key-preserving
+// candidate re-acquires components it already holds, which the manager answers as a re-entrant
+// no-op, so the repeat costs no claim and cannot self-conflict.
 func (o *UpdateOperator) lockReplacement(oldKey []byte, updated storage.Row) error {
 	if o.Locks == nil {
 		return nil
 	}
-	// The old key is the statement's target identity. A row whose primary key is not derivable from
-	// the replacement values has not moved its identity, because a moving primary key is exactly
-	// what makes it derivable; an UPDATE that leaves the key alone is already covered by the lock
-	// taken for the target.
 	newKey, ok := primaryKeyBytes(o.Target, updated)
 	if !ok {
-		return nil
+		// The identity is not derivable from the replacement values, which for an UPDATE means the
+		// key did not move: an UPDATE that leaves the primary key alone is already covered by the
+		// lock taken for the target row, and its index entries are locked below with that key.
+		newKey = oldKey
 	}
-	if len(oldKey) > 0 && string(newKey) == string(oldKey) {
+	if len(newKey) == 0 {
 		return nil
 	}
 	extra, err := indexEntryLocks(o.Target, newKey, updated)
 	if err != nil {
 		return err
 	}
-	return o.Locks.acquireRowLocksForKey(o.Target, newKey, extra)
+	_, err = o.Locks.acquireRowLocksForKey(o.Target, newKey, extra)
+	return err
 }
 
 // assign computes the new row for one candidate.

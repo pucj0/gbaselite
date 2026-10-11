@@ -41,6 +41,28 @@ collation等价值必须使用同锁identity。生成ID持久预留在事务外�
 IGNORE保留既有可忽略错误集合，不能忽略timeout/deadlock/SIconflict；REPLACE/upsert必须锁冲突row及
 所有old/new entries，不利用等待前duplicate缓存。任一post-readTStarget变更都不能被upsert覆盖。
 
+### 唯一值 reservation 与物理 index entry（本轮实现）
+两者是**不同资源**，各自必须与写路径逐字节一致：
+
+| 索引 | 资源 | identity |
+|---|---|---|
+| UNIQUE | 逻辑唯一值 reservation | `UniqueIndex(table,index)` + `storage.IndexValueKey(index,columns,row)`，**不含 owner** |
+| 非唯一 secondary | 物理 entry | `SecondaryIndex(table,index)` + `secondaryEntry`（值部分 **+ owner 后缀**） |
+
+唯一索引的 entry key 就是值本身（写路径把 owner 存为 entry 的 value），所以 reservation 与物理
+entry 是同一资源；把它当成"值+owner"会让两个写同值、不同主键的事务落在两个资源上而永不相遇。
+`IndexValueKey` 复用写入方编码：NULL（含复合索引任一列为 NULL）不 reservation，collation 等价值同
+identity，复合索引整体作为值。
+
+**等待后重校验**：取锁后、写入前，对每个唯一索引在锁下重做当前读（空间/键即 reservation），并按
+"冲突行是否在本语句快照内可见"决策——可见则交给既有 REPLACE/ODKU/IGNORE 机制；不可见（等待期间才
+提交）则普通 INSERT 报 `storage.ErrDuplicateKey`、IGNORE 跳过该行、REPLACE/ODKU 报可重试
+`storageengine.ErrConflict`（禁止把 upsert rebase 到 post-readTS 行）。没有锁能力的后端不做当前读
+（无锁当前读正是不安全 baseline），沿用后端自身并发控制。
+
+UPDATE 与 DELETE 在修改前取旧身份 X 锁与旧索引项；UPDATE 对**每个**候选都再取新身份与新索引项
+（键不变但唯一列变化同样先占位；重复获取由 manager reentrant 语义吸收）。
+
 UPDATE/DELETE：parent snapshot→dedup/first-match/LIMIT→锁后target/catalog验证→ModifyOperator→
 childwrites。目标过期ErrConflict终止整个root，提示retry；兼容目标继续原SET顺序/旧索引移除逻辑。
 PK/索引值迁移锁旧/新identity，multi DELETE沿既有FKorder执行，cascade/SET NULL统一底层锁入口。

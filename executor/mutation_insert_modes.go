@@ -54,7 +54,9 @@ func insertSetStatement(statement parser.Insert) parser.Insert {
 // multi-row IGNORE/REPLACE and ON DUPLICATE KEY UPDATE behave like single-row
 // statements repeated in order, as the legacy executor does.
 func writeInsertedRow(ctx context.Context, write storageengine.Txn, session *Session, target *insertTarget, mode insertMode, row storage.Row, ordinal uint64) (insertOutcome, error) {
-	fallback := fmt.Sprintf("%s/%020d", write.ID(), ordinal)
+	// The fallback heap identity comes from the one canonical encoder, so the key this row is
+	// stored under and the key the lock path protects cannot drift apart.
+	fallback := heapKeyString(write.ID(), ordinal)
 	if !mode.ignore && !mode.replace && len(mode.onDuplicate) == 0 {
 		// Plain inserts keep the original path: a duplicate error aborts the
 		// statement, and the child transaction rollback discards any partial state.

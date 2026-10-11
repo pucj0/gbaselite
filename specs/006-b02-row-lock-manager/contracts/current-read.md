@@ -14,6 +14,23 @@ storageengine新增可选LockingTxn，原Txn/Engine最小接口保持。
 Current read receiver就是read layer；child可读自己的overlay与ancestor，parent不能读未merge child。
 SQL DML验证target使用parent receiver；unique/FK写中检查用child receiver，避免读到别的sibling。
 
+## Grant verification（本轮实现，B02-1 补强）
+
+`ReadCurrent(grant, space, key)` 必须在**仍持有覆盖锁**时验证四件事，缺一即
+`ErrConflict`（fail closed），且不得记录 observation baseline：
+
+1. `grant.OwnerID` 等于本事务的 root owner；跨 root 的 grant 不授权。
+2. 该 owner 仍在 lock registry 中（root 终态后 `ReleaseOwner` 已移除，旧 grant 立即失效）。
+3. `grant.Generation`/`Term` 与该 owner 当前登记值**精确相等**；epoch 变化后的旧 grant 拒绝。
+4. grant 自带的 RECORD 组件精确覆盖被读的 space+key（身份含 TableID/IndexID，以 grant 的组件为
+   身份来源），**并且** manager 实时表里该 owner 在该资源上有 **applied** 的 S/X claim
+   （以 manager 为事实来源）。仍等待中的请求其 claim 是 pending，**不是锁**，不能授权。
+
+因此"OwnerID + GrantID"或"调用方自己拼的组件列表"都不构成能力：`LockGrant` 必须携带
+Components/Generation/Term 并原样回传（中性层 `storageengine.LockGrant` 同样字段）。
+`ReadCurrentUnlocked` 继续可用但永不记录 baseline，其观测不得作为提交基准。
+读前与读后各验证一次；两次之间存在 epoch/grant 失效时丢弃已读到的值。
+
 ## Snapshot / Current / Validation Matrix
 | 操作 | 读取基准 | 是否写回ReadTS | 是否新增dependency | post-readTS变更 |
 |---|---|---|---|---|

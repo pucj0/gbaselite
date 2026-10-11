@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"gbaselite/physical"
 	"gbaselite/sqllayout"
 	"gbaselite/storage"
@@ -203,7 +204,18 @@ func (o *InsertOperator) apply(ctx context.Context, candidate InsertCandidate) e
 	}
 	// The record lock is taken before the write, never after: a lock acquired afterwards would
 	// leave a window in which two transactions both believe the key is free.
-	if err := o.lockCandidate(candidate); err != nil {
+	grant, err := o.lockCandidate(candidate)
+	if err != nil {
+		return err
+	}
+	// With the row and its unique values held, the uniqueness decision is re-derived from the
+	// latest published index state. A decision taken before a wait is not evidence after it.
+	if err := o.verifyUniqueValuesLocked(ctx, candidate, grant); err != nil {
+		if errors.Is(err, errSkipInsertRow) {
+			// IGNORE turned the duplicate into a skipped row: nothing is written, so nothing is
+			// rebased and the affected count stays as it is.
+			return nil
+		}
 		return err
 	}
 	outcome, err := writeInsertedRow(ctx, o.Write, o.Session, o.Target, o.Mode, candidate.Values, candidate.Ordinal)
@@ -217,14 +229,14 @@ func (o *InsertOperator) apply(ctx context.Context, candidate InsertCandidate) e
 	return nil
 }
 
-// lockCandidate takes the exclusive row lock one inserted row needs.
+// lockCandidate takes the exclusive row lock one inserted row needs and returns the capability.
 //
 // The identity is derived from the candidate's own values, so it matches exactly what the write
 // path will install. A candidate whose primary key cannot be derived is refused rather than
-// written unprotected.
-func (o *InsertOperator) lockCandidate(candidate InsertCandidate) error {
+// written unprotected. The returned grant is what the locked uniqueness re-check reads under.
+func (o *InsertOperator) lockCandidate(candidate InsertCandidate) (storageengine.LockGrant, error) {
 	if o.Locks == nil {
-		return nil
+		return storageengine.LockGrant{}, nil
 	}
 	table := o.Target.definition
 	row := candidate.Values
@@ -234,24 +246,34 @@ func (o *InsertOperator) lockCandidate(candidate InsertCandidate) error {
 		// synthesises from this statement's ordinal, so that is the identity to lock.
 		key = heapKey(o.Write, candidate.Ordinal)
 		if len(key) == 0 {
-			return errLockIdentityUnavailable
+			return storageengine.LockGrant{}, errLockIdentityUnavailable
 		}
 	}
 	extra, err := indexEntryLocks(table, key, row)
 	if err != nil {
-		return err
+		return storageengine.LockGrant{}, err
 	}
 	return o.Locks.acquireRowLocksForKey(table, key, extra)
 }
 
 // indexEntryLocks builds the exclusive locks of a row's unique and secondary index entries.
 //
-// The entries are built with the same helper the write path uses, so the lock and the write share
-// one encoding. Without these an INSERT and an UPDATE that collide on a unique index would only
-// meet at commit time, which is the late-conflict behaviour this integration removes.
-// owner must be the row's primary-key bytes, because that is what the writer uses as the index
-// entry's sub-key. Passing anything else would compute a lock key the writer never touches, which
-// would either miss a real conflict or invent one between unrelated rows.
+// Two different identities are built here, and the difference is the whole point of the function:
+//
+//   - A **unique index** is locked on its *logical value reservation*: the index's own namespace
+//     and the encoded value from `storage.IndexValueKey`, which is exactly the key the write path
+//     stores the entry under. The entry's *value* is the owning primary key, so the entry key is
+//     the unique value alone. Appending the owner — as the secondary-entry encoding does — would
+//     give two transactions that write the same unique value under different primary keys two
+//     different resources, and they would never meet.
+//   - A **non-unique secondary index** is locked on its *physical entry*: the value parts plus the
+//     owner suffix, again byte-for-byte what the write path installs. Two rows may legally share
+//     such a value, so only the entry (which includes the owner) identifies one row.
+//
+// `storage.IndexValueKey` is the writer's own encoder, so it carries the published collation,
+// NULL and composite semantics with it: a NULL-containing key is not constrained and therefore
+// reserves nothing, collation-equal values produce one key, and a composite index reserves its
+// whole value. Re-implementing any of that here would let the lock and the write disagree.
 func indexEntryLocks(table versionedTable, owner []byte, row storage.Row) ([]storageengine.LockComponent, error) {
 	if row == nil || len(owner) == 0 {
 		return nil, nil
@@ -259,6 +281,16 @@ func indexEntryLocks(table versionedTable, owner []byte, row storage.Row) ([]sto
 	var components []storageengine.LockComponent
 	for _, index := range table.Definition.Indexes {
 		if index.Primary {
+			continue
+		}
+		if index.Unique {
+			valueKey, ok := storage.IndexValueKey(index, table.Definition.Columns, row)
+			if !ok {
+				// A unique value that is not constrained (a NULL part, or an unresolvable column)
+				// reserves nothing, exactly as it constrains nothing.
+				continue
+			}
+			components = append(components, uniqueValueReservationComponent(sqllayout.UniqueIndex(table.ID, index.Name), table.ID, index.Name, []byte(valueKey)))
 			continue
 		}
 		positions, ok := secondaryColumns(table, index)
@@ -272,11 +304,7 @@ func indexEntryLocks(table versionedTable, owner []byte, row storage.Row) ([]sto
 		if err != nil {
 			return nil, err
 		}
-		space := sqllayout.SecondaryIndex(table.ID, index.Name)
-		if index.Unique {
-			space = sqllayout.UniqueIndex(table.ID, index.Name)
-		}
-		components = append(components, indexEntryComponent(space, table.ID, index.Name, entryKey))
+		components = append(components, indexEntryComponent(sqllayout.SecondaryIndex(table.ID, index.Name), table.ID, index.Name, entryKey))
 	}
 	return components, nil
 }

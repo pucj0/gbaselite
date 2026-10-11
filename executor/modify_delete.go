@@ -89,10 +89,9 @@ func (o *DeleteOperator) Apply(ctx context.Context, candidate DeleteCandidate) e
 	// a snapshot that is about to lose the row. A backend with no lock manager has no lock to take;
 	// the deletion itself still has to happen, so only the lock step is skipped and not the whole
 	// apply.
-	// DELETE locking is deliberately NOT enabled in this release, for the same reason UPDATE
-	// locking is not: the target lock was implemented, but a later statement on the same row could
-	// be left blocked past the holder's commit. Removing a row without a lock keeps today's
-	// behaviour; adding a lock that can hang would not.
+	if err := o.lockTarget(candidate); err != nil {
+		return err
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -107,4 +106,30 @@ func (o *DeleteOperator) Apply(ctx context.Context, candidate DeleteCandidate) e
 	}
 	o.Result.AffectedRows++
 	return nil
+}
+
+// lockTarget takes the exclusive record locks one DELETE needs.
+//
+// It locks the row's physical identity — the key the scan observed, or the table's derived
+// primary-key identity when the candidate carries none — together with the index entries the
+// deletion removes, so a concurrent insert or update of the same row meets this statement on the
+// same resource instead of racing it.
+func (o *DeleteOperator) lockTarget(candidate DeleteCandidate) error {
+	if o.Locks == nil {
+		return nil
+	}
+	key := candidate.Identity.Key
+	if len(key) == 0 {
+		derived, ok := primaryKeyBytes(o.Target, candidate.OldRow)
+		if !ok {
+			return errLockIdentityUnavailable
+		}
+		key = derived
+	}
+	extra, err := indexEntryLocks(o.Target, key, candidate.OldRow)
+	if err != nil {
+		return err
+	}
+	_, err = o.Locks.acquireRowLocksForKey(o.Target, key, extra)
+	return err
 }
