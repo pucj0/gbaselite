@@ -77,9 +77,10 @@ func (e lockingEngineFixture) Close() error { return e.inner.Close() }
 func (e lockingEngineFixture) Locking() bool { return true }
 
 type lockingTxnFixture struct {
-	inner  storageengine.Txn
-	scopes map[uint64]bool
-	next   uint64
+	inner   storageengine.Txn
+	scopes  map[uint64]bool
+	budgets map[uint64]time.Duration
+	next    uint64
 }
 
 var (
@@ -127,7 +128,13 @@ func (t *lockingTxnFixture) NewIterator(ctx context.Context, request storageengi
 	return t.inner.NewIterator(ctx, request)
 }
 
-func (t *lockingTxnFixture) BeginLockScope(_ context.Context, kind storageengine.LockScopeKind) (uint64, error) {
+func (t *lockingTxnFixture) BeginLockScope(ctx context.Context, kind storageengine.LockScopeKind) (uint64, error) {
+	return t.BeginLockScopeBudget(ctx, kind, 0)
+}
+
+// BeginLockScopeBudget mirrors the documented scope contract: the kind is still validated, and the
+// budget is recorded with the scope so a test can assert what the caller asked for.
+func (t *lockingTxnFixture) BeginLockScopeBudget(_ context.Context, kind storageengine.LockScopeKind, budget time.Duration) (uint64, error) {
 	if !kind.Valid() {
 		return 0, storageengine.ErrUnsupported
 	}
@@ -136,6 +143,12 @@ func (t *lockingTxnFixture) BeginLockScope(_ context.Context, kind storageengine
 		t.scopes = make(map[uint64]bool)
 	}
 	t.scopes[t.next] = true
+	if budget > 0 {
+		if t.budgets == nil {
+			t.budgets = make(map[uint64]time.Duration)
+		}
+		t.budgets[t.next] = budget
+	}
 	return t.next, nil
 }
 

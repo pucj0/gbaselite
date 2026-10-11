@@ -84,10 +84,10 @@ type sqlLockPlan struct {
 
 // Annotation renders the plan for EXPLAIN's Extra column.
 //
-// The wording distinguishes a plan that is executed today from one that is only planned: locking
-// reads (`FOR UPDATE`/`FOR SHARE`) are recognised by the parser and still execute as snapshot reads
-// until the locked read path is wired, and an annotation that hid that would read as a promise the
-// engine does not keep.
+// The wording distinguishes a plan the locked read path executes today from one that is only planned.
+// A locking read (`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`) is now served by that path, so
+// `executed` is true for it; the false case remains for a caller that renders a plan without running
+// the statement, and it must not read as a promise the engine does not keep.
 func (p sqlLockPlan) Annotation(executed bool) string {
 	detail := p.reason
 	if detail == "" {
@@ -96,7 +96,7 @@ func (p sqlLockPlan) Annotation(executed bool) string {
 	if executed {
 		return fmt.Sprintf("Locks: %s (%s)", p.kind, detail)
 	}
-	return fmt.Sprintf("Locks: %s (%s; not executed yet: the statement still reads its snapshot)", p.kind, detail)
+	return fmt.Sprintf("Locks: %s (%s; planned only, the statement was not executed)", p.kind, detail)
 }
 
 // planSQLLockingMode maps the locking mode a statement asked for onto the neutral lock mode the

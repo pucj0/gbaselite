@@ -21,9 +21,38 @@ storageengine新增可选LockingTxn，原Txn/Engine最小接口保持。
    观察为 absent 的键**跳过**，绝不返回列表时的旧值；
 4. 进度稳定：下一页严格从上一个已消费键之后继续（正向 Lower 排他、反向 Upper 排他），删除/改写不重复输出；
 5. Close/ctx cancel/epoch reset 均以定义好的终态结束且无锁资源残留。
-6. **已知限制（明示）**：键列表取自本事务快照（含自身 overlay），快照之后别的事务提交的新键不会被枚举；
-   受保护范围内这类插入仍被区间 claim 阻止，且被枚举的键一定重读。要发布这类行需要一个
-   "最新已发布键枚举"的 mvcc API，本 release 未提供（SQL 侧锁定读尚未接线，无用户可见影响）。
+
+### 键列表语义（T032 修正，本轮更新）
+键列表**不再是快照枚举**：它走 `mvcc.Tx.ScanLatestRange`——以 store head 解析发布层并合并本事务/祖先
+stage，且**不记录 range dependency**（当前读不是关于快照的证据，保护它的是它持有的 claim）。因此
+**本事务快照之后别的事务提交的键会被枚举到**；普通 `ScanRange` 未改动，仍在固定 readTS 解析键。
+SQL 侧的对应可见性由 `TestT034LockingScanDiscoversRowsCommittedAfterTheSnapshot` /
+`TestT036...` 端到端锁定（同一事务的普通扫描看不到该行，锁定扫描看到）。
+
+### 会话锁等待预算（T035 修正，本轮更新）
+`innodb_lock_wait_timeout` 是**每次等待**的期限：`Scope.WaitBudget`（duration）由
+`LockingTxn.BeginLockScopeBudget` 传入，`requestDeadlineLocked` 取
+`min(该请求开始等待的时刻 + budget, scope 的 context deadline)`。语句/查询 context 是整条语句的上限，
+因此一条语句内多次短等待共享的是 context 上限而不是会话预算。
+**scope 归属**：scope id 每个 owner 从 1 开始，等待期限必须按"该请求所属 owner 的 scope 树"解析
+（`requestDeadlineLocked(rootID, scopeID)`）；按 id 在全部 owner 中查找会把同号他人 scope 的预算当成
+自己的（已修复，`TestB09BudgetIsReadFromTheRequestingOwnersScope`）。超时/取消/scope 关闭/root 回滚/
+epoch reset 都必须终止等待且不残留请求（`TestB09...`、`TestT036CleanupPaths`）。
+
+### SQL 锁定读路径（T034，本轮实现）
+`executor/locking_read.go`：`bindPhysicalSelect` 通过 `readSourceOperator` 选行源——普通 SELECT 仍是快照
+扫描，锁定读走：
+- **点路径**（`sqlAccessPoint`）：先取 `[表意向, 记录 claim]`，再 `ReadCurrent`；缺失时补取"包含插入位置的
+  Gap"（上界由 `ScanLatestRange` 找到的后继键给出，无后继则到 +∞）并重读；
+- **唯一索引路径**（`sqlAccessUnique`）：先取该唯一值的 reservation（与写入路径同一资源），读出的 entry
+  value 是**拥有该值的主键**，再取**共同主键行**并重读该行；行已被删除则返回空；
+- **范围/whole-domain 路径**：`NewCurrentIterator` + 区间组件；主键范围计划里 planner 未显式给出 namespace
+  （行命名空间只有读取方知道），`provenPrimaryInterval` 负责把它解析为已证明区间，避免把已证明区间降级为
+  整表回退；
+- 表意向模式：X ⇒ IX、S ⇒ IS。WHERE/ORDER BY/LIMIT/反向沿用原管线，因此 WHERE 在**当前行**上重评。
+- **明确拒绝**（fail-closed）：JOIN/派生表/CTE/视图/聚合/DISTINCT/标量查询、以及经**二级索引**的锁定读
+  （其 entry 集合可有多条，尚未接线）；NOWAIT/SKIP LOCKED 由 parser 拒绝。
+
 - `CloseLockScope(scope)`：取消pending，不解root grants。
 上述名称为接口契约候选，实施只能一致调整所有设计/任务，不能偷偷把语义塞入Get。
 Current read receiver就是read layer；child可读自己的overlay与ancestor，parent不能读未merge child。

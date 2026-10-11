@@ -230,9 +230,14 @@ type LockScopeOptions struct {
 	// ParentScopeID nests the scope inside an enclosing one when it is non-zero. It defaults to
 	// the transaction's own scope.
 	ParentScopeID uint64
-	// Deadline bounds how long a request from this scope may wait. Zero means the manager's
-	// session default, which the contract fixes at 50 seconds.
+	// Deadline caps the whole scope: it is the statement's or query's own bound. Zero means "no
+	// context bound". It is not the session's lock-wait budget, which bounds one wait each.
 	Deadline time.Time
+	// WaitBudget is the bound of one wait issued from this scope, as a duration: the session's
+	// `innodb_lock_wait_timeout`. Each request measures it from the moment it starts waiting, so a
+	// statement that waits twice for less than the budget stays inside it. Zero means the manager's
+	// default budget (50 seconds per the contract).
+	WaitBudget time.Duration
 }
 
 // lockScopeKind maps one neutral scope kind onto the lock manager's.
@@ -274,7 +279,7 @@ func (t *Tx) BeginLockScope(ctx context.Context, options LockScopeOptions) (uint
 	if parentScopeID == 0 {
 		parentScopeID = t.lockScopeID
 	}
-	scope, err := t.store.locks.manager.OpenScope(t.LockOwnerID(), t.ID, parentScopeID, kind, options.Deadline)
+	scope, err := t.store.locks.manager.OpenScopeWithBudget(t.LockOwnerID(), t.ID, parentScopeID, kind, options.Deadline, options.WaitBudget)
 	if err != nil {
 		return 0, err
 	}

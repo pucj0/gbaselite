@@ -162,7 +162,7 @@ type AcquireResult struct {
 //
 // Several handles can refer to one request: the caller that queued it and every caller that
 // joined it. They all observe the same decision through the same broadcast, which is why the
-// request can be shared safely 鈥?a wake-up is not a value handed to one receiver but a channel
+// request can be shared safely — a wake-up is not a value handed to one receiver but a channel
 // closed for all of them.
 //
 // Synchronization: the shared decision guards itself with its own small mutex, so Status
@@ -539,7 +539,7 @@ func (m *Manager) Deadlocks(limit int) ([]DeadlockSummary, bool) {
 	return m.inner.Deadlocks(limit)
 }
 
-// Manager is the exported fa莽ade of one engine's lock manager.
+// Manager is the exported fa鑾絘de of one engine's lock manager.
 //
 // It exists so the backend adapter has one documented entry point and tests have one type
 // to hold. It deliberately exposes no way to observe or mutate a transaction: the adapter
@@ -600,6 +600,14 @@ func (m *Manager) OpenScope(rootID, originTxnID string, parentScopeID uint64, ki
 	return m.inner.OpenScope(rootID, originTxnID, parentScopeID, kind, deadline)
 }
 
+// OpenScopeWithBudget opens a scope whose waits each carry the given budget.
+//
+// The budget is a duration and applies to every wait the scope issues, each measured from when that
+// wait starts; the deadline is the scope's context bound and caps all of them together.
+func (m *Manager) OpenScopeWithBudget(rootID, originTxnID string, parentScopeID uint64, kind ScopeKind, deadline time.Time, waitBudget time.Duration) (*Scope, error) {
+	return m.inner.OpenScopeWithBudget(rootID, originTxnID, parentScopeID, kind, deadline, waitBudget)
+}
+
 // CloseScope closes one scope, cancelling its pending requests and keeping every grant.
 func (m *Manager) CloseScope(rootID string, scopeID uint64) ([]uint64, error) {
 	return m.inner.CloseScope(rootID, scopeID)
@@ -639,8 +647,8 @@ func (m *Manager) WaitForGrant(ctx context.Context, rootID string, handle *LockH
 //
 // It is the deterministic synchronization point of the "several callers wait for one request"
 // tests: a hook that blocks parks every caller at exactly the moment before the outcome is
-// awaited, so a test can decide the outcome 鈥?grant, cancel, timeout, deadlock victim, epoch reset
-// 鈥?and then release the callers, and observe which of them learns it. Parking inside the blocking
+// awaited, so a test can decide the outcome — grant, cancel, timeout, deadlock victim, epoch reset
+// — and then release the callers, and observe which of them learns it. Parking inside the blocking
 // path (and not before it) is what makes the test meaningful: a caller parked earlier would take
 // the "already decided" fast path instead of exercising the wake-up under test.
 //
@@ -805,8 +813,8 @@ func (m *Manager) handleDeadline(rootID string, handle *LockHandle) (time.Time, 
 // grantForHandle returns the capability of the request behind one settled handle.
 //
 // The grant is read from the request's own recorded decision, never rebuilt from the owner's
-// registry. The registry lists every resource the root holds 鈥?including locks taken by its other,
-// unrelated requests 鈥?so rebuilding a grant from it would answer a waiter with components its
+// registry. The registry lists every resource the root holds — including locks taken by its other,
+// unrelated requests — so rebuilding a grant from it would answer a waiter with components its
 // request never acquired, lose the grant identity, and put the request id where the origin scope
 // belongs. Reading it back also keeps the answer stable: two callers that wait on one request get
 // one identity, not two reconstructions that drift apart.
@@ -1003,6 +1011,14 @@ func sortOwnersByOrdinal(owners []LockOwner) {
 // belongs to exactly one root" structural rather than a convention. A scope is not a
 // lock owner: closing it cancels its own pending requests and never releases a grant.
 func (m *manager) OpenScope(rootID, originTxnID string, parentScopeID uint64, kind ScopeKind, deadline time.Time) (*Scope, error) {
+	return m.OpenScopeWithBudget(rootID, originTxnID, parentScopeID, kind, deadline, 0)
+}
+
+// OpenScopeWithBudget opens a scope whose waits each carry one budget.
+//
+// waitBudget is the session's lock-wait budget as a duration; zero leaves the manager's default in
+// place. The scope's context deadline (deadline here) still caps the whole scope.
+func (m *manager) OpenScopeWithBudget(rootID, originTxnID string, parentScopeID uint64, kind ScopeKind, deadline time.Time, waitBudget time.Duration) (*Scope, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	owner, ok := m.owners[rootID]
@@ -1017,7 +1033,7 @@ func (m *manager) OpenScope(rootID, originTxnID string, parentScopeID uint64, ki
 		scopes = NewScopeTree()
 		m.scopes[rootID] = scopes
 	}
-	scope, err := scopes.Open(rootID, originTxnID, parentScopeID, kind, m.clock.Now(), deadline)
+	scope, err := scopes.OpenWithBudget(rootID, originTxnID, parentScopeID, kind, m.clock.Now(), deadline, waitBudget)
 	if err != nil {
 		return nil, err
 	}
@@ -1138,8 +1154,8 @@ func (m *manager) CloseScope(rootID string, scopeID uint64) ([]uint64, error) {
 // A join is a caller waiting for a request it did not create, so discarding the scope the join came
 // from has to end that caller's wait: a closed statement scope must not keep blocking, and it must
 // never be handed a grant for a statement that no longer exists. The request itself is deliberately
-// untouched 鈥?it belongs to the scope that created it, to the root and to every other caller still
-// waiting for it 鈥?which is why this is not part of cancelRequestsLocked.
+// untouched — it belongs to the scope that created it, to the root and to every other caller still
+// waiting for it — which is why this is not part of cancelRequestsLocked.
 //
 // The scan runs over the queued requests, which are bounded by the waiter budget, and each scope's
 // join record is removed as it is closed, so a repeated scope close finds nothing left to do.
@@ -1438,7 +1454,7 @@ func (m *manager) grantOfLocked(bundle *requestBundle) LockGrant {
 // the owner has asked for that mode, it has not been given it, and another owner's incompatible
 // grant may still be standing in the way. Re-entrancy answers "you already have this", so
 // answering it from a queued claim would report protection that does not exist. A request for a
-// *stronger* mode is deliberately not satisfied either 鈥?that is an upgrade, which must be taken.
+// *stronger* mode is deliberately not satisfied either — that is an upgrade, which must be taken.
 //
 // The claim must be the *same lock*, not merely a claim of the same conflict domain. Two gaps of
 // one namespace live in one entry because they have to be compared with each other, and holding
@@ -1493,7 +1509,7 @@ func (m *manager) joinableRequestLocked(rootID string, components []ResourceRef)
 // a mode that covers the requested one.
 //
 // The component is matched by its exact claim identity (`ClaimKey`), which is what makes the match
-// independent of the order the caller listed its components in 鈥?and what keeps a queued
+// independent of the order the caller listed its components in — and what keeps a queued
 // `Gap(a,m)` from being treated as already covering a new request for `Gap(n,z)`. Sharing a
 // conflict domain is not covering: the two gaps are different ranges, so joining the queued request
 // would leave the new range protected only by accident.
@@ -1591,7 +1607,7 @@ func (m *manager) newRequestLocked(rootID string, scopeID uint64, deduped []Reso
 		Status:         RequestPending,
 		ReservedBytes:  reservation.Bytes(),
 		ShouldWait:     mayWait,
-		Deadline:       m.requestDeadlineLocked(scopeID),
+		Deadline:       m.requestDeadlineLocked(rootID, scopeID),
 	}
 	bundle := &requestBundle{req: request, reservation: reservation, decision: newRequestState()}
 	bundle.entries = make([]*lockRequest, 0, len(deduped))
@@ -1622,7 +1638,7 @@ func (m *manager) inspectLocked(bundle *requestBundle) ([]*lockRequest, []string
 		lockEntry := m.locks.entryFor(entry.ref)
 		conflict := false
 		// The mode that matters is *this* component's mode. A bundle carries components of
-		// different kinds 鈥?a table intention beside a record lock 鈥?so testing every component
+		// different kinds — a table intention beside a record lock — so testing every component
 		// with one mode would let a record mode be compared against a table intention and the
 		// conflict would be missed or invented.
 		for _, holder := range lockEntry.conflictingHolders(entry.ref, entry.req.OwnerID) {
@@ -1675,8 +1691,8 @@ func (m *manager) enqueueLocked(bundle *requestBundle, blocking []*lockRequest) 
 		lockEntry := m.locks.entryFor(entry.ref)
 		if entry.state != entryAdopted {
 			// A queued component records its claim as *pending*: the claim is real and must count
-			// against other owners 鈥?that is what makes a waiting upgrade protect the row and what
-			// lets a repeated request be recognised as covered 鈥?but it does not yet apply to the
+			// against other owners — that is what makes a waiting upgrade protect the row and what
+			// lets a repeated request be recognised as covered — but it does not yet apply to the
 			// owner's granted mode. An adopted component already has the owner's claim and records
 			// nothing.
 			lockEntry.addClaim(entry.req, entry.ref, true)
@@ -1861,8 +1877,8 @@ func dedupeEdges(edges []LockEdge) []LockEdge {
 // retryWaitingLocked grants every queued bundle whose components are all grantable now.
 //
 // A bundle is granted as a whole or not at all. A per-component grant would make a partially
-// granted bundle observable 鈥?its owner would appear to hold the record but not the table
-// intention 鈥?and would let an unrelated queue pass complete a bundle on the wrong trigger.
+// granted bundle observable — its owner would appear to hold the record but not the table
+// intention — and would let an unrelated queue pass complete a bundle on the wrong trigger.
 // Checking readiness for the whole bundle and then applying it keeps the grant atomic.
 //
 // The pass repeats until it makes no progress, because completing one bundle changes the
@@ -1971,7 +1987,8 @@ func (m *manager) completeBundleLocked(bundle *requestBundle) {
 		bundle.grantID = m.nextGrantID
 	}
 	// The capability is recorded with the request before its terminal status is published, so
-	// every caller of this request 鈥?the one that started it and every caller that joined it 鈥?	// resolves the same identity, the same origin scope and the same component list.
+	// every caller of this request — the one that started it and every caller that joined it —
+	// resolves the same identity, the same origin scope and the same component list.
 	bundle.setGrant(m.buildGrant(bundle))
 	bundle.setStatus(RequestGranted)
 }
@@ -1991,20 +2008,36 @@ const defaultLockWaitTimeout = 50 * time.Second
 // deterministically and no assertion depends on wall-clock elapsed time.
 // requestDeadlineLocked returns the wait deadline of a request issued from one scope.
 //
-// The scope's own deadline *is* the session's lock-wait bound when one was configured: a scope is
-// opened with `now + innodb_lock_wait_timeout`, and the caller may legitimately ask for more than the
-// contract default (the SQL variable accepts up to 86400 seconds). It is therefore not clamped to the
-// default — clamping would silently cut a 300-second session off at 50 seconds, which is exactly the
-// kind of hidden limit a configuration surface must not have. A caller whose query context ends
-// earlier still stops waiting earlier, because the waiting caller observes its own context
-// separately and a cancelled context withdraws the request.
-func (m *manager) requestDeadlineLocked(scopeID uint64) time.Time {
-	for _, scopes := range m.scopes {
-		if scope, ok := scopes.Get(scopeID); ok && !scope.ContextDeadline.IsZero() {
-			return scope.ContextDeadline
+// The bound of one wait is the earlier of two things the contract names:
+//
+//   - the session's lock-wait budget, measured **from now**, because it bounds one wait and not the
+//     statement. A session budget of one second therefore allows two waits of 0.6 seconds each, which
+//     is what `innodb_lock_wait_timeout` means; charging the first wait's elapsed time against the
+//     second would report a timeout the caller cannot explain from the configuration;
+//   - the scope's context deadline, which is the statement's own bound and therefore caps everything
+//     that scope does, no matter how the individual waits are spent.
+//
+// A scope that configured no budget uses the manager's default budget.
+//
+// The scope is looked up inside the *requesting owner's* tree. Scope ids restart at one for every
+// owner, so searching every tree would hand a request the same-numbered scope of an unrelated
+// transaction — and with it that transaction's budget and context deadline. The owner is therefore a
+// parameter rather than something to rediscover from the id.
+func (m *manager) requestDeadlineLocked(rootID string, scopeID uint64) time.Time {
+	budget := defaultLockWaitTimeout
+	if scopes, ok := m.scopes[rootID]; ok {
+		if scope, ok := scopes.Get(scopeID); ok {
+			if scope.WaitBudget > 0 {
+				budget = scope.WaitBudget
+			}
+			deadline := m.clock.Now().Add(budget)
+			if !scope.ContextDeadline.IsZero() && scope.ContextDeadline.Before(deadline) {
+				return scope.ContextDeadline
+			}
+			return deadline
 		}
 	}
-	return m.clock.Now().Add(defaultLockWaitTimeout)
+	return m.clock.Now().Add(budget)
 }
 
 // DetectDeadlock searches the wait-for graph for a cycle and, when it finds one, chooses the
@@ -2628,7 +2661,7 @@ func (m *manager) ResetEpoch(generation, term uint64) int {
 
 	// The ledger has its own lock, so the manager mutex is released first, exactly as ReleaseOwner
 	// does: the two registries are independent and are never nested here. The refund is not
-	// optional bookkeeping 鈥?the owners were deleted above, so a charge left behind would account a
+	// optional bookkeeping — the owners were deleted above, so a charge left behind would account a
 	// lock that no owner holds and no generation can release, which is the "epoch change leaves no
 	// lock resource behind" half of the contract.
 	for _, rootID := range ended {

@@ -272,6 +272,14 @@ type LockPlan struct {
 type LockingTxn interface {
 	// BeginLockScope opens a request scope owned by this transaction's root.
 	BeginLockScope(ctx context.Context, kind LockScopeKind) (uint64, error)
+	// BeginLockScopeBudget opens a request scope whose waits each carry one budget.
+	//
+	// The budget is the bound of **one** wait (`innodb_lock_wait_timeout` as a duration), measured
+	// from the moment each request starts waiting; the scope's context still caps every wait of the
+	// statement. A zero budget leaves the implementation's default in place. It is separate from
+	// BeginLockScope because encoding a per-wait duration as a context deadline turns it into a
+	// statement-wide bound, which is a different rule.
+	BeginLockScopeBudget(ctx context.Context, kind LockScopeKind, budget time.Duration) (uint64, error)
 	// Acquire requests one atomic bundle. It returns a grant, or a neutral error
 	// such as ErrLockWaitTimeout, ErrDeadlock, ErrLockResourceLimit, ErrConflict,
 	// ErrLockInvalidated or ErrUnsupported.

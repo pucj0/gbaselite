@@ -22,6 +22,24 @@ func bindPhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Sess
 	if err := validateSQLSelectShape(statement); err != nil {
 		return nil, err
 	}
+	// A locking read is only served by the locked path below, which is reached for a single-table
+	// SELECT. Every other shape (a join, a derived table, a CTE, a view, a scalar or aggregated
+	// select) is materialized by earlier code that reads the statement snapshot, so a locking read of
+	// one of them has to be refused here — before that code runs — rather than quietly served as if it
+	// held the locks its statement asked for.
+	if statement.Locking {
+		if err := validateLockedReadShape(statement); err != nil {
+			return nil, err
+		}
+		if _, ok := cteFor(session, statement.Table); ok {
+			return nil, fmt.Errorf("%w: common table expressions", errLockedReadShape)
+		}
+		if _, _, isView, err := viewRelation(ctx, tx, session, statement.Table, statement.TableAlias); err != nil {
+			return nil, err
+		} else if isView {
+			return nil, fmt.Errorf("%w: views", errLockedReadShape)
+		}
+	}
 	if statement.Table == "" && statement.Subquery == nil {
 		result, err := executeScalarSelect(session, statement)
 		if err != nil {
@@ -97,12 +115,15 @@ func bindPhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Sess
 	needed := sqlProjectionMask(statement, schema)
 	plan := planSQLAccess(statement, definition, schema, session)
 	ordered := plan.ordered
-	op := bindScan(tx, definition, plan, func(encoded []byte) (storage.Row, error) {
+	op, err := readSourceOperator(ctx, tx, session, statement, definition, plan, func(encoded []byte) (storage.Row, error) {
 		if err := checkQuery(session); err != nil {
 			return nil, err
 		}
 		return decodeSQLRowInto(definition, encoded, needed, nil)
 	})
+	if err != nil {
+		return nil, err
+	}
 	if statement.Where != nil {
 		evaluate := bindSQLFilter(statement.Where, schema, session)
 		op = physical.Filter[storage.Row]{Input: op, Predicate: func(row storage.Row) (bool, error) {

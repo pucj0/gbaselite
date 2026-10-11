@@ -373,6 +373,16 @@ Phase 3（US1）的前置条件已就绪：
 | （本轮第三个缺陷）同 bundle 兄弟被当作 older waiter | **已修复**：`waitersAhead`/`olderBlockers` 会把同一 bundle 的 `Gap(a,m)` 当作 `II(b)` 的 older waiter（包含判定为真），使"同域两组件"的请求永久排队且图上无边；现按 `sameBundleRequest` 跳过自身兄弟。 |
 | 证据 | 新增 `lockmanager/claim_identity_test.go`（A–H 八项）与 `resource_test.go: TestB07ClaimIdentityIsExactInsideOneDomain`；**修复前 6/8 失败**（`.tmp/b07-before.txt`），**修复后全部通过**（`.tmp/b07-after.txt`）。`executor/lock_plan_test.go: TestT025SQLInsertRespectsAProtectedRange` 按用户要求重写为"T1 持锁期间 T3 必须完成"，替换原先在释放后才跑范围外插入的时序。T021–T027 的既有验收在修复后仍全部通过，完成标记保持。 |
 
+## A14. 第十一轮（Phase 5 收尾：T034/T035/T036 验收）
+
+| 上一版结论 | 现状（`.tmp/b11-phase5-report.md`、`.tmp/b11-acceptance.txt`） |
+|---|---|
+| T035「预算粒度是语句级而非每次等待」（A13 遗留） | **已修复**：`Scope.WaitBudget`（duration）+ `LockingTxn.BeginLockScopeBudget` + `requestDeadlineLocked = min(请求开始等待时刻 + budget, scope context deadline)`。**同时修掉一个真实缺陷**：scope id 每 owner 从 1 开始，旧查找遍历全部 owner 的 scope 树，会把同号他人 scope 的预算/期限当成自己的（按 owner 解析，`TestB09BudgetIsReadFromTheRequestingOwnersScope` 回归）。`TestB09LockWaitBudgetAppliesToEachWaitNotToTheStatement` 的 Skip 已删除，虚拟时钟下 0.6s+0.6s 在 1s 预算内均成功，超预算仍超时。 |
+| T032「键列表取自本事务快照，快照后提交的新键不会被枚举」 | **已修复（`09b3be2`）**：键列表走 `mvcc.Tx.ScanLatestRange`（store head 发布层 + 本事务/祖先 stage，不记 range dependency），SQL 侧 `TestT034LockingScanDiscoversRowsCommittedAfterTheSnapshot` 端到端锁定；`iterator.go` 中过时的快照枚举注释已同步删除。 |
+| T034「SQL 路径未接线」 | **已实现**：`executor/locking_read.go`（点路径 / 唯一索引路径 / 范围与 whole-domain 路径），X/IX 与 S/IS，获锁后重读并重评 WHERE，删除行不返回，主键范围不再被降级为整表回退（`provenPrimaryInterval`），显式事务持锁至 COMMIT/ROLLBACK、autocommit 随 root 结束释放；**明确拒绝** JOIN/派生表/CTE/视图/聚合/DISTINCT/标量查询与二级索引访问，NOWAIT/SKIP LOCKED 由 parser 拒绝。 |
+| T034「多索引访问、共同主键行锁」 | **已实现并验收**：唯一索引路径先取该值的 reservation（与写入路径同一资源），再由 entry value（拥有该值的主键）取**共同主键行**并重读；`TestT034UniqueIndexLockingReadSharesTheWritersResources`（不同唯一值不被阻塞、同值被阻塞、提交后为永久 duplicate）与 `TestT036LockIdentityMatchesTheDMLPath`（组件与 DML 逐字段相同）。**二级索引**（非唯一）仍 fail-closed 拒绝。 |
+| T036 双 Session 矩阵 | **本轮补齐并验收**：20 项 SQL 级测试（`executor/locking_read_test.go` + `locking_read_matrix_test.go`），含等待后最新值、共享读兼容/排斥写、快照不变、快照后新行可见、删除行不返回、缺失键插入位置保护、区间内插入等待而区间外完成、per-key baseline、清理路径（timeout/cancel/rollback/disconnect/savepoint）、等待期间无关写入可提交、锁身份与 DML 一致；不依赖 Sleep（wait hook 或短预算）。 |
+
 ## A13. 第八轮（Phase 5/US3：T028、T032、T035 完成；T034、T036 未完成）
 
 | 上一版结论 | 现状（`.tmp/b08-phase5-report.md`） |

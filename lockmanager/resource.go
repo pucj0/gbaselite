@@ -606,9 +606,18 @@ func NewScopeTree() *ScopeTree { return &ScopeTree{scopes: make(map[uint64]*Scop
 // Open registers one scope. A non-zero parent must already exist and belong to the
 // same owner; a child scope can therefore never be attached to another owner's tree.
 //
-// deadline is the effective wait deadline of the scope: the earlier of its session
-// limit and its statement or query context. The zero time means "no scope deadline".
+// deadline is the context deadline of the scope: its statement or query bound. The zero time means
+// "no context deadline". The session's per-wait budget is opened separately, by OpenWithBudget.
 func (t *ScopeTree) Open(ownerID, originTxnID string, parentID uint64, kind ScopeKind, openedAt time.Time, deadline time.Time) (*Scope, error) {
+	return t.OpenWithBudget(ownerID, originTxnID, parentID, kind, openedAt, deadline, 0)
+}
+
+// OpenWithBudget opens a scope whose waits each carry one budget.
+//
+// waitBudget is the session's lock-wait budget as a duration; zero means the manager's default. It is
+// kept separate from the context deadline so that each wait is measured from the moment it starts
+// waiting, while the context deadline still caps the whole scope.
+func (t *ScopeTree) OpenWithBudget(ownerID, originTxnID string, parentID uint64, kind ScopeKind, openedAt time.Time, deadline time.Time, waitBudget time.Duration) (*Scope, error) {
 	if ownerID == "" || !kind.Valid() {
 		return nil, ErrScopeUnknown
 	}
@@ -631,6 +640,7 @@ func (t *ScopeTree) Open(ownerID, originTxnID string, parentID uint64, kind Scop
 		State:           ScopeOpen,
 		OpenedAt:        openedAt,
 		ContextDeadline: deadline,
+		WaitBudget:      waitBudget,
 	}
 	t.scopes[scope.ID] = scope
 	return scope, nil

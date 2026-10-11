@@ -29,8 +29,9 @@ const (
 )
 
 func validateSQLSelectShape(s parser.Select) error {
-	// Locking reads (FOR UPDATE / LOCK IN SHARE MODE) are accepted and served from
-	// the statement snapshot, matching the legacy executor, which never blocked.
+	// A locking read is served by the locked read path (locking_read.go) for a single-table SELECT;
+	// every other shape is refused there rather than served from the snapshot, so this validator stays
+	// shape-agnostic and the locking rules live in one place.
 	if s.Table == "" && s.Subquery == nil {
 		return nil
 	}

@@ -1089,6 +1089,69 @@ T1 回滚后 T2 被唤醒，最后校验数据（50/300 都在）、被释放的
    **遗留**：预算粒度是语句级而非每等待（第 3 点），故 T035 的"严格遵守超时语义"一条**未完全满足**。
 - [ ] **T036**（未完成，不勾选）。
 
+### 第十轮（等待预算语义修正 + T034 锁定读接入）
+
+证据文件 `.tmp/b10-phase5-report.md`；原始输出 `.tmp/b10-acceptance.txt`、`.tmp/b10-acceptance2.txt`。
+新增/扩展测试：`lockmanager/lock_wait_budget_scope_test.go`（每等待预算 + scope 归属）、
+`lockmanager/session_wait_deadline_test.go`（预算双向 + ctx 上限）、
+`executor/locking_read_test.go`（T034/T036 九项 SQL 级验收）。
+
+1. **等待预算粒度（已修复，第三项的偏差关闭）**：
+   - 发现并修复一个**真实缺陷**：scope id 每个 owner 从 1 开始，而 `requestDeadlineLocked` 原先遍历
+     **所有 owner 的 scope 树**，于是请求可能拿到"别人同号 scope"的预算/期限。现在按请求所属 owner
+     解析（`requestDeadlineLocked(rootID, scopeID)`），并有 `TestB09BudgetIsReadFromTheRequestingOwnersScope`
+     回归（两个 owner 同号 scope、不同预算，各自在自己的期限结束）。
+   - 会话预算改为**每次等待**的 duration：`Scope.WaitBudget` + `OpenScopeWithBudget` +
+     `requestDeadlineLocked = min(now+budget, scope ctx deadline)`；中立层新增
+     `LockingTxn.BeginLockScopeBudget(ctx, kind, budget)`（adapter/mvcc/contract 夹具同步），
+     executor 不再把预算编码成语句级 ctx deadline。
+   - 测试：`TestB09LockWaitBudgetAppliesToEachWaitNotToTheStatement`（1s 预算内两次 0.6s 等待均成功，
+     超预算的等待仍超时）、`TestB08ContextDeadlineCapsTheSessionBudget`（query ctx 早于预算时先结束）。
+2. **T034 锁定读接入 SQL 执行器（已实现，含明确拒绝面）**：新增 `executor/locking_read.go`，
+   `bindPhysicalSelect` 只用 `readSourceOperator` 选择行源——普通 SELECT 仍是原来的快照扫描，锁定读走
+   锁定路径：先按锁计划取访问区间（range 需 Proven；否则显式 whole-domain），再逐键取 claim 并
+   `ReadCurrent` 重读；点路径先取记录 claim 再重读，缺失时补取"包含插入位置的 Gap"；X 配 IX、S 配 IS；
+   WHERE/ORDER BY/LIMIT/反向沿用原管线（因此 WHERE 在**当前行**上重评）；语句 scope 结束时保留 grants，
+   autocommit 随 root 结束释放。**明确拒绝**（fail-closed）：JOIN/派生表/CTE/视图/聚合/DISTINCT/标量查询，
+   以及经唯一/二级索引的访问（`lockedReadIndexGuard`，其计划键是索引项不是行）。
+3. **T036（部分覆盖）**：`executor/locking_read_test.go` 覆盖 FOR UPDATE 排他（写者等到预算超时、COMMIT 后
+   可写）、FOR SHARE 兼容读且排斥写者（含 LOCK IN SHARE MODE 别名）、普通 SELECT 保持快照、等待后读到
+   **最新已提交值**（用 `lockedReadWaitHook` 证明"确实已排队"）、等待期间被删除的行不返回、快照之后提交的
+   新行被锁定扫描发现（普通扫描看不到）、缺失键的插入位置保护、不支持形态与半保护计划的拒绝。
+
+- [x] **T028**（勾选，本轮复验 `-run TestT028` 通过）。
+- [x] **T032**（勾选，本轮复验 `-run TestT032` 通过；上一轮已修旧快照枚举与锁计划校验）。
+- [x] **T035**（勾选）：默认 50s、范围 1..86400、拒绝非法值、服务端 SET 与 `@@变量`、1205 映射、
+   **每次等待**预算 + query ctx 上限（本轮修正并复验；executor 5 组 + server 3 项 + lockmanager 6 项全通过）。
+- [ ] **T034**（**不勾选**）：SQL 路径已实现并验收 FOR UPDATE/FOR SHARE/普通 SELECT/重读/新行发现/删除行/
+  插入位置/生命周期/拒绝面；但 **多索引访问与共同主键行锁**（经唯一/二级索引的锁定读）尚未实现，
+  当前以 fail-closed 拒绝，故不满足全部验收条件。
+- [ ] **T036**（**不勾选**）：A–L 矩阵仅部分覆盖（见第 3 点）；savepoint/断连/epoch reset/死锁受害者/
+  NOWAIT·SKIP LOCKED 的端到端项仍缺。
+
+### 第十一轮（Phase 5 收尾：T034/T035/T036）
+
+证据：`.tmp/b11-phase5-report.md`、`.tmp/b11-acceptance.txt`。测试：`executor/locking_read_test.go`（9 项）、
+`executor/locking_read_matrix_test.go`（11 项）、`lockmanager/lock_wait_budget_scope_test.go`、
+`lockmanager/session_wait_deadline_test.go`。生产改动：`executor/locking_read.go`（新增锁定读路径：点 /
+唯一索引 / 范围与 whole-domain）、`executor/physical_select.go`（行源选择与形态拒绝）、
+`lockmanager/{types,resource,manager}.go` + `mvcc/locking.go` + `storageengine/locking.go` +
+`storageengine/mvccadapter/locking.go`（每次等待预算与按 owner 解析期限）、`executor/dml_locking.go`、
+`storageengine/mvccadapter/iterator.go`（过时快照枚举注释清理）。
+
+- [x] **T034**：SQL 锁定读接入（`FOR UPDATE`=X/IX、`FOR SHARE`/`LOCK IN SHARE MODE`=S/IS、普通 SELECT 仍快照）；
+  点路径记录锁 + 缺失键插入位置 Gap；唯一索引路径共享 DML 的 reservation 与共同主键行（
+  `TestT034UniqueIndexLockingReadSharesTheWritersResources`、`TestT036LockIdentityMatchesTheDMLPath`）；
+  范围路径 `NewCurrentIterator` + 已证明区间（`provenPrimaryInterval` 修正主键范围被降级为整表回退的问题）；
+  获锁后重读并重评 WHERE（删除行不返回、快照后新行可见）；ORDER BY/LIMIT/反向沿用同一管线；
+  显式事务持锁至 COMMIT/ROLLBACK、autocommit 随 root 结束释放；未支持形态与二级索引访问在产生副作用前拒绝。
+  **仍 fail-closed**：非唯一二级索引的锁定读（`lockedReadIndexGuard`，其 entry 集合可含多条）。
+- [x] **T035**：每次等待预算（`Scope.WaitBudget` + `BeginLockScopeBudget` + 按 owner 解析期限），
+  ctx 上限更早时先结束；SET SESSION/SHOW/`@@`/1205 保持正确；Skip 已删除且原复现用例通过。
+- [x] **T036**：20 项 SQL 双 Session 矩阵全部通过，含清理路径（timeout/cancel/rollback/disconnect/savepoint）、
+  等待期间无关写入与提交不被阻塞、锁身份与 DML 一致；确定性 barrier（`lockedReadWaitHook`）或短预算判定等待，
+  不依赖 Sleep；`-count=5` 多轮通过。
+
 ### 本轮证据文件
 | 文件 | 内容 |
 |---|---|

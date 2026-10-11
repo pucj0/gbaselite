@@ -9,12 +9,11 @@ import (
 // lock_wait_budget_scope_test.go checks *which* bound `innodb_lock_wait_timeout` is.
 //
 // The approved contract (contracts/lock-manager.md, contracts/sql-locking.md §Session options) makes
-// it the bound of **one lock wait**: "等待期限是会话 lock 期限与 ctx 期限的较早者", where the session
-// value is a duration (default 50s, settable to 86400s) and the context is the statement's own
-// deadline. A statement that takes two waits of 0.6s each with a 1-second session budget is therefore
-// within budget on both, while a *statement-wide* interpretation of the same value would kill the
-// second wait for the first wait's elapsed time — and would report a timeout the caller cannot explain
-// from the contract.
+// it the bound of **one lock wait**: "等待期限是会话 lock 期限与 ctx 期限的较早者", where the session value
+// is a duration (default 50s, settable to 86400s) and the context is the statement's own deadline. A
+// statement that takes two waits of 0.6s each with a 1-second session budget is therefore within budget
+// on both, while a *statement-wide* interpretation of the same value would kill the second wait for the
+// first wait's elapsed time — and would report a timeout the caller cannot explain from the contract.
 //
 // The test drives the manager's virtual clock, so the two readings are told apart without sleeping.
 
@@ -32,36 +31,18 @@ func t09Holder(t *testing.T, m *Manager, rootID, key string) {
 	owner.grant(context.Background(), indexRecord("t09", "PRIMARY", []byte(key)), ixIntent("t09"))
 }
 
-// TestB09LockWaitBudgetAppliesToEachWaitNotToTheStatement shows that a session budget of one second
-// allows two waits of 0.6 seconds each inside one statement scope.
+// TestB09LockWaitBudgetAppliesToEachWaitNotToTheStatement shows that a one-second session budget allows
+// two waits of 0.6 seconds each inside one statement scope, and still ends a wait that exceeds it.
 //
-// SKIPPED — the behaviour under test is *not* what the implementation does today, and this test is the
-// recorded evidence of the deviation rather than a passing description of it. The measurement is exact
-// and reproducible (run it with the skip removed): after the first wait consumed 0.6s of a one-second
-// scope budget, the second wait of the same size is expired by `CheckTimeouts` because the budget is
-// carried as the *scope's* absolute deadline instead of as a per-request duration.
-//
-// What the contract says (contracts/lock-manager.md, contracts/sql-locking.md §Session options): the
-// wait bound of one request is the earlier of the session's lock-wait *duration* (default 50s,
-// settable to 86400s) and the statement's context deadline. Two waits inside one second are therefore
-// both legal, while a statement whose context ends earlier still stops earlier.
-//
-// The fix is scoped and does not need a redesign: give the scope a wait *budget* (a duration), compute
-// each request's deadline as `min(now + budget, scope context deadline)` in
-// `manager.requestDeadlineLocked`, and carry the budget to the scope through the neutral locking
-// capability (`LockingTxn`) instead of encoding it as a context deadline in the executor. That touches
-// `lockmanager` (Scope field + OpenScope variant + requestDeadlineLocked), `mvcc` (LockScopeOptions),
-// `storageengine` (one optional interface method), `storageengine/mvccadapter` (pass-through),
-// `storageengine/locking_contract_test.go` (its fixture) and `executor/dml_locking.go` (pass the
-// session budget rather than a derived deadline). It is deliberately NOT half-applied here: a
-// manager-only change would leave the SQL-visible behaviour exactly as it is today.
+// This is the case that distinguished the two readings of the contract: with the budget carried as the
+// scope's absolute deadline, the second wait was expired by the first wait's elapsed time. It is a
+// regression test for that, and it fails against that implementation.
 func TestB09LockWaitBudgetAppliesToEachWaitNotToTheStatement(t *testing.T) {
-	t.Skip("known deviation: the session lock-wait budget is applied as a statement-wide deadline, not per wait (see the test comment for the measured evidence and the scoped fix)")
 	ctx := context.Background()
 	m, clock := newPublicManager(t, BudgetLimits{})
 
-	// The statement scope carries the session budget as its wait bound: one second from now.
-	owner := t08Waiter(t, m, "root-b09", clock.Now().Add(1*time.Second))
+	// The statement scope carries the session budget: one second, applied to each wait.
+	owner := t08Waiter(t, m, "root-b09", 1*time.Second)
 
 	// First wait: queued behind a holder, released after 0.6s.
 	t09Holder(t, m, "root-b09-holder-1", "k1")
@@ -112,6 +93,49 @@ func TestB09LockWaitBudgetAppliesToEachWaitNotToTheStatement(t *testing.T) {
 
 	m.ReleaseOwner("root-b09-holder-3")
 	m.ReleaseOwner("root-b09")
+	if size := m.LockTableSize(); size != 0 {
+		t.Fatalf("lock table = %d after cleanup, want 0", size)
+	}
+}
+
+// TestB09BudgetIsReadFromTheRequestingOwnersScope guards the lookup itself.
+//
+// Scope ids restart at one for every owner, so a manager that searched all owners' scope trees would
+// hand a request the same-numbered scope of an unrelated transaction — and with it that transaction's
+// budget. Two owners are therefore opened with different budgets, and each one's wait must end at its
+// own bound: 1s and 300s respectively are far enough apart to tell them apart on the virtual clock.
+func TestB09BudgetIsReadFromTheRequestingOwnersScope(t *testing.T) {
+	ctx := context.Background()
+	m, clock := newPublicManager(t, BudgetLimits{})
+
+	short := t08Waiter(t, m, "root-b09-short", 1*time.Second)
+	long := t08Waiter(t, m, "root-b09-long", 300*time.Second)
+	if short.scopeID != long.scopeID {
+		t.Fatalf("the fixture no longer exercises the shared-id case: %d vs %d", short.scopeID, long.scopeID)
+	}
+
+	t09Holder(t, m, "root-b09-holder", "k1")
+	shortWait := short.acquire(ctx, indexRecord("t09", "PRIMARY", []byte("k1")), ixIntent("t09"))
+	longWait := long.acquire(ctx, indexRecord("t09", "PRIMARY", []byte("k1")), ixIntent("t09"))
+	if shortWait.Op != LockOpWait || longWait.Op != LockOpWait {
+		t.Fatalf("wait ops = %s / %s, want both WAIT", shortWait.Op, longWait.Op)
+	}
+
+	// Past the 1s budget: the short-budget owner is done, the 300s one is untouched.
+	clock.Advance(2 * time.Second)
+	if expired := m.CheckTimeouts(); expired != 1 {
+		t.Fatalf("CheckTimeouts = %d at +2s, want exactly the 1s-budget owner", expired)
+	}
+	if status := m.WaitStatus("root-b09-short", shortWait.Wait); status != RequestTimedOut {
+		t.Fatalf("the 1s-budget owner = %s, want TIMED_OUT", status)
+	}
+	if status := m.WaitStatus("root-b09-long", longWait.Wait); status != RequestPending {
+		t.Fatalf("the 300s-budget owner = %s at +2s, want PENDING", status)
+	}
+
+	m.ReleaseOwner("root-b09-holder")
+	m.ReleaseOwner("root-b09-short")
+	m.ReleaseOwner("root-b09-long")
 	if size := m.LockTableSize(); size != 0 {
 		t.Fatalf("lock table = %d after cleanup, want 0", size)
 	}

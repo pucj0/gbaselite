@@ -80,22 +80,29 @@ JDBC、Go MySQL 驱动等客户端提供服务。
   读取最新已发布版本 + 本事务 overlay），以及 **lock-aware 有限页迭代器**（先保护访问区间，再按页
   取锁并逐键重读；等待期间不持有任何存储 view）。迭代器的键列表取自**最新已发布状态 + 本事务/祖先
   overlay**，因此能发现本事务快照之后别的事务已提交的键；普通 `Get`/`Scan` 仍严格保持 B01 快照语义
-  （同一事务的普通范围读看不到那些键）。它目前**尚未**被 SQL 语句使用（见下）。
+  （同一事务的普通范围读看不到那些键）。
   - 锁定扫描必须携带可用的锁计划：已证明的范围（`range` + `Proven`）或显式 whole-domain 回退；
     空计划、record-only 计划、跨 namespace 或不覆盖扫描范围的范围一律**拒绝**。
   - 带 TableID 标签的 interval（Gap/Next-Key）与 record 一样，必须在同一 bundle 内提供表意向（IX）。
-  - **已知限制**：`innodb_lock_wait_timeout` 当前按**语句级**期限生效（executor 把会话预算编码为语句
-    scope 的 context deadline），而合同要求它是**每次锁等待**的期限；会话值本身（默认 50s、1..86400、
-    GLOBAL 拒绝）与 1..86400 的双向生效都可用，但一条语句内多次等待会被前一次已耗时间提前结束。
+  - 会话的锁等待预算是**每次等待**的期限（`innodb_lock_wait_timeout`，默认 50s、1..86400、GLOBAL 拒绝），
+    语句/查询 context 的期限是整条语句的上限；两者取更早者，一条语句内多次短等待不会被前一次耗时拖垮。
+  - **每个事务的 scope id 从 1 开始**，因此等待期限必须按"该请求所属 owner 的 scope 树"解析；按 id
+    在全部 owner 里查找会把同号的他人 scope 预算当成自己的（已修复并有回归测试）。
 
-**仍未实现**：`SELECT ... FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE` 仍按快照读执行
-（解析器识别，执行器未接线），Current Read 只是存储层能力；EXPLAIN 对锁定读只标注**计划**并注明
-尚未执行。**没有任何 SQL 语句会申请 Gap/Next-Key**（锁定读属后续阶段），所以区间保护目前只在
-另一方可直接申请区间时生效——测试与中立锁定能力可以申请，SQL 的 `UPDATE`/`DELETE` 范围候选仍
-只锁它实际改动/删除的行，不锁整个范围；raw 写也不登记表意向。死锁检测没有后台驱动方，因此两个
+**锁定读已接入 SQL 执行器**：`SELECT ... FOR UPDATE` 取 X + IX，`FOR SHARE` / `LOCK IN SHARE MODE`
+取 S + IS，普通 `SELECT` 仍是快照读（不受影响）。锁定读先保护访问区间再读取，**获锁后重读最新已提交
+版本**并重新评估 WHERE：等待期间被删除或不再匹配的行不会返回，快照之后别的事务提交的新行能被锁定扫描
+发现（普通扫描看不到），不存在的键会保护其插入位置，`LIMIT`/`ORDER BY`/反向扫描沿用同一管线；锁在显式
+事务中保留到 COMMIT/ROLLBACK，autocommit 下随语句 root 结束释放；EXPLAIN 的 Locks 标注现在表示**已执行**
+的计划。经**唯一索引**等值访问的锁定读同样已接入：它先取得该唯一值的 reservation（与写入路径同一资源），
+再由 entry 记录的拥有者主键取得**共同主键行**并重读该行。**明确拒绝**（fail-closed，不会静默退化为快照读）：
+JOIN/派生表/CTE/视图/聚合/DISTINCT/标量查询上的锁定读，以及经**非唯一二级索引**访问的锁定读（其 entry 集合
+可含多条，尚未接线）；NOWAIT / SKIP LOCKED 由 parser 拒绝。
+
+**仍未实现**：`UPDATE`/`DELETE` 的范围候选仍只锁它实际改动/删除的行，不锁整个范围；raw 写也不登记表意向。
+死锁检测没有后台驱动方，因此两个
 会话互相等待同一批行时各自等到
-50 秒锁等待期限（**不会**被立即选为死锁受害者回滚）；`innodb_lock_wait_timeout` 会话变量、
-1205/1213 的 SQL 错误映射与锁诊断的 SQL 入口都不可用；同一主键的并发插入会正确等待，但失败方拿到的是可重试的行版本冲突而不是
+50 秒锁等待期限（**不会**被立即选为死锁受害者回滚）；同一主键的并发插入会正确等待，但失败方拿到的是可重试的行版本冲突而不是
 duplicate-key。规划明确保留固定 readTS 与提交冲突规则、A05 parent-read/child-write，
 不改变持久化格式或 WAL/Raft 协议，也不宣称完整 InnoDB 兼容。
 
@@ -812,7 +819,7 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 | 连接 | MySQL TCP、认证、TLS、COM_QUERY、Prepared Statement、二进制结果、`CONNECTION_ID()`、`SHOW [FULL] PROCESSLIST`、`KILL [QUERY\|CONNECTION] <id>` | 不是完整 MySQL 协议实现；连接管理只覆盖本进程内的连接，跨账号查看/终止会话需要 PROCESS 授权 |
 | DDL | 数据库/表/视图创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引（含 `USING BTREE` 与索引 `COMMENT '...'`）、CREATE TABLE AS SELECT、CREATE TABLE LIKE、RENAME TABLE | 视图定义存入 MVCC catalog 并在引用时重新绑定，表与视图共用一个命名空间；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
 | 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源与视图源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT/RIGHT/CROSS，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …，目标表可无主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；不支持子查询作为连接输入；视图不可写 |
-| 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT/RIGHT/CROSS JOIN、派生表、非递归与递归 CTE、视图（含嵌套视图）、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询）、锁定读（按快照读处理） | 窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
+| 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT/RIGHT/CROSS JOIN、派生表、非递归与递归 CTE、视图（含嵌套视图）、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询）、锁定读（`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`：真正加锁并按当前读执行；JOIN/派生表/CTE/视图/聚合/非唯一二级索引访问上明确拒绝） | 窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
 | 事务 | BEGIN/COMMIT/ROLLBACK、SAVEPOINT/ROLLBACK TO/RELEASE、SET autocommit=0/1、断连回滚、语句失败回滚 | 快照隔离；不支持 LOCK TABLES、隔离级别切换或串行化保证；每个事务最多 32 个存活 savepoint layer（`RELEASE`/同名替换只释放名字，匿名 layer 仍占名额，超限报 resource limit） |
 | 约束 | PRIMARY KEY、UNIQUE、CHECK（含 MySQL 的 `CHECK (...) NOT ENFORCED`）、同库外键（RESTRICT/NO ACTION/CASCADE/SET NULL，含自引用） | 不支持跨库外键；受引用表 ALTER 有限制；级联深度上限 32；`NOT ENFORCED` 只保留定义并回显（`CHECK_CONSTRAINTS.ENFORCED=NO`），不校验行 |
 | 类型 | INT/BIGINT、文本、日期时间、BOOLEAN、精确 DECIMAL、JSON 列及现有标量函数、ON UPDATE CURRENT_TIMESTAMP | TIMESTAMP 尚无独立 UTC 存储语义 |

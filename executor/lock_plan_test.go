@@ -123,13 +123,15 @@ func TestT025LockPlanClassification(t *testing.T) {
 			if testCase.wantKind != lockPlanNone && !strings.Contains(annotation, string(testCase.wantKind)) {
 				t.Fatalf("annotation %q does not name the plan kind %q", annotation, testCase.wantKind)
 			}
-			// Locking reads are recognised but not executed yet; the annotation has to say so, or a
-			// reader would take it for a lock the statement already takes.
-			if testCase.wantKind != lockPlanNone && !strings.Contains(annotation, "not executed yet") {
-				t.Fatalf("annotation %q hides that the plan is not executed yet", annotation)
+			// A plan rendered without running its statement has to say so, or a reader would take it
+			// for a lock the statement already takes. The wording changed when the locked read path
+			// landed: locking reads are executed now, so the false case means "planned only" rather
+			// than "the statement still reads its snapshot".
+			if testCase.wantKind != lockPlanNone && !strings.Contains(annotation, "planned only") {
+				t.Fatalf("annotation %q hides that the plan was not executed", annotation)
 			}
 			executed := plan.Annotation(true)
-			if strings.Contains(executed, "not executed yet") {
+			if strings.Contains(executed, "planned only") {
 				t.Fatalf("annotation %q claims a pending state for an executed plan", executed)
 			}
 		})

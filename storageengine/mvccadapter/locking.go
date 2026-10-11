@@ -3,6 +3,7 @@ package mvccadapter
 import (
 	"context"
 	"errors"
+	"time"
 
 	"gbaselite/lockmanager"
 	"gbaselite/mvcc"
@@ -63,6 +64,22 @@ func (t *txn) BeginLockScope(ctx context.Context, kind storageengine.LockScopeKi
 		return 0, storageengine.ErrUnsupported
 	}
 	options := mvcc.LockScopeOptions{Kind: kind}
+	if deadline, ok := ctx.Deadline(); ok {
+		options.Deadline = deadline
+	}
+	return t.inner.BeginLockScope(ctx, options)
+}
+
+// BeginLockScopeBudget opens a scope whose waits each carry the given budget.
+//
+// The budget is a duration and is measured per wait, so a statement that waits twice for less than the
+// session's bound each time stays inside it. The context deadline, when there is one, still caps every
+// wait of the statement.
+func (t *txn) BeginLockScopeBudget(ctx context.Context, kind storageengine.LockScopeKind, budget time.Duration) (uint64, error) {
+	if _, ok := t.LockingTxn(); !ok {
+		return 0, storageengine.ErrUnsupported
+	}
+	options := mvcc.LockScopeOptions{Kind: kind, WaitBudget: budget}
 	if deadline, ok := ctx.Deadline(); ok {
 		options.Deadline = deadline
 	}

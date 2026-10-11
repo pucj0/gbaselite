@@ -105,7 +105,7 @@ var errCurrentPageFull = errors.New("current scan page is full")
 // No storage view is held across a wait: the page listing releases its bbolt read transaction
 // before the consumer sees a key (mvcc's range scan pages that way), and the iterator takes its
 // record locks after the listing returned, one key at a time. A caller that stops between two
-// Next() calls therefore holds no view, no cursor and no gate 閳?only the lock claims it asked for.
+// Next() calls therefore holds no view, no cursor and no gate 闁?only the lock claims it asked for.
 type currentIterator struct {
 	ctx    context.Context
 	tx     *mvcc.Tx
@@ -191,7 +191,7 @@ func newCurrentIterator(ctx context.Context, tx *mvcc.Tx, scope uint64, request 
 //     requested range, with `Proven` set. The planner proved the bounds match the stored byte order,
 //     which is what makes the interval a real protection rather than a guess;
 //   - an explicit whole-domain fallback: the unbounded interval component for the namespace, with
-//     `Proven` false. It protects everything, and saying so is mandatory 鈥?an empty plan is *not*
+//     `Proven` false. It protects everything, and saying so is mandatory — an empty plan is *not*
 //     "everything", it is nothing;
 //   - nothing else. A record-only or insertion plan belongs to the point path, which proves its key
 //     and reads it through ReadCurrent; using it for a scan would leave the range unprotected while
@@ -383,18 +383,16 @@ func (i *currentIterator) listKeys() bool {
 // pageKeys lists the keys of the next page, in the scan's direction, resuming strictly after the
 // last consumed key.
 //
-// The listing is a snapshot+overlay range scan of this transaction, so a key this transaction
-// inserted itself is listed as well. The underlying scan releases its bbolt read transaction before
-// every consumer call, which is what makes "no view is held across a wait" structural rather than a
-// promise this loop has to keep.
+// The listing is a *current* listing: it resolves the published side at the store's head and merges
+// this transaction's own and its ancestors' staged writes (mvcc.Tx.ScanLatestRange), so a key another
+// transaction committed after this transaction's snapshot *is* enumerated - a locked scan that only
+// re-read the keys its snapshot listed would silently omit a row that exists. It records no range
+// dependency, because a current read is not evidence about the snapshot: what protects it is the claim
+// it holds, not the read timestamp. An ordinary ScanRange is untouched and still resolves its keys at
+// the transaction's fixed readTS.
 //
-// Known limitation, stated rather than hidden: because the listing is taken at the transaction's
-// snapshot, a key that another transaction committed *after* this snapshot is not enumerated by the
-// scan. Its insertion is still excluded from the protected range by the interval claim, and any key
-// that *is* enumerated is re-read under its claim (so no stale value is ever returned), but a locked
-// scan that must publish rows committed after the snapshot needs a latest-published key enumeration
-// that this release does not have. Locking reads are also not enabled yet on the SQL side, so no
-// user-visible statement depends on it.
+// The underlying scan releases its bbolt read transaction before every consumer call, which is what
+// makes "no view is held across a wait" structural rather than a promise this loop has to keep.
 func (i *currentIterator) pageKeys() ([][]byte, bool, error) {
 	bounds := i.bounds
 	if i.lastKey != nil {

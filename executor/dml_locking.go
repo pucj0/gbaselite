@@ -3,7 +3,6 @@ package executor
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"gbaselite/sqllayout"
@@ -40,14 +39,9 @@ type dmlLockScope struct {
 	scope  uint64
 	closed bool
 
-	// cancel releases the deadline this scope derived from the session lock-wait
-	// budget. It is nil when the caller's own context was the earlier bound.
+	// cancel releases any cancelable context this scope wrapped around the caller's. It is nil
+	// whenever the caller's context is used as it arrived.
 	cancel context.CancelFunc
-	// sessionDeadline is the instant the session lock-wait budget reaches, or the zero
-	// time when the session budget is not this scope's effective bound. It is what
-	// distinguishes "the session budget ran out" from "the caller's context ended" in
-	// the error a failed request reports.
-	sessionDeadline time.Time
 }
 
 // beginDMLLockScope opens one statement lock scope for a mutation.
@@ -55,15 +49,11 @@ type dmlLockScope struct {
 // It returns a scope that is safe to close twice, so every exit path in the pipeline can defer the
 // close without tracking whether it already ran.
 //
-// Wait bound: the effective bound of every request from this scope is the *earlier*
-// of the caller's context deadline and the session's `innodb_lock_wait_timeout`
-// budget. The neutral locking API carries no deadline, so the session half travels as
-// the scope's context — the lock manager already ends a wait when that context is
-// done, and it withdraws the pending request rather than leaving a phantom waiter
-// behind. The derived deadline is never later than the context that arrived, so a
-// caller's deadline can only be narrowed and never widened, and a caller whose context
-// is already the earlier bound keeps that context (and its existing error mapping)
-// untouched.
+// Wait bound: the bound of **one** wait issued from this scope is the earlier of the session's
+// `innodb_lock_wait_timeout` budget (carried to the scope as a per-wait duration) and the caller's
+// context deadline, which caps the whole statement. Both readings matter: a statement that waits
+// twice for less than the session budget each time is inside its budget, while a caller whose context
+// ends earlier stops every wait immediately.
 func beginDMLLockScope(ctx context.Context, txn storageengine.Txn) (*dmlLockScope, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -83,19 +73,19 @@ func beginDMLLockScope(ctx context.Context, txn storageengine.Txn) (*dmlLockScop
 		return nil, nil
 	}
 	var cancel context.CancelFunc
-	var sessionDeadline time.Time
-	if deadline, derived := dmlSessionLockDeadline(ctx, lockWaitTimeoutForContext(ctx), time.Now()); derived {
-		ctx, cancel = context.WithDeadline(ctx, deadline)
-		sessionDeadline = deadline
-	}
-	scope, err := locks.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	// The session's lock-wait budget travels as the scope's *per-wait* budget, not as a context
+	// deadline: the contract bounds one wait with it, so a statement that waits twice for less than
+	// the budget each time stays inside it, while a caller whose context ends earlier still stops every
+	// wait of the statement earlier. Encoding it as a deadline would turn a per-wait bound into a
+	// statement-wide one, which is a different rule with a different observable outcome.
+	scope, err := locks.BeginLockScopeBudget(ctx, storageengine.LockScopeStatement, lockWaitTimeoutForContext(ctx))
 	if err != nil {
 		if cancel != nil {
 			cancel()
 		}
 		return nil, err
 	}
-	return &dmlLockScope{ctx: ctx, locks: locks, scope: scope, cancel: cancel, sessionDeadline: sessionDeadline}, nil
+	return &dmlLockScope{ctx: ctx, locks: locks, scope: scope, cancel: cancel}, nil
 }
 
 // dmlSessionLockDeadline reports the absolute instant of the session lock-wait budget
@@ -266,20 +256,13 @@ func (s *dmlLockScope) acquireRowLocksForKey(table versionedTable, key []byte, e
 
 // lockWaitError reports a failed lock request in the vocabulary of its cause.
 //
-// The manager ends a wait as soon as the request's context is done and reports that
-// context's error; the session lock-wait budget travels on exactly that context
-// because the neutral locking API has no deadline parameter. A wait that ended on the
-// session budget must therefore be reported as the lock-wait timeout the contract
-// names — storageengine.ErrLockWaitTimeout, which the protocol layer maps to the
-// MySQL timeout error — while a deadline or cancellation that came from the caller's
-// own context keeps its existing cancellation mapping. Whether this scope derived the
-// deadline itself is exactly that distinction.
+// The manager ends a wait whose per-wait budget ran out with ErrLockWaitTimeout, which already is the
+// error the contract names and the protocol layer maps to the MySQL lock-wait timeout. A deadline or
+// cancellation that came from the caller's own context is left exactly as it arrived, so the caller's
+// bound keeps its existing cancellation mapping instead of being reported as a session timeout.
 func (s *dmlLockScope) lockWaitError(err error) error {
-	if s == nil || err == nil || s.sessionDeadline.IsZero() {
+	if s == nil || err == nil {
 		return err
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("%w: session %s expired", storageengine.ErrLockWaitTimeout, innodbLockWaitVariable)
 	}
 	return err
 }

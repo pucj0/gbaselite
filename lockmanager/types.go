@@ -376,6 +376,14 @@ type Scope struct {
 	State           ScopeState
 	OpenedAt        time.Time
 	ContextDeadline time.Time
+	// WaitBudget is the bound of *one* wait issued from this scope, as a duration. It is the
+	// session's `innodb_lock_wait_timeout`, and it is deliberately a duration rather than an
+	// absolute deadline: the bound applies to each request when it starts waiting, so a statement
+	// that waits twice for less than the budget each time stays inside it. ContextDeadline caps the
+	// whole scope instead, so an earlier query deadline still ends every wait.
+	//
+	// Zero means "use the manager's default budget".
+	WaitBudget time.Duration
 }
 
 // CanRequest reports whether the scope may issue a new request.
