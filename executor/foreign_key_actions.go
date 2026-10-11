@@ -20,7 +20,12 @@ func normalizeSQLReferentialAction(action string) string {
 // foreign key that references this row, before the row itself is written. Child
 // mutations stay inside the caller's statement child transaction, so a failure
 // anywhere in the cascade rolls the whole original statement back.
-func applyForeignKeyActions(ctx context.Context, write storageengine.Txn, session *Session, table versionedTable, oldRow, newRow storage.Row, visiting map[string]bool, depth int) error {
+//
+// locks is the *statement's* lock scope, the same one the explicit statement used: the derived writes
+// reach child rows through the ordinary index and primary identities, so they claim their resources
+// through the same helpers instead of writing around the lock manager. A nil scope means the backend
+// has no lock manager, in which case the derived write keeps the concurrency control that backend has.
+func applyForeignKeyActions(ctx context.Context, write storageengine.Txn, session *Session, locks *dmlLockScope, table versionedTable, oldRow, newRow storage.Row, visiting map[string]bool, depth int) error {
 	if oldRow == nil {
 		return nil
 	}
@@ -67,7 +72,7 @@ func applyForeignKeyActions(ctx context.Context, write storageengine.Txn, sessio
 					continue
 				}
 			}
-			if err := cascadeForeignKeyAction(ctx, write, session, table, child, foreignKey, oldKey, newRow, action, visiting, depth); err != nil {
+			if err := cascadeForeignKeyAction(ctx, write, session, locks, table, child, foreignKey, oldKey, newRow, action, visiting, depth); err != nil {
 				return err
 			}
 		}
@@ -78,7 +83,7 @@ func applyForeignKeyActions(ctx context.Context, write storageengine.Txn, sessio
 // cascadeForeignKeyAction applies one action to every child row that references
 // the parent's old key. Matching rows are collected first so the child table is
 // never mutated while it is being scanned.
-func cascadeForeignKeyAction(ctx context.Context, write storageengine.Txn, session *Session, parent, child versionedTable, foreignKey storage.ForeignKey, oldKey string, newRow storage.Row, action string, visiting map[string]bool, depth int) error {
+func cascadeForeignKeyAction(ctx context.Context, write storageengine.Txn, session *Session, locks *dmlLockScope, parent, child versionedTable, foreignKey storage.ForeignKey, oldKey string, newRow storage.Row, action string, visiting map[string]bool, depth int) error {
 	childPositions := make([]int, len(foreignKey.Columns))
 	for index, name := range foreignKey.Columns {
 		position := sqlColumnPosition(child, name)
@@ -136,8 +141,16 @@ func cascadeForeignKeyAction(ctx context.Context, write storageengine.Txn, sessi
 				updated[childPositions[index]] = storage.NullValue(child.Definition.Columns[childPositions[index]].Type)
 			}
 		}
+		// A derived write is still a write. CASCADE and SET NULL reach child rows through the same
+		// index entries and primary identities an explicit statement would, so they claim the same
+		// resources through the statement's own lock scope: a derived write that wrote without claiming
+		// would change rows an explicit writer is holding a lock on, which is precisely the bypass the
+		// lock manager exists to prevent.
+		if err := lockCascadeTarget(locks, child, target.key, target.row, updated); err != nil {
+			return err
+		}
 		if action == "CASCADE" && newRow == nil {
-			if err := applyForeignKeyActions(ctx, write, session, child, target.row, nil, visiting, depth+1); err != nil {
+			if err := applyForeignKeyActions(ctx, write, session, locks, child, target.row, nil, visiting, depth+1); err != nil {
 				return err
 			}
 			if err := writeVersionedRow(ctx, write, child, target.key, target.row, nil, ""); err != nil {
@@ -145,7 +158,7 @@ func cascadeForeignKeyAction(ctx context.Context, write storageengine.Txn, sessi
 			}
 			continue
 		}
-		if err := applyForeignKeyActions(ctx, write, session, child, target.row, updated, visiting, depth+1); err != nil {
+		if err := applyForeignKeyActions(ctx, write, session, locks, child, target.row, updated, visiting, depth+1); err != nil {
 			return err
 		}
 		if err := writeVersionedRowUnchecked(ctx, write, child, target.key, target.row, updated, ""); err != nil {
@@ -153,6 +166,40 @@ func cascadeForeignKeyAction(ctx context.Context, write storageengine.Txn, sessi
 		}
 	}
 	return nil
+}
+
+// lockCascadeTarget claims one child row and its index entries before a derived write touches it.
+//
+// It reuses the lock components of the ordinary write path, so a cascaded row and an explicitly
+// written row meet on exactly the same resources. The old identity is locked first (the row the
+// derivation observed), then the replacement's unique reservations: a SET NULL or CASCADE update frees
+// a value and installs another, and both halves must be claimed exactly as an explicit UPDATE claims
+// them.
+func lockCascadeTarget(locks *dmlLockScope, child versionedTable, key []byte, oldRow, updated storage.Row) error {
+	if locks == nil {
+		// A backend without a lock manager keeps the concurrency control it always had.
+		return nil
+	}
+	extra, err := indexEntryLocks(child, key, oldRow, false)
+	if err != nil {
+		return err
+	}
+	if _, err := locks.acquireRowLocksForKey(child, key, extra); err != nil {
+		return err
+	}
+	if updated == nil {
+		return nil
+	}
+	newKey, ok := primaryKeyBytes(child, updated)
+	if !ok || len(newKey) == 0 {
+		newKey = key
+	}
+	replacement, err := indexEntryLocks(child, newKey, updated, true)
+	if err != nil {
+		return err
+	}
+	_, err = locks.acquireRowLocksForKey(child, newKey, replacement)
+	return err
 }
 
 func childReferencesKey(child, parent versionedTable, foreignKey storage.ForeignKey, row storage.Row, oldKey string) bool {

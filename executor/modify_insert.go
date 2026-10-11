@@ -218,7 +218,7 @@ func (o *InsertOperator) apply(ctx context.Context, candidate InsertCandidate) e
 		}
 		return err
 	}
-	outcome, err := writeInsertedRow(ctx, o.Write, o.Session, o.Target, o.Mode, candidate.Values, candidate.Ordinal)
+	outcome, err := writeInsertedRow(ctx, o.Write, o.Session, o.Locks, o.Target, o.Mode, candidate.Values, candidate.Ordinal)
 	if err != nil {
 		return err
 	}

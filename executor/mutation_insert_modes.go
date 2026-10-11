@@ -53,7 +53,12 @@ func insertSetStatement(statement parser.Insert) parser.Insert {
 // child transaction, so rows written earlier in the same statement are visible:
 // multi-row IGNORE/REPLACE and ON DUPLICATE KEY UPDATE behave like single-row
 // statements repeated in order, as the legacy executor does.
-func writeInsertedRow(ctx context.Context, write storageengine.Txn, session *Session, target *insertTarget, mode insertMode, row storage.Row, ordinal uint64) (insertOutcome, error) {
+//
+// locks is the statement's lock scope. The duplicate variants rewrite or remove rows a plain INSERT
+// never touches, so they claim the rows they change through the same helpers instead of writing around
+// the lock manager; IGNORE writes nothing and therefore claims nothing beyond the insertion claim the
+// caller already took.
+func writeInsertedRow(ctx context.Context, write storageengine.Txn, session *Session, locks *dmlLockScope, target *insertTarget, mode insertMode, row storage.Row, ordinal uint64) (insertOutcome, error) {
 	// The fallback heap identity comes from the one canonical encoder, so the key this row is
 	// stored under and the key the lock path protects cannot drift apart.
 	fallback := heapKeyString(write.ID(), ordinal)
@@ -76,11 +81,11 @@ func writeInsertedRow(ctx context.Context, write storageengine.Txn, session *Ses
 		return insertOutcome{affected: 1, inserted: true}, nil
 	}
 	if len(mode.onDuplicate) > 0 {
-		affected, err := updateDuplicateInsertRow(ctx, write, session, target, row, conflicts, mode.onDuplicate)
+		affected, err := updateDuplicateInsertRow(ctx, write, session, locks, target, row, conflicts, mode.onDuplicate)
 		return insertOutcome{affected: affected}, err
 	}
 	if mode.replace {
-		return replaceDuplicateInsertRow(ctx, write, session, target, row, conflicts, fallback)
+		return replaceDuplicateInsertRow(ctx, write, session, locks, target, row, conflicts, fallback)
 	}
 	return insertOutcome{}, nil // IGNORE skips the conflicting row.
 }
@@ -154,10 +159,15 @@ func insertConflicts(tx storageengine.Txn, target *insertTarget, candidate stora
 // removed and the candidate is stored, so the affected count is one per removed
 // row plus the inserted row. Referenced conflict rows are reported exactly like
 // the legacy executor, which rejects replacing a row that child rows reference.
-func replaceDuplicateInsertRow(ctx context.Context, write storageengine.Txn, session *Session, target *insertTarget, candidate storage.Row, conflicts []insertConflict, fallback string) (insertOutcome, error) {
+func replaceDuplicateInsertRow(ctx context.Context, write storageengine.Txn, session *Session, locks *dmlLockScope, target *insertTarget, candidate storage.Row, conflicts []insertConflict, fallback string) (insertOutcome, error) {
 	outcome := insertOutcome{affected: len(conflicts) + 1}
 	for _, conflict := range conflicts {
-		if err := applyForeignKeyActions(ctx, write, session, target.definition, conflict.row, nil, nil, 0); err != nil {
+		// REPLACE removes the conflicting row: the removal and the FK actions it triggers are writes
+		// like any other and claim their resources through the statement's scope.
+		if err := lockCascadeTarget(locks, target.definition, conflict.key, conflict.row, nil); err != nil {
+			return insertOutcome{}, err
+		}
+		if err := applyForeignKeyActions(ctx, write, session, locks, target.definition, conflict.row, nil, nil, 0); err != nil {
 			return insertOutcome{}, err
 		}
 		if err := writeVersionedRow(ctx, write, target.definition, conflict.key, conflict.row, nil, ""); err != nil {
@@ -178,8 +188,13 @@ func replaceDuplicateInsertRow(ctx context.Context, write storageengine.Txn, ses
 // conflicting row. Assignments are evaluated like the legacy executor: plain
 // column names read the row being updated (including earlier assignments in the
 // same list) and VALUES(column) reads the candidate row.
-func updateDuplicateInsertRow(ctx context.Context, write storageengine.Txn, session *Session, target *insertTarget, candidate storage.Row, conflicts []insertConflict, assignments []parser.InsertAssignment) (int, error) {
+func updateDuplicateInsertRow(ctx context.Context, write storageengine.Txn, session *Session, locks *dmlLockScope, target *insertTarget, candidate storage.Row, conflicts []insertConflict, assignments []parser.InsertAssignment) (int, error) {
 	conflict := conflicts[0]
+	// ON DUPLICATE KEY UPDATE rewrites an existing row, so it claims that row and the index values the
+	// rewrite installs, exactly as an explicit UPDATE of the same row would.
+	if err := lockCascadeTarget(locks, target.definition, conflict.key, conflict.row, nil); err != nil {
+		return 0, err
+	}
 	columns := target.columns
 	updated := append(storage.Row(nil), conflict.row...)
 	for _, assignment := range assignments {

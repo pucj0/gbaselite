@@ -98,7 +98,7 @@ func (o *DeleteOperator) Apply(ctx context.Context, candidate DeleteCandidate) e
 	if deleteApplyHook != nil {
 		deleteApplyHook(candidate, o.Target.CatalogName)
 	}
-	if err := applyForeignKeyActions(ctx, o.Write, o.Session, o.Target, candidate.OldRow, nil, nil, 0); err != nil {
+	if err := applyForeignKeyActions(ctx, o.Write, o.Session, o.Locks, o.Target, candidate.OldRow, nil, nil, 0); err != nil {
 		return err
 	}
 	if err := writeVersionedRow(ctx, o.Write, o.Target, candidate.Identity.Key, candidate.OldRow, nil, ""); err != nil {

@@ -116,7 +116,7 @@ func (o *UpdateOperator) Apply(ctx context.Context, candidate UpdateCandidate) e
 	if err != nil {
 		return err
 	}
-	if err = applyForeignKeyActions(ctx, o.Write, o.Session, o.Target, candidate.OldRow, updated, nil, 0); err != nil {
+	if err = applyForeignKeyActions(ctx, o.Write, o.Session, o.Locks, o.Target, candidate.OldRow, updated, nil, 0); err != nil {
 		return err
 	}
 	// The old physical key travels unchanged when the candidate carries one: a

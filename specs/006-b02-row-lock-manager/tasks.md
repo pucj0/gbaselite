@@ -408,7 +408,19 @@ gap/new-key写和完整SQL发布仍依赖后续phase，不能将US1当作完整B
 ## Phase 6: US4 DML 与唯一索引 (T037–T046, P1)
 **Goal**: A05所有write路径保护同资源、原候选语义不变。
 
-> **执行结果：本轮未达成，无任务可勾选。**
+> **历史记录（已被后续提交取代，保留原文以示过程）**
+>
+> 最初一轮执行时确认"没有任何 DML 路径获取锁"，交付了 `executor/dml_locking.go`、DML 三分支语句作用域、
+> 固定锁申请顺序（表意向 → 主键行 → 索引条目）与两个固定负向测试，并因"waiter 在 holder 提交后不唤醒"
+> 而**刻意停用** UPDATE/DELETE 目标锁，交付了 `TestB02UpdateTargetLockingIsNotEnabled` 与
+> `TestB02ConcurrentInsertSameUniqueKeyIsStillAccepted`。
+>
+> **现状（本轮核对）**：这两条固定负向测试**已不存在**（`dml_locking_test.go` 顶部注释记录了它们的移除与
+> 替代），目标锁已启用并被 `executor/locking_unique_test.go` 的正向用例（同唯一值等待后报 duplicate、
+> NULL/复合/collation 等价、UPDATE 预留）覆盖；唤醒缺陷随后由 `09b3be2` 之前的 B07 claim 身份修复解决。
+> 因此下面这段历史描述**不再代表当前实现**，仅作为过程记录保留。
+
+> **执行结果（第一轮）：本轮未达成，无任务可勾选。**
 >
 > 本轮开始时确认：**没有任何 DML 路径获取锁**（`executor` 中 `LockingTxn`/`BeginLockScope`/
 > `.Acquire(` 无匹配），`executor` 也不读取锁定模式。因此本轮不是"集成"而是"从零加锁"。
@@ -1166,6 +1178,33 @@ Gap 用前驱/后继限定）、`storageengine/mvccadapter/iterator.go`（逐行
 - [x] **T035**（复验通过）。
 - [x] **T036**（复验通过 + 边界补齐）：新增缺席键 Gap 边界（10/100/42/150、最小/最大/空表）、
   七种 statement 终态清理、共享范围读与 INSERT/UPDATE 的冲突与兼容。
+
+### 第十三轮（Phase 5 质量门禁 + Phase 6 部分实施）
+
+证据：`.tmp/b13-phase5-report.md`、`.tmp/b13-acceptance.txt`。新增测试：
+`storageengine/mvccadapter/locking_gates_test.go`（Phase 5 门禁四项）、
+`executor/locking_foreign_key_test.go`（T039/T042/T044 四项）。生产改动：
+`executor/foreign_key_actions.go`（`applyForeignKeyActions`/`cascadeForeignKeyAction` 增加语句锁作用域参数 +
+`lockCascadeTarget` 复用 `indexEntryLocks`/`acquireRowLocksForKey`）、
+`executor/mutation_insert_modes.go`（REPLACE/ON DUPLICATE KEY UPDATE 经同一作用域取锁）、
+`executor/modify_update.go`/`modify_delete.go`/`modify_insert.go`（传入作用域）。
+
+**Phase 5 门禁（本轮）**：
+- **CI**：本机**无法取得 CI 结果**（无网络，`.tmp` 里的 CI 日志是无关的旧 hardening 运行），
+  `go test -race` **无法执行**（无 C 工具链、无 WSL 访问权限、Docker 守护进程未运行）；
+  Linux race 步骤在 `.github/workflows/test.yml` 中已覆盖 `./mvcc ./storageengine/... ./executor ./server`
+  与 `./lockmanager`，但**本轮没有 CI 结果可报告**。
+- **T028/T032/T034/T035/T036**：复验命令见报告；主复选框保持已勾选状态。
+- **KeysAround 两次探测之间的并发 INSERT/DELETE**：`TestP5StaleBoundsAfterAConcurrentInsert`、
+  `TestP5StaleBoundsAfterAConcurrentDelete`、`TestP5AbsentKeyProtectionUnderConcurrency`（8 轮）
+  ——结论：陈旧边界只会**更宽**（保守安全），缺席键自身位置恒在保护范围内，不存在漏锁；
+  并发删除后继键时保护**不会**悄悄扩展为整个命名空间。
+- **Scope Close 残留**：`TestP5ScopeCloseLeavesNoPendingRequestOrLedgerCharge` 用真实计数断言
+  PendingRequests/WaitEdges/Ledger.Waiters/Ledger.Edges 归零、账本回到基线、锁表不增长、
+  释放 holder 后**无幽灵等待者**取得 grant。
+
+**Phase 6（本轮实施部分，逐项状态见报告 §3）**：T044 已实现（FK 派生写入经语句作用域取锁），
+T039/T042 新增验收测试；T037/T038/T040/T041/T043/T045/T046 的复核结论见报告。
 
 ### 本轮证据文件
 | 文件 | 内容 |

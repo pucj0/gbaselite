@@ -373,6 +373,16 @@ Phase 3（US1）的前置条件已就绪：
 | （本轮第三个缺陷）同 bundle 兄弟被当作 older waiter | **已修复**：`waitersAhead`/`olderBlockers` 会把同一 bundle 的 `Gap(a,m)` 当作 `II(b)` 的 older waiter（包含判定为真），使"同域两组件"的请求永久排队且图上无边；现按 `sameBundleRequest` 跳过自身兄弟。 |
 | 证据 | 新增 `lockmanager/claim_identity_test.go`（A–H 八项）与 `resource_test.go: TestB07ClaimIdentityIsExactInsideOneDomain`；**修复前 6/8 失败**（`.tmp/b07-before.txt`），**修复后全部通过**（`.tmp/b07-after.txt`）。`executor/lock_plan_test.go: TestT025SQLInsertRespectsAProtectedRange` 按用户要求重写为"T1 持锁期间 T3 必须完成"，替换原先在释放后才跑范围外插入的时序。T021–T027 的既有验收在修复后仍全部通过，完成标记保持。 |
 
+## A15. 第十三轮（Phase 5 质量门禁 + Phase 6 部分实施）
+
+| 上一版结论 | 现状（`.tmp/b13-phase5-report.md`、`.tmp/b13-acceptance.txt`） |
+|---|---|
+| Phase 5 尚缺"KeysAround 两次探测之间并发 INSERT/DELETE"与"Scope Close 后无残留"两项门禁 | **已补齐并通过**：`TestP5StaleBoundsAfterAConcurrentInsert/Delete`（陈旧边界只会更宽 ⇒ 保守安全；缺席键位置恒受保护；不会悄悄扩展到整个命名空间）、`TestP5AbsentKeyProtectionUnderConcurrency`（8 轮安全不变量：插入成功 ⇔ 读者已观测到该行）、`TestP5ScopeCloseLeavesNoPendingRequestOrLedgerCharge`（真实计数：PendingRequests/WaitEdges/Ledger.Waiters/Edges 归零、账本回基线、锁表不增长、**无幽灵等待者**）。 |
+| tasks.md 的 Phase 6 段落记录"DML 无锁、目标锁刻意停用、INSERT 不阻塞" | **该描述已过时**：两条固定负向测试（`TestB02UpdateTargetLockingIsNotEnabled`、`TestB02ConcurrentInsertSameUniqueKeyIsStillAccepted`）已不存在，目标锁已启用并被 `locking_unique_test.go` 正向用例覆盖；段落已改为"历史记录（已被后续提交取代）"并保留原文。 |
+| T044「FK CASCADE/SET NULL 派生写入不得绕开锁管理器」 | **已实现**：`applyForeignKeyActions`/`cascadeForeignKeyAction` 接收语句锁作用域，`lockCascadeTarget` 复用 `indexEntryLocks`/`acquireRowLocksForKey`（旧身份 + 替换的 unique reservation），无第二套加锁器；`TestT039CascadeDeleteClaimsTheChildRowAndItsIndexes` 用生产 seam `dmlLockRequestHook` 断言派生写真的申报了子行主键与唯一/二级索引项（改动前该处**没有任何**被捕获的请求），`TestT039CascadeDeleteWaitsForAConcurrentLockingRead`、`TestT039SetNullDerivedWriteWaitsForAConcurrentLockingRead` 用真实双 Session 断言派生写等待并核对最终数据。 |
+| T042「REPLACE / ON DUPLICATE KEY UPDATE 锁后判重」 | **已补齐取锁**：`replaceDuplicateInsertRow`/`updateDuplicateInsertRow` 经语句作用域申报被删除/重写的行及其索引项；`TestT042ReplaceClaimsTheRowItRemoves`（组件级）与既有的 `locking_unique_test.go` 正向用例共同覆盖。 |
+| Phase 5 的 CI / race 结论 | **仍无可报告的 CI 结果**：本机无网络（取不到 Actions 结果）、无 C 工具链、无 WSL 访问权限、Docker 守护进程未运行 ⇒ `go test -race` **未执行**（不写成通过）。 |
+
 ## A14. 第十一轮（Phase 5 收尾：T034/T035/T036 验收）
 
 | 上一版结论 | 现状（`.tmp/b11-phase5-report.md`、`.tmp/b11-acceptance.txt`） |
