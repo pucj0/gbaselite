@@ -183,3 +183,21 @@ func rollbackSessionTransaction(session *Session) {
 		_ = outermost.Rollback()
 	}
 }
+
+// abortDeadlockSessionTransaction rolls back the victim root to release all locks,
+// but retains the aborted root on session.transaction so subsequent writes and COMMIT
+// are rejected.
+func abortDeadlockSessionTransaction(session *Session) {
+	if session.transaction == nil {
+		return
+	}
+	for index := len(session.savepoints) - 1; index >= 0; index-- {
+		_ = session.savepoints[index].tx.Rollback()
+	}
+	outermost := outermostTransaction(session)
+	session.savepoints = nil
+	if outermost != nil {
+		_ = outermost.Rollback()
+	}
+	session.transaction = outermost
+}

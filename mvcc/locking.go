@@ -336,6 +336,7 @@ func (t *Tx) WaitForLock(ctx context.Context, handle *lockmanager.LockHandle) (l
 	if !ok {
 		return lockmanager.LockGrant{}, storageengine.ErrUnsupported
 	}
+	manager.DetectDeadlock()
 	result, err := manager.WaitForGrantResult(ctx, t.LockOwnerID(), handle)
 	if err != nil {
 		return lockmanager.LockGrant{}, err
@@ -492,6 +493,10 @@ func (t *Tx) AbortRequestReason() lockmanager.AbortReason {
 		return ""
 	}
 	return manager.AbortReasonOf(t.LockOwnerID())
+}
+
+func (t *Tx) deadlockAborted() bool {
+	return t.AbortRequestReason() == lockmanager.AbortDeadlock
 }
 
 // canStillCommit reports whether the transaction may still reach a durable publication.

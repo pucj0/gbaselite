@@ -408,6 +408,9 @@ func (t *Tx) Commit(ctx context.Context) (uint64, error) {
 		return 0, ErrConflict
 	}
 	if t.closed {
+		if t.deadlockAborted() {
+			return 0, storageengine.ErrDeadlock
+		}
 		return 0, ErrClosed
 	}
 	if t.parent != nil {

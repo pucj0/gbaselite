@@ -210,7 +210,12 @@ func loadVersionedTableInternal(tx storageengine.Txn, session *Session, name str
 // parent-read / child-write split for every DML family. It is nil in production.
 var statementTxnHook func(statement parser.Statement, read, write storageengine.Txn)
 
-func (e *Engine) executeSQLStatement(session *Session, statement parser.Statement) (*Result, error) {
+func (e *Engine) executeSQLStatement(session *Session, statement parser.Statement) (resultOut *Result, errOut error) {
+	defer func() {
+		if errOut != nil && errors.Is(errOut, storageengine.ErrDeadlock) {
+			abortDeadlockSessionTransaction(session)
+		}
+	}()
 	ctx := session.Context
 	if ctx == nil {
 		ctx = context.Background()
