@@ -484,6 +484,20 @@ gap/new-key写和完整SQL发布仍依赖后续phase，不能将US1当作完整B
         `ErrLockWaitTimeout`→1205，含 `errors.Join` 与双重 `fmt.Errorf` 包装；`lockmanager/deadlock_edges_test.go`
         （新）精确构造两 root 混合环（B→A `EdgeHolder` + A→B `EdgeOlderWaiter`）并验证 victim 退出后图边归零。
 
+## Phase 6 后续：并发边界复审（P1/P2 两个疑点，均确认为真实缺陷并已修复）
+
+基线 `032b2bc`。本轮**不新增任务编号**、**不勾选 T065–T072**（它们的证据文件与本次改动的 CI race 结果尚不存在），
+只记录复审结论。逐项复验矩阵、命令与退出码见 `.tmp/b02-phase6-final-review.md`。
+
+| 疑点 | 复现结论 | 根因 | 修复 |
+|---|---|---|---|
+| **P1** 锁后 `ErrConflict` 是否真正要求 Root 重试 | **确认为缺陷**。真实双 Session 序列（B `BEGIN`→改 id=2；A `BEGIN`→改 id=1；B 改 id=1 进入等待；A `COMMIT`）中，B 的 `UPDATE` 返回文案为 "row version conflict; retry transaction" 的冲突，但随后**不 ROLLBACK 直接 COMMIT 成功**，把 id=2 的修改发布了。即"要求重试"的错误之后事务仍可提交 | `executeSQLStatement` 的 defer 只对 `ErrDeadlock` 终结 Root；过期目标冲突与其它 `ErrConflict` 混在一起，没有任何路径标记 Root | 新增 `executor/stale_target.go` 的 `staleDMLTargetError`（消息与 `ErrConflict` 逐字节相同、`Unwrap` 保持 `errors.Is` 兼容）区分"快照对某行已过期"这一类；8 处 DML 过期判定改用它；`executeSQLStatement` 按原因分派：死锁走原 victim 流程，过期目标走 `abortStaleTargetSessionTransaction`（丢弃全部 savepoint 层、回滚并**保留** Root、记录 `session.retryConflict`）；被标记的会话除 `ROLLBACK`/`BEGIN` 外一律以原冲突拒绝（**含 COMMIT**）；autocommit 不标记会话。锁等待超时与取消**不在**该分派内 |
+| **P2** UPDATE 对身份未变索引项是否被不必要的 Insert Intention 阻塞 | **确认为缺陷**。用中性锁 API 只持一个索引 Gap（不持任何行锁）后：只改非索引列的 `UPDATE` 被阻塞到 **2s 预算耗尽**；而不持 Gap 时同一语句约 20ms | `claimModifyReplacement` 对 updated 的**每个**索引项调用 `indexEntryLocks(..., true)`，未与旧行比较，导致既有索引项也申报 II | 新增 `indexEntryIdentity`/`indexEntryClaim`/`indexReplacementLocks`：逐索引比较**旧/新 entry key**，只有键真的新增才申报 II，记录锁仍然始终申报；`claimModifyReplacement` 与 `lockCascadeTarget`（相同形状）都改用它 |
+
+**P2 保持正确的方向（修复后复测）**：值迁入被保护区间仍被阻塞；主键移动导致 owner 后缀变化的二级项仍被阻塞；
+移除旧项不被 Gap 阻塞；唯一索引在值未变而 owner 移动时**不**申报 II（其键是值本身，写路径原地更新 owner）。
+**P1 保持正确的方向**：锁等待超时仍只让语句失败且事务可继续提交；死锁仍走 victim 流程报 `ErrDeadlock`；
+autocommit 冲突后会话仍可用。
 ## Phase 7: US5 生命周期、死锁、耐久性 (T047–T057, P1)
 **Goal**: root正确结束，有限等待，五提交路径一致；发布前阻塞gate。
 

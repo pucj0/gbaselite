@@ -97,6 +97,16 @@ type Session struct {
 	// contract default; read it through LockWaitTimeout and write it through
 	// SetLockWaitTimeout so every validation rule lives in one place.
 	lockWaitTimeout time.Duration
+
+	// retryConflict records that the session's explicit transaction was ended because a statement
+	// found a row it had to write replaced by a newer committed version. The root is retained (closed)
+	// so the session keeps reporting the transaction, and every statement except ROLLBACK and BEGIN is
+	// refused with this error until the caller ends the transaction.
+	//
+	// It is deliberately separate from the deadlock path: both must stop the root publishing, but a
+	// stale target is retryable in a different sense from a chosen victim, and neither a lock wait
+	// timeout nor a user cancellation is allowed to reach either state.
+	retryConflict error
 }
 
 type navicatCopySource struct {

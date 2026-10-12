@@ -331,10 +331,19 @@ func TestT037AFailedStatementLeavesNoWriteBehind(t *testing.T) {
 	if err := awaitStatement(t, done, "the multi-row UPDATE"); !errors.Is(err, storageengine.ErrConflict) {
 		t.Fatalf("the multi-row UPDATE = %v, want the retryable ErrConflict", err)
 	}
-	// Nothing the statement staged leaked into its own transaction.
-	if got := t035Rows(t, f.must(waiter, "SELECT v FROM items WHERE id=1")); got != "1;" {
-		t.Fatalf("the failed statement leaked its write into the transaction: %q", got)
+	// The conflict ends the transaction rather than the statement, so the transaction cannot be read
+	// from, committed, or written through any more: every one of those would be an opportunity to
+	// publish the work that was abandoned together with the stale candidate.
+	if _, err := f.engine.Execute(waiter, "SELECT v FROM items WHERE id=1"); !errors.Is(err, storageengine.ErrConflict) {
+		t.Fatalf("a read after the stale target = %v, want the retryable ErrConflict", err)
 	}
+	if _, err := f.engine.Execute(waiter, "UPDATE items SET v=100 WHERE id=1"); !errors.Is(err, storageengine.ErrConflict) {
+		t.Fatalf("a write after the stale target = %v, want the retryable ErrConflict", err)
+	}
+	if _, err := f.engine.Execute(waiter, "COMMIT"); !errors.Is(err, storageengine.ErrConflict) {
+		t.Fatalf("COMMIT after the stale target = %v, want the retryable ErrConflict", err)
+	}
+	// ROLLBACK is the statement that ends the unusable transaction.
 	f.must(waiter, "ROLLBACK")
 	if got := t035Rows(t, f.must(holder, "SELECT id,v FROM items ORDER BY id")); got != "1,1;2,5;" {
 		t.Fatalf("rows = %q, want row 1 untouched by the rolled-back statement", got)

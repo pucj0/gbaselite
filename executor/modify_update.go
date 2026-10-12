@@ -129,7 +129,7 @@ func (o *UpdateOperator) Apply(ctx context.Context, candidate UpdateCandidate) e
 	// The replacement identity and its index entries are claimed before anything is derived from
 	// them, so the window between "this row will hold the new key" and "this row holds the new key" is
 	// covered, and a referential action never writes a value whose own resources are unclaimed.
-	if err = claimModifyReplacement(ctx, o.Locks, o.Write, o.Target, claim.key, updated); err != nil {
+	if err = claimModifyReplacement(ctx, o.Locks, o.Write, o.Target, claim.key, candidate.OldRow, updated); err != nil {
 		return err
 	}
 	if err = applyForeignKeyActions(ctx, o.Write, o.Session, o.Locks, o.Target, candidate.OldRow, updated, nil, 0); err != nil {

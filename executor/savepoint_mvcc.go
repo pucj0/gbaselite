@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"gbaselite/parser"
 	"gbaselite/storageengine"
 	"strings"
 )
@@ -170,6 +171,10 @@ func (e *Engine) commitSessionTransaction(session *Session) error {
 
 // rollbackSessionTransaction discards every layer, including the outermost one.
 func rollbackSessionTransaction(session *Session) {
+	// Ending the transaction also clears the "this root must be retried" record, because the caller has
+	// now done the one thing that record exists to force. Clearing it anywhere else would either leave
+	// a fresh transaction permanently refused or let an abandoned one be used again.
+	session.retryConflict = nil
 	if session.transaction == nil {
 		return
 	}
@@ -182,6 +187,48 @@ func rollbackSessionTransaction(session *Session) {
 	if outermost != nil {
 		_ = outermost.Rollback()
 	}
+}
+
+// retryEndsTransaction reports whether a statement is allowed to run on a session whose transaction
+// has been marked as one that must be retried.
+//
+// Only the two statements that end or replace the transaction are allowed: ROLLBACK performs the
+// retry the caller was asked for, and BEGIN replaces the abandoned root with a fresh one. Everything
+// else — including COMMIT, which is the statement that could publish the abandoned work — is refused.
+func retryEndsTransaction(statement parser.Statement) bool {
+	switch statement.(type) {
+	case parser.Rollback, parser.Begin:
+		return true
+	default:
+		return false
+	}
+}
+
+// abortStaleTargetSessionTransaction ends a transaction whose statement found a stale DML target.
+//
+// It follows the same shape as the deadlock victim path, and for the same reason: the root is rolled
+// back so every lock, pending request and graph edge it held is released immediately, but it is
+// retained on the session so the session keeps reporting the transaction and refuses to do anything
+// else with it until the caller ends it. Releasing the locks is what keeps a doomed transaction from
+// blocking anyone while the caller decides to retry, and retaining the root is what keeps the rest of
+// its writes from being published.
+func abortStaleTargetSessionTransaction(session *Session, cause error) {
+	if session == nil || session.transaction == nil {
+		// The statement was not part of an explicit transaction, so its own root is the unit that
+		// failed and there is nothing of the session's to end. Marking the session here would refuse
+		// the caller's next, unrelated statement.
+		return
+	}
+	for index := len(session.savepoints) - 1; index >= 0; index-- {
+		_ = session.savepoints[index].tx.Rollback()
+	}
+	outermost := outermostTransaction(session)
+	session.savepoints = nil
+	if outermost != nil {
+		_ = outermost.Rollback()
+	}
+	session.transaction = outermost
+	session.retryConflict = cause
 }
 
 // abortDeadlockSessionTransaction rolls back the victim root to release all locks,

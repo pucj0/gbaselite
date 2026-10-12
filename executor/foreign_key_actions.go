@@ -205,7 +205,7 @@ func lockCascadeTarget(ctx context.Context, write storageengine.Txn, locks *dmlL
 			return err
 		}
 		if staleTargetObservation(write, observation) {
-			return storageengine.ErrConflict
+			return staleTargetConflict()
 		}
 	}
 	if updated == nil {
@@ -215,7 +215,10 @@ func lockCascadeTarget(ctx context.Context, write storageengine.Txn, locks *dmlL
 	if !ok || len(newKey) == 0 {
 		newKey = key
 	}
-	replacement, err := indexEntryLocks(child, newKey, updated, true)
+	// A derived write installing a value is the same question as any other UPDATE installing one: an
+	// entry whose key the child already had is not an insertion, and claiming an intention for it would
+	// let an interval that only blocks new keys hold up a referential action that creates no key.
+	replacement, err := indexReplacementLocks(child, key, newKey, oldRow, updated)
 	if err != nil {
 		return err
 	}

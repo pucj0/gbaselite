@@ -132,11 +132,16 @@ func TestB02UpdateWaiterIsWokenByHolderCommit(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the second UPDATE was still blocked after the holder committed")
 	}
-	// The rejected statement wrote nothing — the write path was never reached — so the root it
-	// belonged to has an empty write set and committing it changes no row. That is not the same as
-	// the statement being allowed to commit: nothing was written for the commit to publish.
-	if _, err := e.Execute(b, "COMMIT"); err != nil {
-		t.Fatalf("committing the transaction whose statement was rejected: %v", err)
+	// The conflict ends the transaction, not just the statement: the rest of the unit of work was
+	// computed from the snapshot that has just been proven too old, so it must be retried rather than
+	// partially published. COMMIT is therefore refused with the same retryable conflict, and the row
+	// the holder committed stays exactly as it is.
+	if _, err := e.Execute(b, "COMMIT"); !errors.Is(err, storageengine.ErrConflict) {
+		t.Fatalf("COMMIT after the stale target = %v, want the retryable ErrConflict", err)
+	}
+	// ROLLBACK is the statement that performs the retry the caller was asked for.
+	if _, err := e.Execute(b, "ROLLBACK"); err != nil {
+		t.Fatalf("ROLLBACK after the stale target: %v", err)
 	}
 	// The holder's value survives, which is the point of the check: the woken statement never wrote.
 	row, err := e.Execute(a, "SELECT v FROM items WHERE id=10")
@@ -205,9 +210,12 @@ func TestB02DeleteWaiterIsWokenByHolderCommit(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the second DELETE was still blocked after the holder committed")
 	}
-	// The rejected statement staged no delete, so committing its root publishes nothing.
-	if _, err := e.Execute(b, "COMMIT"); err != nil {
-		t.Fatalf("committing the transaction whose statement was rejected: %v", err)
+	// The conflict ends the transaction, so the delete that was abandoned cannot be published either.
+	if _, err := e.Execute(b, "COMMIT"); !errors.Is(err, storageengine.ErrConflict) {
+		t.Fatalf("COMMIT after the stale target = %v, want the retryable ErrConflict", err)
+	}
+	if _, err := e.Execute(b, "ROLLBACK"); err != nil {
+		t.Fatalf("ROLLBACK after the stale target: %v", err)
 	}
 	// The holder removed the row and nothing put it back.
 	row, err := e.Execute(setup, "SELECT COUNT(*) FROM items WHERE id=10")

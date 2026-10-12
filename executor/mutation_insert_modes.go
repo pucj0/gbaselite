@@ -223,7 +223,7 @@ func updateDuplicateInsertRow(ctx context.Context, write storageengine.Txn, sess
 		// (staleTargetObservation). A stale target is the retryable conflict FR-017/FR-018 prescribe, and
 		// re-evaluating on the new version would silently rebase the statement onto data it never read.
 		if staleTargetObservation(write, observation) {
-			return 0, storageengine.ErrConflict
+			return 0, staleTargetConflict()
 		}
 	}
 	columns := target.columns

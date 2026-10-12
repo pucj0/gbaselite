@@ -309,12 +309,12 @@ func (o *InsertOperator) currentInsertConflicts(ctx context.Context, candidate I
 			// decision taken on released state is the retryable conflict, so the root re-reads the current
 			// state instead of this statement inventing one (and instead of a permanent duplicate error
 			// for a value that is in fact free).
-			return nil, storageengine.ErrConflict
+			return nil, staleTargetConflict()
 		case len(owner) > 0 && !bytes.Equal(owner, conflict.key):
 			// The value now belongs to a different row than the one this statement's snapshot named.
 			// Resolving that would mean recomputing on data this statement never read, so it is the
 			// retryable conflict the contract prescribes.
-			return nil, storageengine.ErrConflict
+			return nil, staleTargetConflict()
 		default:
 			survivors = append(survivors, conflict)
 		}
@@ -401,6 +401,48 @@ func insertionIntention(space, tableID, indexID string, key []byte) []storageeng
 	}}
 }
 
+// indexEntryIdentity reports the namespace and key of one index's entry for one row.
+//
+// It reports ok=false for an index that cannot be named at all: a unique value that does not constrain
+// (a NULL part, an unresolvable column) reserves nothing, exactly as it constrains nothing, and an
+// index whose columns cannot be resolved is not claimed. That omission cannot lose a duplicate — the
+// commit validator still catches it — it only means the loser learns at commit rather than while
+// waiting.
+//
+// It is the one place a claim key is derived for an index entry, so the claim a statement takes and
+// the comparison the replacement path makes cannot disagree about what an entry's identity is.
+func indexEntryIdentity(table versionedTable, index storage.Index, owner []byte, row storage.Row) (string, []byte, bool, error) {
+	if index.Unique {
+		valueKey, ok := storage.IndexValueKey(index, table.Definition.Columns, row)
+		if !ok {
+			return "", nil, false, nil
+		}
+		return sqllayout.UniqueIndex(table.ID, index.Name), []byte(valueKey), true, nil
+	}
+	positions, ok := secondaryColumns(table, index)
+	if !ok {
+		return "", nil, false, nil
+	}
+	entryKey, _, err := secondaryEntry(table, positions, owner, row)
+	if err != nil {
+		return "", nil, false, err
+	}
+	return sqllayout.SecondaryIndex(table.ID, index.Name), entryKey, true, nil
+}
+
+// indexEntryClaim builds both halves of one index entry's claim: the insertion intention when the entry
+// is a new key, and always the record claim that decides contention on the key itself.
+func indexEntryClaim(index storage.Index, tableID, space string, key []byte, inserting bool) []storageengine.LockComponent {
+	var components []storageengine.LockComponent
+	if inserting {
+		components = append(components, insertionIntention(space, tableID, index.Name, key)...)
+	}
+	if index.Unique {
+		return append(components, uniqueValueReservationComponent(space, tableID, index.Name, key))
+	}
+	return append(components, indexEntryComponent(space, tableID, index.Name, key))
+}
+
 // indexEntryLocks builds the exclusive locks of a row's unique and secondary index entries.
 //
 // Two different identities are built here, and the difference is the whole point of the function:
@@ -433,36 +475,61 @@ func indexEntryLocks(table versionedTable, owner []byte, row storage.Row, insert
 		if index.Primary {
 			continue
 		}
-		if index.Unique {
-			valueKey, ok := storage.IndexValueKey(index, table.Definition.Columns, row)
-			if !ok {
-				// A unique value that is not constrained (a NULL part, or an unresolvable column)
-				// reserves nothing, exactly as it constrains nothing.
-				continue
-			}
-			space := sqllayout.UniqueIndex(table.ID, index.Name)
-			if inserting {
-				components = append(components, insertionIntention(space, table.ID, index.Name, []byte(valueKey))...)
-			}
-			components = append(components, uniqueValueReservationComponent(space, table.ID, index.Name, []byte(valueKey)))
-			continue
-		}
-		positions, ok := secondaryColumns(table, index)
-		if !ok {
-			// An index whose columns cannot be resolved is not locked here. Its conflict is still
-			// caught by the commit validator, so the omission cannot lose a duplicate; it only
-			// means the loser learns at commit rather than while waiting.
-			continue
-		}
-		entryKey, _, err := secondaryEntry(table, positions, owner, row)
+		space, key, ok, err := indexEntryIdentity(table, index, owner, row)
 		if err != nil {
 			return nil, err
 		}
-		space := sqllayout.SecondaryIndex(table.ID, index.Name)
-		if inserting {
-			components = append(components, insertionIntention(space, table.ID, index.Name, entryKey)...)
+		if !ok {
+			continue
 		}
-		components = append(components, indexEntryComponent(space, table.ID, index.Name, entryKey))
+		components = append(components, indexEntryClaim(index, table.ID, space, key, inserting)...)
+	}
+	return components, nil
+}
+
+// indexReplacementLocks builds the claims for the entries an UPDATE installs.
+//
+// It differs from indexEntryLocks in exactly one question, and that question is why it exists: is this
+// entry a *new key*, or is it the entry the row already had?
+//
+//   - The key is the one the old row already had: the write path updates that entry in place, or skips
+//     it entirely when nothing about it changed, and no new key appears in the index. Claiming an
+//     insertion intention for it would let an interval that only blocks new keys hold up a rewrite of
+//     an existing record — precisely what a Gap promises not to do. The record claim still travels, so
+//     two writers of the same entry still meet on it.
+//   - The key is new: it carries the intention, because that is the key another transaction's interval
+//     is meant to stop. A value that migrates into a protected range is an insertion however it was
+//     reached, and a primary-key move rewrites the owner suffix of every secondary entry, so all of
+//     those are new keys as well.
+//
+// The comparison is between the keys the claims themselves name, not between column values: only the
+// key decides whether the index gains an entry, and an index whose columns cannot be resolved is
+// invisible to both sides of the comparison.
+func indexReplacementLocks(table versionedTable, oldKey, newKey []byte, oldRow, updated storage.Row) ([]storageengine.LockComponent, error) {
+	if updated == nil || len(newKey) == 0 {
+		return nil, nil
+	}
+	var components []storageengine.LockComponent
+	for _, index := range table.Definition.Indexes {
+		if index.Primary {
+			continue
+		}
+		space, key, ok, err := indexEntryIdentity(table, index, newKey, updated)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		inserting := true
+		if oldRow != nil && len(oldKey) > 0 {
+			_, previous, previousOK, err := indexEntryIdentity(table, index, oldKey, oldRow)
+			if err != nil {
+				return nil, err
+			}
+			inserting = !previousOK || !bytes.Equal(previous, key)
+		}
+		components = append(components, indexEntryClaim(index, table.ID, space, key, inserting)...)
 	}
 	return components, nil
 }

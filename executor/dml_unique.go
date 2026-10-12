@@ -68,7 +68,7 @@ func (o *InsertOperator) verifyUniqueValuesLocked(ctx context.Context, candidate
 				// its snapshot is a row the statement never read, so rewriting it would rebase the
 				// statement onto post-readTS state: that is the retryable conflict, not a rewrite.
 				if staleTargetObservation(o.Write, observation) {
-					return storageengine.ErrConflict
+					return staleTargetConflict()
 				}
 			default:
 				// A plain INSERT cannot make the key free by retrying: the occupant is committed.
@@ -109,7 +109,7 @@ func (o *InsertOperator) verifyUniqueValuesLocked(ctx context.Context, candidate
 		case o.Mode.ignore:
 			return errSkipInsertRow
 		case o.Mode.replace || len(o.Mode.onDuplicate) > 0:
-			return storageengine.ErrConflict
+			return staleTargetConflict()
 		default:
 			return storage.ErrDuplicateKey
 		}

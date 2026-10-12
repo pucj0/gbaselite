@@ -81,7 +81,7 @@ func claimModifyTarget(ctx context.Context, locks *dmlLockScope, write storageen
 		return modifyClaim{}, err
 	}
 	if staleTargetObservation(write, observation) {
-		return modifyClaim{}, storageengine.ErrConflict
+		return modifyClaim{}, staleTargetConflict()
 	}
 	return modifyClaim{key: key}, nil
 }
@@ -95,7 +95,14 @@ func claimModifyTarget(ctx context.Context, locks *dmlLockScope, write storageen
 // the reservation it took so a concurrent insert cannot slip in. A key-preserving candidate
 // re-acquires components it already holds, which the manager answers as a re-entrant no-op, so the
 // repeat costs no claim and cannot self-conflict.
-func claimModifyReplacement(ctx context.Context, locks *dmlLockScope, write storageengine.Txn, table versionedTable, oldKey []byte, updated storage.Row) error {
+//
+// oldRow is the row as this statement read it, and it is what decides whether each index entry the
+// replacement installs is a *new key* or the entry the row already had. The distinction is not a
+// refinement: an entry whose key is unchanged is not an insertion, the write path updates it in place,
+// and claiming an insertion intention for it would let an interval that only blocks new keys hold up a
+// rewrite of an existing record. Passing the old row is therefore what keeps the interval rule honest
+// about what it blocks.
+func claimModifyReplacement(ctx context.Context, locks *dmlLockScope, write storageengine.Txn, table versionedTable, oldKey []byte, oldRow, updated storage.Row) error {
 	if locks == nil {
 		return nil
 	}
@@ -110,9 +117,9 @@ func claimModifyReplacement(ctx context.Context, locks *dmlLockScope, write stor
 		return errLockIdentityUnavailable
 	}
 	moved := !bytes.Equal(newKey, oldKey)
-	// The entries the replacement installs are new keys in their indexes, so this half carries the
-	// insertion claim: an interval another transaction protects over that index must block it.
-	extra, err := indexEntryLocks(table, newKey, updated, true)
+	// Each entry carries the insertion half only when its key is one the old row did not have, so a
+	// range another transaction protects over that index blocks a genuine new key and nothing else.
+	extra, err := indexReplacementLocks(table, oldKey, newKey, oldRow, updated)
 	if err != nil {
 		return err
 	}
@@ -197,7 +204,7 @@ func verifyReplacementUniqueValues(ctx context.Context, locks *dmlLockScope, wri
 		if visible {
 			return storage.ErrDuplicateKey
 		}
-		return storageengine.ErrConflict
+		return staleTargetConflict()
 	}
 	return nil
 }

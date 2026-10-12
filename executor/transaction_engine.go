@@ -212,10 +212,24 @@ var statementTxnHook func(statement parser.Statement, read, write storageengine.
 
 func (e *Engine) executeSQLStatement(session *Session, statement parser.Statement) (resultOut *Result, errOut error) {
 	defer func() {
-		if errOut != nil && errors.Is(errOut, storageengine.ErrDeadlock) {
+		if errOut == nil {
+			return
+		}
+		switch {
+		case errors.Is(errOut, storageengine.ErrDeadlock):
 			abortDeadlockSessionTransaction(session)
+		case isStaleTargetConflict(errOut):
+			abortStaleTargetSessionTransaction(session, errOut)
 		}
 	}()
+	// A transaction whose statement found a stale target cannot be used again: its other statements
+	// were computed from the snapshot that has just been proven too old, so the whole unit of work has
+	// to be retried. ROLLBACK ends it and BEGIN replaces it, exactly as they do for a deadlock victim;
+	// every other statement — COMMIT included — is refused with the original conflict, so a caller can
+	// never publish the abandoned work by accident.
+	if session.retryConflict != nil && !retryEndsTransaction(statement) {
+		return nil, session.retryConflict
+	}
 	ctx := session.Context
 	if ctx == nil {
 		ctx = context.Background()
