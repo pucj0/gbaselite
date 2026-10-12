@@ -122,16 +122,29 @@ func TestB02UpdateWaiterIsWokenByHolderCommit(t *testing.T) {
 
 	select {
 	case err := <-waited:
-		if err != nil {
-			t.Fatalf("the woken UPDATE failed: %v", err)
+		// The candidate this statement selected describes the version it read from its parent
+		// snapshot, and the holder has since replaced that version. The contract's answer is the
+		// retryable conflict, reported here rather than discovered at commit: the statement must not
+		// write over the newer row, and it must not silently rebase its SET onto it either.
+		if !errors.Is(err, storageengine.ErrConflict) {
+			t.Fatalf("the woken UPDATE = %v, want the retryable ErrConflict", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the second UPDATE was still blocked after the holder committed")
 	}
-	// The woken statement re-read the row it waited for, so its own view is consistent
-	// and its commit is decided by the ordinary B01 conflict rule rather than by a lock.
-	if _, err := e.Execute(b, "COMMIT"); err == nil || !errors.Is(err, storageengine.ErrConflict) {
-		t.Fatalf("commit after the wake = %v, want a stale-snapshot conflict", err)
+	// The rejected statement wrote nothing — the write path was never reached — so the root it
+	// belonged to has an empty write set and committing it changes no row. That is not the same as
+	// the statement being allowed to commit: nothing was written for the commit to publish.
+	if _, err := e.Execute(b, "COMMIT"); err != nil {
+		t.Fatalf("committing the transaction whose statement was rejected: %v", err)
+	}
+	// The holder's value survives, which is the point of the check: the woken statement never wrote.
+	row, err := e.Execute(a, "SELECT v FROM items WHERE id=10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := t035Rows(t, row); got != "3;" {
+		t.Fatalf("row 10 holds %q, want the holder's committed value: the woken statement wrote anyway", got)
 	}
 }
 
@@ -184,14 +197,25 @@ func TestB02DeleteWaiterIsWokenByHolderCommit(t *testing.T) {
 
 	select {
 	case err := <-waited:
-		if err != nil {
-			t.Fatalf("the woken DELETE failed: %v", err)
+		// The row this statement's snapshot read is gone, so its candidate names a version that no
+		// longer exists. Deleting on that candidate would remove whatever occupies the key now.
+		if !errors.Is(err, storageengine.ErrConflict) {
+			t.Fatalf("the woken DELETE = %v, want the retryable ErrConflict", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the second DELETE was still blocked after the holder committed")
 	}
-	if _, err := e.Execute(b, "COMMIT"); err == nil || !errors.Is(err, storageengine.ErrConflict) {
-		t.Fatalf("commit after the wake = %v, want a stale-snapshot conflict", err)
+	// The rejected statement staged no delete, so committing its root publishes nothing.
+	if _, err := e.Execute(b, "COMMIT"); err != nil {
+		t.Fatalf("committing the transaction whose statement was rejected: %v", err)
+	}
+	// The holder removed the row and nothing put it back.
+	row, err := e.Execute(setup, "SELECT COUNT(*) FROM items WHERE id=10")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(row.Rows) != 1 || row.Rows[0][0] != int64(0) {
+		t.Fatalf("row 10 is still present after the holder's delete: %v", row.Rows)
 	}
 }
 

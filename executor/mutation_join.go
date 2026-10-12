@@ -21,7 +21,12 @@ import (
 // then does LIMIT count the surviving targets. Writes go through the statement child
 // transaction while the join reads the parent statement snapshot, so a late error rolls the
 // whole statement back and no updated row can be re-read by the same statement.
-func (e *Engine) joinUpdateSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Update) (*Result, error) {
+//
+// The same statement lock scope the other write paths use is threaded through here, so an UPDATE
+// JOIN claims and verifies each target it writes exactly as a plain UPDATE does. Without it the
+// joined form would be the one statement that rewrites a row without protecting it, which is the
+// asymmetry this pipeline is most likely to grow by accident.
+func (e *Engine) joinUpdateSQL(ctx context.Context, read, write storageengine.Txn, session *Session, statement parser.Update, locks *dmlLockScope) (*Result, error) {
 	definition, schema, catalogKey, err := loadVersionedTable(read, session, statement.Table)
 	if err != nil {
 		return nil, err
@@ -47,7 +52,7 @@ func (e *Engine) joinUpdateSQL(ctx context.Context, read, write storageengine.Tx
 	if err != nil {
 		return nil, err
 	}
-	affected, err := plan.run(ctx, definition, definition.Definition.Columns, assignments, schema, write)
+	affected, err := plan.run(ctx, definition, definition.Definition.Columns, assignments, schema, write, locks)
 	if err != nil {
 		return nil, err
 	}

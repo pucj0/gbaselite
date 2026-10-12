@@ -101,12 +101,22 @@ lock 同形：表内 10/100 时对缺席 42 的保护是 `(10,100)`，插入 150
 JOIN/派生表/CTE/视图/聚合/DISTINCT/标量查询上的锁定读，以及经**非唯一二级索引**访问的锁定读（其 entry 集合
 可含多条，尚未接线）；NOWAIT / SKIP LOCKED 由 parser 拒绝。
 
+**DML 目标锁与版本校验已接入统一 A05 管线**：`INSERT`/`UPDATE`/`DELETE`，以及 `UPDATE ... JOIN`、
+多表 `DELETE`、`INSERT ... SELECT`，都在 `mutateSQL` 开启**语句级**锁作用域，并按固定顺序申请
+**表意向 → 主键行 → 索引条目**；因此锁定读、DML 与 raw `Txn.Put`/`Delete` 在**同一物理资源**上相遇。
+`UPDATE`/`DELETE` 在**取得行锁之后**按 `CurrentObservation.ChangeTS` 校验候选是否仍是本语句快照读到的
+版本：过期目标（包括已被删除的 tombstone）返回**可重试的 `ErrConflict`**，**不会**用最新行重算 `SET`，
+也**不会**静默 rebase。`UPDATE` 改主键时同时保护**旧/新**行身份与**全部旧/新**索引项。唯一值改用
+**值本身**的 reservation 作为锁身份（不再附主键后缀），所以并发插入同一唯一值会真正排队，唤醒后按最新
+已发布的 index 重判：普通 `INSERT` 报 **duplicate-key**，`INSERT IGNORE` 跳过该行，
+`REPLACE`/`ON DUPLICATE KEY UPDATE` 对**本语句未曾读到**的占用者报可重试冲突（拒绝 rebase）；
+主键冲突同样在锁后重判并报 duplicate-key（不再退化为行版本冲突）。
+
 **仍未实现**：`UPDATE`/`DELETE` 的范围候选仍只锁它实际改动/删除的行，不锁整个范围；raw 写也不登记表意向。
-死锁检测没有后台驱动方，因此两个
-会话互相等待同一批行时各自等到
-50 秒锁等待期限（**不会**被立即选为死锁受害者回滚）；同一主键的并发插入会正确等待，但失败方拿到的是可重试的行版本冲突而不是
-duplicate-key。规划明确保留固定 readTS 与提交冲突规则、A05 parent-read/child-write，
-不改变持久化格式或 WAL/Raft 协议，也不宣称完整 InnoDB 兼容。
+**自动死锁检测**在进入等待时被驱动：两/三 root 成环时**较晚注册者**被选为 victim，以 `ErrDeadlock`（协议
+1213）回滚，其等待队列与 wait-for 图边随之归零；超时（1205）与单条等待的上限由会话
+`innodb_lock_wait_timeout` 与该语句 context 期限中**更早者**决定。规划明确保留固定 readTS 与提交冲突规则、
+A05 parent-read/child-write，不改变持久化格式或 WAL/Raft 协议，也不宣称完整 InnoDB 兼容。
 
 ## 项目定位
 
@@ -820,9 +830,9 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 |---|---|---|
 | 连接 | MySQL TCP、认证、TLS、COM_QUERY、Prepared Statement、二进制结果、`CONNECTION_ID()`、`SHOW [FULL] PROCESSLIST`、`KILL [QUERY\|CONNECTION] <id>` | 不是完整 MySQL 协议实现；连接管理只覆盖本进程内的连接，跨账号查看/终止会话需要 PROCESS 授权 |
 | DDL | 数据库/表/视图创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引（含 `USING BTREE` 与索引 `COMMENT '...'`）、CREATE TABLE AS SELECT、CREATE TABLE LIKE、RENAME TABLE | 视图定义存入 MVCC catalog 并在引用时重新绑定，表与视图共用一个命名空间；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
-| 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源与视图源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT/RIGHT/CROSS，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …，目标表可无主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；不支持子查询作为连接输入；视图不可写 |
+| 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源与视图源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT/RIGHT/CROSS，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …，目标表可无主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；所有写入路径都在同一个 A05 修改管线上取锁，`UPDATE`/`DELETE` 取得行锁后按版本校验目标，过期目标报可重试冲突而不用最新行重算 SET；不支持子查询作为连接输入；视图不可写 |
 | 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT/RIGHT/CROSS JOIN、派生表、非递归与递归 CTE、视图（含嵌套视图）、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询）、锁定读（`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`：真正加锁并按当前读执行；JOIN/派生表/CTE/视图/聚合/非唯一二级索引访问上明确拒绝） | 窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
-| 事务 | BEGIN/COMMIT/ROLLBACK、SAVEPOINT/ROLLBACK TO/RELEASE、SET autocommit=0/1、断连回滚、语句失败回滚 | 快照隔离；不支持 LOCK TABLES、隔离级别切换或串行化保证；每个事务最多 32 个存活 savepoint layer（`RELEASE`/同名替换只释放名字，匿名 layer 仍占名额，超限报 resource limit） |
+| 事务 | BEGIN/COMMIT/ROLLBACK、SAVEPOINT/ROLLBACK TO/RELEASE、SET autocommit=0/1、断连回滚、语句失败回滚、`innodb_lock_wait_timeout` | 快照隔离；行级锁按资源（表意向 → 主键行 → 索引条目）申请，死锁在等待时自动检测并回滚较晚注册的 victim；不支持 LOCK TABLES、隔离级别切换或串行化保证；每个事务最多 32 个存活 savepoint layer（`RELEASE`/同名替换只释放名字，匿名 layer 仍占名额，超限报 resource limit） |
 | 约束 | PRIMARY KEY、UNIQUE、CHECK（含 MySQL 的 `CHECK (...) NOT ENFORCED`）、同库外键（RESTRICT/NO ACTION/CASCADE/SET NULL，含自引用） | 不支持跨库外键；受引用表 ALTER 有限制；级联深度上限 32；`NOT ENFORCED` 只保留定义并回显（`CHECK_CONSTRAINTS.ENFORCED=NO`），不校验行 |
 | 类型 | INT/BIGINT、文本、日期时间、BOOLEAN、精确 DECIMAL、JSON 列及现有标量函数、ON UPDATE CURRENT_TIMESTAMP | TIMESTAMP 尚无独立 UTC 存储语义 |
 | 账号 | 单机用户、密码、授权及权限元数据 | 用户目录独立持久化，不参与业务事务，不经过 Raft；复制节点拒绝账号 SQL |

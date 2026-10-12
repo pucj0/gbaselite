@@ -109,23 +109,30 @@ func (o *UpdateOperator) Run(ctx context.Context) error {
 // It is exported so the UPDATE JOIN pipeline, which selects its candidates before it
 // materialises them, can hand each one to the same implementation a plain UPDATE uses.
 func (o *UpdateOperator) Apply(ctx context.Context, candidate UpdateCandidate) error {
-	if err := o.lockTarget(candidate); err != nil {
+	// The target is claimed and then verified against the statement's own snapshot before anything is
+	// computed from it. A target another root rewrote after this statement read it is the retryable
+	// conflict, reported here rather than discovered at commit: the statement's candidate describes a
+	// version that is gone, and continuing would write over the newer one.
+	claim, err := claimModifyTarget(ctx, o.Locks, o.Write, o.Target, candidate.Identity.Key, candidate.OldRow)
+	if err != nil {
 		return err
 	}
 	updated, err := o.assign(candidate)
 	if err != nil {
 		return err
 	}
-	if err = applyForeignKeyActions(ctx, o.Write, o.Session, o.Locks, o.Target, candidate.OldRow, updated, nil, 0); err != nil {
-		return err
-	}
 	// The old physical key travels unchanged when the candidate carries one: a
 	// primary-key UPDATE deletes the old key and stores the new one inside the write path.
 	// An UPDATE JOIN candidate leaves the key empty and relies on the target's primary key,
 	// which is what the joined-row evaluation context can address.
-	// The replacement identity is locked before the write, so the window between "this row will
-	// hold the new key" and "this row holds the new key" is covered.
-	if err = o.lockReplacement(candidate.Identity.Key, updated); err != nil {
+	//
+	// The replacement identity and its index entries are claimed before anything is derived from
+	// them, so the window between "this row will hold the new key" and "this row holds the new key" is
+	// covered, and a referential action never writes a value whose own resources are unclaimed.
+	if err = claimModifyReplacement(ctx, o.Locks, o.Write, o.Target, claim.key, updated); err != nil {
+		return err
+	}
+	if err = applyForeignKeyActions(ctx, o.Write, o.Session, o.Locks, o.Target, candidate.OldRow, updated, nil, 0); err != nil {
 		return err
 	}
 	if err = writeVersionedRow(ctx, o.Write, o.Target, candidate.Identity.Key, candidate.OldRow, updated, ""); err != nil {
@@ -135,66 +142,9 @@ func (o *UpdateOperator) Apply(ctx context.Context, candidate UpdateCandidate) e
 	return nil
 }
 
-// lockTarget takes the exclusive record locks one UPDATE needs.
-//
-// It locks the *old* identity by its encoded key, which is what the candidate carries. The new
-// identity is locked separately by lockReplacement once the replacement row exists, because a
-// primary-key UPDATE installs a new key while removing the old one and a concurrent insert of
-// either key must meet this transaction on the same resource.
-func (o *UpdateOperator) lockTarget(candidate UpdateCandidate) error {
-	if o.Locks == nil {
-		return nil
-	}
-	// The candidate's encoded key is the exact identity the write path removes, so it is preferred
-	// over re-deriving one from the row: a table with no primary key has no derivable key at all.
-	key := candidate.Identity.Key
-	if len(key) == 0 {
-		derived, ok := primaryKeyBytes(o.Target, candidate.OldRow)
-		if !ok {
-			return errLockIdentityUnavailable
-		}
-		key = derived
-	}
-	// The old row's entries are being removed, not created, so this half takes no insertion claim.
-	extra, err := indexEntryLocks(o.Target, key, candidate.OldRow, false)
-	if err != nil {
-		return err
-	}
-	_, err = o.Locks.acquireRowLocksForKey(o.Target, key, extra)
-	return err
-}
-
-// lockReplacement takes the locks of the row an UPDATE is about to install.
-//
-// It runs for every candidate, not only for one that moves its primary key, because the *index
-// values* it installs can change while the key stays put: an UPDATE that writes a unique value
-// another row already holds must meet that row's reservation, and an UPDATE that frees a value must
-// still hold the reservation it took so a concurrent insert cannot slip in. A key-preserving
-// candidate re-acquires components it already holds, which the manager answers as a re-entrant
-// no-op, so the repeat costs no claim and cannot self-conflict.
-func (o *UpdateOperator) lockReplacement(oldKey []byte, updated storage.Row) error {
-	if o.Locks == nil {
-		return nil
-	}
-	newKey, ok := primaryKeyBytes(o.Target, updated)
-	if !ok {
-		// The identity is not derivable from the replacement values, which for an UPDATE means the
-		// key did not move: an UPDATE that leaves the primary key alone is already covered by the
-		// lock taken for the target row, and its index entries are locked below with that key.
-		newKey = oldKey
-	}
-	if len(newKey) == 0 {
-		return nil
-	}
-	// The entry the replacement installs is a new key in its index, so this half carries the
-	// insertion claim: a range another transaction protects over that index must block it.
-	extra, err := indexEntryLocks(o.Target, newKey, updated, true)
-	if err != nil {
-		return err
-	}
-	_, err = o.Locks.acquireRowLocksForKey(o.Target, newKey, extra)
-	return err
-}
+// The UPDATE target and replacement claims live in locking_modify.go, so every DML path that
+// rewrites an existing row verifies its target through the same code rather than through a private
+// copy of the rule.
 
 // assign computes the new row for one candidate.
 //

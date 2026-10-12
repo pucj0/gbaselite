@@ -437,3 +437,21 @@ Phase 3（US1）的前置条件已就绪：
 | 「会话锁期限可在 1..86400 生效」 | **此前只能缩短到 ≤50s**（`requestDeadlineLocked` 把 scope deadline 夹到默认值）：本轮取消夹取，`mvccadapter.BeginLockScope` 传入 ctx deadline ⇒ 1..86400 双向生效；服务端 `SET SESSION innodb_lock_wait_timeout` 与 `@@innodb_lock_wait_timeout` 也已接线（此前仅 executor 路径）。 |
 | SELECT FOR UPDATE/SHARE | **仍未接入（T034 未完成）**：接入点与所需改动见报告 §5；不做半接线（避免"旧快照候选直接返回旧结果"或降低既有可用行为）。T036 的 A–L 依赖它，同样未开始。 |
 
+
+## A14. Phase 6（US4 DML 与唯一索引）完成：T037–T046 全部勾选
+
+| 任务 | 设计 | 实施位置 | 测试 | 证据 |
+|---|---|---|---|---|
+| T037 | 锁后按版本校验 DML 候选 | `executor/locking_modify.go` | `executor/locking_modify_test.go`（新，15 例）；`executor/locking_dml_wake_test.go`、`executor/mvcc_engine_test.go`（断言改为早冲突） | `go test ./executor/ -run TestT037` 全通过 |
+| T038 | 主键与 UNIQUE reservation 的锁后重判 | `executor/dml_unique.go`（新增主键分支）、`executor/modify_insert.go` | `executor/locking_unique_test.go`（＋6 例） | `go test ./executor/ -run TestT038` 全通过 |
+| T040 | parent 目标 current verification、old/new 资源收集 | `executor/locking_modify.go`（`claimModifyTarget`/`claimModifyReplacement`/`verifyReplacementUniqueValues`） | 同上 T037/T038 用例 | 过期目标返回 `ErrConflict`；`!Exists` 墓碑同样冲突 |
+| T041 | 锁验证接入四条 DML 路径 | `executor/modify_update.go`、`modify_delete.go`、`mutation.go`、`mutation_join_pipeline.go`、`multi_delete_pipeline.go` | `TestT037JoinUpdateTargetIsVerified`、`TestT037MultiTableDeleteTargetIsVerified` | UPDATE JOIN 与多表 DELETE 均申报并被校验 |
+| T043 | 统一 old/new row 与 index 锁编码 | `executor/modify_insert.go`（`indexEntryLocks`）、`executor/secondary_index.go`（写路径，未改） | `executor/locking_index_claims_test.go`（新） | 语句实际 claim 与 `storage.IndexValueKey`/`secondaryEntry` 复算键逐项相等 |
+| T045 | raw 与 SQL 同资源、无旁路、replay 不等待 | `mvcc/locking.go`（未改） | `mvcc/locking_client_write_test.go`（新） | raw Delete 等待共享读；`Store.Apply` 期间注入时钟未 armed |
+| T046 | A05 全形状回归 | `executor/mutation.go`（未改语义） | `executor/locking_modify_pipeline_test.go`（新） | 各形状均申报表意向；affected/LastInsertID/dedup 不变 |
+| Part 5 | 死锁回归补强（不改生产逻辑） | — | `server/mysql_deadlock_error_code_test.go`、`lockmanager/deadlock_edges_test.go`（新） | 1213/1205 映射含 `errors.Join` 包装；两 root 混合环 `EdgeHolder`+`EdgeOlderWaiter` 且 victim 退出后归零 |
+
+**FR 覆盖增量**：FR-005/014/015/016/017/018/026/029/030/032 在本轮获得 SQL 端到端验收。
+
+**仍未覆盖**：FR-019/022（T055 复制与提交矩阵）、FR-028 的 server/diagnostics 面（T060–T064）、
+FR-033 的质量门（T065–T072）。`UPDATE`/`DELETE` 的范围候选仍不锁整个范围（T025/T027 未完成）。

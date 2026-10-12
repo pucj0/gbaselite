@@ -2,7 +2,10 @@ package executor
 
 import (
 	"errors"
+	"fmt"
 	"gbaselite/storage"
+	"gbaselite/storageengine"
+	"sync"
 	"testing"
 	"time"
 )
@@ -246,4 +249,202 @@ func TestB02UpdateReservesTheUniqueValueItInstalls(t *testing.T) {
 		t.Fatalf("the INSERT after the rollback failed: %v", err)
 	}
 	f.must(b, "COMMIT")
+}
+
+// TestT038ConcurrentInsertSamePrimaryKeyWaitsThenReportsDuplicate covers the primary-key half of the
+// reservation rule, which is not a UNIQUE index at all and so was never reached by the value check.
+//
+// Without a primary-key re-check under the claim, the woken statement finds nothing wrong in its own
+// snapshot, stages the row, and is rejected at commit with a generic version conflict: a retry
+// instruction for a key that can never become free.
+func TestT038ConcurrentInsertSamePrimaryKeyWaitsThenReportsDuplicate(t *testing.T) {
+	f := newUniqueFixture(t, "CREATE TABLE u(id BIGINT PRIMARY KEY, sku VARCHAR(20) UNIQUE)")
+	a := &Session{CurrentDatabase: "test"}
+	b := &Session{CurrentDatabase: "test"}
+	defer f.engine.CloseSession(a)
+	defer f.engine.CloseSession(b)
+
+	f.must(a, "BEGIN")
+	f.must(b, "BEGIN")
+	f.must(a, "INSERT INTO u VALUES(1,'A')")
+
+	barrier := newDMLWaitBarrier()
+	barrier.arm(t)
+	// Different unique value, same primary key: the only thing the two statements meet on is the key.
+	done := insertInFlight(f.engine, b, "INSERT INTO u VALUES(1,'B')")
+	barrier.wait(t, "the second INSERT of the same primary key")
+	f.must(a, "COMMIT")
+
+	if err := awaitStatement(t, done, "the same-key INSERT"); !errors.Is(err, storage.ErrDuplicateKey) {
+		t.Fatalf("the woken INSERT = %v, want storage.ErrDuplicateKey", err)
+	}
+	_, _ = f.engine.Execute(b, "ROLLBACK")
+	rows, err := f.engine.Execute(f.setup, "SELECT COUNT(*) FROM u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows == nil || len(rows.Rows) != 1 || rows.Rows[0][0] != int64(1) {
+		t.Fatalf("committed rows = %v, want exactly the holder's row", rows.Rows)
+	}
+}
+
+// TestT038InsertIgnoreSkipsTheRowItWaitedFor proves IGNORE still skips the row after the wait, rather
+// than writing it or reporting the conflict the plain form reports.
+func TestT038InsertIgnoreSkipsTheRowItWaitedFor(t *testing.T) {
+	f := newUniqueFixture(t, "CREATE TABLE u(id BIGINT PRIMARY KEY, sku VARCHAR(20) UNIQUE)")
+	a := &Session{CurrentDatabase: "test"}
+	b := &Session{CurrentDatabase: "test"}
+	defer f.engine.CloseSession(a)
+	defer f.engine.CloseSession(b)
+
+	f.must(a, "BEGIN")
+	f.must(b, "BEGIN")
+	f.must(a, "INSERT INTO u VALUES(1,'A')")
+
+	barrier := newDMLWaitBarrier()
+	barrier.arm(t)
+	done := insertInFlight(f.engine, b, "INSERT IGNORE INTO u VALUES(2,'A')")
+	barrier.wait(t, "the IGNORE insert of the reserved value")
+	f.must(a, "COMMIT")
+
+	if err := awaitStatement(t, done, "the IGNORE insert"); err != nil {
+		t.Fatalf("INSERT IGNORE reported %v, want the row simply skipped", err)
+	}
+	f.must(b, "COMMIT")
+	rows, err := f.engine.Execute(f.setup, "SELECT id FROM u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The skipped row was never written, and the value still belongs to its original owner.
+	if got := t035Rows(t, rows); got != "1;" {
+		t.Fatalf("rows = %q, want only the holder's row", got)
+	}
+}
+
+// TestT038ReplaceRewritesTheOccupantItCouldRead is the compatibility half of the REPLACE rule: an
+// occupant the statement's own snapshot can read is the statement's to replace.
+func TestT038ReplaceRewritesTheOccupantItCouldRead(t *testing.T) {
+	f := newUniqueFixture(t, "CREATE TABLE u(id BIGINT PRIMARY KEY, sku VARCHAR(20) UNIQUE)",
+		"INSERT INTO u VALUES(1,'A')")
+	session := &Session{CurrentDatabase: "test"}
+	defer f.engine.CloseSession(session)
+
+	f.must(session, "REPLACE INTO u VALUES(2,'A')")
+	rows, err := f.engine.Execute(f.setup, "SELECT id,sku FROM u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := t035Rows(t, rows); got != "2,A;" {
+		t.Fatalf("rows = %q, want the value moved off row 1 onto row 2", got)
+	}
+}
+
+// TestT038UpsertRewritesTheOccupantItCouldRead is the same compatibility half for ON DUPLICATE KEY
+// UPDATE: the conflicting row is the one the statement updates, and it is one this statement can see.
+func TestT038UpsertRewritesTheOccupantItCouldRead(t *testing.T) {
+	f := newUniqueFixture(t, "CREATE TABLE u(id BIGINT PRIMARY KEY, sku VARCHAR(20) UNIQUE)",
+		"INSERT INTO u VALUES(1,'A')")
+	session := &Session{CurrentDatabase: "test"}
+	defer f.engine.CloseSession(session)
+
+	f.must(session, "INSERT INTO u VALUES(2,'A') ON DUPLICATE KEY UPDATE sku='B'")
+	rows, err := f.engine.Execute(f.setup, "SELECT id,sku FROM u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := t035Rows(t, rows); got != "1,B;" {
+		t.Fatalf("rows = %q, want the conflicting row itself updated", got)
+	}
+}
+
+// TestT038UpsertRefusesToRewriteAnOccupantItNeverRead is the other half, and the reason the re-check
+// exists: the occupant was published while this statement waited, so it is not a row the statement
+// read. Rewriting it would rebase the statement onto post-readTS state, which is the retryable
+// conflict — not a silent rewrite and not a permanent duplicate either, because the value is very
+// much reachable once the statement runs again on a fresh snapshot.
+func TestT038UpsertRefusesToRewriteAnOccupantItNeverRead(t *testing.T) {
+	for _, variant := range []struct {
+		name string
+		sql  string
+	}{
+		{"REPLACE", "REPLACE INTO u VALUES(2,'A')"},
+		{"ON DUPLICATE KEY UPDATE", "INSERT INTO u VALUES(2,'A') ON DUPLICATE KEY UPDATE sku='B'"},
+	} {
+		t.Run(variant.name, func(t *testing.T) {
+			f := newUniqueFixture(t, "CREATE TABLE u(id BIGINT PRIMARY KEY, sku VARCHAR(20) UNIQUE)")
+			a := &Session{CurrentDatabase: "test"}
+			b := &Session{CurrentDatabase: "test"}
+			defer f.engine.CloseSession(a)
+			defer f.engine.CloseSession(b)
+
+			f.must(a, "BEGIN")
+			f.must(b, "BEGIN")
+			// The occupant of 'A' does not exist when b's snapshot is taken.
+			f.must(a, "INSERT INTO u VALUES(1,'A')")
+
+			barrier := newDMLWaitBarrier()
+			barrier.arm(t)
+			done := insertInFlight(f.engine, b, variant.sql)
+			barrier.wait(t, "the "+variant.name+" of the reserved value")
+			f.must(a, "COMMIT")
+
+			if err := awaitStatement(t, done, "the "+variant.name); !errors.Is(err, storageengine.ErrConflict) {
+				t.Fatalf("the %s = %v, want the retryable ErrConflict", variant.name, err)
+			}
+			_, _ = f.engine.Execute(b, "ROLLBACK")
+			// Nothing was rewritten on top of a row the statement never read.
+			rows, err := f.engine.Execute(f.setup, "SELECT id,sku FROM u")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := t035Rows(t, rows); got != "1,A;" {
+				t.Fatalf("rows = %q, want the holder's row untouched", got)
+			}
+		})
+	}
+}
+
+// TestT038AtMostOneInsertWins is the acceptance criterion in its bluntest form: several sessions race
+// to insert one unique value, and exactly one of them may end up committed.
+func TestT038AtMostOneInsertWins(t *testing.T) {
+	f := newUniqueFixture(t, "CREATE TABLE u(id BIGINT PRIMARY KEY, sku VARCHAR(20) UNIQUE)")
+	const writers = 4
+
+	results := make([]error, writers)
+	sessions := make([]*Session, writers)
+	for i := range sessions {
+		sessions[i] = &Session{CurrentDatabase: "test"}
+		defer f.engine.CloseSession(sessions[i])
+	}
+	var started sync.WaitGroup
+	var finished sync.WaitGroup
+	started.Add(writers)
+	for i := 0; i < writers; i++ {
+		finished.Add(1)
+		go func(index int) {
+			defer finished.Done()
+			started.Done()
+			started.Wait()
+			_, err := f.engine.Execute(sessions[index], fmt.Sprintf("INSERT INTO u VALUES(%d,'A')", index+1))
+			results[index] = err
+		}(i)
+	}
+	finished.Wait()
+
+	winners := 0
+	for _, err := range results {
+		if err == nil {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("%d of %d concurrent inserts of one unique value succeeded, want exactly 1 (errors: %v)", winners, writers, results)
+	}
+	rows, err := f.engine.Execute(f.setup, "SELECT COUNT(*) FROM u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows.Rows) != 1 || rows.Rows[0][0] != int64(1) {
+		t.Fatalf("committed rows = %v, want exactly one winner", rows.Rows)
+	}
 }

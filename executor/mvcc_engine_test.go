@@ -62,14 +62,22 @@ func TestMVCCSQLTransactionsAndReopen(t *testing.T) {
 	run(a, "COMMIT")
 	select {
 	case err := <-waited:
-		if err != nil {
-			t.Fatalf("the woken UPDATE failed: %v", err)
+		// B's candidate describes the version it read before A committed. Verifying the target under
+		// the lock finds the newer version and answers with the retryable conflict, so B never writes
+		// over A's row.
+		if !errors.Is(err, storageengine.ErrConflict) {
+			t.Fatalf("the woken UPDATE = %v, want the retryable ErrConflict", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the concurrent UPDATE was not woken by the holder's commit")
 	}
-	if _, err = e.Execute(b, "COMMIT"); !errors.Is(err, storageengine.ErrConflict) {
-		t.Fatalf("conflict: %v", err)
+	// The rejected statement staged nothing, so its root has an empty write set: committing it
+	// publishes no row and cannot overwrite the holder's version.
+	if _, err = e.Execute(b, "COMMIT"); err != nil {
+		t.Fatalf("committing the transaction whose statement was rejected: %v", err)
+	}
+	if r = run(s, "SELECT v FROM items WHERE id=10"); r.Rows[0][0] != int64(5) {
+		t.Fatalf("row 10 = %v, want the holder's round-two committed value", r.Rows)
 	}
 	if _, err = e.Execute(s, `INSERT INTO items(v,name) VALUES(7,'c'),(8,'a')`); err == nil {
 		t.Fatal("duplicate accepted")

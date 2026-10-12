@@ -222,7 +222,7 @@ func (p updateJoinPlan) deduped(ordinal *uint64) *physical.TargetRowDedup[update
 //
 // The candidate the write path receives is the one dedup selected, so the source row that produced
 // the identity is also the one that supplies the assignment values: first match wins.
-func (p updateJoinPlan) run(ctx context.Context, target versionedTable, targetColumns []storage.Column, assignments []updateAssignment, schema *storage.Table, write storageengine.Txn) (uint64, error) {
+func (p updateJoinPlan) run(ctx context.Context, target versionedTable, targetColumns []storage.Column, assignments []updateAssignment, schema *storage.Table, write storageengine.Txn, locks *dmlLockScope) (uint64, error) {
 	var ordinal uint64
 	// The write path consumes the deduplicated candidates directly. A candidate only has to be
 	// reshaped so OldRow is exactly the target's own columns; the joined evaluation row and the old
@@ -246,6 +246,7 @@ func (p updateJoinPlan) run(ctx context.Context, target versionedTable, targetCo
 		Assignments: assignments,
 		Write:       write,
 		Session:     p.session,
+		Locks:       locks,
 	}
 	if err := operator.Run(ctx); err != nil {
 		return 0, err

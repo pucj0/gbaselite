@@ -256,7 +256,15 @@ func (e *Engine) mutateSQL(ctx context.Context, read, write storageengine.Txn, s
 		return e.insertSQL(ctx, read, write, session, value, locks)
 	case parser.Update:
 		if len(value.Joins) > 0 {
-			return e.joinUpdateSQL(ctx, read, write, session, value)
+			// UPDATE JOIN goes through its own pipeline, so its statement scope is opened here rather
+			// than in the plain-UPDATE branch below. Closing it withdraws only this statement's pending
+			// requests and keeps every grant the root already holds.
+			locks, lockErr := beginDMLLockScope(ctx, write)
+			if lockErr != nil {
+				return nil, lockErr
+			}
+			defer locks.close()
+			return e.joinUpdateSQL(ctx, read, write, session, value, locks)
 		}
 		definition, schema, k, err := loadVersionedTable(read, session, value.Table)
 		if err != nil {

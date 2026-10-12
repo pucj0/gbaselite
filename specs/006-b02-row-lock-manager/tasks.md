@@ -439,21 +439,50 @@ gap/new-key写和完整SQL发布仍依赖后续phase，不能将US1当作完整B
 >    其余任务（T037、T038、T040、T041、T043、T045、T046）按实际进展维护，未达到全量验收者保持未勾选。
 
 ### Tests first
-- [ ] T037 [P] [US4] 在 `executor/locking_modify_test.go`（新）测试stale UPDATE/DELETE、post-readTS墓碑、parent候选、JOINfirstmatch/dedup/LIMIT/SET顺序与Halloween；验收：早冲突结束root，兼容候选结果与A05相同；FR-017/018/030/032，SC-004。
-- [ ] T038 [P] [US4] 在 `executor/locking_unique_test.go`（新）测试同PK/UNIQUE、NULL/collation、等待后判重、IGNORE/REPLACE/upsert；验收：至多一个插入胜者、不能忽略lock/SIerrors；FR-005/014/015/016/018。
+- [x] T037 [P] [US4] 在 `executor/locking_modify_test.go`（新）测试stale UPDATE/DELETE、post-readTS墓碑、parent候选、JOINfirstmatch/dedup/LIMIT/SET顺序与Halloween；验收：早冲突结束root，兼容候选结果与A05相同；FR-017/018/030/032，SC-004。
+- [x] T038 [P] [US4] 在 `executor/locking_unique_test.go`（新）测试同PK/UNIQUE、NULL/collation、等待后判重、IGNORE/REPLACE/upsert；验收：至多一个插入胜者、不能忽略lock/SIerrors；FR-005/014/015/016/018。
 - [x] T039 [P] [US4] 在 `executor/locking_foreign_key_test.go`（新）测试旧/新PK/index、heapidentity、多目标DELETE、cascade/SETNULL与schema变化；验收：共同rowidentity、guard基准保持；FR-014/015/017/018/032。
       **证据**：`executor/locking_foreign_key_test.go` 与 `locking_derived_test.go` 覆盖 CASCADE/SET NULL/RESTRICT/多层级联/整体回滚、等待后重验与锁身份一致性。
 
 ### Implementation
-- [ ] T040 [US4] 实现parenttarget currentverification与old/new资源收集在 `executor/locking_modify.go`（新）；验收：latest>readTS早ErrConflict、metadata先验证再解码，不refreshsource；FR-014/017/018/032。
-- [ ] T041 [US4] 将lock验证接入 `executor/modify_update.go`、`executor/modify_delete.go`、`executor/mutation_join_pipeline.go`、`executor/multi_delete_pipeline.go`；验收：仍parentread/childwrite、原Identity与SET顺序，不扫描child；FR-014/017/018/030。
+- [x] T040 [US4] 实现parenttarget currentverification与old/new资源收集在 `executor/locking_modify.go`（新）；验收：latest>readTS早ErrConflict、metadata先验证再解码，不refreshsource；FR-014/017/018/032。
+- [x] T041 [US4] 将lock验证接入 `executor/modify_update.go`、`executor/modify_delete.go`、`executor/mutation_join_pipeline.go`、`executor/multi_delete_pipeline.go`；验收：仍parentread/childwrite、原Identity与SET顺序，不扫描child；FR-014/017/018/030。
 - [x] T042 [US4] 将插入与duplicatevariant锁后判重接入 `executor/modify_insert.go`、`executor/mutation_insert_modes.go`；验收：II+X/unique reservation、NULL/collation/旧target检查、原ID预留与LastInsertID；FR-005/014/016/018。
       **证据**：`executor/locking_unique_test.go` 与 `locking_derived_test.go` 覆盖 ODKU 锁后重新确认 reservation owner、新旧索引项 II+X 申报、过期目标 ErrConflict、REPLACE 锁目标、重复变体不吞锁错误。
-- [ ] T043 [US4] 在 `executor/mutation.go`、`executor/secondary_index.go` 统一old/newrow及index锁，维护namespacebinding；验收：所有indexwrites进入同路径，无第二套rowwriter；FR-014/015/016/026。
+- [x] T043 [US4] 在 `executor/mutation.go`、`executor/secondary_index.go` 统一old/newrow及index锁，维护namespacebinding；验收：所有indexwrites进入同路径，无第二套rowwriter；FR-014/015/016/026。
 - [x] T044 [US4] 在 `executor/foreign_key.go` 接入派生write锁而保留point/range/catalog guards；验收：cascade、SETNULL与既有depth/budget约束不绕过，dependencyonly语义不变；FR-014/018/032。
       **证据**：`executor/foreign_key_actions.go` 实现 `lockCascadeTarget`，派生写在写入前申报子行主键与索引项，并在写入前做过期目标比对；`TestT039CascadeDeleteClaimsTheChildRowAndItsIndexes` 断言组件。
-- [ ] T045 [US4] 在 `mvcc/locking_client_write_test.go`（新）证明直接Txn.Put/Delete与SQL持锁同identity、ctx取消、缺失key/重新插入；验收：raw写无锁旁路，apply/replay仍不等待；FR-014/026/029。
-- [ ] T046 [US4] 在 `executor/locking_modify_pipeline_test.go`（新）及原A05fixtures回归全部INSERT/UPDATE/DELETE/自引用/spill/stageerror；验收：affectedrows、dedup、LastInsertID、statementrollback与临时资源一致；FR-014/017/024/030，SC-004。
+- [x] T045 [US4] 在 `mvcc/locking_client_write_test.go`（新）证明直接Txn.Put/Delete与SQL持锁同identity、ctx取消、缺失key/重新插入；验收：raw写无锁旁路，apply/replay仍不等待；FR-014/026/029。
+- [x] T046 [US4] 在 `executor/locking_modify_pipeline_test.go`（新）及原A05fixtures回归全部INSERT/UPDATE/DELETE/自引用/spill/stageerror；验收：affectedrows、dedup、LastInsertID、statementrollback与临时资源一致；FR-014/017/024/030，SC-004。
+      **本轮证据（Phase 6 收尾）**：以上七项均由真实 SQL 多 Session 测试验收，全部通过。
+      - **T040**：新增 `executor/locking_modify.go`（`claimModifyTarget` / `claimModifyReplacement` /
+        `verifyReplacementUniqueValues`）。目标行与其旧索引项先取锁，**再**在锁下 `ReadCurrent` 并按
+        `staleTargetObservation`（`CurrentObservation.ChangeTS > readTS`，含 `!Exists` 墓碑）判定过期，
+        过期即返回可重试 `ErrConflict`；改主键时同时申报新行身份的 II + Record X 与全部新旧索引项。
+      - **T041**：`modify_update.go`、`modify_delete.go` 改用同一 claim；`mutation.go` 为 `UPDATE ... JOIN`
+        与多表 DELETE 开启语句锁作用域并穿透到 `mutation_join_pipeline.go`（`updateJoinPlan.run` 新增
+        `locks`）与 `multi_delete_pipeline.go`。仍为 parent 固定快照选候选、child 仅写入。
+      - **T037**：`executor/locking_modify_test.go`（新，15 个用例）覆盖 stale UPDATE/DELETE、post-readTS
+        墓碑、parent 候选集固定、并发插入不影响等待者、UPDATE JOIN、多表 DELETE、主键迁移的旧/新身份、
+        语句失败整体回滚、JOIN first-match/dedup/LIMIT、SET 求值顺序、Halloween、拒绝后不长期持锁。
+        已有 `executor/locking_dml_wake_test.go`、`mvcc_engine_test.go` 相应断言更新为"早冲突"语义。
+      - **T038**：`executor/locking_unique_test.go` 扩充 6 组用例（同主键等待后 duplicate、IGNORE 跳过、
+        REPLACE/ODKU 对可见占用者改写、对快照后占用者报冲突、4 并发同唯一值仅一个胜者）；
+        `executor/dml_unique.go` 增加**主键 reservation 的锁后重判**，失败方由"行版本冲突"改为 duplicate-key。
+      - **T043**：`executor/locking_index_claims_test.go`（新）把语句实际申请的 lock component 与
+        `storage.IndexValueKey` / `secondaryEntry` 复算的写入键逐项比对（唯一索引取裸值、
+        二级索引含 owner 后缀），并验证 UPDATE 同时申报新旧索引位置、DELETE 申报被删项且不带 II。
+      - **T045**：`mvcc/locking_client_write_test.go`（新）覆盖 raw Delete 对共享读的等待、raw 写被
+        holder 回滚释放、raw 写在其 root 结束后拒绝入缓冲、以及 `Store.Apply`/replay 在用户持锁期间
+        **不进入等待**（以注入时钟是否 armed 判定，不用计时）。
+      - **T046**：`executor/locking_modify_pipeline_test.go`（新）以"是否申报表意向"证明 INSERT VALUES /
+        INSERT SELECT / INSERT IGNORE / REPLACE / ODKU / UPDATE / UPDATE JOIN / DELETE / 多表 DELETE 全部
+        仍走 A05 统一管线，并覆盖 FK CASCADE 与 SET NULL 的派生写、SAVEPOINT 保留语义、root 两种结束方式
+        与提交冲突后的锁归零、以及 spill 路径（300 行 UPDATE JOIN 与多表 DELETE）。affected rows、
+        LastInsertID、dedup 语义与既有 A05 一致。
+      - **Part 5 补强**：`server/mysql_deadlock_error_code_test.go`（新）验证 `ErrDeadlock`→1213、
+        `ErrLockWaitTimeout`→1205，含 `errors.Join` 与双重 `fmt.Errorf` 包装；`lockmanager/deadlock_edges_test.go`
+        （新）精确构造两 root 混合环（B→A `EdgeHolder` + A→B `EdgeOlderWaiter`）并验证 victim 退出后图边归零。
 
 ## Phase 7: US5 生命周期、死锁、耐久性 (T047–T057, P1)
 **Goal**: root正确结束，有限等待，五提交路径一致；发布前阻塞gate。

@@ -85,11 +85,11 @@ func (o *DeleteOperator) Run(ctx context.Context) error {
 // storage layer: secondary and unique index entries for the old values are removed and the
 // row is dropped.
 func (o *DeleteOperator) Apply(ctx context.Context, candidate DeleteCandidate) error {
-	// The row is locked before it is removed, so a concurrent writer waits rather than building on
-	// a snapshot that is about to lose the row. A backend with no lock manager has no lock to take;
-	// the deletion itself still has to happen, so only the lock step is skipped and not the whole
-	// apply.
-	if err := o.lockTarget(candidate); err != nil {
+	// The row is claimed and then verified before it is removed, so a concurrent writer either waits
+	// here or has already published a newer version this statement refuses to delete. A backend with
+	// no lock manager has no claim to verify under; the deletion itself still has to happen, so only
+	// the claim step is skipped and not the whole apply.
+	if _, err := claimModifyTarget(ctx, o.Locks, o.Write, o.Target, candidate.Identity.Key, candidate.OldRow); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -108,30 +108,5 @@ func (o *DeleteOperator) Apply(ctx context.Context, candidate DeleteCandidate) e
 	return nil
 }
 
-// lockTarget takes the exclusive record locks one DELETE needs.
-//
-// It locks the row's physical identity — the key the scan observed, or the table's derived
-// primary-key identity when the candidate carries none — together with the index entries the
-// deletion removes, so a concurrent insert or update of the same row meets this statement on the
-// same resource instead of racing it.
-func (o *DeleteOperator) lockTarget(candidate DeleteCandidate) error {
-	if o.Locks == nil {
-		return nil
-	}
-	key := candidate.Identity.Key
-	if len(key) == 0 {
-		derived, ok := primaryKeyBytes(o.Target, candidate.OldRow)
-		if !ok {
-			return errLockIdentityUnavailable
-		}
-		key = derived
-	}
-	// A DELETE removes entries; it never creates one. Passing false therefore keeps the removal
-	// free of insertion claims: an interval that only blocks new keys must not hold up a delete.
-	extra, err := indexEntryLocks(o.Target, key, candidate.OldRow, false)
-	if err != nil {
-		return err
-	}
-	_, err = o.Locks.acquireRowLocksForKey(o.Target, key, extra)
-	return err
-}
+// The DELETE target claim lives in locking_modify.go, so the row a delete removes is claimed and
+// verified by the same code every other DML path uses.

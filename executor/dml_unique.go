@@ -47,6 +47,35 @@ func (o *InsertOperator) verifyUniqueValuesLocked(ctx context.Context, candidate
 	table := o.Target.definition
 	row := candidate.Values
 	ownKey, hasOwnKey := primaryKeyBytes(table, row)
+	// The primary key is a reservation in exactly the same sense the unique values are, and it has to
+	// be re-checked from the published state for exactly the same reason: a root that committed a row
+	// under this key while this statement waited is not in this statement's snapshot, so the snapshot
+	// says the key is free while it is not. Without this the statement would stage the row, find
+	// nothing wrong in its own view, and be rejected at commit with a generic version conflict — a
+	// retry instruction for a key that can never become free.
+	if hasOwnKey {
+		observation, err := o.Locks.readLockedValue(ctx, grant, sqllayout.Rows(table.ID), ownKey)
+		if err != nil {
+			return err
+		}
+		if observation.Exists {
+			switch {
+			case o.Mode.ignore:
+				return errSkipInsertRow
+			case o.Mode.replace || len(o.Mode.onDuplicate) > 0:
+				// REPLACE and ON DUPLICATE KEY UPDATE are allowed to rewrite an occupant the statement
+				// can read, and the existing duplicate machinery does that. An occupant published after
+				// its snapshot is a row the statement never read, so rewriting it would rebase the
+				// statement onto post-readTS state: that is the retryable conflict, not a rewrite.
+				if staleTargetObservation(o.Write, observation) {
+					return storageengine.ErrConflict
+				}
+			default:
+				// A plain INSERT cannot make the key free by retrying: the occupant is committed.
+				return storage.ErrDuplicateKey
+			}
+		}
+	}
 	for _, index := range table.Definition.Indexes {
 		if index.Primary || !index.Unique {
 			continue
