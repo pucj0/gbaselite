@@ -195,6 +195,12 @@ func (t *txn) NewIterator(ctx context.Context, r storageengine.ScanRequest) (sto
 		return t.inner.ScanRange(ctx, r.Space, r.Range, y)
 	})
 }
+func (t *txn) Closed() bool {
+	if t.inner == nil {
+		return true
+	}
+	return t.inner.Closed()
+}
 func (e *engine) NewIterator(ctx context.Context, rev uint64, r storageengine.ScanRequest) (storageengine.Iterator, error) {
 	return newIterator(ctx, r, func(y func([]byte, []byte) error) error {
 		if r.Unordered {
@@ -202,4 +208,7 @@ func (e *engine) NewIterator(ctx context.Context, rev uint64, r storageengine.Sc
 		}
 		return e.store.ScanRange(ctx, rev, r.Space, r.Range, y)
 	})
+}
+func (e *engine) LockManager() *lockmanager.Manager {
+	return e.locks
 }

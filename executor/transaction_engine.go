@@ -249,7 +249,15 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 	switch value := statement.(type) {
 	case parser.Begin:
 		if session.transaction != nil {
-			return nil, errors.New("transaction already active")
+			if outermost := outermostTransaction(session); outermost != nil {
+				if c, ok := outermost.(interface{ Closed() bool }); ok && c.Closed() {
+					rollbackSessionTransaction(session)
+				} else {
+					return nil, errors.New("transaction already active")
+				}
+			} else {
+				return nil, errors.New("transaction already active")
+			}
 		}
 		tx, err := e.Backend.Begin(ctx)
 		session.transaction = tx

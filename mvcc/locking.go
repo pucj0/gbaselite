@@ -496,6 +496,11 @@ func (t *Tx) AbortRequestReason() lockmanager.AbortReason {
 }
 
 func (t *Tx) deadlockAborted() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.abortReason == string(lockmanager.AbortDeadlock) || t.abortReason == "deadlock" {
+		return true
+	}
 	return t.AbortRequestReason() == lockmanager.AbortDeadlock
 }
 

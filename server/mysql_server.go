@@ -669,6 +669,8 @@ func mysqlExecutionErrorCode(err error) uint16 {
 		return 1041
 	case errors.Is(err, storageengine.ErrNotLeader):
 		return 1290
+	case errors.Is(err, storageengine.ErrDeadlock):
+		return 1213
 	case errors.Is(err, storageengine.ErrConflict):
 		return 1213
 	case errors.Is(err, storageengine.ErrLockWaitTimeout):

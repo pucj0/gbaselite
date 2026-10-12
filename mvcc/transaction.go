@@ -171,6 +171,12 @@ func (t *Tx) Child() (*Tx, error) { return t.ChildContext(context.Background()) 
 // cannot release the root's record X even in principle.
 func (t *Tx) ChildContext(ctx context.Context) (*Tx, error) {
 	if t.closed || t.generation != t.store.generation.Load() {
+		if t.generation != t.store.generation.Load() {
+			return nil, ErrClosed
+		}
+		if t.deadlockAborted() {
+			return nil, storageengine.ErrDeadlock
+		}
 		return nil, ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
@@ -196,7 +202,13 @@ func (t *Tx) readOp(space string, rowKey []byte) (Op, bool, error) {
 
 // checkOpen reports whether this transaction may still be used.
 func (t *Tx) checkOpen() error {
-	if t.closed || t.generation != t.store.generation.Load() {
+	if t.generation != t.store.generation.Load() {
+		return ErrClosed
+	}
+	if t.closed {
+		if t.deadlockAborted() {
+			return storageengine.ErrDeadlock
+		}
 		return ErrClosed
 	}
 	return nil
@@ -590,6 +602,11 @@ func (t *Tx) finish(state TransactionState, options TransitionOptions) error {
 	if t.closed {
 		return nil
 	}
+	if state == TransactionAborted && options.Reason == "" {
+		if reason := t.AbortRequestReason(); reason != "" {
+			options.Reason = string(reason)
+		}
+	}
 	// The order is the contract's and each step depends on the previous one:
 	//
 	//  1. the semantic outcome is recorded while the registry entry still exists;
@@ -710,4 +727,9 @@ func (t *Tx) State() TransactionState {
 
 func (t *Tx) Guard(space string, rowKey []byte) error {
 	return t.write(Op{Space: space, Key: rowKey, Check: true})
+}
+
+// Closed reports whether the transaction is closed.
+func (t *Tx) Closed() bool {
+	return t.closed
 }

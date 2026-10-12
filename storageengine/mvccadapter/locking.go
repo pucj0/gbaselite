@@ -50,6 +50,14 @@ func (t *txn) lockManager() *lockmanager.Manager {
 	return t.engine.locks
 }
 
+// LockManagerOf returns the engine's underlying lock manager, if available.
+func LockManagerOf(e storageengine.Engine) *lockmanager.Manager {
+	if eng, ok := e.(*engine); ok {
+		return eng.locks
+	}
+	return nil
+}
+
 // BeginLockScope opens one request scope owned by this transaction's root.
 // BeginLockScope opens one request scope owned by this transaction's root.
 //
