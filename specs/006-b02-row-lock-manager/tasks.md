@@ -1227,6 +1227,33 @@ multi-DELETE、INSERT SELECT）都开语句级 `dmlLockScope` 并按"表意向 �
    `updated=nil` 且在赋值求值之前执行。
 3. **用等待前的行求值并写入**——根因：冲突行是在取锁之前读出的，等待期间他人提交的修改会被覆盖。
 
+### 第十五轮（P1：DML 锁后过期目标不得自动 Rebase；唯一 reservation 释放语义；真正的等待后唤起）
+
+证据：`.tmp/b15-phase5-report.md`、`.tmp/b15-acceptance.txt`。新增测试（`executor/locking_derived_test.go`）：
+`TestP1UpsertTargetChangedAfterTheSnapshotConflicts`、
+`TestP1UpsertAfterTheUniqueOwnerReleasedInsertsInstead`（用 `newDMLWaitBarrier` 证明**确实入队**后受让）、
+`TestP1CascadeGrantedAfterTheWaitRevalidates`（同一条 SQL 内等待 → 受让 → 继续）。生产改动：
+`executor/modify_insert.go`（新增 `currentInsertConflicts`/`uniqueReservationOwner`：**冲突是否存在**按当前
+reservation owner 重算，**冲突指向哪一行**仍取本语句快照）、`executor/mutation_insert_modes.go`
+（`insertConflict` 增加 `uniqueIndex`/`valueKey`；`updateDuplicateInsertRow` 不再用 ReadCurrent 的结果重算并覆盖，
+改为与快照行**比对**：不同 ⇒ `ErrConflict`、不存在 ⇒ 普通插入；`writeInsertedRow` 接收重算后的冲突列表）、
+`executor/foreign_key_actions.go`（`lockCascadeTarget` 在派生写前做同样的过期目标比对）。
+
+**修复前 → 根因 → 修复后**：
+1. **过期目标自动 Rebase**：修复前 `INSERT INTO items VALUES(1,7) ON DUPLICATE KEY UPDATE v=9`（T2 快照 readTS
+   早于 T1 提交，T1 已把该行改为 v=8）**静默成功**并覆盖 T1 的提交值。根因：上一轮让
+   `updateDuplicateInsertRow` 用 `ReadCurrent`（`readLockedValue`）读到的最新行**重算赋值**——既改写他人的提交，
+   又为被重算的 key 记下 write baseline，绕过旧快照的 DML 验证（违反 FR-017/FR-018 与 current-read.md §A05
+   "newest target change > readTS 报冲突，不用新 row 重算 SET"）。修复后：锁下只做**比对**
+   （`encodeSQLRow(快照行)` vs 当前值），不同即返回可重试 `ErrConflict`，T1 的值保持不变。
+2. **唯一 reservation 已释放但快照仍有旧冲突**：修复前 T2 等待 T1（v 7→8）提交后，同一条
+   `INSERT (2,7) ON DUPLICATE KEY UPDATE v=9` **把 id=1 改成 v=9**（终态 `1,9;`），v=7 丢失。根因：重复策略由
+   **快照**的 `insertConflicts` 决定，而锁下的 reservation 复查已知 7 已释放，两者冲突时仍是快照说了算。
+   修复后：冲突是否存在按当前 reservation owner 重算——不存在（释放）或改属他人 ⇒ 可重试 `ErrConflict`
+   （**不是**永久 1062，也**不是**错误更新 id=1）；重试后按新快照插入 `(2,7)`，行与唯一索引一致。
+3. **连带缺陷**：等待后受让的 CASCADE 派生写返回**永久**外键错误（派生值由等待前的行算出）。
+   `lockCascadeTarget` 加入同样的过期比对 ⇒ 可重试 `ErrConflict`；重试后级联成功且保留他人对该行的修改。
+
 | 文件 | 内容 |
 |---|---|
 | `.tmp/b02-baseline.md` | T001 实施前测试基线（环境、退出码、21 包结果、耗时、已存在失败=0） |

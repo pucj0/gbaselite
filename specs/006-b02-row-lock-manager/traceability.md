@@ -373,6 +373,14 @@ Phase 3（US1）的前置条件已就绪：
 | （本轮第三个缺陷）同 bundle 兄弟被当作 older waiter | **已修复**：`waitersAhead`/`olderBlockers` 会把同一 bundle 的 `Gap(a,m)` 当作 `II(b)` 的 older waiter（包含判定为真），使"同域两组件"的请求永久排队且图上无边；现按 `sameBundleRequest` 跳过自身兄弟。 |
 | 证据 | 新增 `lockmanager/claim_identity_test.go`（A–H 八项）与 `resource_test.go: TestB07ClaimIdentityIsExactInsideOneDomain`；**修复前 6/8 失败**（`.tmp/b07-before.txt`），**修复后全部通过**（`.tmp/b07-after.txt`）。`executor/lock_plan_test.go: TestT025SQLInsertRespectsAProtectedRange` 按用户要求重写为"T1 持锁期间 T3 必须完成"，替换原先在释放后才跑范围外插入的时序。T021–T027 的既有验收在修复后仍全部通过，完成标记保持。 |
 
+## A17. 第十五轮（P1：过期目标不 Rebase + 唯一 reservation 释放语义 + 真正等待后唤起）
+
+| 上一版结论 | 现状（`.tmp/b15-phase5-report.md`、`.tmp/b15-acceptance.txt`） |
+|---|---|
+| T042 的 upsert 用 `ReadCurrent` 的最新行继续计算 | **两个 P1 均修复**。① 过期目标**静默 rebase**：修复前 `INSERT items VALUES(1,7) ON DUPLICATE KEY UPDATE v=9`（T2 readTS 早于 T1 提交，T1 已改 v=8）**成功并覆盖** T1 的提交值——违反 FR-017/FR-018 与 current-read.md §A05（"newest target change > readTS 报冲突，不用新 row 重算 SET"），并靠 `ReadCurrent` 记下的 baseline 绕过旧快照 DML 验证。修复后锁下只**比对**快照行与当前值：不同 ⇒ 可重试 `ErrConflict`，T1 的值保留。② **唯一 reservation 已释放而快照仍有旧冲突**：修复前 T2 等待 T1（v 7→8）提交后把 `id=1` 改成 `v=9`（终态 `1,9;`），v=7 丢失。修复后**冲突是否存在**按当前 reservation owner 重算（释放或换主 ⇒ 可重试 `ErrConflict`，非永久 1062、非错误更新 id=1），重试后正确插入 `(2,7)` 且唯一索引一致。 |
+| T044 的"等待后重验"只有超时→重试形态 | **已补真正唤起**：`TestP1CascadeGrantedAfterTheWaitRevalidates` 用 `newDMLWaitBarrier` 证明同一条 SQL **入队后被受让**，受让后的派生写因目标过期返回可重试 `ErrConflict`（修复前是**永久**外键错误），重试后级联成功且保留他人对该行的修改。 |
+| CI 失败（MVCC transaction race regression） | **无法读取 CI 状态**（本机无网络，取不到 Actions 日志），因此不区分"既有不稳定"与"真实数据竞争"；可执行的替代证据：`go test ./mvcc/ -count=5`、`./storageengine/... ./server -count=3`、`./executor/... -count=5`、`./lockmanager/... -count=5` **全部通过**，本机重复运行**未能复现**该失败；`go test -race` 仍因无 C 工具链**未执行**。 |
+
 ## A16. 第十四轮（ON DUPLICATE 外键级联、新旧索引锁、等待后重验）
 
 | 上一版结论 | 现状（`.tmp/b14-phase5-report.md`、`.tmp/b14-acceptance.txt`） |

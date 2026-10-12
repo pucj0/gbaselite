@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +31,12 @@ type insertOutcome struct {
 type insertConflict struct {
 	key []byte
 	row storage.Row
+	// uniqueIndex is the position of the unique index whose value conflict this is, or -1 when the
+	// conflict is the candidate's primary key. It is what lets the locked re-check ask the *reservation*
+	// of that value rather than re-reading the row the snapshot named.
+	uniqueIndex int
+	// valueKey is the encoded unique value the reservation is stored under, set for a unique conflict.
+	valueKey []byte
 }
 
 // insertSetStatement rewrites INSERT ... SET into the single-row VALUES form the
@@ -59,7 +66,7 @@ func insertSetStatement(statement parser.Insert) parser.Insert {
 // never touches, so they claim the rows they change through the same helpers instead of writing around
 // the lock manager; IGNORE writes nothing and therefore claims nothing beyond the insertion claim the
 // caller already took.
-func writeInsertedRow(ctx context.Context, write storageengine.Txn, session *Session, locks *dmlLockScope, target *insertTarget, mode insertMode, row storage.Row, ordinal uint64) (insertOutcome, error) {
+func writeInsertedRow(ctx context.Context, write storageengine.Txn, session *Session, locks *dmlLockScope, target *insertTarget, mode insertMode, row storage.Row, ordinal uint64, conflicts []insertConflict) (insertOutcome, error) {
 	// The fallback heap identity comes from the one canonical encoder, so the key this row is
 	// stored under and the key the lock path protects cannot drift apart.
 	fallback := heapKeyString(write.ID(), ordinal)
@@ -71,10 +78,8 @@ func writeInsertedRow(ctx context.Context, write storageengine.Txn, session *Ses
 		}
 		return insertOutcome{affected: 1, inserted: true}, nil
 	}
-	conflicts, err := insertConflicts(write, target, row)
-	if err != nil {
-		return insertOutcome{}, err
-	}
+	// The conflicts are the ones the caller re-derived from the current state under the statement's
+	// claims, so a value another transaction released while this statement waited is not among them.
 	if len(conflicts) == 0 {
 		if err := writeVersionedRow(ctx, write, target.definition, nil, nil, row, fallback); err != nil {
 			return insertOutcome{}, err
@@ -105,7 +110,7 @@ func insertConflicts(tx storageengine.Txn, target *insertTarget, candidate stora
 	rows := tx.Table(target.definition.ID)
 	seen := make(map[string]bool, 1)
 	conflicts := make([]insertConflict, 0, 1)
-	collect := func(owner []byte, exists bool) error {
+	collect := func(owner []byte, exists bool, uniqueIndex int, valueKey []byte) error {
 		if !exists {
 			return nil
 		}
@@ -125,7 +130,12 @@ func insertConflicts(tx storageengine.Txn, target *insertTarget, candidate stora
 			return err
 		}
 		seen[identity] = true
-		conflicts = append(conflicts, insertConflict{key: append([]byte(nil), owner...), row: decoded})
+		conflicts = append(conflicts, insertConflict{
+			key:         append([]byte(nil), owner...),
+			row:         decoded,
+			uniqueIndex: uniqueIndex,
+			valueKey:    append([]byte(nil), valueKey...),
+		})
 		return nil
 	}
 	if primary, ok := sqlPrimaryIndex(target.definition); ok {
@@ -134,12 +144,12 @@ func insertConflicts(tx storageengine.Txn, target *insertTarget, candidate stora
 			if err != nil {
 				return nil, err
 			}
-			if err := collect(key, exists); err != nil {
+			if err := collect(key, exists, -1, nil); err != nil {
 				return nil, err
 			}
 		}
 	}
-	for _, index := range target.definition.Definition.Indexes {
+	for position, index := range target.definition.Definition.Indexes {
 		if index.Primary || !index.Unique {
 			continue
 		}
@@ -151,7 +161,7 @@ func insertConflicts(tx storageengine.Txn, target *insertTarget, candidate stora
 		if err != nil {
 			return nil, err
 		}
-		if err := collect(owner, exists); err != nil {
+		if err := collect(owner, exists, position, []byte(key)); err != nil {
 			return nil, err
 		}
 	}
@@ -221,11 +231,19 @@ func updateDuplicateInsertRow(ctx context.Context, write storageengine.Txn, sess
 			// caller performs because it owns the heap fallback identity.
 			return 0, errUpsertTargetGone
 		}
-		decoded, err := decodeSQLRow(target.definition, observation.Value)
+		// The row is read under the claim to answer one question only: is it still the version this
+		// statement's snapshot read? Any difference means another transaction committed a change after
+		// this statement's readTS, and FR-017/FR-018 make that a retryable conflict rather than a new
+		// row to recompute the assignments on. Re-evaluating on the new version would silently rebase the
+		// statement onto data it never read, and the locked observation must not become a fresh write
+		// baseline for a target the statement's own snapshot rejects.
+		snapshotEncoded, err := encodeSQLRow(target.definition, conflict.row)
 		if err != nil {
 			return 0, err
 		}
-		currentRow = decoded
+		if !bytes.Equal(observation.Value, snapshotEncoded) {
+			return 0, storageengine.ErrConflict
+		}
 	}
 	columns := target.columns
 	updated := append(storage.Row(nil), currentRow...)

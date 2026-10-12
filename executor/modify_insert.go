@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"gbaselite/physical"
@@ -218,7 +219,28 @@ func (o *InsertOperator) apply(ctx context.Context, candidate InsertCandidate) e
 		}
 		return err
 	}
-	outcome, err := writeInsertedRow(ctx, o.Write, o.Session, o.Locks, o.Target, o.Mode, candidate.Values, candidate.Ordinal)
+	// *Whether* a conflict exists is decided from the current state, because the snapshot's answer may
+	// describe a value another transaction has since released. *Which row* a surviving conflict names
+	// stays the one this statement's snapshot saw: recomputing the duplicate policy on a post-snapshot
+	// row would rebase the statement onto data it never read (FR-017/018). The re-derivation below
+	// therefore only drops conflicts that are gone and reports a conflict that moved to a new owner.
+	conflicts, err := o.currentInsertConflicts(ctx, candidate, grant)
+	if err != nil {
+		return err
+	}
+	if len(conflicts) == 0 {
+		// No conflict remains: the candidate is an ordinary insert, which is what a released unique
+		// value means. The insertion claims were taken before the wait, so the identity is still held.
+		if err := writeVersionedRow(ctx, o.Write, o.Target.definition, nil, nil, candidate.Values, heapKeyString(o.Write.ID(), candidate.Ordinal)); err != nil {
+			return err
+		}
+		o.Result.AffectedRows++
+		if generatedOK {
+			o.Result.recordGenerated(generated, true)
+		}
+		return nil
+	}
+	outcome, err := writeInsertedRow(ctx, o.Write, o.Session, o.Locks, o.Target, o.Mode, candidate.Values, candidate.Ordinal, conflicts)
 	if err != nil {
 		return err
 	}
@@ -227,6 +249,98 @@ func (o *InsertOperator) apply(ctx context.Context, candidate InsertCandidate) e
 		o.Result.recordGenerated(generated, true)
 	}
 	return nil
+}
+
+// currentInsertConflicts re-derives the duplicate conflicts of one candidate from the latest published
+// state, under the claims this statement already holds.
+//
+// The snapshot's conflict list answers "what did this statement see", which is the wrong question after
+// a wait: the unique value it saw as taken may have been released by the transaction it waited for. This
+// function asks the reservation itself — the record every writer of a unique value claims — and the
+// candidate's primary key:
+//
+//   - a unique conflict survives only while the reservation still names the row the snapshot found;
+//   - a reservation that now names a *different* row is a conflict the statement cannot resolve from its
+//     own snapshot, so it is refused with the retryable conflict the contract prescribes;
+//   - a reservation that is gone means the value is free, and that conflict is dropped;
+//   - a primary-key conflict survives while a row still occupies the key. Its *content* is left to the
+//     snapshot: the duplicate policy keeps the row this statement read as its target, and
+//     updateDuplicateInsertRow reports the conflict if that row has changed since.
+func (o *InsertOperator) currentInsertConflicts(ctx context.Context, candidate InsertCandidate, grant storageengine.LockGrant) ([]insertConflict, error) {
+	if o.Locks == nil {
+		// Without a lock manager there is no claim to re-read under, so the snapshot's answer stands,
+		// exactly as the unlocked backend has always behaved.
+		return insertConflicts(o.Write, o.Target, candidate.Values)
+	}
+	snapshot, err := insertConflicts(o.Write, o.Target, candidate.Values)
+	if err != nil {
+		return nil, err
+	}
+	if len(snapshot) == 0 {
+		return nil, nil
+	}
+	table := o.Target.definition
+	survivors := make([]insertConflict, 0, len(snapshot))
+	for _, conflict := range snapshot {
+		if conflict.uniqueIndex < 0 {
+			// A primary-key conflict is about the row at that key, and whether it is there now. Its
+			// content is left to the snapshot: the policy keeps the row this statement read as its
+			// target, and updateDuplicateInsertRow reports the conflict if that row has changed since.
+			_, exists, err := o.Write.Table(table.ID).Get(conflict.key)
+			if err != nil {
+				return nil, err
+			}
+			if !exists {
+				continue
+			}
+			survivors = append(survivors, conflict)
+			continue
+		}
+		owner, exists, err := o.uniqueReservationOwner(ctx, table, conflict, grant)
+		if err != nil {
+			return nil, err
+		}
+		switch {
+		case !exists:
+			// The reservation is gone: the value this statement's snapshot saw as taken was released
+			// while it waited. The statement cannot resolve that from its own snapshot — its duplicate
+			// reasoning names a row that no longer owns the value, and the write path validates an insert
+			// against that same stale view, where the value is still taken. The contract's answer for a
+			// decision taken on released state is the retryable conflict, so the root re-reads the current
+			// state instead of this statement inventing one (and instead of a permanent duplicate error
+			// for a value that is in fact free).
+			return nil, storageengine.ErrConflict
+		case len(owner) > 0 && !bytes.Equal(owner, conflict.key):
+			// The value now belongs to a different row than the one this statement's snapshot named.
+			// Resolving that would mean recomputing on data this statement never read, so it is the
+			// retryable conflict the contract prescribes.
+			return nil, storageengine.ErrConflict
+		default:
+			survivors = append(survivors, conflict)
+		}
+	}
+	return survivors, nil
+}
+
+// uniqueReservationOwner reads the current owner of one unique value under the statement's claim.
+func (o *InsertOperator) uniqueReservationOwner(ctx context.Context, table versionedTable, conflict insertConflict, grant storageengine.LockGrant) ([]byte, bool, error) {
+	if conflict.uniqueIndex < 0 || conflict.uniqueIndex >= len(table.Definition.Indexes) {
+		return nil, false, nil
+	}
+	index := table.Definition.Indexes[conflict.uniqueIndex]
+	if !index.Unique {
+		return nil, false, nil
+	}
+	space := sqllayout.UniqueIndex(table.ID, index.Name)
+	observation, err := o.Locks.readLockedValue(ctx, grant, space, conflict.valueKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if !observation.Exists {
+		return nil, false, nil
+	}
+	// The entry's value is the owning primary key, which is the encoding the write path installs.
+	return observation.Value, true, nil
 }
 
 // lockCandidate takes the exclusive row lock one inserted row needs and returns the capability.
@@ -272,7 +386,7 @@ func (o *InsertOperator) lockCandidate(candidate InsertCandidate) (storageengine
 //
 // The two halves answer different questions, which is why both exist: the intention is what a
 // covering Gap blocks (FR-003/FR-005), and the record lock is what decides same-key contention
-// (FR-005: "同键竞争由 record X/唯一键 reservation 决定").
+// (FR-005: "鍚岄敭绔炰簤鐢?record X/鍞竴閿?reservation 鍐冲畾").
 func insertionIntention(space, tableID, indexID string, key []byte) []storageengine.LockComponent {
 	if len(key) == 0 {
 		return nil

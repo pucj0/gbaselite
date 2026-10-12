@@ -1,9 +1,11 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
@@ -184,8 +186,28 @@ func lockCascadeTarget(locks *dmlLockScope, child versionedTable, key []byte, ol
 	if err != nil {
 		return err
 	}
-	if _, err := locks.acquireRowLocksForKey(child, key, extra); err != nil {
+	grant, err := locks.acquireRowLocksForKey(child, key, extra)
+	if err != nil {
 		return err
+	}
+	// The derived write was computed from the row this statement's snapshot read. Another transaction may
+	// have committed a change to that row while this statement waited for the claim, and writing the
+	// derivation over it would discard that commit — or, as the referential validation then reports it,
+	// fail with a permanent reference error for a value derived from a row that is no longer current. The
+	// contract's answer for a target whose newest committed change is newer than the statement's readTS is
+	// the retryable conflict (FR-017/FR-018), so it is reported here, before any derived write.
+	if oldRow != nil {
+		observation, err := locks.readLockedValue(context.Background(), grant, sqllayout.Rows(child.ID), key)
+		if err != nil {
+			return err
+		}
+		snapshotEncoded, err := encodeSQLRow(child, oldRow)
+		if err != nil {
+			return err
+		}
+		if observation.Exists && !bytes.Equal(observation.Value, snapshotEncoded) {
+			return storageengine.ErrConflict
+		}
 	}
 	if updated == nil {
 		return nil
