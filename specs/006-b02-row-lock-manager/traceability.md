@@ -459,8 +459,9 @@ FR-033 的质量门（T065–T072）。`UPDATE`/`DELETE` 的范围候选仍不�
 
 | 编号 | 结论 | 实施位置 | 测试 | 证据 |
 |---|---|---|---|---|
-| P1 过期目标的 Root 重试 | **缺陷已修复**：错误说"retry transaction"但事务仍可提交，会发布同一快照算出的其余写入 | `executor/stale_target.go`（新）、`executor/transaction_engine.go`、`executor/savepoint_mvcc.go`、8 处过期判定点 | `executor/stale_target_retry_test.go`（新，6 例）；`executor/locking_dml_wake_test.go`、`executor/mvcc_engine_test.go`、`executor/locking_modify_test.go` 断言更新 | 修复前 `id=2=200` 被提交；修复后 COMMIT 被同一冲突拒绝、`id=2=20` |
+| P1 过期目标的 Root 重试 | **缺陷已修复**：错误说"retry transaction"但事务仍可提交，会发布同一快照算出的其余写入 | `executor/stale_target.go`（新）、`executor/transaction_engine.go`、`executor/savepoint_mvcc.go`、8 处过期判定点 | `executor/stale_target_retry_test.go`（新，8 例）；`executor/locking_dml_wake_test.go`、`executor/mvcc_engine_test.go`、`executor/locking_modify_test.go` 断言更新 | 修复前 `id=2=200` 被提交；修复后 COMMIT 被同一冲突拒绝、`id=2=20`；连续操作被拒与 BEGIN 重置正常 |
 | P2 既有索引项的 II | **缺陷已修复**：身份未变的索引项也申报 Insert Intention，被只挡新键的 Gap 错误阻塞 | `executor/modify_insert.go`（`indexEntryIdentity`/`indexEntryClaim`/`indexReplacementLocks`）、`executor/locking_modify.go`、`executor/foreign_key_actions.go` | `executor/locking_replacement_entries_test.go`（新，3 组 13 例） | 修复前 2s 超时；修复后 18ms，且迁入被保护区间的项仍被阻塞 |
+| P3 外键级联子表主键漏行 II | **缺陷已修复**：子表主键迁移时仅申报 Record X 漏申报 II，绕过覆盖子表新键的 Gap 锁 | `executor/foreign_key_actions.go`（`lockCascadeTarget` 直接复用 `claimModifyReplacement`） | `executor/locking_cascade_gap_test.go`（新，2 例） | 修复前子表行空间漏 II 绕过 Gap；修复后子表主键迁移真实被 Gap 阻断，WaitEdges 确认等待，放开后正确提交 |
 
 **FR 影响**：FR-017/FR-018 的"锁后过期目标要求 root 重试"至此有可执行语义；FR-003/FR-005 的
 "Gap 只阻挡新键"在 UPDATE 路径上成立（此前在 UPDATE 上被违反）。

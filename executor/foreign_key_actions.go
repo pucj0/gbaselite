@@ -211,19 +211,11 @@ func lockCascadeTarget(ctx context.Context, write storageengine.Txn, locks *dmlL
 	if updated == nil {
 		return nil
 	}
-	newKey, ok := primaryKeyBytes(child, updated)
-	if !ok || len(newKey) == 0 {
-		newKey = key
-	}
-	// A derived write installing a value is the same question as any other UPDATE installing one: an
-	// entry whose key the child already had is not an insertion, and claiming an intention for it would
-	// let an interval that only blocks new keys hold up a referential action that creates no key.
-	replacement, err := indexReplacementLocks(child, key, newKey, oldRow, updated)
-	if err != nil {
-		return err
-	}
-	_, err = locks.acquireRowLocksForKey(child, newKey, replacement)
-	return err
+	// The derived replacement is an UPDATE onto the child table, so it must claim its new identity
+	// and index entries through the same rules an explicit UPDATE uses: moving the child's primary key
+	// claims the insertion intention at that new key (so an interval covering the insertion point blocks
+	// the cascade), unchanged index entries claim no intention, and unique reservations are verified.
+	return claimModifyReplacement(ctx, locks, write, child, key, oldRow, updated)
 }
 
 func childReferencesKey(child, parent versionedTable, foreignKey storage.ForeignKey, row storage.Row, oldKey string) bool {

@@ -313,3 +313,97 @@ func TestP1TheStaleTargetRefusalIsNotADeadlock(t *testing.T) {
 	}
 	p.must(b, "ROLLBACK")
 }
+
+// TestP1RepeatedOperationsAreRefusedWithoutLosingConflict verifies that once a transaction is marked
+// with a stale target conflict, subsequent operations (SELECT, INSERT, UPDATE, DELETE, SAVEPOINT,
+// COMMIT) are repeatedly refused and the retryConflict marker is not cleared prematurely.
+func TestP1RepeatedOperationsAreRefusedWithoutLosingConflict(t *testing.T) {
+	p := newP1Fixture(t)
+	a := t034Session(t, p.f, 20)
+	b := t034Session(t, p.f, 20)
+
+	p.must(a, "BEGIN")
+	p.must(a, "UPDATE items SET v=11 WHERE id=1")
+
+	p.must(b, "BEGIN")
+	p.must(b, "UPDATE items SET v=200 WHERE id=2")
+
+	barrier := newDMLWaitBarrier()
+	barrier.arm(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.f.engine.Execute(b, "UPDATE items SET v=111 WHERE id=1")
+		done <- err
+	}()
+	barrier.wait(t, "B's UPDATE of id=1")
+	p.must(a, "COMMIT")
+
+	if err := awaitStatement(t, done, "B's UPDATE"); !errors.Is(err, storageengine.ErrConflict) {
+		t.Fatalf("expected ErrConflict, got %v", err)
+	}
+
+	// Repeated operations must all be refused without losing the conflict marker:
+	stmts := []string{
+		"SELECT * FROM items WHERE id=2",
+		"INSERT INTO items VALUES(4, 40)",
+		"UPDATE items SET v=99 WHERE id=2",
+		"DELETE FROM items WHERE id=2",
+		"SAVEPOINT sp1",
+		"ROLLBACK TO SAVEPOINT sp1",
+		"RELEASE SAVEPOINT sp1",
+		"COMMIT",
+	}
+
+	for _, sql := range stmts {
+		if _, err := p.f.engine.Execute(b, sql); !errors.Is(err, storageengine.ErrConflict) {
+			t.Fatalf("statement %q was not refused with ErrConflict, got %v", sql, err)
+		}
+	}
+
+	// Session's retryConflict marker is preserved until ROLLBACK
+	p.must(b, "ROLLBACK")
+
+	// After ROLLBACK, the session is clean and operations succeed
+	res := p.must(b, "SELECT id, v FROM items ORDER BY id")
+	if got := t035Rows(t, res); got != "1,11;2,20;3,30;" {
+		t.Fatalf("unexpected data after rollback: %q", got)
+	}
+}
+
+// TestP1BeginResetsAbortedSessionState verifies that when a transaction has been aborted by a stale
+// target conflict, a subsequent BEGIN resets the aborted session and starts a fresh, usable transaction.
+func TestP1BeginResetsAbortedSessionState(t *testing.T) {
+	p := newP1Fixture(t)
+	a := t034Session(t, p.f, 20)
+	b := t034Session(t, p.f, 20)
+
+	p.must(a, "BEGIN")
+	p.must(a, "UPDATE items SET v=11 WHERE id=1")
+
+	p.must(b, "BEGIN")
+	barrier := newDMLWaitBarrier()
+	barrier.arm(t)
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.f.engine.Execute(b, "UPDATE items SET v=111 WHERE id=1")
+		done <- err
+	}()
+	barrier.wait(t, "B's UPDATE")
+	p.must(a, "COMMIT")
+
+	if err := awaitStatement(t, done, "B's UPDATE"); !errors.Is(err, storageengine.ErrConflict) {
+		t.Fatalf("expected ErrConflict, got %v", err)
+	}
+
+	// Directly call BEGIN without ROLLBACK:
+	p.must(b, "BEGIN")
+
+	// Fresh transaction should be fully usable and succeed
+	p.must(b, "UPDATE items SET v=222 WHERE id=2")
+	p.must(b, "COMMIT")
+
+	res := p.must(a, "SELECT id, v FROM items WHERE id=2")
+	if got := t035Rows(t, res); got != "2,222;" {
+		t.Fatalf("expected id=2 to be 222 after new transaction commit, got %q", got)
+	}
+}
