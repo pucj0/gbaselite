@@ -1206,7 +1206,27 @@ Gap 用前驱/后继限定）、`storageengine/mvccadapter/iterator.go`（逐行
 **Phase 6（本轮实施部分，逐项状态见报告 §3）**：T044 已实现（FK 派生写入经语句作用域取锁），
 T039/T042 新增验收测试；T037/T038/T040/T041/T043/T045/T046 的复核结论见报告。
 
-### 本轮证据文件
+### 第十四轮（T039/T042/T044 派生写入：ON DUPLICATE 外键级联、新旧索引锁、等待后重验）
+
+证据：`.tmp/b14-phase5-report.md`、`.tmp/b14-acceptance.txt`。新增测试 `executor/locking_derived_test.go`（7 项）。
+生产改动：`executor/mutation_insert_modes.go`（`updateDuplicateInsertRow` 改为"先锁行 → 在锁下重读当前行 →
+再求值 → 申报新主键/新索引资源（II+X 成对）→ 执行参照动作 → 写入"，新增 `errUpsertTargetGone` 处理等待期间
+目标行消失的情形；`writeInsertedRow` 把该哨兵转为普通插入）。
+
+**当前实现状态（与本文件上文历史记录对照）**：DML 三条写入路径（INSERT/UPDATE/DELETE 及 JOIN、
+multi-DELETE、INSERT SELECT）都开语句级 `dmlLockScope` 并按"表意向 → 主键行 → 索引条目"取锁；
+`applyForeignKeyActions` 的 CASCADE/SET NULL 派生写经 `lockCascadeTarget` 复用
+`indexEntryLocks`/`acquireRowLocksForKey`；REPLACE 与 ON DUPLICATE KEY UPDATE 同样经该作用域取锁。
+历史记录里"没有 DML 取锁 / 目标锁刻意停用 / INSERT 不阻塞"的描述**仅代表最初一轮**，已被上述实现取代。
+
+**本轮修复的三个缺陷（最小复现 → 根因 → 修复）**：
+1. `INSERT parent(id=1) ON DUPLICATE KEY UPDATE id=2` 不触发 `ON UPDATE CASCADE`（子行仍指向旧主键，
+   而等价的 `UPDATE parent SET id=2` 会级联）——根因：`writeVersionedRow` 只做引用校验、不执行参照动作，
+   而 `updateDuplicateInsertRow` 没有像 `modify_update.go` 那样调用 `applyForeignKeyActions`。
+2. 同一语句**只申报旧行与旧索引资源**，不申报新主键/新 UNIQUE/Secondary 资源——根因：取锁调用传了
+   `updated=nil` 且在赋值求值之前执行。
+3. **用等待前的行求值并写入**——根因：冲突行是在取锁之前读出的，等待期间他人提交的修改会被覆盖。
+
 | 文件 | 内容 |
 |---|---|
 | `.tmp/b02-baseline.md` | T001 实施前测试基线（环境、退出码、21 包结果、耗时、已存在失败=0） |

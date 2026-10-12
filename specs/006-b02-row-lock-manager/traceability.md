@@ -373,6 +373,15 @@ Phase 3（US1）的前置条件已就绪：
 | （本轮第三个缺陷）同 bundle 兄弟被当作 older waiter | **已修复**：`waitersAhead`/`olderBlockers` 会把同一 bundle 的 `Gap(a,m)` 当作 `II(b)` 的 older waiter（包含判定为真），使"同域两组件"的请求永久排队且图上无边；现按 `sameBundleRequest` 跳过自身兄弟。 |
 | 证据 | 新增 `lockmanager/claim_identity_test.go`（A–H 八项）与 `resource_test.go: TestB07ClaimIdentityIsExactInsideOneDomain`；**修复前 6/8 失败**（`.tmp/b07-before.txt`），**修复后全部通过**（`.tmp/b07-after.txt`）。`executor/lock_plan_test.go: TestT025SQLInsertRespectsAProtectedRange` 按用户要求重写为"T1 持锁期间 T3 必须完成"，替换原先在释放后才跑范围外插入的时序。T021–T027 的既有验收在修复后仍全部通过，完成标记保持。 |
 
+## A16. 第十四轮（ON DUPLICATE 外键级联、新旧索引锁、等待后重验）
+
+| 上一版结论 | 现状（`.tmp/b14-phase5-report.md`、`.tmp/b14-acceptance.txt`） |
+|---|---|
+| T042 的 ON DUPLICATE KEY UPDATE 只锁旧行后直接写入 | **三个缺陷已修**：① 未调用 `applyForeignKeyActions` ⇒ `INSERT parent(id=1) ON DUPLICATE KEY UPDATE id=2` **不触发** `ON UPDATE CASCADE`（等价 UPDATE 会触发）；② 只申报旧行/旧索引资源（组件级证据：捕获到的请求只有旧唯一值 `uq_v` 的 II+X）；③ 用**等待前**的行求值并写入 ⇒ 覆盖等待期间他人提交的修改。修法：先锁行 → 在锁下用 `readLockedValue` 重读当前行 → 再求值 → `lockCascadeTarget(..., currentRow, updated)` 申报新主键与全部新索引项（`indexEntryLocks` 负责 II 与 Record X 成对）→ 执行参照动作 → 写入；等待期间目标行消失时返回 `errUpsertTargetGone`，调用方按普通插入处理。 |
+| T039/T044 的派生写等待后重验无测试 | **已补测**：`TestT044CascadeRevalidatesTheChildItWaitedFor`（等待后不覆盖他人的另一列修改）、`TestT044CascadeRespectsTheCurrentChildState`（子行被删除/改指向后派生写不得复活或覆盖）、`TestT044MultiLevelFailureRollsBackTheStatement`（多层任一步失败 ⇒ 语句整体回滚，父/子/孙均不变）、`TestT042DuplicateVariantsDoNotSwallowLockErrors`（REPLACE/IGNORE/ON DUPLICATE 不得吞掉锁等待超时）。 |
+| T042 的参照动作覆盖（ON UPDATE SET NULL / RESTRICT / 多层） | **已覆盖**：`TestT042OnDuplicateUpdateHonoursEveryUpdateAction`、`TestT042OnDuplicateUpdateCascadesAcrossLevels`、`TestT042OnDuplicateKeyUpdateRunsForeignKeyActions`（与等价 UPDATE 对照）。**未覆盖**：显式 `NO ACTION` 与**自引用**外键。 |
+| Phase 6 历史文字"尚未接入任何 DML 锁" | 已按用户要求保留历史记录并在同段明确**当前实现状态**（三条写入路径均开语句级 `dmlLockScope`、派生写经 `lockCascadeTarget` 复用既有加锁器）。 |
+
 ## A15. 第十三轮（Phase 5 质量门禁 + Phase 6 部分实施）
 
 | 上一版结论 | 现状（`.tmp/b13-phase5-report.md`、`.tmp/b13-acceptance.txt`） |

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"gbaselite/parser"
+	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
 	"strings"
@@ -82,6 +83,14 @@ func writeInsertedRow(ctx context.Context, write storageengine.Txn, session *Ses
 	}
 	if len(mode.onDuplicate) > 0 {
 		affected, err := updateDuplicateInsertRow(ctx, write, session, locks, target, row, conflicts, mode.onDuplicate)
+		if errors.Is(err, errUpsertTargetGone) {
+			// The conflicting row vanished while this statement waited for its lock: the candidate is a
+			// plain insert now, and its own insertion claim was already taken by the caller.
+			if err := writeVersionedRow(ctx, write, target.definition, nil, nil, row, fallback); err != nil {
+				return insertOutcome{}, err
+			}
+			return insertOutcome{affected: 1, inserted: true}, nil
+		}
 		return insertOutcome{affected: affected}, err
 	}
 	if mode.replace {
@@ -188,15 +197,38 @@ func replaceDuplicateInsertRow(ctx context.Context, write storageengine.Txn, ses
 // conflicting row. Assignments are evaluated like the legacy executor: plain
 // column names read the row being updated (including earlier assignments in the
 // same list) and VALUES(column) reads the candidate row.
+//
+// The conflict that brought the statement here was found *before* anything was locked, so it describes
+// a version of the row rather than the row itself. The order below is therefore: claim the row, re-read
+// it under the claim, evaluate the assignments against what is actually there, claim the resources the
+// new values install, run the referential actions of those values, and only then write. Evaluating
+// against the pre-lock row would write over a change another session committed while this statement
+// waited, and skipping the referential actions is what left a cascading child behind the old key.
 func updateDuplicateInsertRow(ctx context.Context, write storageengine.Txn, session *Session, locks *dmlLockScope, target *insertTarget, candidate storage.Row, conflicts []insertConflict, assignments []parser.InsertAssignment) (int, error) {
 	conflict := conflicts[0]
-	// ON DUPLICATE KEY UPDATE rewrites an existing row, so it claims that row and the index values the
-	// rewrite installs, exactly as an explicit UPDATE of the same row would.
-	if err := lockCascadeTarget(locks, target.definition, conflict.key, conflict.row, nil); err != nil {
-		return 0, err
+	currentRow := conflict.row
+	if locks != nil {
+		grant, err := locks.acquireRowLocksForKey(target.definition, conflict.key, nil)
+		if err != nil {
+			return 0, err
+		}
+		observation, err := locks.readLockedValue(ctx, grant, sqllayout.Rows(target.definition.ID), conflict.key)
+		if err != nil {
+			return 0, err
+		}
+		if !observation.Exists {
+			// The row the duplicate check found is gone: the statement is a plain insert now, which the
+			// caller performs because it owns the heap fallback identity.
+			return 0, errUpsertTargetGone
+		}
+		decoded, err := decodeSQLRow(target.definition, observation.Value)
+		if err != nil {
+			return 0, err
+		}
+		currentRow = decoded
 	}
 	columns := target.columns
-	updated := append(storage.Row(nil), conflict.row...)
+	updated := append(storage.Row(nil), currentRow...)
 	for _, assignment := range assignments {
 		position, ok := insertColumnPosition(target, assignment.Column)
 		if !ok {
@@ -232,11 +264,28 @@ func updateDuplicateInsertRow(ctx context.Context, write storageengine.Txn, sess
 		}
 		updated[position] = converted
 	}
-	if err := writeVersionedRow(ctx, write, target.definition, conflict.key, conflict.row, updated, ""); err != nil {
+	// The values the rewrite installs are known now, so the resources *they* need are claimed too: the
+	// new primary key and every index entry of the new row, each insertion claim paired with the record
+	// claim it belongs to (indexEntryLocks builds that pairing) so a concurrent range cannot slip past.
+	if err := lockCascadeTarget(locks, target.definition, conflict.key, currentRow, updated); err != nil {
+		return 0, err
+	}
+	// The referential actions of the values this rewrite installs: an upsert that moves a referenced key
+	// must cascade exactly like the equivalent UPDATE, or child rows keep pointing at a key that no
+	// longer exists.
+	if err := applyForeignKeyActions(ctx, write, session, locks, target.definition, currentRow, updated, nil, 0); err != nil {
+		return 0, err
+	}
+	if err := writeVersionedRow(ctx, write, target.definition, conflict.key, currentRow, updated, ""); err != nil {
 		return 0, err
 	}
 	return 1, nil
 }
+
+// errUpsertTargetGone reports that the row an ON DUPLICATE KEY UPDATE was about to rewrite disappeared
+// while the statement waited for its lock. The caller then treats the statement as a plain insert,
+// which is what the row's absence means.
+var errUpsertTargetGone = errors.New("the upsert target no longer exists")
 
 func insertColumnPosition(target *insertTarget, name string) (int, bool) {
 	unqualified := stripQualifier(name)
@@ -247,5 +296,3 @@ func insertColumnPosition(target *insertTarget, name string) (int, bool) {
 	}
 	return 0, false
 }
-
-var _ = errors.Is
