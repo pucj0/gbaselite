@@ -706,10 +706,10 @@ func (e *lockEntry) ownerBlocksWith(ownerID string, mode Mode, entry *lockReques
 		if claim.request == entry.req {
 			continue
 		}
-		if claim.pending && claim.request != nil && claim.request.EnqueueOrdinal > entry.req.EnqueueOrdinal {
-			// A *younger* pending claim arrived after this request. The queue is FIFO, so it must
-			// not block an older request: doing so would let every later arrival hold back an
-			// earlier one for ever.
+		if claim.pending {
+			// A pending claim belongs to a request that is still waiting. It is not an applied grant,
+			// so it cannot generate a HOLDER block or a HOLDER edge: the fairness rule handles older
+			// waiters separately through waitersAhead and olderBlockers (as EdgeOlderWaiter).
 			continue
 		}
 		// The conflict decision needs the held component's own bounds, because a Gap blocks an

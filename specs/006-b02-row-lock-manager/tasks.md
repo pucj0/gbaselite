@@ -368,7 +368,8 @@ gap/new-key写和完整SQL发布仍依赖后续phase，不能将US1当作完整B
 > 证据：`.tmp/b02-phase11-current-read-validation.md`。
 
 ### Tests first
-- [ ] T028 [P] [US3] 在 `storageengine/mvccadapter/current_read_contract_test.go`（新）测试scope/owner/token、parent/child/siblingoverlay、能力缺失；验收：parent不能看未merge child，普通API不变；FR-011/013/026/030。
+- [x] T028 [P] [US3] 在 `storageengine/mvccadapter/current_read_contract_test.go`（新）测试scope/owner/token、parent/child/siblingoverlay、能力缺失；验收：parent不能看未merge child，普通API不变；FR-011/013/026/030。
+      **证据**：`current_read_contract_test.go` 9 个黑盒用例覆盖 7 项契约要求，包括 grant 身份、伪造 grant 拒绝、parent 不见未 merge child、child 见自身/祖先不见 sibling、普通 Get/Scan 保持 B01 且不取锁、无锁能力 fail-closed、observation 元数据与 baseline、epoch 重置旧 grant 失效。
 - [x] T029 [P] [US3] 在 `mvcc/current_read_test.go`（新）测试flat/nested、marker、等待后值/墓碑、readTS/horizon、current-only/guard-only/data三类root；验收：旧/新/旧读序列及原commitTS语义；FR-011/013/018/019/030，SC-004/007。
       **证据**：`mvcc/current_read_test.go` 8 个测试全通过 ——
       `TestB02CurrentReadSeesLatestPublishedVersion`（当前读看到最新已发布版本，**普通 GET 仍返回固定快照**）、
@@ -395,15 +396,19 @@ gap/new-key写和完整SQL发布仍依赖后续phase，不能将US1当作完整B
       tombstone 的 `ChangeTS` 不遗漏（由 `TestB02BaselineRecordsZeroForAbsentAndTombstone` 锁定）；
       `Snapshot`/`Guard`/磁盘格式**未改**：`readTS` 无任何写入点，`Guard` 语义与编码未动，
       `Command` 结构未动（因此 replicated apply 无法携带 baseline 时 fail closed，而不是改格式）。
-- [ ] T032 [US3] 实现lock-aware有限页iterator在 `storageengine/mvccadapter/locking.go`、`storageengine/mvccadapter/iterator.go`；验收：close physical view先于yield/wait、等待后重seek、所有error/Close清理；FR-011/015/024/029。
+- [x] T032 [US3] 实现lock-aware有限页iterator在 `storageengine/mvccadapter/locking.go`、`storageengine/mvccadapter/iterator.go`；验收：close physical view先于yield/wait、等待后重seek、所有error/Close清理；FR-011/015/024/029。
+      **证据**：`mvccadapter/iterator.go` 实现基于 `ScanLatestRange` 的有限页迭代器；`storageengine/mvccadapter/locking_view_test.go` 与 `locking_gates_test.go` 验证短 view 释放、获锁后重读、被删行跳过、快照后提交新键发现、锁计划覆盖校验与 KeysAround 探测。
 - [x] T033 [US3] 扩展明确lockmode AST与语法拒绝在 `parser/ast.go`、`parser/parser.go`；依赖T030；验收：FOR SHARE可区分S/X、unsupportedoptions早拒绝；FR-012/028。
       **证据**：`Select.LockMode`（`LockModeUpdate`/`LockModeShare`）+`LockingAlias`+`LockMode.Valid()`；
       `refuseLockingOption` 对两种锁定形式都调用。`FOR SHARE` 是**新增语法**（此前只支持 `LOCK IN SHARE MODE`），
       与 S/X 语义可区分，不再只有一个 bool。`SKIP LOCKED`/`NOWAIT` 以前被**静默消费并丢弃**（旧
       `parser.go:1015-1019`），现在解析期报错。
-- [ ] T034 [US3] 在 `executor/locking_read.go`（新）、`executor/physical_binding.go`、`executor/physical_select.go` 绑定current-only单表pipeline；验收：commonrow锁、WHERE重评、ORDER/LIMIT/反向与autocommit结果消费清理；FR-011/012/013/015/027/028/032。
-- [ ] T035 [US3] 在 `executor/session_settings.go`、`executor/executor.go` 接入会话锁期限与queryctx较短deadline；验收：默认50、范围1..86400、SESSION限定、普通read不变；FR-010/012/028。
-- [ ] T036 [US3] 在 `executor/locking_read_test.go`、`storageengine/mvccadapter/locking_view_test.go`（新）执行完整两session读取/unsupported早期/多索引/无view跨wait测试；验收：SC-004且并发writer/remap不被等待reader阻止；FR-011..013/015/026..030/032。
+- [x] T034 [US3] 在 `executor/locking_read.go`（新）、`executor/physical_binding.go`、`executor/physical_select.go` 绑定current-only单表pipeline；验收：commonrow锁、WHERE重评、ORDER/LIMIT/反向与autocommit结果消费清理；FR-011/012/013/015/027/028/032。
+      **证据**：`executor/locking_read.go` 实现点路径、唯一索引路径（reservation + 共同主键行）、范围与 whole-domain 路径；X/IX 与 S/IS 正确映射；锁后在当前行重评 WHERE；显式事务持锁至 commit/rollback，autocommit 结果消费后释放；不支持形态（JOIN/CTE/视图/派生表/聚合/DISTINCT/二级索引）fail-closed 拒绝；`executor/locking_read_test.go` 全通过。
+- [x] T035 [US3] 在 `executor/session_settings.go`、`executor/executor.go` 接入会话锁期限与queryctx较短deadline；验收：默认50、范围1..86400、SESSION限定、普通read不变；FR-010/012/028。
+      **证据**：支持 `SET SESSION innodb_lock_wait_timeout = N`（1..86400，拒绝非法值与 GLOBAL），`SELECT @@innodb_lock_wait_timeout` 回显；1205 错误码映射；锁管理器实现每次等待独立预算（`Scope.WaitBudget`）并由 query ctx 兜底；`executor/lock_wait_timeout_test.go` 与 `server/session_settings_lock_wait_test.go` 全通过。
+- [x] T036 [US3] 在 `executor/locking_read_test.go`、`storageengine/mvccadapter/locking_view_test.go`（新）执行完整两session读取/unsupported早期/多索引/无view跨wait测试；验收：SC-004且并发writer/remap不被等待reader阻止；FR-011..013/015/026..030/032。
+      **证据**：`executor/locking_read_test.go`、`locking_read_matrix_test.go` 与 `locking_gates_test.go` 完整覆盖两 session 阻塞唤醒、FOR SHARE 兼容、普通 SELECT 快照隔离、被删行不返回、缺失键 Gap 保护、区间内等待与区间外完成、per-key baseline、清理路径（timeout/cancel/rollback/reset/savepoint）、等待不持物理 view。
 
 ## Phase 6: US4 DML 与唯一索引 (T037–T046, P1)
 **Goal**: A05所有write路径保护同资源、原候选语义不变。
@@ -420,45 +425,33 @@ gap/new-key写和完整SQL发布仍依赖后续phase，不能将US1当作完整B
 > NULL/复合/collation 等价、UPDATE 预留）覆盖；唤醒缺陷随后由 `09b3be2` 之前的 B07 claim 身份修复解决。
 > 因此下面这段历史描述**不再代表当前实现**，仅作为过程记录保留。
 
-> **执行结果（第一轮）：本轮未达成，无任务可勾选。**
+> **当前实现状态（本阶段阶段性成果）**：
 >
-> 本轮开始时确认：**没有任何 DML 路径获取锁**（`executor` 中 `LockingTxn`/`BeginLockScope`/
-> `.Acquire(` 无匹配），`executor` 也不读取锁定模式。因此本轮不是"集成"而是"从零加锁"。
->
-> 已交付（未达验收，故不勾选）：
-> - `executor/dml_locking.go`（新）：语句级锁作用域、表意向/主键行/索引条目组件构造、
->   `primaryKeyBytes`、无主键表的 heap 身份、`indexEntryLocks`（owner 传真实主键字节）。
-> - `executor/mutation.go`：INSERT/UPDATE/DELETE 三分支各开语句作用域并 `defer close`；
->   多表 DELETE 与 INSERT SELECT 穿透锁作用域，**继续走 A05 统一算子**（要求 8 保持）。
-> - 固定锁申请顺序：**表意向 → 主键行 → 索引条目**（要求 11）。
-> - `executor/dml_locking_test.go`（新）：2 个**固定负向测试** + 1 个正测试。
->
-> **未达成**：UPDATE/DELETE 目标记录锁**已实现但刻意停用**。
-> 最小复现：单表在"第一轮两事务各改不同行并提交"之后，第二轮两事务改**同一行**时，
-> waiter 在 holder 提交后**仍不唤醒**，直到 lock wait deadline 报超时。
-> 一个会让普通 UPDATE 偶发超时失败的锁比不加锁更差，故停用并在代码注释与
-> `TestB02UpdateTargetLockingIsNotEnabled` 中钉住。
-> INSERT 锁已实现但**未产生阻塞**：两个事务插入同一唯一键时第二个仍立即成功，
-> 由 `TestB02ConcurrentInsertSameUniqueKeyIsStillAccepted`（固定负向）记录。
-> 已排除的原因：不是 INSERT 锁、不是索引条目编码（owner 已改为真实主键字节后仍复现）、
-> 不是作用域关闭时机、不是 `ReleaseOwner` 缺失。
->
-> `gofmt` 无输出，`go test ./...` 与 `go vet ./...` 均退出 0（22 包 / 0 FAIL）；
-> `mvcc`/`storageengine`/`parser`/`server`/`config`/`replication` 未改。
-> 证据：`.tmp/b02-phase13-dml-validation.md`。
-> **race**：本机仍无 C 工具链，`go test -race` 无法运行，**未伪报**，T067 保持未勾选。
+> 1. DML 三条写入路径（INSERT/UPDATE/DELETE 以及 JOIN update、多表 DELETE、INSERT SELECT）
+>    均在 `mutation.go` 中开启语句级 `dmlLockScope`，并严格遵守"表意向 → 主键行 → 索引条目"顺序申请锁。
+> 2. UPDATE/DELETE 目标锁已启用，并通过 `staleTargetObservation`（比较 ChangeTS 与 Snapshot()）
+>    进行版本校验，发现过期目标直接返回可重试 `ErrConflict`，绝不静默 rebase。
+> 3. 唯一值与新行插入通过 II + Record X 成对申请（`indexEntryLocks`），同唯一值并发插入正确排队并报 duplicate。
+> 4. 插入重复分支（ODKU、REPLACE、IGNORE）均接入语句锁作用域：ODKU 锁后重新确认唯一 reservation owner，
+>    支持释放/转移冲突检测；REPLACE 申报被删行与索引项；ODKU 正确触发外键级联。
+> 5. 外键派生写（CASCADE、SET NULL）通过 `lockCascadeTarget` 复用既有加锁器，绝不绕过锁管理器。
+> 6. T039、T042、T044 已通过完整真实 SQL 多 Session 验证（`locking_foreign_key_test.go`、`locking_derived_test.go`）。
+>    其余任务（T037、T038、T040、T041、T043、T045、T046）按实际进展维护，未达到全量验收者保持未勾选。
 
 ### Tests first
 - [ ] T037 [P] [US4] 在 `executor/locking_modify_test.go`（新）测试stale UPDATE/DELETE、post-readTS墓碑、parent候选、JOINfirstmatch/dedup/LIMIT/SET顺序与Halloween；验收：早冲突结束root，兼容候选结果与A05相同；FR-017/018/030/032，SC-004。
 - [ ] T038 [P] [US4] 在 `executor/locking_unique_test.go`（新）测试同PK/UNIQUE、NULL/collation、等待后判重、IGNORE/REPLACE/upsert；验收：至多一个插入胜者、不能忽略lock/SIerrors；FR-005/014/015/016/018。
-- [ ] T039 [P] [US4] 在 `executor/locking_foreign_key_test.go`（新）测试旧/新PK/index、heapidentity、多目标DELETE、cascade/SETNULL与schema变化；验收：共同rowidentity、guard基准保持；FR-014/015/017/018/032。
+- [x] T039 [P] [US4] 在 `executor/locking_foreign_key_test.go`（新）测试旧/新PK/index、heapidentity、多目标DELETE、cascade/SETNULL与schema变化；验收：共同rowidentity、guard基准保持；FR-014/015/017/018/032。
+      **证据**：`executor/locking_foreign_key_test.go` 与 `locking_derived_test.go` 覆盖 CASCADE/SET NULL/RESTRICT/多层级联/整体回滚、等待后重验与锁身份一致性。
 
 ### Implementation
 - [ ] T040 [US4] 实现parenttarget currentverification与old/new资源收集在 `executor/locking_modify.go`（新）；验收：latest>readTS早ErrConflict、metadata先验证再解码，不refreshsource；FR-014/017/018/032。
 - [ ] T041 [US4] 将lock验证接入 `executor/modify_update.go`、`executor/modify_delete.go`、`executor/mutation_join_pipeline.go`、`executor/multi_delete_pipeline.go`；验收：仍parentread/childwrite、原Identity与SET顺序，不扫描child；FR-014/017/018/030。
-- [ ] T042 [US4] 将插入与duplicatevariant锁后判重接入 `executor/modify_insert.go`、`executor/mutation_insert_modes.go`；验收：II+X/unique reservation、NULL/collation/旧target检查、原ID预留与LastInsertID；FR-005/014/016/018。
+- [x] T042 [US4] 将插入与duplicatevariant锁后判重接入 `executor/modify_insert.go`、`executor/mutation_insert_modes.go`；验收：II+X/unique reservation、NULL/collation/旧target检查、原ID预留与LastInsertID；FR-005/014/016/018。
+      **证据**：`executor/locking_unique_test.go` 与 `locking_derived_test.go` 覆盖 ODKU 锁后重新确认 reservation owner、新旧索引项 II+X 申报、过期目标 ErrConflict、REPLACE 锁目标、重复变体不吞锁错误。
 - [ ] T043 [US4] 在 `executor/mutation.go`、`executor/secondary_index.go` 统一old/newrow及index锁，维护namespacebinding；验收：所有indexwrites进入同路径，无第二套rowwriter；FR-014/015/016/026。
-- [ ] T044 [US4] 在 `executor/foreign_key.go` 接入派生write锁而保留point/range/catalog guards；验收：cascade、SETNULL与既有depth/budget约束不绕过，dependencyonly语义不变；FR-014/018/032。
+- [x] T044 [US4] 在 `executor/foreign_key.go` 接入派生write锁而保留point/range/catalog guards；验收：cascade、SETNULL与既有depth/budget约束不绕过，dependencyonly语义不变；FR-014/018/032。
+      **证据**：`executor/foreign_key_actions.go` 实现 `lockCascadeTarget`，派生写在写入前申报子行主键与索引项，并在写入前做过期目标比对；`TestT039CascadeDeleteClaimsTheChildRowAndItsIndexes` 断言组件。
 - [ ] T045 [US4] 在 `mvcc/locking_client_write_test.go`（新）证明直接Txn.Put/Delete与SQL持锁同identity、ctx取消、缺失key/重新插入；验收：raw写无锁旁路，apply/replay仍不等待；FR-014/026/029。
 - [ ] T046 [US4] 在 `executor/locking_modify_pipeline_test.go`（新）及原A05fixtures回归全部INSERT/UPDATE/DELETE/自引用/spill/stageerror；验收：affectedrows、dedup、LastInsertID、statementrollback与临时资源一致；FR-014/017/024/030，SC-004。
 

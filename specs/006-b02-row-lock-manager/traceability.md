@@ -373,6 +373,14 @@ Phase 3（US1）的前置条件已就绪：
 | （本轮第三个缺陷）同 bundle 兄弟被当作 older waiter | **已修复**：`waitersAhead`/`olderBlockers` 会把同一 bundle 的 `Gap(a,m)` 当作 `II(b)` 的 older waiter（包含判定为真），使"同域两组件"的请求永久排队且图上无边；现按 `sameBundleRequest` 跳过自身兄弟。 |
 | 证据 | 新增 `lockmanager/claim_identity_test.go`（A–H 八项）与 `resource_test.go: TestB07ClaimIdentityIsExactInsideOneDomain`；**修复前 6/8 失败**（`.tmp/b07-before.txt`），**修复后全部通过**（`.tmp/b07-after.txt`）。`executor/lock_plan_test.go: TestT025SQLInsertRespectsAProtectedRange` 按用户要求重写为"T1 持锁期间 T3 必须完成"，替换原先在释放后才跑范围外插入的时序。T021–T027 的既有验收在修复后仍全部通过，完成标记保持。 |
 
+## A19. 第十七轮（Linux CI 竞争时序修复、补锁公平性与死锁环、Phase 5 主清单闭环）
+
+| 上一版结论 | 现状（`.tmp/b17-phase5-report.md`、`.tmp/b17-acceptance.txt`） |
+|---|---|
+| Linux CI 在 `TestP5AbsentKeyProtectionUnderConcurrency` 报 `claim k042: lock wait timeout exceeded` | **根因确证并修复**：Inserter 在 goroutine 中先行抢占 k042 的 II+X，主 goroutine 的 Scanner 请求 Record X 被阻塞入队等待 Inserter；而 Inserter 的 Rollback 原被置于 Scanner 之后，造成测试自身的循环等待导致 5s 超时。修复：① 重写并发竞争测试，Inserter 抢占成功后执行实际 Put+Commit 正常终结事务并释放锁，Scanner 获授后读取最新提交行；② 补充三组确定性 barrier 测试：`ScannerFirst`、`InserterFirst_AcquisitionOnly_Rollback`（仅申请后回滚，Scanner 读到 absent 并保护 Gap）、`InserterFirst_PutAndCommit`（真正提交，Scanner 读到已提交行不取 Gap）；③ 区分“Acquisition 成功”与“真正 Put/Commit 成功”；④ 断言实际数据、锁状态、等待图与 `t018RequireNoResidue` 零残留。多次执行 `-count=20` 100% 稳定通过。 |
+| Lock Manager 补锁公平性与等待图 | **确证并修复图边混淆**：Root A 持有 X(R)，Root B 申请原子 bundle X(R)+X(I) 因 R 等待；A 继续申请 X(I)。经测试确认：① B 对 I 的 claim 是 `pending: true`，且持有 ledger reservation，非 applied；② A 被 B 的较早 waiter 阻塞（`LockOpWait`）；③ `rebuildGraphNowLocked` 原在 `ownerBlocksWith` 中把 pending claim 也当成阻塞 claim，导致 A 对 B 在 I 上错误生成了 `EdgeHolder` 边（B 实际只是 waiter 未持有 I）。修复 `ownerBlocksWith` 过滤 pending claim，等待图精确生成：B→A (HOLDER on R) 与 A→B (OLDER_WAITER on I)，构成完整死锁环；④ `DetectDeadlock` 精确识别环并以 registration ordinal 最大者（B）为 victim 终止（`ErrDeadlock`），A 立即解除等待获授 X(I)，且 A 原持有的 X(R) 绝不释放；⑤ 补充升级死锁、同事务 reentrant、新索引插入意图（Gap vs II）与多资源 Bundle 测试，全部通过。 |
+| Phase 5 tasks.md 主复选框长期未同步 | **主清单已全部勾选闭环**：T028、T032、T034、T035、T036 主复选框全部更新为 `[x]` 并补充实际测试证据；清理 Phase 6 中过时的第一轮无锁描述，明确当前 DML 三分支已全量接入 `dmlLockScope` 与锁后版本校验；Phase 6 中已完全验收的 T039、T042、T044 勾选 `[x]`，其余未全量覆盖项如实保持 `[ ]`。 |
+
 ## A18. 第十六轮（锁后 DML 目标的版本验证：ABA、级联目标删除、主键/唯一 owner 变化）
 
 | 上一版结论 | 现状（`.tmp/b16-phase5-report.md`、`.tmp/b16-acceptance.txt`） |

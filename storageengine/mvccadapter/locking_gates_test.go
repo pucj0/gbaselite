@@ -217,6 +217,244 @@ func TestP5StaleBoundsAfterAConcurrentDelete(t *testing.T) {
 	t018RequireNoResidue(t, e)
 }
 
+// t05LockedPointRead replicates the full openLockedPoint production logic:
+// Acquire Record X -> ReadCurrent -> if exists, return observation.
+// If absent -> KeysAround -> Acquire Gap -> ReadCurrent recheck -> return observation.
+func t05LockedPointRead(t *testing.T, ctx context.Context, locking storageengine.LockingTxn, scope uint64, key string) storageengine.CurrentObservation {
+	t.Helper()
+	grant, err := locking.Acquire(ctx, scope, storageengine.LockRequest{Components: t05RecordClaim(key, storageengine.LockModeX)})
+	if err != nil {
+		t.Fatalf("claim %s: %v", key, err)
+	}
+	observation, err := locking.ReadCurrent(ctx, grant, t032Space, []byte(key))
+	if err != nil {
+		t.Fatalf("read %s under its claim: %v", key, err)
+	}
+	if observation.Exists {
+		return observation
+	}
+	previous, next, err := locking.KeysAround(ctx, t032Space, []byte(key))
+	if err != nil {
+		t.Fatalf("keys around %s: %v", key, err)
+	}
+	if _, err := locking.Acquire(ctx, scope, storageengine.LockRequest{Components: t05IntervalClaim(previous, next)}); err != nil {
+		t.Fatalf("protect the gap around %s: %v", key, err)
+	}
+	recheck, err := locking.ReadCurrent(ctx, grant, t032Space, []byte(key))
+	if err != nil {
+		t.Fatalf("re-read %s under gap claim: %v", key, err)
+	}
+	return recheck
+}
+
+// TestP5AbsentKeyProtection_Deterministic_ScannerFirst proves the deterministic path where scanner
+// acquires protection first: scanner holds Record X and Gap, inserter is blocked, and once scanner
+// finishes inserter can proceed.
+func TestP5AbsentKeyProtection_Deterministic_ScannerFirst(t *testing.T) {
+	e := t018OpenEngine(t)
+	ctx := context.Background()
+	t032Seed(t, e, "k010", "v")
+	t032Seed(t, e, "k100", "v")
+
+	scanner := t018Begin(t, e)
+	scannerLocking := t032Locking(t, scanner)
+	scannerScope := t032Scope(t, ctx, scannerLocking)
+
+	// Scanner completes absent-key protection first (Record X + Gap on k042):
+	obs := t05LockedPointRead(t, ctx, scannerLocking, scannerScope, "k042")
+	if obs.Exists {
+		t.Fatalf("k042 exists, want absent")
+	}
+
+	inserter := t018Begin(t, e)
+	inserterLocking := t032Locking(t, inserter)
+	inserterScope := t032Scope(t, ctx, inserterLocking)
+
+	// 1. Inserter with ShouldWait: false is immediately rejected with ErrConflict:
+	if !t05InsertBlocked(t, ctx, inserterLocking, inserterScope, "k042") {
+		t.Fatal("insertion at k042 was allowed despite scanner's gap lock")
+	}
+
+	// 2. Inserter with ShouldWait: true is queued waiting for Scanner's gap:
+	queued := make(chan error, 1)
+	go func() {
+		_, err := inserterLocking.Acquire(ctx, inserterScope, storageengine.LockRequest{
+			Components: t05InsertionClaim("k042"),
+		})
+		queued <- err
+	}()
+	t032AwaitPending(t, e, inserter.ID(), 1)
+	if edges := e.locks.WaitEdges(); len(edges) == 0 {
+		t.Fatal("expected wait edges from inserter to scanner")
+	}
+
+	// Scanner rolls back:
+	if err := scanner.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Inserter is unblocked and granted:
+	select {
+	case err := <-queued:
+		if err != nil {
+			t.Fatalf("queued insert failed after scanner rollback: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued inserter never unblocked after scanner rollback")
+	}
+
+	// Inserter can now Put and Commit:
+	if err := inserter.Put(t032Space, []byte("k042"), []byte("v-inserted")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inserter.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify final data: k042 exists
+	checkTx := t018Begin(t, e)
+	val, ok, err := checkTx.Get(t032Space, []byte("k042"))
+	if err != nil || !ok || string(val) != "v-inserted" {
+		t.Fatalf("k042 should exist with v-inserted, got ok=%v val=%s", ok, val)
+	}
+	_ = checkTx.Rollback()
+	t018RequireNoResidue(t, e)
+}
+
+// TestP5AbsentKeyProtection_Deterministic_InserterFirst_AcquisitionOnly_Rollback proves the case
+// where inserter acquires lock first, scanner queues behind it, and when inserter rolls back (without
+// writing), scanner wakes up, observes absent, and protects the gap.
+func TestP5AbsentKeyProtection_Deterministic_InserterFirst_AcquisitionOnly_Rollback(t *testing.T) {
+	e := t018OpenEngine(t)
+	ctx := context.Background()
+	t032Seed(t, e, "k010", "v")
+	t032Seed(t, e, "k100", "v")
+
+	inserter := t018Begin(t, e)
+	inserterLocking := t032Locking(t, inserter)
+	inserterScope := t032Scope(t, ctx, inserterLocking)
+
+	// Inserter acquires lock first (acquisition only, no Put/Commit):
+	_, err := inserterLocking.Acquire(ctx, inserterScope, storageengine.LockRequest{
+		Components: t05InsertionClaim("k042"),
+	})
+	if err != nil {
+		t.Fatalf("inserter acquire failed: %v", err)
+	}
+
+	scanner := t018Begin(t, e)
+	scannerLocking := t032Locking(t, scanner)
+	scannerScope := t032Scope(t, ctx, scannerLocking)
+
+	// Scanner requests point read in goroutine -> will wait on Record X held by inserter!
+	done := make(chan storageengine.CurrentObservation, 1)
+	go func() {
+		obs := t05LockedPointRead(t, ctx, scannerLocking, scannerScope, "k042")
+		done <- obs
+	}()
+	t032AwaitPending(t, e, scanner.ID(), 1)
+
+	// Assert wait graph: scanner -> inserter
+	if edges := e.locks.WaitEdges(); len(edges) == 0 {
+		t.Fatal("expected wait edges from scanner to inserter")
+	}
+
+	// Inserter rolls back without Put/Commit:
+	if err := inserter.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Scanner wakes up, acquires Record X, sees absent, protects Gap:
+	var obs storageengine.CurrentObservation
+	select {
+	case obs = <-done:
+		if obs.Exists {
+			t.Fatalf("scanner saw row exists after inserter rollback without commit")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scanner never woke up after inserter rollback")
+	}
+
+	if err := scanner.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify final data: k042 does not exist
+	checkTx := t018Begin(t, e)
+	val, ok, err := checkTx.Get(t032Space, []byte("k042"))
+	if err != nil || ok {
+		t.Fatalf("k042 should not exist in store, got ok=%v, val=%s", ok, val)
+	}
+	_ = checkTx.Rollback()
+	t018RequireNoResidue(t, e)
+}
+
+// TestP5AbsentKeyProtection_Deterministic_InserterFirst_PutAndCommit proves the case where inserter
+// acquires lock and commits a real Put: scanner queues, and when inserter commits, scanner wakes up,
+// observes the committed row, and returns it without taking a gap lock.
+func TestP5AbsentKeyProtection_Deterministic_InserterFirst_PutAndCommit(t *testing.T) {
+	e := t018OpenEngine(t)
+	ctx := context.Background()
+	t032Seed(t, e, "k010", "v")
+	t032Seed(t, e, "k100", "v")
+
+	inserter := t018Begin(t, e)
+	inserterLocking := t032Locking(t, inserter)
+	inserterScope := t032Scope(t, ctx, inserterLocking)
+
+	// Inserter acquires lock AND stages Put:
+	_, err := inserterLocking.Acquire(ctx, inserterScope, storageengine.LockRequest{
+		Components: t05InsertionClaim("k042"),
+	})
+	if err != nil {
+		t.Fatalf("inserter acquire failed: %v", err)
+	}
+	if err := inserter.Put(t032Space, []byte("k042"), []byte("v-committed")); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := t018Begin(t, e)
+	scannerLocking := t032Locking(t, scanner)
+	scannerScope := t032Scope(t, ctx, scannerLocking)
+
+	// Scanner requests point read in goroutine -> waits on Record X held by inserter:
+	done := make(chan storageengine.CurrentObservation, 1)
+	go func() {
+		obs := t05LockedPointRead(t, ctx, scannerLocking, scannerScope, "k042")
+		done <- obs
+	}()
+	t032AwaitPending(t, e, scanner.ID(), 1)
+
+	// Inserter commits -> publishes row and releases lock:
+	if _, err := inserter.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Scanner wakes up, acquires Record X, sees published row:
+	var obs storageengine.CurrentObservation
+	select {
+	case obs = <-done:
+		if !obs.Exists || string(obs.Value) != "v-committed" {
+			t.Fatalf("scanner should see committed row, got exists=%v, val=%s", obs.Exists, obs.Value)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scanner never woke up after inserter commit")
+	}
+
+	if err := scanner.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify final data: k042 exists with "v-committed":
+	checkTx := t018Begin(t, e)
+	val, ok, err := checkTx.Get(t032Space, []byte("k042"))
+	if err != nil || !ok || string(val) != "v-committed" {
+		t.Fatalf("k042 should exist with v-committed, got ok=%v, val=%s", ok, val)
+	}
+	_ = checkTx.Rollback()
+	t018RequireNoResidue(t, e)
+}
+
 // TestP5AbsentKeyProtectionUnderConcurrency races a real insertion against the absent-key protection and
 // asserts the safety invariant: whenever the insert succeeds, the reader must have observed the row. A
 // single run cannot choose the interleaving, so the invariant is asserted and the repetition is what
@@ -232,8 +470,6 @@ func TestP5AbsentKeyProtectionUnderConcurrency(t *testing.T) {
 			scanner := t018Begin(t, e)
 			scannerLocking := t032Locking(t, scanner)
 			scannerScope := t032Scope(t, ctx, scannerLocking)
-			// Both transactions are created here, on the test goroutine: the helper reports failures with
-			// t.Fatalf, which is only legal from the goroutine running the test.
 			inserter := t018Begin(t, e)
 			inserterLocking := t032Locking(t, inserter)
 			inserterScope := t032Scope(t, ctx, inserterLocking)
@@ -244,23 +480,26 @@ func TestP5AbsentKeyProtectionUnderConcurrency(t *testing.T) {
 					Components: t05InsertionClaim("k042"),
 					ShouldWait: func(context.Context) bool { return false },
 				})
+				if err == nil {
+					// Inserter won the race and acquired the lock: commit the insert so scanner waiting
+					// on it can wake up and observe the committed row!
+					_ = inserter.Put(t032Space, []byte("k042"), []byte("v-concurrent"))
+					_, _ = inserter.Commit(ctx)
+				}
 				inserted <- err
 			}()
 
-			t05ProtectAbsent(t, ctx, scannerLocking, scannerScope, "k042")
-			// What the reader's decision rests on: it re-reads the key under its claim.
-			grant, err := scannerLocking.Acquire(ctx, scannerScope, storageengine.LockRequest{Components: t05RecordClaim("k042", storageengine.LockModeS)})
-			if err != nil {
-				t.Fatalf("re-claim for the re-read: %v", err)
-			}
-			observation, err := scannerLocking.ReadCurrent(ctx, grant, t032Space, []byte("k042"))
-			if err != nil {
-				t.Fatalf("re-read under the claim: %v", err)
-			}
+			observation := t05LockedPointRead(t, ctx, scannerLocking, scannerScope, "k042")
 			select {
 			case insertErr := <-inserted:
-				if insertErr == nil && !observation.Exists {
-					t.Fatal("the insert at the absent key succeeded while the reader still observed it missing: the claim lost the position")
+				if insertErr == nil {
+					if !observation.Exists || string(observation.Value) != "v-concurrent" {
+						t.Fatalf("inserter committed but scanner saw exists=%v val=%s", observation.Exists, observation.Value)
+					}
+				} else {
+					if observation.Exists {
+						t.Fatalf("inserter was blocked (%v) but scanner saw row exists", insertErr)
+					}
 				}
 			case <-time.After(10 * time.Second):
 				t.Fatal("the racing insert never finished")

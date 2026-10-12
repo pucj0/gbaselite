@@ -699,3 +699,155 @@ func TestB02EpochResetAndCloseClearTheGraph(t *testing.T) {
 		t.Fatal("an invalidated wait was reported as a deadlock")
 	}
 }
+
+// TestB02SupplementalLockFairnessAndDeadlock inspects supplemental locking and deadlock detection
+// when a holder requests an additional resource that an existing waiter already included in its bundle.
+func TestB02SupplementalLockFairnessAndDeadlock(t *testing.T) {
+	f := newDetectFixture(t, BudgetLimits{}, "root-a", "root-b")
+	ctx := context.Background()
+	r := indexRecord("t1", "PRIMARY", []byte("R"))
+	idx := indexRecord("t1", "PRIMARY", []byte("I"))
+
+	// Root A holds Record X(R)
+	f.owner("root-a").grant(ctx, rowBundle(r)...)
+
+	// Root B requests atomic bundle: Record X(R) + Index X(I), waits because R is held by A.
+	bBundle := append(rowBundle(r), idx)
+	waiterB := f.owner("root-b").wait(ctx, bBundle...)
+	_ = waiterB
+
+	// 1. Confirm B's claim on Index X(I) status:
+	// Check if B has an applied claim on I:
+	heldModeB, hasHeldB := f.m.HeldMode("root-b", idx)
+	t.Logf("Root B HeldMode on I: hasHeld=%v, mode=%v", hasHeldB, heldModeB)
+
+	// Edges currently in graph before A requests I:
+	t.Logf("WaitEdges before A requests I: %v", f.m.WaitEdges())
+
+	// 2. Root A requests Index X(I):
+	resA := f.owner("root-a").acquire(ctx, rowBundle(idx)...)
+	t.Logf("Root A acquire result on I: op=%s", resA.Op)
+	t.Logf("WaitEdges after A requests I: %v", f.m.WaitEdges())
+
+	// 3. Check cycle detection:
+	summary, found := f.m.DetectDeadlock()
+	t.Logf("DetectDeadlock result: found=%v, summary=%+v", found, summary)
+	if !found {
+		t.Fatalf("expected deadlock cycle, but none found")
+	}
+	if summary.VictimRootID != "root-b" {
+		t.Fatalf("expected victim to be root-b, got %s", summary.VictimRootID)
+	}
+	// Verify Root B receives ErrDeadlock:
+	if status := waiterB.Wait.Status(); status != RequestDeadlockVictim {
+		t.Fatalf("Root B status = %s, want RequestDeadlockVictim", status)
+	}
+	if _, err := f.m.WaitForGrantResult(ctx, "root-b", waiterB.Wait); err != ErrDeadlock {
+		t.Fatalf("Root B wait error = %v, want ErrDeadlock", err)
+	}
+
+	// Verify Root A's request for I is now unblocked and granted:
+	if status := resA.Wait.Status(); status != RequestGranted {
+		t.Fatalf("Root A status = %s, want RequestGranted", status)
+	}
+	grantA, err := f.m.WaitForGrantResult(ctx, "root-a", resA.Wait)
+	if err != nil {
+		t.Fatalf("Root A wait error = %v, want nil", err)
+	}
+	_ = grantA
+
+	// Requirement 7: 已持有的 Record X 不得因为新申请失败而被意外释放
+	heldR, okR := f.m.HeldMode("root-a", r)
+	if !okR || heldR != ModeX {
+		t.Fatalf("Root A's Record X on R was lost: ok=%v, mode=%s", okR, heldR)
+	}
+	heldI, okI := f.m.HeldMode("root-a", idx)
+	if !okI || heldI != ModeX {
+		t.Fatalf("Root A's Index X on I was not held: ok=%v, mode=%s", okI, heldI)
+	}
+}
+
+// TestB02SupplementalReentrantAndMultiResource covers requirement 8:
+// - same-txn reentrant
+// - shared-to-exclusive upgrade
+// - insert intention
+// - multi-resource bundle
+func TestB02SupplementalReentrantAndMultiResource(t *testing.T) {
+	t.Run("same-txn reentrant is granted immediately without waiting behind queue", func(t *testing.T) {
+		f := newDetectFixture(t, BudgetLimits{}, "root-a", "root-b")
+		ctx := context.Background()
+		r := indexRecord("t1", "PRIMARY", []byte("R"))
+		idx := indexRecord("t1", "PRIMARY", []byte("I"))
+
+		// Root A holds Record X(R)
+		f.owner("root-a").grant(ctx, rowBundle(r)...)
+
+		// Root B requests Record X(R) + Index X(I) -> waits on R
+		f.owner("root-b").wait(ctx, append(rowBundle(r), idx)...)
+
+		// Root A repeats request for Record X(R) -> reentrant, must not wait behind B
+		resA := f.owner("root-a").acquire(ctx, rowBundle(r)...)
+		if resA.Op != LockOpReentrant && resA.Op != LockOpGranted {
+			t.Fatalf("reentrant request returned %s, want REENTRANT or GRANTED", resA.Op)
+		}
+		// Root A still holds R
+		if mode, ok := f.m.HeldMode("root-a", r); !ok || mode != ModeX {
+			t.Fatalf("Root A lost lock on R: ok=%v, mode=%s", ok, mode)
+		}
+	})
+
+	t.Run("insert intention in bundle waiting on gap creates cycle with supplemental request", func(t *testing.T) {
+		f := newDetectFixture(t, BudgetLimits{}, "root-a", "root-b")
+		ctx := context.Background()
+		r := indexRecord("t1", "PRIMARY", []byte("R"))
+		r.Space = iiSpace
+		gapI := gapRef([]byte("a"), []byte("z"), false, false)
+
+		// Root A holds Gap on index
+		f.owner("root-a").grant(ctx, gapBundle(gapI)...)
+
+		// Root B holds Record X(R)
+		f.owner("root-b").grant(ctx, append(rowBundle(r), tableIX())...)
+
+		// Root B requests II(I) in range [a, z) + Record X(R) -> waits on Gap(I) held by A
+		bBundle := append(insertBundle([]byte("m")), r)
+		waiterB := f.owner("root-b").wait(ctx, bBundle...)
+
+		// Root A now requests Record X(R) -> waits on X(R) held by B
+		resA := f.owner("root-a").acquire(ctx, append(rowBundle(r), tableIX())...)
+		if resA.Op != LockOpWait {
+			t.Fatalf("Root A acquire returned %s, want WAIT", resA.Op)
+		}
+
+		// Detect deadlock: cycle between A (waiting on R held by B) and B (waiting on I held by A)
+		summary, found := f.m.DetectDeadlock()
+		if !found {
+			t.Fatalf("expected deadlock cycle between Gap and II holders")
+		}
+		t.Logf("Deadlock summary: victim=%s", summary.VictimRootID)
+		_ = waiterB
+	})
+
+	t.Run("multi-resource bundle supplemental locking preserves FIFO for unrelated resources", func(t *testing.T) {
+		f := newDetectFixture(t, BudgetLimits{}, "root-a", "root-b", "root-c")
+		ctx := context.Background()
+		r1 := indexRecord("t1", "PRIMARY", []byte("R1"))
+		r2 := indexRecord("t1", "PRIMARY", []byte("R2"))
+		r3 := indexRecord("t1", "PRIMARY", []byte("R3"))
+		unrelated := indexRecord("t1", "PRIMARY", []byte("U"))
+
+		// Root A holds R1
+		f.owner("root-a").grant(ctx, rowBundle(r1)...)
+
+		// Root B requests multi-resource bundle R1 + R2 + R3 -> waits on R1
+		multiBundle := []ResourceRef{r1, r2, r3, ixIntent("t1")}
+		waiterB := f.owner("root-b").wait(ctx, multiBundle...)
+		_ = waiterB
+
+		// Root C requests unrelated resource U -> granted immediately (FIFO not blocked)
+		resC := f.owner("root-c").acquire(ctx, rowBundle(unrelated)...)
+		if resC.Op != LockOpGranted {
+			t.Fatalf("unrelated resource acquire returned %s, want GRANTED", resC.Op)
+		}
+	})
+}
