@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -88,14 +87,6 @@ func writeInsertedRow(ctx context.Context, write storageengine.Txn, session *Ses
 	}
 	if len(mode.onDuplicate) > 0 {
 		affected, err := updateDuplicateInsertRow(ctx, write, session, locks, target, row, conflicts, mode.onDuplicate)
-		if errors.Is(err, errUpsertTargetGone) {
-			// The conflicting row vanished while this statement waited for its lock: the candidate is a
-			// plain insert now, and its own insertion claim was already taken by the caller.
-			if err := writeVersionedRow(ctx, write, target.definition, nil, nil, row, fallback); err != nil {
-				return insertOutcome{}, err
-			}
-			return insertOutcome{affected: 1, inserted: true}, nil
-		}
 		return insertOutcome{affected: affected}, err
 	}
 	if mode.replace {
@@ -183,7 +174,7 @@ func replaceDuplicateInsertRow(ctx context.Context, write storageengine.Txn, ses
 	for _, conflict := range conflicts {
 		// REPLACE removes the conflicting row: the removal and the FK actions it triggers are writes
 		// like any other and claim their resources through the statement's scope.
-		if err := lockCascadeTarget(locks, target.definition, conflict.key, conflict.row, nil); err != nil {
+		if err := lockCascadeTarget(ctx, write, locks, target.definition, conflict.key, conflict.row, nil); err != nil {
 			return insertOutcome{}, err
 		}
 		if err := applyForeignKeyActions(ctx, write, session, locks, target.definition, conflict.row, nil, nil, 0); err != nil {
@@ -226,22 +217,12 @@ func updateDuplicateInsertRow(ctx context.Context, write storageengine.Txn, sess
 		if err != nil {
 			return 0, err
 		}
-		if !observation.Exists {
-			// The row the duplicate check found is gone: the statement is a plain insert now, which the
-			// caller performs because it owns the heap fallback identity.
-			return 0, errUpsertTargetGone
-		}
-		// The row is read under the claim to answer one question only: is it still the version this
-		// statement's snapshot read? Any difference means another transaction committed a change after
-		// this statement's readTS, and FR-017/FR-018 make that a retryable conflict rather than a new
-		// row to recompute the assignments on. Re-evaluating on the new version would silently rebase the
-		// statement onto data it never read, and the locked observation must not become a fresh write
-		// baseline for a target the statement's own snapshot rejects.
-		snapshotEncoded, err := encodeSQLRow(target.definition, conflict.row)
-		if err != nil {
-			return 0, err
-		}
-		if !bytes.Equal(observation.Value, snapshotEncoded) {
+		// The row is read under the claim to answer one question: is it still the *version* this
+		// statement's snapshot read? Byte equality is not that question — a row changed and changed back
+		// is byte-identical — so the answer comes from the observation's own version metadata
+		// (staleTargetObservation). A stale target is the retryable conflict FR-017/FR-018 prescribe, and
+		// re-evaluating on the new version would silently rebase the statement onto data it never read.
+		if staleTargetObservation(write, observation) {
 			return 0, storageengine.ErrConflict
 		}
 	}
@@ -285,7 +266,7 @@ func updateDuplicateInsertRow(ctx context.Context, write storageengine.Txn, sess
 	// The values the rewrite installs are known now, so the resources *they* need are claimed too: the
 	// new primary key and every index entry of the new row, each insertion claim paired with the record
 	// claim it belongs to (indexEntryLocks builds that pairing) so a concurrent range cannot slip past.
-	if err := lockCascadeTarget(locks, target.definition, conflict.key, currentRow, updated); err != nil {
+	if err := lockCascadeTarget(ctx, write, locks, target.definition, conflict.key, currentRow, updated); err != nil {
 		return 0, err
 	}
 	// The referential actions of the values this rewrite installs: an upsert that moves a referenced key
@@ -299,11 +280,6 @@ func updateDuplicateInsertRow(ctx context.Context, write storageengine.Txn, sess
 	}
 	return 1, nil
 }
-
-// errUpsertTargetGone reports that the row an ON DUPLICATE KEY UPDATE was about to rewrite disappeared
-// while the statement waited for its lock. The caller then treats the statement as a plain insert,
-// which is what the row's absence means.
-var errUpsertTargetGone = errors.New("the upsert target no longer exists")
 
 func insertColumnPosition(target *insertTarget, name string) (int, bool) {
 	unqualified := stripQualifier(name)

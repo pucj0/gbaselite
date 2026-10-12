@@ -1254,6 +1254,25 @@ reservation owner 重算，**冲突指向哪一行**仍取本语句快照）、`
 3. **连带缺陷**：等待后受让的 CASCADE 派生写返回**永久**外键错误（派生值由等待前的行算出）。
    `lockCascadeTarget` 加入同样的过期比对 ⇒ 可重试 `ErrConflict`；重试后级联成功且保留他人对该行的修改。
 
+### 第十六轮（锁后 DML 目标的**版本**验证：ABA、级联目标删除、主键/唯一 owner 变化）
+
+证据：`.tmp/b16-phase5-report.md`、`.tmp/b16-acceptance.txt`。新增测试 `executor/locking_stale_version_test.go`
+（7 个测试 / 8 个用例）。生产改动：`executor/dml_locking.go`（新增 `staleTargetObservation`：按
+**Source / HasChange / ChangeTS vs Txn.Snapshot()** 判定过期目标，Overlay 永不判过期）、
+`executor/mutation_insert_modes.go`（upsert 的锁后判定改用该函数；移除 `errUpsertTargetGone` 的"自动转普通插入"
+路径——目标消失同样属于过期目标，按契约返回可重试冲突）、`executor/foreign_key_actions.go`
+（`lockCascadeTarget` 改用该函数，并**接受语句 Context**：原为 `context.Background()`，取消时无法及时终止）。
+
+**修复前失败证据（真实 SQL）**：① ABA（`(1,7)→v=8→v=7`）后 T2 的 upsert 返回 `<nil>`（字节比较认为快照有效）；
+② 主键删除后重新插入 → `<nil>`；③ 唯一值 ABA（reservation 删除后由同一行重建，owner 值字节相同）→ 放行；
+④ 级联目标在等待期间被删除 → 原先 `Exists=false` 时直接跳过校验（可能复活已删除的行）；⑤ 级联目标 ABA → 放行。
+**修复后**：五种情形均返回可重试 `ErrConflict`，且不覆盖/不复活任何行（终态逐项断言）；本事务自身 Overlay 的
+upsert 仍按 read-your-writes 正常更新；普通 `SELECT ... FOR UPDATE` 的 Current Read 语义未改动（既有用例全绿）。
+
+**附带发现（记录，未在本轮修复）**：持有者若在**已有其他事务等待**同一资源时再申请该资源上的**追加**组件
+（例如先 `SELECT ... FOR UPDATE` 再 `DELETE` 需要索引项），会按公平队列排在等待者之后 → 双方互等直至超时。
+两个级联测试因此调整为"持有者先完成自身写入、等待者再入队"（可观测契约不变）；该队列顺序问题作为独立发现列入报告。
+
 | 文件 | 内容 |
 |---|---|
 | `.tmp/b02-baseline.md` | T001 实施前测试基线（环境、退出码、21 包结果、耗时、已存在失败=0） |

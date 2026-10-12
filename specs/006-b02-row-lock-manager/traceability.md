@@ -373,6 +373,15 @@ Phase 3（US1）的前置条件已就绪：
 | （本轮第三个缺陷）同 bundle 兄弟被当作 older waiter | **已修复**：`waitersAhead`/`olderBlockers` 会把同一 bundle 的 `Gap(a,m)` 当作 `II(b)` 的 older waiter（包含判定为真），使"同域两组件"的请求永久排队且图上无边；现按 `sameBundleRequest` 跳过自身兄弟。 |
 | 证据 | 新增 `lockmanager/claim_identity_test.go`（A–H 八项）与 `resource_test.go: TestB07ClaimIdentityIsExactInsideOneDomain`；**修复前 6/8 失败**（`.tmp/b07-before.txt`），**修复后全部通过**（`.tmp/b07-after.txt`）。`executor/lock_plan_test.go: TestT025SQLInsertRespectsAProtectedRange` 按用户要求重写为"T1 持锁期间 T3 必须完成"，替换原先在释放后才跑范围外插入的时序。T021–T027 的既有验收在修复后仍全部通过，完成标记保持。 |
 
+## A18. 第十六轮（锁后 DML 目标的版本验证：ABA、级联目标删除、主键/唯一 owner 变化）
+
+| 上一版结论 | 现状（`.tmp/b16-phase5-report.md`、`.tmp/b16-acceptance.txt`） |
+|---|---|
+| 锁后目标校验用 `bytes.Equal(快照行, 当前行)` | **改为版本校验**：新增 `staleTargetObservation`，按 `Source / HasChange / ChangeTS vs Txn.Snapshot()` 判定；Overlay（本事务/祖先暂存）永不判过期以保留 read-your-writes。**修复前**：ABA（`(1,7)→8→7`）的 upsert 返回 `<nil>`、主键删除后重插返回 `<nil>`、唯一值 ABA 放行、级联目标被删除时**跳过校验**（可能复活已删除行）、级联 ABA 放行。**修复后**五者均返回可重试 `ErrConflict` 且终态无覆盖/无复活；`TestP2UpsertAcceptsItsOwnStagedOverlay` 证明显式保留自身 Overlay 的合法更新。 |
+| `lockCascadeTarget` 使用 `context.Background()` | **改为语句 Context**（取消可及时终止），并复用同一版本校验。 |
+| 预期外的仓库状态 | 本轮开始时工作树**丢失了 274 个已跟踪测试文件**（仅 `executor/` 下 101 个测试文件只剩 1 个）；已用 `git restore .` 恢复（仅测试文件受影响、内容未改动），随后才执行验收。 |
+| CI（Ubuntu MVCC transaction race regression） | **无法读取 CI 日志/堆栈**（本机无网络）⇒ 不区分"既有不稳定"与"真实数据竞争"，也不声明通过；可执行替代：`./mvcc -count=5`、`./executor/... -count=5`、`./lockmanager/... -count=5` **全部通过且未复现**；`go test -race` 因无 C 工具链**未执行**。 |
+
 ## A17. 第十五轮（P1：过期目标不 Rebase + 唯一 reservation 释放语义 + 真正等待后唤起）
 
 | 上一版结论 | 现状（`.tmp/b15-phase5-report.md`、`.tmp/b15-acceptance.txt`） |

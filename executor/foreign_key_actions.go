@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -148,7 +147,7 @@ func cascadeForeignKeyAction(ctx context.Context, write storageengine.Txn, sessi
 		// resources through the statement's own lock scope: a derived write that wrote without claiming
 		// would change rows an explicit writer is holding a lock on, which is precisely the bypass the
 		// lock manager exists to prevent.
-		if err := lockCascadeTarget(locks, child, target.key, target.row, updated); err != nil {
+		if err := lockCascadeTarget(ctx, write, locks, child, target.key, target.row, updated); err != nil {
 			return err
 		}
 		if action == "CASCADE" && newRow == nil {
@@ -177,7 +176,7 @@ func cascadeForeignKeyAction(ctx context.Context, write storageengine.Txn, sessi
 // derivation observed), then the replacement's unique reservations: a SET NULL or CASCADE update frees
 // a value and installs another, and both halves must be claimed exactly as an explicit UPDATE claims
 // them.
-func lockCascadeTarget(locks *dmlLockScope, child versionedTable, key []byte, oldRow, updated storage.Row) error {
+func lockCascadeTarget(ctx context.Context, write storageengine.Txn, locks *dmlLockScope, child versionedTable, key []byte, oldRow, updated storage.Row) error {
 	if locks == nil {
 		// A backend without a lock manager keeps the concurrency control it always had.
 		return nil
@@ -191,21 +190,21 @@ func lockCascadeTarget(locks *dmlLockScope, child versionedTable, key []byte, ol
 		return err
 	}
 	// The derived write was computed from the row this statement's snapshot read. Another transaction may
-	// have committed a change to that row while this statement waited for the claim, and writing the
-	// derivation over it would discard that commit — or, as the referential validation then reports it,
-	// fail with a permanent reference error for a value derived from a row that is no longer current. The
-	// contract's answer for a target whose newest committed change is newer than the statement's readTS is
-	// the retryable conflict (FR-017/FR-018), so it is reported here, before any derived write.
+	// have committed a change to that row while this statement waited for the claim — including deleting
+	// it — and writing the derivation over that would discard the commit (or write the row back into
+	// existence). The contract's answer for a target whose newest committed change is newer than the
+	// statement's readTS is the retryable conflict (FR-017/FR-018), reported here before any derived
+	// write. The check is on the row's *version*, not its bytes: a child rewritten and restored while the
+	// statement waited is byte-identical and still stale.
+	//
+	// The statement's own context is used, so a cancelled statement stops waiting for this verification
+	// instead of running it to completion on a background context.
 	if oldRow != nil {
-		observation, err := locks.readLockedValue(context.Background(), grant, sqllayout.Rows(child.ID), key)
+		observation, err := locks.readLockedValue(ctx, grant, sqllayout.Rows(child.ID), key)
 		if err != nil {
 			return err
 		}
-		snapshotEncoded, err := encodeSQLRow(child, oldRow)
-		if err != nil {
-			return err
-		}
-		if observation.Exists && !bytes.Equal(observation.Value, snapshotEncoded) {
+		if staleTargetObservation(write, observation) {
 			return storageengine.ErrConflict
 		}
 	}

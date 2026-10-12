@@ -287,6 +287,38 @@ func (s *dmlLockScope) readLockedValue(ctx context.Context, grant storageengine.
 // without any signal.
 var errLockIdentityUnavailable = errors.New("cannot derive the lock identity of a modified row")
 
+// staleTargetObservation reports whether a locked observation of a DML target is newer than the
+// statement's own snapshot.
+//
+// A byte comparison of the observed row against the row the snapshot read answers the wrong question: a
+// row rewritten to another value and back again is byte-identical while its version, and every index
+// entry that named it, were replaced after the statement's readTS. A target whose newest committed
+// change is newer than the statement's snapshot is the conflict FR-017/FR-018 prescribes, so the
+// comparison is made on the *version* the storage layer recorded:
+//
+//   - an observation taken from this transaction's own (or an ancestor's) layer is not a committed
+//     change at all: it is the statement's read-your-writes view, and it is never stale;
+//   - a published observation whose change sequence is at or below the statement's snapshot is the
+//     version the statement itself read, so the target is unchanged;
+//   - a published observation newer than the snapshot, or a target that has no observation at all where
+//     the statement read one, is stale: the statement's candidate describes a version that is gone, and
+//     it must be retried rather than rewritten.
+func staleTargetObservation(txn storageengine.Txn, observation storageengine.CurrentObservation) bool {
+	if observation.Source == storageengine.CurrentSourceOverlay {
+		return false
+	}
+	if !observation.Exists {
+		return true
+	}
+	if !observation.HasChange {
+		return false
+	}
+	if txn == nil {
+		return true
+	}
+	return observation.ChangeTS > txn.Snapshot()
+}
+
 // dmlLockRequestHook, when non-nil, may adjust the neutral lock request a mutation is about to
 // issue. It exists so a concurrency acceptance test can install the neutral ShouldWait decision
 // and observe the exact moment a request is about to wait on another owner, which is what makes
