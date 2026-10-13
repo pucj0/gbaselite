@@ -235,7 +235,11 @@ func (n *Node) VerifyLeader(ctx context.Context) error {
 		return err
 	}
 	if err := wait(ctx, n.raft.VerifyLeader()); err != nil {
-		n.onLeaderLoss()
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if n.raft != nil && n.raft.State() != raft.Leader {
+				n.onLeaderLoss()
+			}
+		}
 		return err
 	}
 	return nil
@@ -245,15 +249,31 @@ func (n *Node) Barrier(ctx context.Context) error {
 		return err
 	}
 	if err := wait(ctx, n.raft.VerifyLeader()); err != nil {
-		n.onLeaderLoss()
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if n.raft != nil && n.raft.State() != raft.Leader {
+				n.onLeaderLoss()
+			}
+		}
 		return err
 	}
 	if err := wait(ctx, n.raft.Barrier(timeout(ctx))); err != nil {
-		n.onLeaderLoss()
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if n.raft != nil && n.raft.State() != raft.Leader {
+				n.onLeaderLoss()
+			}
+		}
 		return err
 	}
 	n.SyncLockEpoch()
 	return nil
+}
+
+// LeadershipTransfer instructs Raft to transfer leadership to another peer in the cluster.
+func (n *Node) LeadershipTransfer(ctx context.Context) error {
+	if err := n.check(); err != nil {
+		return err
+	}
+	return wait(ctx, n.raft.LeadershipTransfer())
 }
 
 func (n *Node) onLeaderLoss() {

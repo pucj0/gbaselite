@@ -4,95 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"gbaselite/mvcc"
 	"gbaselite/replication"
 	"gbaselite/storageengine"
-	"gbaselite/storageengine/mvccadapter"
 )
 
 // locking_epoch_test.go is the T054 suite: leader-only Current Read, Barrier vs VerifyLeader,
 // Term fence, and loss-wake on replication.
 
 func TestT054LeaderBarrierLinearizableOrderingAndTermFence(t *testing.T) {
-	var peers []replication.Peer
-	for i := 0; i < 3; i++ {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		peers = append(peers, replication.Peer{ID: fmt.Sprint(i), Address: l.Addr().String()})
-		l.Close()
-	}
-
-	dirs := make([]string, 3)
-	engines := make([]storageengine.Engine, 3)
-	defer func() {
-		for _, e := range engines {
-			if e != nil {
-				e.Close()
-			}
-		}
-	}()
-
-	openNode := func(i int) {
-		dirs[i] = t.TempDir()
-		opts := storageengine.Options{
-			Replication: &storageengine.ReplicationOptions{
-				ID:        peers[i].ID,
-				Bind:      peers[i].Address,
-				Advertise: peers[i].Address,
-				Directory: filepath.Join(dirs[i], "raft"),
-				Bootstrap: i == 0,
-			},
-		}
-		for _, p := range peers {
-			opts.Replication.Peers = append(opts.Replication.Peers, storageengine.Peer{ID: p.ID, Address: p.Address})
-		}
-		var err error
-		engines[i], err = mvccadapter.Open(filepath.Join(dirs[i], "data"), opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	for i := 0; i < 3; i++ {
-		openNode(i)
-	}
-
-	// Wait for leader election
-	leaderIdx := -1
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		for i, eng := range engines {
-			if repEng, ok := eng.(storageengine.ReplicatedEngine); ok {
-				rep := repEng.Replica()
-				if rep != nil && rep.Status().State == "Leader" {
-					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-					err := rep.Barrier(ctx)
-					cancel()
-					if err == nil {
-						leaderIdx = i
-						break
-					}
-				}
-			}
-		}
-		if leaderIdx >= 0 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if leaderIdx < 0 {
-		t.Fatal("failed to elect a leader within deadline")
-	}
-
-	leaderEng := engines[leaderIdx]
+	tc := newTestCluster(t, 3)
+	defer tc.Close()
+	leaderIdx := tc.WaitForLeader(15 * time.Second)
+	leaderEng := tc.engines[leaderIdx]
+	engines := tc.engines
 	ctx := context.Background()
 
 	// 1. Verify Leader Barrier succeeds on Leader
@@ -209,74 +137,10 @@ func TestT054CommandFormatHasNoNewFields(t *testing.T) {
 // leadership or closes, waiting lock requests are promptly woken with ErrLockInvalidated,
 // and the former leader cannot continue serving Current Reads under the old term.
 func TestT054LeaderLossWakesWaitersWithErrLockInvalidated(t *testing.T) {
-	var peers []replication.Peer
-	for i := 0; i < 3; i++ {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		peers = append(peers, replication.Peer{ID: fmt.Sprint(i), Address: l.Addr().String()})
-		l.Close()
-	}
-
-	dirs := make([]string, 3)
-	engines := make([]storageengine.Engine, 3)
-	defer func() {
-		for _, e := range engines {
-			if e != nil {
-				e.Close()
-			}
-		}
-	}()
-
-	for i := 0; i < 3; i++ {
-		dirs[i] = t.TempDir()
-		opts := storageengine.Options{
-			Replication: &storageengine.ReplicationOptions{
-				ID:        peers[i].ID,
-				Bind:      peers[i].Address,
-				Advertise: peers[i].Address,
-				Directory: filepath.Join(dirs[i], "raft"),
-				Bootstrap: i == 0,
-			},
-		}
-		for _, p := range peers {
-			opts.Replication.Peers = append(opts.Replication.Peers, storageengine.Peer{ID: p.ID, Address: p.Address})
-		}
-		var err error
-		engines[i], err = mvccadapter.Open(filepath.Join(dirs[i], "data"), opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	leaderIdx := -1
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		for i, eng := range engines {
-			if repEng, ok := eng.(storageengine.ReplicatedEngine); ok {
-				rep := repEng.Replica()
-				if rep != nil && rep.Status().State == "Leader" {
-					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-					err := rep.Barrier(ctx)
-					cancel()
-					if err == nil {
-						leaderIdx = i
-						break
-					}
-				}
-			}
-		}
-		if leaderIdx >= 0 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if leaderIdx < 0 {
-		t.Fatal("failed to elect a leader within deadline")
-	}
-
-	leaderEng := engines[leaderIdx]
+	tc := newTestCluster(t, 3)
+	defer tc.Close()
+	leaderIdx := tc.WaitForLeader(15 * time.Second)
+	leaderEng := tc.engines[leaderIdx]
 	ctx := context.Background()
 
 	txA, err := leaderEng.Begin(ctx)
@@ -344,7 +208,7 @@ func TestT054LeaderLossWakesWaitersWithErrLockInvalidated(t *testing.T) {
 
 	// Now shut down leader to simulate leader loss
 	leaderEng.Close()
-	engines[leaderIdx] = nil
+	tc.engines[leaderIdx] = nil
 
 	// Waiter txB must be woken with ErrLockInvalidated!
 	select {
@@ -366,74 +230,10 @@ func TestT054LeaderLossWakesWaitersWithErrLockInvalidated(t *testing.T) {
 // TestT054CurrentIteratorTermFenceInterruptsOnLeaderLoss verifies that an open CurrentIterator
 // cannot continue yielding records once the leader term moves or leadership is lost.
 func TestT054CurrentIteratorTermFenceInterruptsOnLeaderLoss(t *testing.T) {
-	var peers []replication.Peer
-	for i := 0; i < 3; i++ {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		peers = append(peers, replication.Peer{ID: fmt.Sprint(i), Address: l.Addr().String()})
-		l.Close()
-	}
-
-	dirs := make([]string, 3)
-	engines := make([]storageengine.Engine, 3)
-	defer func() {
-		for _, e := range engines {
-			if e != nil {
-				e.Close()
-			}
-		}
-	}()
-
-	for i := 0; i < 3; i++ {
-		dirs[i] = t.TempDir()
-		opts := storageengine.Options{
-			Replication: &storageengine.ReplicationOptions{
-				ID:        peers[i].ID,
-				Bind:      peers[i].Address,
-				Advertise: peers[i].Address,
-				Directory: filepath.Join(dirs[i], "raft"),
-				Bootstrap: i == 0,
-			},
-		}
-		for _, p := range peers {
-			opts.Replication.Peers = append(opts.Replication.Peers, storageengine.Peer{ID: p.ID, Address: p.Address})
-		}
-		var err error
-		engines[i], err = mvccadapter.Open(filepath.Join(dirs[i], "data"), opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	leaderIdx := -1
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		for i, eng := range engines {
-			if repEng, ok := eng.(storageengine.ReplicatedEngine); ok {
-				rep := repEng.Replica()
-				if rep != nil && rep.Status().State == "Leader" {
-					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-					err := rep.Barrier(ctx)
-					cancel()
-					if err == nil {
-						leaderIdx = i
-						break
-					}
-				}
-			}
-		}
-		if leaderIdx >= 0 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if leaderIdx < 0 {
-		t.Fatal("failed to elect a leader within deadline")
-	}
-
-	leaderEng := engines[leaderIdx]
+	tc := newTestCluster(t, 3)
+	defer tc.Close()
+	leaderIdx := tc.WaitForLeader(15 * time.Second)
+	leaderEng := tc.engines[leaderIdx]
 	ctx := context.Background()
 
 	// Seed 3 keys
@@ -501,7 +301,7 @@ func TestT054CurrentIteratorTermFenceInterruptsOnLeaderLoss(t *testing.T) {
 
 	// Now shut down leader to simulate leader loss
 	leaderEng.Close()
-	engines[leaderIdx] = nil
+	tc.engines[leaderIdx] = nil
 
 	// Next() must detect leader loss and return false with error!
 	if it.Next() {
@@ -511,4 +311,276 @@ func TestT054CurrentIteratorTermFenceInterruptsOnLeaderLoss(t *testing.T) {
 		t.Fatal("iterator returned nil error after leader loss")
 	}
 	t.Logf("Iterator properly interrupted after leader loss with error: %v", it.Err())
+}
+
+// TestT054QueryCancellationDoesNotResetLockEpoch verifies Task 2: cancelling a query context
+// or timing out on Barrier/VerifyLeader returns context.Canceled / DeadlineExceeded without
+// erroneously triggering an engine-wide Lock Epoch Reset. Held locks and waiting requests remain intact.
+func TestT054QueryCancellationDoesNotResetLockEpoch(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.Close()
+	leaderIdx := tc.WaitForLeader(15 * time.Second)
+	leaderEng := tc.engines[leaderIdx]
+	ctx := context.Background()
+
+	// 1. Root A holds lock on row k1
+	txA, err := leaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback()
+
+	locksA := txA.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	ltxA, _ := locksA.LockingTxn()
+	scopeA, err := ltxA.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tableRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeIX,
+		Kind:    storageengine.LockComponentTableIntent,
+		Space:   "row/test",
+		TableID: "t1",
+	}
+	rowRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeX,
+		Kind:    storageengine.LockComponentRecord,
+		Space:   "row/test",
+		TableID: "t1",
+		Key:     []byte("k1"),
+	}
+
+	if _, err := ltxA.Acquire(ctx, scopeA, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}}); err != nil {
+		t.Fatalf("txA Acquire failed: %v", err)
+	}
+
+	// 2. Root B requests row k1 and enters wait
+	txB, err := leaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txB.Rollback()
+
+	locksB := txB.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	ltxB, _ := locksB.LockingTxn()
+	scopeB, err := ltxB.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doneB := make(chan error, 1)
+	go func() {
+		_, err := ltxB.Acquire(ctx, scopeB, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}})
+		doneB <- err
+	}()
+
+	// Confirm B is waiting
+	select {
+	case err := <-doneB:
+		t.Fatalf("txB did not wait on held lock: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// 3. Query C executes Barrier with a cancelled context
+	rep := leaderEng.(storageengine.ReplicatedEngine).Replica()
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	errC := rep.Barrier(cancelCtx)
+	if !errors.Is(errC, context.Canceled) {
+		t.Fatalf("expected context.Canceled for C Barrier, got: %v", errC)
+	}
+
+	// Also test timeout context on VerifyLeader
+	timeoutCtx, cancelTimeout := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancelTimeout()
+	time.Sleep(time.Millisecond) // ensure expired
+	errVerify := rep.(storageengine.LeaderVerifier).VerifyLeader(timeoutCtx)
+	if !errors.Is(errVerify, context.DeadlineExceeded) && !errors.Is(errVerify, context.Canceled) {
+		t.Fatalf("expected context deadline error for VerifyLeader, got: %v", errVerify)
+	}
+
+	// 4. Assert Leader status and Term are unchanged!
+	status := rep.Status()
+	if status.State != "Leader" {
+		t.Fatalf("leader state changed unexpectedly: %s", status.State)
+	}
+
+	// 5. Assert B is STILL waiting (not woken with ErrLockInvalidated, not prematurely granted)
+	select {
+	case err := <-doneB:
+		t.Fatalf("txB was erroneously unblocked after query C cancellation: %v", err)
+	default:
+	}
+
+	// 6. Commit A -> B is woken normally!
+	if err := txA.Put("row/test", []byte("k1"), []byte("valA")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txA.Commit(ctx); err != nil {
+		t.Fatalf("txA Commit failed: %v", err)
+	}
+
+	// Now B must be granted!
+	select {
+	case err := <-doneB:
+		if err != nil {
+			t.Fatalf("txB failed after txA commit: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("txB was not woken after txA commit")
+	}
+
+	_ = txB.Rollback()
+}
+
+// TestT054RealLeadershipTransferWakesWaitersAndEnforcesTermFence tests Task 4:
+// When Leader A gracefully transfers leadership to another peer (without closing A):
+// 1. A becomes Follower;
+// 2. Waiters on A are woken with ErrLockInvalidated;
+// 3. New leader B is elected under new term;
+// 4. New leader B successfully executes Barrier, Current Read, and write;
+// 5. A's old grant cannot be used anymore.
+func TestT054RealLeadershipTransferWakesWaitersAndEnforcesTermFence(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.Close()
+	leaderIdx := tc.WaitForLeader(15 * time.Second)
+	leaderEng := tc.engines[leaderIdx]
+	ctx := context.Background()
+
+	// 1. On Leader A: Root 1 holds lock on k1, Root 2 waits on k1
+	txA, err := leaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback()
+
+	locksA := txA.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	ltxA, _ := locksA.LockingTxn()
+	scopeA, err := ltxA.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tableRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeIX,
+		Kind:    storageengine.LockComponentTableIntent,
+		Space:   "row/test",
+		TableID: "t1",
+	}
+	rowRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeX,
+		Kind:    storageengine.LockComponentRecord,
+		Space:   "row/test",
+		TableID: "t1",
+		Key:     []byte("k1"),
+	}
+
+	grantA, err := ltxA.Acquire(ctx, scopeA, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}})
+	if err != nil {
+		t.Fatalf("txA Acquire failed: %v", err)
+	}
+
+	txB, err := leaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txB.Rollback()
+
+	locksB := txB.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	ltxB, _ := locksB.LockingTxn()
+	scopeB, err := ltxB.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doneB := make(chan error, 1)
+	go func() {
+		_, err := ltxB.Acquire(ctx, scopeB, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}})
+		doneB <- err
+	}()
+
+	select {
+	case err := <-doneB:
+		t.Fatalf("txB did not wait on held lock: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// 2. Gracefully transfer leadership away from Leader A (A stays alive, does not Close!)
+	repA := leaderEng.(storageengine.ReplicatedEngine).Replica()
+	if err := repA.(storageengine.LeadershipTransferrer).LeadershipTransfer(ctx); err != nil {
+		t.Fatalf("LeadershipTransfer failed: %v", err)
+	}
+
+	// Waiter txB on former leader A must be woken with ErrLockInvalidated!
+	select {
+	case err := <-doneB:
+		if !errors.Is(err, storageengine.ErrLockInvalidated) {
+			t.Fatalf("expected ErrLockInvalidated for txB after leadership transfer, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("txB was not woken after leadership transfer")
+	}
+
+	// 3. Wait for new leader to be elected
+	newLeaderIdx := -1
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		for i, eng := range tc.engines {
+			if i == leaderIdx || eng == nil {
+				continue
+			}
+			rep := eng.(storageengine.ReplicatedEngine).Replica()
+			if rep != nil && rep.Status().State == "Leader" {
+				ctxBarrier, cancel := context.WithTimeout(context.Background(), time.Second)
+				err := rep.Barrier(ctxBarrier)
+				cancel()
+				if err == nil {
+					newLeaderIdx = i
+					break
+				}
+			}
+		}
+		if newLeaderIdx >= 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if newLeaderIdx < 0 {
+		t.Fatal("failed to elect a new leader after transfer")
+	}
+
+	// 4. On new leader: Barrier succeeds, Current Read succeeds, write succeeds and commits
+	newLeaderEng := tc.engines[newLeaderIdx]
+	txNew, err := newLeaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txNew.Rollback()
+
+	if err := txNew.Put("row/test", []byte("k1"), []byte("valNewLeader")); err != nil {
+		t.Fatal(err)
+	}
+	seqNew, err := txNew.Commit(ctx)
+	if err != nil {
+		t.Fatalf("new leader commit failed: %v", err)
+	}
+	if seqNew == 0 {
+		t.Fatal("new leader commit allocated 0 sequence")
+	}
+
+	// 5. Old grant on former leader A cannot continue to be used
+	_, err = ltxA.ReadCurrent(ctx, grantA, "row/test", []byte("k1"))
+	if err == nil {
+		t.Fatal("former leader accepted Current Read under old grant")
+	}
 }

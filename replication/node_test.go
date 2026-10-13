@@ -14,13 +14,17 @@ import (
 )
 
 func TestThreeNodeFailoverAndMinority(t *testing.T) {
+	listeners := make([]net.Listener, 3)
 	var peers []Peer
 	for i := 0; i < 3; i++ {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
+		listeners[i] = l
 		peers = append(peers, Peer{ID: fmt.Sprint(i), Address: l.Addr().String()})
+	}
+	for _, l := range listeners {
 		l.Close()
 	}
 	nodes := make([]*Node, 3)

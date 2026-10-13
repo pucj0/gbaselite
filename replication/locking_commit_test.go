@@ -3,63 +3,18 @@ package replication_test
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"gbaselite/replication"
 	"gbaselite/storageengine"
-	"gbaselite/storageengine/mvccadapter"
 )
 
 // locking_commit_test.go is the T055 replicated Raft commit path integration test.
 
 func openReplicatedCluster(t *testing.T, count int) ([]storageengine.Engine, []replication.Peer, func()) {
-	t.Helper()
-	var peers []replication.Peer
-	for i := 0; i < count; i++ {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		peers = append(peers, replication.Peer{ID: fmt.Sprint(i), Address: l.Addr().String()})
-		l.Close()
-	}
-
-	dirs := make([]string, count)
-	engines := make([]storageengine.Engine, count)
-	cleanup := func() {
-		for _, e := range engines {
-			if e != nil {
-				e.Close()
-			}
-		}
-	}
-
-	for i := 0; i < count; i++ {
-		dirs[i] = t.TempDir()
-		opts := storageengine.Options{
-			Replication: &storageengine.ReplicationOptions{
-				ID:        peers[i].ID,
-				Bind:      peers[i].Address,
-				Advertise: peers[i].Address,
-				Directory: filepath.Join(dirs[i], "raft"),
-				Bootstrap: i == 0,
-			},
-		}
-		for _, p := range peers {
-			opts.Replication.Peers = append(opts.Replication.Peers, storageengine.Peer{ID: p.ID, Address: p.Address})
-		}
-		var err error
-		engines[i], err = mvccadapter.Open(filepath.Join(dirs[i], "data"), opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	return engines, peers, cleanup
+	tc := newTestCluster(t, count)
+	return tc.engines, tc.peers, tc.Close
 }
 
 func waitForLeader(t *testing.T, engines []storageengine.Engine) int {
@@ -67,6 +22,9 @@ func waitForLeader(t *testing.T, engines []storageengine.Engine) int {
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		for i, eng := range engines {
+			if eng == nil {
+				continue
+			}
 			if repEng, ok := eng.(storageengine.ReplicatedEngine); ok {
 				rep := repEng.Replica()
 				if rep != nil && rep.Status().State == "Leader" {

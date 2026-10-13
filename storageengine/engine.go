@@ -132,6 +132,11 @@ type LeaderVerifier interface {
 	VerifyLeader(context.Context) error
 }
 
+// LeadershipTransferrer is an optional capability of a Replica to step down and transfer leadership.
+type LeadershipTransferrer interface {
+	LeadershipTransfer(context.Context) error
+}
+
 type Replica interface {
 	Barrier(context.Context) error
 	Status() ReplicationStatus

@@ -111,3 +111,83 @@ func TestT054SyncLockEpochRaftTermChange(t *testing.T) {
 		t.Fatalf("txC lost its lock after idempotent SyncLockEpoch: mode=%v held=%v", mode, held)
 	}
 }
+
+// TestT054ConcurrentSyncLockEpochTOCTOUEliminated verifies that concurrent calls to SyncLockEpoch
+// for the same term transition execute ResetEpoch at most once, and a newly registered Root
+// in the new term is not wiped out by a redundant concurrent reset.
+func TestT054ConcurrentSyncLockEpochTOCTOUEliminated(t *testing.T) {
+	f := newRawLockFixture(t)
+	ctx := context.Background()
+
+	const termN uint64 = 5
+	f.store.ResetLockEpoch(termN)
+
+	// Two concurrent SyncLockEpoch(6) requests coordinated with a start barrier
+	const termNext uint64 = 6
+	start := make(chan struct{})
+	res1 := make(chan bool, 1)
+	res2 := make(chan bool, 1)
+
+	go func() {
+		<-start
+		res1 <- f.store.SyncLockEpoch(termNext)
+	}()
+	go func() {
+		<-start
+		res2 <- f.store.SyncLockEpoch(termNext)
+	}()
+
+	close(start)
+	r1 := <-res1
+	r2 := <-res2
+
+	// Exactly one must return true (performed transition), and the other must return false (idempotent no-op)
+	if (r1 && r2) || (!r1 && !r2) {
+		t.Fatalf("expected exactly one sync to return true, got r1=%v r2=%v", r1, r2)
+	}
+
+	// Register a new Root in termNext and verify it holds a lock safely
+	propNext := &termProposer{Store: f.store, term: termNext}
+	tx, err := f.store.Begin(ctx, propNext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	if err := tx.Put(rawSpace, rawKey, []byte("valNew")); err != nil {
+		t.Fatal(err)
+	}
+	if mode, held := f.manager.HeldMode(tx.ID, xRef(rawSpace, rawKey)); !held || mode != lockmanager.ModeX {
+		t.Fatalf("new transaction lost lock: mode=%v held=%v", mode, held)
+	}
+}
+
+// TestT054StaleTermSyncCannotRevertEpoch verifies that a SyncLockEpoch request with a stale term
+// cannot roll back the epoch or invalidate newer locks.
+func TestT054StaleTermSyncCannotRevertEpoch(t *testing.T) {
+	f := newRawLockFixture(t)
+	ctx := context.Background()
+
+	const currentTerm uint64 = 20
+	f.store.ResetLockEpoch(currentTerm)
+
+	prop := &termProposer{Store: f.store, term: currentTerm}
+	tx, err := f.store.Begin(ctx, prop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	if err := tx.Put(rawSpace, rawKey, []byte("val20")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stale term 19 must be rejected and must not invalidate tx's lock
+	if synced := f.store.SyncLockEpoch(19); synced {
+		t.Fatal("SyncLockEpoch with stale term 19 returned true, expected false")
+	}
+
+	if mode, held := f.manager.HeldMode(tx.ID, xRef(rawSpace, rawKey)); !held || mode != lockmanager.ModeX {
+		t.Fatalf("tx in term 20 lost its lock after stale term sync: mode=%v held=%v", mode, held)
+	}
+}

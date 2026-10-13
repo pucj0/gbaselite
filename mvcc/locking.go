@@ -35,7 +35,7 @@ import (
 // all, which is the default and keeps B01 behaviour unchanged.
 type LockBinding struct {
 	manager *lockmanager.Manager
-	mu      sync.Mutex
+	epochMu sync.Mutex
 	// storeGeneration records the B01 generation the binding was last synchronised with, so a
 	// generation change is recognisable as an epoch change.
 	storeGeneration uint64
@@ -72,10 +72,10 @@ func (s *Store) AttachLocks(manager *lockmanager.Manager) (*LockBinding, error) 
 	if s.locks != nil && s.locks.manager != binding.manager {
 		return nil, ErrLocksAttached
 	}
-	binding.mu.Lock()
+	binding.epochMu.Lock()
 	binding.storeGeneration = s.generation.Load()
 	binding.storeTerm = 0
-	binding.mu.Unlock()
+	binding.epochMu.Unlock()
 	s.locks = binding
 	return binding, nil
 }
@@ -103,39 +103,50 @@ func (s *Store) CloseLocks() {
 // restore locks are held, which is what makes the invalidated set exact: a transaction created
 // under the old generation is already invalid because newTx registers under Store.views, and the
 // lock manager now agrees with the registry instead of keeping an owner the registry dropped.
+//
+// It is protected by binding.epochMu so concurrent epoch resets are strictly serialized and
+// monotonic: a stale term cannot overwrite a newer term, and identical (generation, term)
+// transitions are idempotent.
 func (s *Store) ResetLockEpoch(term uint64) int {
 	binding := s.locks
 	if binding == nil {
 		return 0
 	}
+	binding.epochMu.Lock()
+	defer binding.epochMu.Unlock()
+
 	generation := s.generation.Load()
-	binding.mu.Lock()
+	// Monotonicity: an epoch reset for an older term cannot roll back epoch state.
+	if generation == binding.storeGeneration && term < binding.storeTerm {
+		return 0
+	}
 	binding.storeGeneration = generation
 	binding.storeTerm = term
-	binding.mu.Unlock()
 	return binding.manager.ResetEpoch(generation, term)
 }
 
 // SyncLockEpoch synchronises the lock epoch with the store's generation and Raft leader term
 // when either has drifted, and reports whether it had to act.
 //
-// It is the safety net for a generation or term change: a caller that bumped the generation
-// through some other path or stepped into a new Raft term still cannot leave lock owners behind,
-// because the drift is detected from both the generation and the term rather than assumed.
-// Repeated calls with identical generation and term are strictly idempotent and no-ops.
+// It is protected by binding.epochMu so concurrent sync calls for the same term transition
+// execute ResetEpoch at most once without a TOCTOU race window. A second concurrent call sees
+// the updated state and returns false without performing a redundant reset that could kill
+// newly registered roots.
 func (s *Store) SyncLockEpoch(term uint64) bool {
 	binding := s.locks
 	if binding == nil {
 		return false
 	}
+	binding.epochMu.Lock()
+	defer binding.epochMu.Unlock()
+
 	generation := s.generation.Load()
-	binding.mu.Lock()
-	if binding.storeGeneration == generation && binding.storeTerm == term {
-		binding.mu.Unlock()
+	if generation == binding.storeGeneration && term <= binding.storeTerm {
 		return false
 	}
-	binding.mu.Unlock()
-	s.ResetLockEpoch(term)
+	binding.storeGeneration = generation
+	binding.storeTerm = term
+	binding.manager.ResetEpoch(generation, term)
 	return true
 }
 
