@@ -141,6 +141,7 @@ var _ storageengine.LeadershipTransferrer = replica{}
 func (r replica) VerifyLeader(ctx context.Context) error       { return r.node.VerifyLeader(ctx) }
 func (r replica) Barrier(ctx context.Context) error            { return r.node.Barrier(ctx) }
 func (r replica) LeadershipTransfer(ctx context.Context) error { return r.node.LeadershipTransfer(ctx) }
+func (r replica) Node() *replication.Node                      { return r.node }
 func (r replica) Status() storageengine.ReplicationStatus {
 	s := r.node.Status()
 	return storageengine.ReplicationStatus{ID: s.ID, State: s.State, Leader: s.Leader, LeaderID: s.LeaderID, Applied: s.Applied}

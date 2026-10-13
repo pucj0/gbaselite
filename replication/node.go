@@ -46,6 +46,11 @@ type Node struct {
 	store       *mvcc.Store
 	failure     sync.Mutex
 	fatal       error
+
+	leadershipMu sync.Mutex
+	isLeader     bool
+	leaderTerm   uint64
+	tenure       uint64
 }
 type Status struct {
 	ID, State, Leader, LeaderID string
@@ -144,16 +149,29 @@ func Open(store *mvcc.Store, options Options) (*Node, error) {
 				if !ok {
 					return
 				}
-				if !isLeader {
-					node.onLeaderLoss()
+				if isLeader {
+					node.onLeaderElected(node.Term())
 				} else {
-					node.SyncLockEpoch()
+					node.leadershipMu.Lock()
+					tenure := node.tenure
+					term := node.leaderTerm
+					if term == 0 {
+						term = node.Term()
+					}
+					isCurrentLeader := node.isLeader && node.raft != nil && node.raft.State() == raft.Leader
+					node.leadershipMu.Unlock()
+					if isCurrentLeader {
+						continue
+					}
+					node.onLeaderLoss(tenure, term)
 				}
 			case <-node.fatalSignal:
-				node.onLeaderLoss()
+				tenure, term := node.currentTenureAndTerm()
+				node.onLeaderLoss(tenure, term)
 				_ = node.raft.Shutdown().Error()
 			case <-node.stopped:
-				node.onLeaderLoss()
+				tenure, term := node.currentTenureAndTerm()
+				node.onLeaderLoss(tenure, term)
 				return
 			}
 		}
@@ -199,12 +217,34 @@ func (n *Node) check() error {
 		return n.fatal
 	}
 	if n.raft.State() != raft.Leader {
-		n.onLeaderLoss()
+		tenure, term := n.currentTenureAndTerm()
+		n.onLeaderLoss(tenure, term)
 		return fmt.Errorf("%w; raft leader=%s", ErrNotLeader, n.Status().Leader)
 	}
 	return nil
 }
+
+var (
+	waitStartedHookMu sync.Mutex
+	waitStartedHook   func()
+)
+
+// SetWaitStartedHook sets a testing hook invoked when wait begins waiting on a raft.Future.
+func SetWaitStartedHook(hook func()) func() {
+	waitStartedHookMu.Lock()
+	defer waitStartedHookMu.Unlock()
+	prev := waitStartedHook
+	waitStartedHook = hook
+	return prev
+}
+
 func wait(ctx context.Context, future raft.Future) error {
+	waitStartedHookMu.Lock()
+	hook := waitStartedHook
+	waitStartedHookMu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	done := make(chan error, 1)
 	go func() { done <- future.Error() }()
 	select {
@@ -237,7 +277,8 @@ func (n *Node) VerifyLeader(ctx context.Context) error {
 	if err := wait(ctx, n.raft.VerifyLeader()); err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			if n.raft != nil && n.raft.State() != raft.Leader {
-				n.onLeaderLoss()
+				tenure, term := n.currentTenureAndTerm()
+				n.onLeaderLoss(tenure, term)
 			}
 		}
 		return err
@@ -251,7 +292,8 @@ func (n *Node) Barrier(ctx context.Context) error {
 	if err := wait(ctx, n.raft.VerifyLeader()); err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			if n.raft != nil && n.raft.State() != raft.Leader {
-				n.onLeaderLoss()
+				tenure, term := n.currentTenureAndTerm()
+				n.onLeaderLoss(tenure, term)
 			}
 		}
 		return err
@@ -259,7 +301,8 @@ func (n *Node) Barrier(ctx context.Context) error {
 	if err := wait(ctx, n.raft.Barrier(timeout(ctx))); err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			if n.raft != nil && n.raft.State() != raft.Leader {
-				n.onLeaderLoss()
+				tenure, term := n.currentTenureAndTerm()
+				n.onLeaderLoss(tenure, term)
 			}
 		}
 		return err
@@ -276,18 +319,63 @@ func (n *Node) LeadershipTransfer(ctx context.Context) error {
 	return wait(ctx, n.raft.LeadershipTransfer())
 }
 
-func (n *Node) onLeaderLoss() {
+func (n *Node) onLeaderElected(term uint64) {
+	n.leadershipMu.Lock()
+	n.isLeader = true
+	n.leaderTerm = term
+	n.tenure++
+	n.leadershipMu.Unlock()
+
+	n.SyncLockEpoch()
+}
+
+func (n *Node) onLeaderLoss(eventTenure uint64, eventTerm uint64) {
+	n.leadershipMu.Lock()
+	// Stale event check: if node is currently active Leader in a newer tenure or newer term, ignore!
+	if n.isLeader && (n.tenure > eventTenure || n.leaderTerm > eventTerm) {
+		n.leadershipMu.Unlock()
+		return
+	}
+	// Duplicate event check: if already stepped down for this tenure, ignore!
+	if !n.isLeader && n.tenure >= eventTenure && eventTenure > 0 {
+		n.leadershipMu.Unlock()
+		return
+	}
+	n.isLeader = false
+	n.leadershipMu.Unlock()
+
 	if n.store != nil {
-		n.store.ResetLockEpoch(n.Term())
+		n.store.ResetLockEpoch(eventTerm)
 	}
 }
+
+func (n *Node) currentTenureAndTerm() (uint64, uint64) {
+	n.leadershipMu.Lock()
+	defer n.leadershipMu.Unlock()
+	term := n.leaderTerm
+	if term == 0 {
+		term = n.Term()
+	}
+	return n.tenure, term
+}
+
+// Testing helpers for deterministic event coordination
+func (n *Node) HandleLeaderLossForTesting(tenure, term uint64) { n.onLeaderLoss(tenure, term) }
+func (n *Node) HandleLeaderElectedForTesting(term uint64)      { n.onLeaderElected(term) }
+func (n *Node) CurrentTenureForTesting() (uint64, uint64)      { return n.currentTenureAndTerm() }
 
 // SyncLockEpoch synchronizes the underlying store's lock epoch with the node's current Raft term.
 func (n *Node) SyncLockEpoch() bool {
 	if n.store == nil {
 		return false
 	}
-	return n.store.SyncLockEpoch(n.Term())
+	term := n.Term()
+	n.leadershipMu.Lock()
+	if n.isLeader && term > n.leaderTerm {
+		n.leaderTerm = term
+	}
+	n.leadershipMu.Unlock()
+	return n.store.SyncLockEpoch(term)
 }
 func (n *Node) Propose(ctx context.Context, command mvcc.Command) (mvcc.Result, error) {
 	// The publication marker is the durable commit point, so a commit that is

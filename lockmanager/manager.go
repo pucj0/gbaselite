@@ -35,6 +35,9 @@ import (
 type manager struct {
 	mu sync.Mutex
 
+	generation uint64
+	term       uint64
+
 	bindings *Bindings
 	ledger   *Ledger
 	clock    Clock
@@ -467,6 +470,8 @@ func newManager(limits BudgetLimits, generation uint64, clock Clock) (*manager, 
 		clock = SystemClock{}
 	}
 	return &manager{
+		generation:     generation,
+		term:           0,
 		bindings:       NewBindings(generation),
 		ledger:         ledger,
 		clock:          clock,
@@ -528,6 +533,26 @@ func (m *Manager) Diagnostics(options DiagnosticsOptions) LockDiagnosticsPage {
 // goroutine inside the manager, which keeps the manager free of background work and makes the
 // timeout path testable with a virtual clock.
 func (m *Manager) CheckTimeouts() int { return m.inner.CheckTimeouts() }
+
+// Generation reports the manager's current active generation.
+func (m *manager) Generation() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.generation
+}
+
+// Term reports the manager's current active leader term.
+func (m *manager) Term() uint64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.term
+}
+
+// Generation reports the manager's current active generation.
+func (m *Manager) Generation() uint64 { return m.inner.Generation() }
+
+// Term reports the manager's current active leader term.
+func (m *Manager) Term() uint64 { return m.inner.Term() }
 
 // ResetEpoch invalidates the current generation or leader term.
 func (m *Manager) ResetEpoch(generation, term uint64) int {
@@ -2620,6 +2645,8 @@ func (m *Manager) OfferedMode(rootID string, resource ResourceRef) (Mode, bool) 
 // publication stays with the transaction layer, not here.
 func (m *manager) ResetEpoch(generation, term uint64) int {
 	m.mu.Lock()
+	m.generation = generation
+	m.term = term
 	invalidated := 0
 	ended := make([]string, 0, len(m.owners))
 	for rootID, owner := range m.owners {

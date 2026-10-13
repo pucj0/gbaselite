@@ -10,6 +10,7 @@ import (
 	"gbaselite/mvcc"
 	"gbaselite/replication"
 	"gbaselite/storageengine"
+	"gbaselite/storageengine/mvccadapter"
 )
 
 // locking_epoch_test.go is the T054 suite: leader-only Current Read, Barrier vs VerifyLeader,
@@ -379,17 +380,29 @@ func TestT054QueryCancellationDoesNotResetLockEpoch(t *testing.T) {
 		doneB <- err
 	}()
 
-	// Confirm B is waiting
-	select {
-	case err := <-doneB:
-		t.Fatalf("txB did not wait on held lock: %v", err)
-	case <-time.After(200 * time.Millisecond):
+	// Confirm B is waiting using WaitEdges without sleep
+	lm := mvccadapter.LockManagerOf(leaderEng)
+	if lm == nil {
+		t.Fatal("no lock manager on leader")
+	}
+	waitDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		if len(lm.WaitEdges()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(lm.WaitEdges()) == 0 {
+		t.Fatal("txB did not establish wait edge on held lock")
 	}
 
-	// 3. Query C executes Barrier with a cancelled context
+	// 3. Query C executes Barrier with a cancelled context (confirm future started before cancellation via hook)
 	rep := leaderEng.(storageengine.ReplicatedEngine).Replica()
 	cancelCtx, cancel := context.WithCancel(context.Background())
-	cancel() // cancel immediately
+	prevHook := replication.SetWaitStartedHook(func() {
+		cancel()
+	})
+	defer replication.SetWaitStartedHook(prevHook)
 
 	errC := rep.Barrier(cancelCtx)
 	if !errors.Is(errC, context.Canceled) {
@@ -509,15 +522,28 @@ func TestT054RealLeadershipTransferWakesWaitersAndEnforcesTermFence(t *testing.T
 		doneB <- err
 	}()
 
-	select {
-	case err := <-doneB:
-		t.Fatalf("txB did not wait on held lock: %v", err)
-	case <-time.After(200 * time.Millisecond):
+	// Confirm B is waiting using WaitEdges without sleep
+	lmA := mvccadapter.LockManagerOf(leaderEng)
+	if lmA == nil {
+		t.Fatal("no lock manager on leader A")
+	}
+	waitDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		if len(lmA.WaitEdges()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(lmA.WaitEdges()) == 0 {
+		t.Fatal("txB did not establish wait edge on held lock")
 	}
 
-	// 2. Gracefully transfer leadership away from Leader A (A stays alive, does not Close!)
+	// 2. Gracefully transfer leadership away from Leader A (bounded context, A stays alive)
+	transferCtx, cancelTransfer := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelTransfer()
+
 	repA := leaderEng.(storageengine.ReplicatedEngine).Replica()
-	if err := repA.(storageengine.LeadershipTransferrer).LeadershipTransfer(ctx); err != nil {
+	if err := repA.(storageengine.LeadershipTransferrer).LeadershipTransfer(transferCtx); err != nil {
 		t.Fatalf("LeadershipTransfer failed: %v", err)
 	}
 
@@ -529,6 +555,12 @@ func TestT054RealLeadershipTransferWakesWaitersAndEnforcesTermFence(t *testing.T
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("txB was not woken after leadership transfer")
+	}
+
+	// Verify all residues on former leader A are cleared
+	statsA := lmA.Stats()
+	if statsA.PendingRequests != 0 || statsA.WaitEdges != 0 || statsA.ActiveOwners != 0 || lmA.LockTableSize() != 0 {
+		t.Fatalf("former leader lock manager has residue after step down: stats=%+v, size=%d", statsA, lmA.LockTableSize())
 	}
 
 	// 3. Wait for new leader to be elected
@@ -582,5 +614,148 @@ func TestT054RealLeadershipTransferWakesWaitersAndEnforcesTermFence(t *testing.T
 	_, err = ltxA.ReadCurrent(ctx, grantA, "row/test", []byte("k1"))
 	if err == nil {
 		t.Fatal("former leader accepted Current Read under old grant")
+	}
+}
+
+// TestT054DelayedLeaderLossEventCannotInvalidateNewTermRoot verifies Section A:
+// A delayed Leader Loss event from an old tenure/term cannot wipe out a new Root
+// operating legally in a subsequent tenure/term.
+func TestT054DelayedLeaderLossEventCannotInvalidateNewTermRoot(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.Close()
+	leaderIdx := tc.WaitForLeader(15 * time.Second)
+	leaderEng := tc.engines[leaderIdx]
+	ctx := context.Background()
+
+	nodeA := leaderEng.(storageengine.ReplicatedEngine).Replica().(interface{ Node() *replication.Node }).Node()
+	tenure1, term1 := nodeA.CurrentTenureForTesting()
+
+	// 1. Root 1 on Leader A holds lock on k1
+	tx1, err := leaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx1.Rollback()
+
+	locks1 := tx1.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	ltx1, _ := locks1.LockingTxn()
+	scope1, err := ltx1.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tableRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeIX,
+		Kind:    storageengine.LockComponentTableIntent,
+		Space:   "row/test",
+		TableID: "t1",
+	}
+	rowRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeX,
+		Kind:    storageengine.LockComponentRecord,
+		Space:   "row/test",
+		TableID: "t1",
+		Key:     []byte("k1"),
+	}
+
+	if _, err := ltx1.Acquire(ctx, scope1, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}}); err != nil {
+		t.Fatalf("tx1 Acquire failed: %v", err)
+	}
+
+	// Root 2 waits on k1
+	tx2, err := leaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx2.Rollback()
+
+	locks2 := tx2.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	ltx2, _ := locks2.LockingTxn()
+	scope2, err := ltx2.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done2 := make(chan error, 1)
+	go func() {
+		_, err := ltx2.Acquire(ctx, scope2, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}})
+		done2 <- err
+	}()
+
+	lmA := mvccadapter.LockManagerOf(leaderEng)
+	waitDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		if len(lmA.WaitEdges()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 2. Node A experiences leader loss of tenure 1 (term 1)
+	nodeA.HandleLeaderLossForTesting(tenure1, term1)
+
+	// Waiter Root 2 must be woken with ErrLockInvalidated
+	select {
+	case err := <-done2:
+		if !errors.Is(err, storageengine.ErrLockInvalidated) {
+			t.Fatalf("expected ErrLockInvalidated for tx2, got: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("tx2 was not woken after leader loss")
+	}
+
+	// 3. Node A is elected Leader again in Term+1 (tenure 2)
+	term2 := term1 + 1
+	nodeA.HandleLeaderElectedForTesting(term2)
+
+	// 4. In new tenure 2 / Term 2, a new Root 3 acquires lock on k1
+	tx3, err := leaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx3.Rollback()
+
+	locks3 := tx3.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	ltx3, _ := locks3.LockingTxn()
+	scope3, err := ltx3.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	grant3, err := ltx3.Acquire(ctx, scope3, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}})
+	if err != nil {
+		t.Fatalf("tx3 Acquire in new term failed: %v", err)
+	}
+
+	// 5. A delayed LeaderCh=false event from tenure 1 is delivered!
+	nodeA.HandleLeaderLossForTesting(tenure1, term1)
+
+	// 6. Confirm Root 3 in Term 2 is NOT invalidated by the delayed old event!
+	obs, err := ltx3.ReadCurrent(ctx, grant3, "row/test", []byte("k1"))
+	if err != nil {
+		t.Fatalf("tx3 was erroneously invalidated by delayed old loss event: %v", err)
+	}
+	_ = obs
+
+	// 7. Duplicate loss event for tenure 1 still does not affect Root 3!
+	nodeA.HandleLeaderLossForTesting(tenure1, term1)
+	if _, err := ltx3.ReadCurrent(ctx, grant3, "row/test", []byte("k1")); err != nil {
+		t.Fatalf("tx3 lost its lock after duplicate loss event: %v", err)
+	}
+
+	// 8. When true leader loss of tenure 2 occurs:
+	tenure2, _ := nodeA.CurrentTenureForTesting()
+	nodeA.HandleLeaderLossForTesting(tenure2, term2)
+
+	// Now Root 3's grant IS invalidated!
+	_, err = ltx3.ReadCurrent(ctx, grant3, "row/test", []byte("k1"))
+	if err == nil {
+		t.Fatal("expected failure for tx3 after genuine loss of tenure 2, got nil")
 	}
 }
