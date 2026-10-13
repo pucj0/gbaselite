@@ -124,6 +124,18 @@ autocommit 下的过期目标只让该语句失败，不会波及会话。普通
 `innodb_lock_wait_timeout` 与该语句 context 期限中**更早者**决定。规划明确保留固定 readTS 与提交冲突规则、
 A05 parent-read/child-write，不改变持久化格式或 WAL/Raft 协议，也不宣称完整 InnoDB 兼容。
 
+**锁管理配置与管理员诊断**：
+- **全局预算配置**（YAML/环境变量）：`lock_memory_mb`（默认 64MiB 内存上限）、`lock_max_requests_per_txn`（默认 262144 单事务分量上限）、`lock_max_waiters`（默认 4096 全局等待队列上限）、`lock_deadlock_work_limit`（默认 100000 图遍历工作上限）。0 取默认值，负数与越界拒绝。
+- **会话变量**：`SET [SESSION] innodb_lock_wait_timeout = <1..86400>`（默认 50s，GLOBAL 明确拒绝）。
+- **错误码协议映射**：锁等待超时映射为 MySQL 1205 (HY000)，死锁受害者映射为 1213 (40001)。
+- **管理员诊断命令**（仅管理员有权执行，普通用户报 access denied；单页最大 256 行截断）：
+  - `SHOW ENGINE LOCKS [LIMIT <n>]`：显示已获授的锁持有者列表、代数、任期、模式及匿名资源代号；
+  - `SHOW ENGINE LOCK WAITS [LIMIT <n>]`：显示排队中的等待请求、阻塞者及已等待时长；
+  - `SHOW ENGINE DEADLOCKS [LIMIT <n>]`：显示最近保留的死锁摘要环；
+  - `SHOW ENGINE [INNODB|GB_LOCKS] STATUS`：标准三列（Type, Name, Status）输出包含全局锁计数与当前图快照版本元数据；
+  - `SHOW ENGINE {LOCKS|LOCK WAITS|DEADLOCKS} STATUS`：空锁表时亦可查看当前快照版本（SnapshotRevision）、截断标识与分页 Token（NextCursor）。
+- **隐私保护**：所有诊断视图中严格排除原始 Key、Row 数据、表名空间与 SQL 文本，资源标识均采用引擎局部的匿名序号。
+
 ## 项目定位
 
 GBaseLite 面向以下场景：
@@ -838,7 +850,7 @@ MVCC 是唯一运行事务引擎。`snapshot`、`paged` 不再作为服务模式
 | DDL | 数据库/表/视图创建删除、TRUNCATE、常用 ALTER、主键/唯一/普通索引（含 `USING BTREE` 与索引 `COMMENT '...'`）、CREATE TABLE AS SELECT、CREATE TABLE LIKE、RENAME TABLE | 视图定义存入 MVCC catalog 并在引用时重新绑定，表与视图共用一个命名空间；DDL 在 MVCC 事务内，无 MySQL 隐式提交 |
 | 写入 | INSERT VALUES/表达式/参数/SET、INSERT SELECT（含 UNION ALL 源与视图源）、INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、单表 UPDATE/DELETE、UPDATE JOIN（INNER/LEFT/RIGHT/CROSS，连接输入须为基表）、多表 DELETE（DELETE t1,t2 FROM … / DELETE FROM t1,t2 USING …，目标表可无主键） | 写入中的子查询与 WHERE/SET/VALUES 表达式共用语句快照；所有写入路径都在同一个 A05 修改管线上取锁，`UPDATE`/`DELETE` 取得行锁后按版本校验目标，过期目标报可重试冲突而不用最新行重算 SET；不支持子查询作为连接输入；视图不可写 |
 | 查询 | 投影、WHERE、排序、分页、DISTINCT、聚合、GROUP BY/HAVING、INNER/LEFT/RIGHT/CROSS JOIN、派生表、非递归与递归 CTE、视图（含嵌套视图）、UNION/UNION ALL、排名与聚合窗口、标量/IN/EXISTS 子查询（含相关子查询）、锁定读（`FOR UPDATE`/`FOR SHARE`/`LOCK IN SHARE MODE`：真正加锁并按当前读执行；JOIN/派生表/CTE/视图/聚合/非唯一二级索引访问上明确拒绝） | 窗口不与 GROUP BY/HAVING 混用，不支持显式窗口 frame；UNION 要求列数一致，未实现完整 MySQL 类型合并 |
-| 事务 | BEGIN/COMMIT/ROLLBACK、SAVEPOINT/ROLLBACK TO/RELEASE、SET autocommit=0/1、断连回滚、语句失败回滚、`innodb_lock_wait_timeout` | 快照隔离；行级锁按资源（表意向 → 主键行 → 索引条目）申请，死锁在等待时自动检测并回滚较晚注册的 victim；锁后发现 DML 目标已过期则以可重试冲突**结束整个事务**（仅 autocommit 与锁等待超时停在语句级）；不支持 LOCK TABLES、隔离级别切换或串行化保证；每个事务最多 32 个存活 savepoint layer（`RELEASE`/同名替换只释放名字，匿名 layer 仍占名额，超限报 resource limit） |
+| 事务 | BEGIN/COMMIT/ROLLBACK、SAVEPOINT/ROLLBACK TO/RELEASE、SET autocommit=0/1、断连回滚、语句失败回滚、`innodb_lock_wait_timeout`、`SHOW ENGINE [INNODB] {LOCKS|LOCK WAITS|DEADLOCKS|STATUS}` | 快照隔离；行级锁按资源（表意向 → 主键行 → 索引条目）申请，死锁在等待时自动检测并回滚较晚注册的 victim；锁后发现 DML 目标已过期则以可重试冲突**结束整个事务**（仅 autocommit 与锁等待超时停在语句级）；支持管理员 SHOW ENGINE 锁诊断与状态审计；不支持 LOCK TABLES、隔离级别切换或串行化保证；每个事务最多 32 个存活 savepoint layer（`RELEASE`/同名替换只释放名字，匿名 layer 仍占名额，超限报 resource limit） |
 | 约束 | PRIMARY KEY、UNIQUE、CHECK（含 MySQL 的 `CHECK (...) NOT ENFORCED`）、同库外键（RESTRICT/NO ACTION/CASCADE/SET NULL，含自引用） | 不支持跨库外键；受引用表 ALTER 有限制；级联深度上限 32；`NOT ENFORCED` 只保留定义并回显（`CHECK_CONSTRAINTS.ENFORCED=NO`），不校验行 |
 | 类型 | INT/BIGINT、文本、日期时间、BOOLEAN、精确 DECIMAL、JSON 列及现有标量函数、ON UPDATE CURRENT_TIMESTAMP | TIMESTAMP 尚无独立 UTC 存储语义 |
 | 账号 | 单机用户、密码、授权及权限元数据 | 用户目录独立持久化，不参与业务事务，不经过 Raft；复制节点拒绝账号 SQL |

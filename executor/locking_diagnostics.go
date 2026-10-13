@@ -28,13 +28,51 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 		return nil, storageengine.ErrUnsupported
 	}
 
+	eng := stmt.Engine
+	if eng == "" {
+		eng = "INNODB"
+	}
+
+	if stmt.Status {
+		cols := resultColumns("Engine", "View", "SnapshotRevision", "Total", "Truncated", "NextCursor", "Limit")
+		switch stmt.Kind {
+		case "LOCKS":
+			page, err := diag.LocksPage("", stmt.Limit)
+			if err != nil {
+				return nil, err
+			}
+			rows := [][]any{{eng, "LOCKS", strconv.FormatUint(page.SnapshotRevision, 10), strconv.Itoa(len(page.Rows)), strconv.FormatBool(page.Truncated), page.NextCursor, strconv.Itoa(page.Limit)}}
+			res := &Result{Columns: cols, Rows: rows}
+			res.Message = fmt.Sprintf("SnapshotRevision: %d, Truncated: %v, NextCursor: %s", page.SnapshotRevision, page.Truncated, page.NextCursor)
+			return res, nil
+		case "LOCK WAITS":
+			page, err := diag.WaitPage("", stmt.Limit)
+			if err != nil {
+				return nil, err
+			}
+			rows := [][]any{{eng, "LOCK WAITS", strconv.FormatUint(page.SnapshotRevision, 10), strconv.Itoa(len(page.Rows)), strconv.FormatBool(page.Truncated), page.NextCursor, strconv.Itoa(page.Limit)}}
+			res := &Result{Columns: cols, Rows: rows}
+			res.Message = fmt.Sprintf("SnapshotRevision: %d, Truncated: %v, NextCursor: %s", page.SnapshotRevision, page.Truncated, page.NextCursor)
+			return res, nil
+		case "DEADLOCKS":
+			page, err := diag.DeadlocksPage("", stmt.Limit)
+			if err != nil {
+				return nil, err
+			}
+			rows := [][]any{{eng, "DEADLOCKS", strconv.FormatUint(page.SnapshotRevision, 10), strconv.Itoa(len(page.Rows)), strconv.FormatBool(page.Truncated), page.NextCursor, strconv.Itoa(page.Limit)}}
+			res := &Result{Columns: cols, Rows: rows}
+			res.Message = fmt.Sprintf("SnapshotRevision: %d, Truncated: %v, NextCursor: %s", page.SnapshotRevision, page.Truncated, page.NextCursor)
+			return res, nil
+		}
+	}
+
 	switch stmt.Kind {
 	case "LOCKS":
 		page, err := diag.LocksPage("", stmt.Limit)
 		if err != nil {
 			return nil, err
 		}
-		cols := resultColumns("GrantID", "RootID", "ScopeID", "Generation", "Term", "Mode", "ResourceKind", "OpaqueResourceID", "GrantedAt", "SnapshotRevision", "Truncated")
+		cols := resultColumns("GrantID", "RootID", "ScopeID", "Generation", "Term", "Mode", "ResourceKind", "OpaqueResourceID", "GrantedAt", "SnapshotRevision", "Truncated", "NextCursor")
 		rows := make([][]any, 0, len(page.Rows))
 		for _, r := range page.Rows {
 			grantedAt := ""
@@ -53,6 +91,7 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 				grantedAt,
 				strconv.FormatUint(page.SnapshotRevision, 10),
 				strconv.FormatBool(page.Truncated),
+				page.NextCursor,
 			})
 		}
 		res := &Result{Columns: cols, Rows: rows}
@@ -64,7 +103,7 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 		if err != nil {
 			return nil, err
 		}
-		cols := resultColumns("RequestID", "RootID", "ScopeID", "RequestedMode", "OpaqueResourceID", "BlockerRootIDs", "Reason", "WaitMilliseconds", "Deadline", "SnapshotRevision", "Truncated")
+		cols := resultColumns("RequestID", "RootID", "ScopeID", "RequestedMode", "OpaqueResourceID", "BlockerRootIDs", "Reason", "WaitMilliseconds", "Deadline", "SnapshotRevision", "Truncated", "NextCursor")
 		rows := make([][]any, 0, len(page.Rows))
 		for _, w := range page.Rows {
 			deadlineStr := ""
@@ -83,6 +122,7 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 				deadlineStr,
 				strconv.FormatUint(page.SnapshotRevision, 10),
 				strconv.FormatBool(page.Truncated),
+				page.NextCursor,
 			})
 		}
 		res := &Result{Columns: cols, Rows: rows}
@@ -94,7 +134,7 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 		if err != nil {
 			return nil, err
 		}
-		cols := resultColumns("DetectedOrdinal", "GraphRevision", "VictimRootID", "CycleRootIDs", "AnonymousIDs", "Modes", "Truncated")
+		cols := resultColumns("DetectedOrdinal", "GraphRevision", "VictimRootID", "CycleRootIDs", "AnonymousIDs", "Modes", "Truncated", "NextCursor")
 		rows := make([][]any, 0, len(page.Rows))
 		for _, d := range page.Rows {
 			var anonStr []string
@@ -113,6 +153,7 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 				strings.Join(anonStr, ","),
 				strings.Join(modeStr, ","),
 				strconv.FormatBool(d.Truncated),
+				page.NextCursor,
 			})
 		}
 		res := &Result{Columns: cols, Rows: rows}
@@ -124,15 +165,15 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 		if err != nil {
 			return nil, err
 		}
-		eng := stmt.Engine
-		if eng == "" {
-			eng = "INNODB"
-		}
+		page, _ := diag.LocksPage("", 1)
 		cols := resultColumns("Type", "Name", "Status")
-		statusText := fmt.Sprintf("LOCK STATS: ActiveOwners=%d GrantedComponents=%d PendingRequests=%d WaitEdges=%d MemoryBytes=%d Timeouts=%d Deadlocks=%d ResourceRejections=%d EpochInvalidations=%d",
-			stats.ActiveOwners, stats.GrantedComponents, stats.PendingRequests, stats.WaitEdges, stats.MemoryBytes, stats.Timeouts, stats.Deadlocks, stats.ResourceRejections, stats.EpochInvalidations)
+		statusText := fmt.Sprintf("LOCK STATS: ActiveOwners=%d GrantedComponents=%d PendingRequests=%d WaitEdges=%d MemoryBytes=%d Timeouts=%d Deadlocks=%d ResourceRejections=%d EpochInvalidations=%d SnapshotRevision=%d Truncated=%v NextCursor=%s",
+			stats.ActiveOwners, stats.GrantedComponents, stats.PendingRequests, stats.WaitEdges, stats.MemoryBytes, stats.Timeouts, stats.Deadlocks, stats.ResourceRejections, stats.EpochInvalidations,
+			page.SnapshotRevision, page.Truncated, page.NextCursor)
 		rows := [][]any{{eng, "", statusText}}
-		return &Result{Columns: cols, Rows: rows}, nil
+		res := &Result{Columns: cols, Rows: rows}
+		res.Message = fmt.Sprintf("SnapshotRevision: %d, Truncated: %v, NextCursor: %s", page.SnapshotRevision, page.Truncated, page.NextCursor)
+		return res, nil
 
 	default:
 		return nil, fmt.Errorf("unsupported SHOW ENGINE LOCKS command %q", stmt.Kind)

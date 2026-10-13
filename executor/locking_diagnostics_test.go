@@ -18,23 +18,28 @@ func TestT062ShowEngineDiagnosticsAdminAndUserPermissions(t *testing.T) {
 
 	// 1. Admin can query SHOW ENGINE LOCKS, LOCK WAITS, DEADLOCKS, STATUS
 	resLocks := f.must(adminSession, "SHOW ENGINE LOCKS")
-	if len(resLocks.Columns) != 11 {
-		t.Fatalf("expected 11 columns for SHOW ENGINE LOCKS, got %d", len(resLocks.Columns))
+	if len(resLocks.Columns) != 12 {
+		t.Fatalf("expected 12 columns for SHOW ENGINE LOCKS, got %d", len(resLocks.Columns))
 	}
 
 	resWaits := f.must(adminSession, "SHOW ENGINE LOCK WAITS")
-	if len(resWaits.Columns) != 11 {
-		t.Fatalf("expected 11 columns for SHOW ENGINE LOCK WAITS, got %d", len(resWaits.Columns))
+	if len(resWaits.Columns) != 12 {
+		t.Fatalf("expected 12 columns for SHOW ENGINE LOCK WAITS, got %d", len(resWaits.Columns))
 	}
 
 	resDeadlocks := f.must(adminSession, "SHOW ENGINE DEADLOCKS")
-	if len(resDeadlocks.Columns) != 7 {
-		t.Fatalf("expected 7 columns for SHOW ENGINE DEADLOCKS, got %d", len(resDeadlocks.Columns))
+	if len(resDeadlocks.Columns) != 8 {
+		t.Fatalf("expected 8 columns for SHOW ENGINE DEADLOCKS, got %d", len(resDeadlocks.Columns))
 	}
 
 	resStatus := f.must(adminSession, "SHOW ENGINE INNODB STATUS")
 	if len(resStatus.Columns) != 3 {
 		t.Fatalf("expected 3 columns for SHOW ENGINE INNODB STATUS, got %d", len(resStatus.Columns))
+	}
+
+	resLockStatus := f.must(adminSession, "SHOW ENGINE LOCKS STATUS")
+	if len(resLockStatus.Columns) != 7 {
+		t.Fatalf("expected 7 columns for SHOW ENGINE LOCKS STATUS, got %d", len(resLockStatus.Columns))
 	}
 
 	// 2. Non-admin user is rejected

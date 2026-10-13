@@ -307,7 +307,91 @@ func TestT063ThreeTransactionDeadlockCycle100Runs(t *testing.T) {
 	}
 }
 
-func TestT063GrantAndCancelRace100Runs(t *testing.T) {
+func TestT063GrantBeforeCancelSchedule100Runs(t *testing.T) {
+	for run := 0; run < 100; run++ {
+		m, err := NewManager(BudgetLimits{}, 1, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+
+		_, _ = m.RegisterOwner("root-a", 1, 0, 10)
+		_, _ = m.RegisterOwner("root-b", 1, 0, 10)
+		sA, _ := m.OpenScope("root-a", "s-a", 0, ScopeStatement, time.Time{})
+		sB, _ := m.OpenScope("root-b", "s-b", 0, ScopeStatement, time.Time{})
+
+		tiX := t063TableIntentRef("row/t1", "t1", ModeIX)
+		r1 := t063RowRef("row/t1", "t1", "k1", ModeX)
+
+		_, _ = m.Acquire(ctx, "root-a", sA.ID, []ResourceRef{tiX, r1})
+		rB, _ := m.Acquire(ctx, "root-b", sB.ID, []ResourceRef{tiX, r1})
+
+		// Causal schedule 1: Holder releases first -> Waiter is GRANTED
+		m.ReleaseOwner("root-a")
+		if st := rB.Wait.Status(); st != RequestGranted {
+			t.Fatalf("run %d: expected RequestGranted after release, got %v", run, st)
+		}
+
+		// Subsequent cancel must NOT change already granted status
+		cancelStatus := m.Cancel("root-b", rB.Wait)
+		if cancelStatus != RequestGranted {
+			t.Fatalf("run %d: Cancel returned %v, expected RequestGranted (cannot cancel granted)", run, cancelStatus)
+		}
+		if st := rB.Wait.Status(); st != RequestGranted {
+			t.Fatalf("run %d: status mutated to %v after Cancel, expected RequestGranted", run, st)
+		}
+
+		m.ReleaseOwner("root-b")
+		if m.LockTableSize() != 0 || m.Stats().ActiveOwners != 0 {
+			t.Fatalf("run %d: residue left after run: size=%d", run, m.LockTableSize())
+		}
+		m.Close()
+	}
+}
+
+func TestT063CancelBeforeReleaseSchedule100Runs(t *testing.T) {
+	for run := 0; run < 100; run++ {
+		m, err := NewManager(BudgetLimits{}, 1, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+
+		_, _ = m.RegisterOwner("root-a", 1, 0, 10)
+		_, _ = m.RegisterOwner("root-b", 1, 0, 10)
+		sA, _ := m.OpenScope("root-a", "s-a", 0, ScopeStatement, time.Time{})
+		sB, _ := m.OpenScope("root-b", "s-b", 0, ScopeStatement, time.Time{})
+
+		tiX := t063TableIntentRef("row/t1", "t1", ModeIX)
+		r1 := t063RowRef("row/t1", "t1", "k1", ModeX)
+
+		_, _ = m.Acquire(ctx, "root-a", sA.ID, []ResourceRef{tiX, r1})
+		rB, _ := m.Acquire(ctx, "root-b", sB.ID, []ResourceRef{tiX, r1})
+
+		// Causal schedule 2: Waiter is canceled first -> CANCELED
+		cancelStatus := m.Cancel("root-b", rB.Wait)
+		if cancelStatus != RequestCanceled {
+			t.Fatalf("run %d: expected RequestCanceled, got %v", run, cancelStatus)
+		}
+		if st := rB.Wait.Status(); st != RequestCanceled {
+			t.Fatalf("run %d: expected status RequestCanceled, got %v", run, st)
+		}
+
+		// Subsequent release of Holder A must NOT grant the canceled waiter
+		m.ReleaseOwner("root-a")
+		if st := rB.Wait.Status(); st != RequestCanceled {
+			t.Fatalf("run %d: status mutated to %v after Holder release, expected RequestCanceled", run, st)
+		}
+
+		m.ReleaseOwner("root-b")
+		if m.LockTableSize() != 0 || m.Stats().ActiveOwners != 0 {
+			t.Fatalf("run %d: residue left after run: size=%d", run, m.LockTableSize())
+		}
+		m.Close()
+	}
+}
+
+func TestT063GrantAndCancelConcurrentRaceStress100Runs(t *testing.T) {
 	for run := 0; run < 100; run++ {
 		m, err := NewManager(BudgetLimits{}, 1, nil)
 		if err != nil {
@@ -353,7 +437,7 @@ func TestT063GrantAndCancelRace100Runs(t *testing.T) {
 	}
 }
 
-func TestT063TimeoutAndGrantRace100Runs(t *testing.T) {
+func TestT063TimeoutBeforeGrantSchedule100Runs(t *testing.T) {
 	for run := 0; run < 100; run++ {
 		clock := NewFakeClock(time.Unix(1000, 0))
 		m, err := NewManager(BudgetLimits{}, 1, clock)
@@ -365,7 +449,7 @@ func TestT063TimeoutAndGrantRace100Runs(t *testing.T) {
 		_, _ = m.RegisterOwner("root-a", 1, 0, 10)
 		_, _ = m.RegisterOwner("root-b", 1, 0, 10)
 		sA, _ := m.OpenScope("root-a", "s-a", 0, ScopeStatement, time.Time{})
-		sB, _ := m.OpenScope("root-b", "s-b", 0, ScopeStatement, time.Time{}.Add(5*time.Second))
+		sB, _ := m.OpenScope("root-b", "s-b", 0, ScopeStatement, clock.Now().Add(5*time.Second))
 
 		tiX := t063TableIntentRef("row/t1", "t1", ModeIX)
 		r1 := t063RowRef("row/t1", "t1", "k1", ModeX)
@@ -373,18 +457,136 @@ func TestT063TimeoutAndGrantRace100Runs(t *testing.T) {
 		_, _ = m.Acquire(ctx, "root-a", sA.ID, []ResourceRef{tiX, r1})
 		rB, _ := m.Acquire(ctx, "root-b", sB.ID, []ResourceRef{tiX, r1})
 
-		// Advance clock past deadline and check timeouts
-		clock.Advance(6 * time.Second)
+		// 1. Time < 5s: must stay RequestPending
+		clock.Advance(4 * time.Second)
 		timedOut := m.CheckTimeouts()
-		if timedOut != 1 {
-			t.Fatalf("run %d: expected 1 timeout, got %d", run, timedOut)
+		if timedOut != 0 {
+			t.Fatalf("run %d: expected 0 timeout at 4s, got %d", run, timedOut)
 		}
-		if rB.Wait.Status() != RequestTimedOut {
-			t.Fatalf("run %d: expected RequestTimedOut, got %v", run, rB.Wait.Status())
+		if rB.Wait.Status() != RequestPending {
+			t.Fatalf("run %d: expected RequestPending at 4s, got %v", run, rB.Wait.Status())
 		}
 
+		// 2. Exactly at/past 5s boundary: now.After(deadline) triggers timeout
+		clock.Advance(1*time.Second + time.Millisecond)
+		timedOut = m.CheckTimeouts()
+		if timedOut != 1 {
+			t.Fatalf("run %d: expected 1 timeout past 5s deadline, got %d", run, timedOut)
+		}
+		if rB.Wait.Status() != RequestTimedOut {
+			t.Fatalf("run %d: expected RequestTimedOut at 5s, got %v", run, rB.Wait.Status())
+		}
+
+		// 3. Repeated CheckTimeouts does not complete again
+		if repeated := m.CheckTimeouts(); repeated != 0 {
+			t.Fatalf("run %d: expected 0 on repeated CheckTimeouts, got %d", run, repeated)
+		}
+
+		// 4. Subsequent release of A does not grant timed-out waiter
 		m.ReleaseOwner("root-a")
+		if rB.Wait.Status() != RequestTimedOut {
+			t.Fatalf("run %d: status mutated to %v after Holder release", run, rB.Wait.Status())
+		}
+
 		m.ReleaseOwner("root-b")
+		if m.LockTableSize() != 0 || m.Stats().ActiveOwners != 0 || m.Stats().WaitEdges != 0 || m.Stats().PendingRequests != 0 {
+			t.Fatalf("run %d: residue left after timeout schedule", run)
+		}
+		m.Close()
+	}
+}
+
+func TestT063GrantBeforeTimeoutSchedule100Runs(t *testing.T) {
+	for run := 0; run < 100; run++ {
+		clock := NewFakeClock(time.Unix(1000, 0))
+		m, err := NewManager(BudgetLimits{}, 1, clock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+
+		_, _ = m.RegisterOwner("root-a", 1, 0, 10)
+		_, _ = m.RegisterOwner("root-b", 1, 0, 10)
+		sA, _ := m.OpenScope("root-a", "s-a", 0, ScopeStatement, time.Time{})
+		sB, _ := m.OpenScope("root-b", "s-b", 0, ScopeStatement, clock.Now().Add(5*time.Second))
+
+		tiX := t063TableIntentRef("row/t1", "t1", ModeIX)
+		r1 := t063RowRef("row/t1", "t1", "k1", ModeX)
+
+		_, _ = m.Acquire(ctx, "root-a", sA.ID, []ResourceRef{tiX, r1})
+		rB, _ := m.Acquire(ctx, "root-b", sB.ID, []ResourceRef{tiX, r1})
+
+		// Holder releases at T+2s before deadline
+		clock.Advance(2 * time.Second)
+		m.ReleaseOwner("root-a")
+
+		if rB.Wait.Status() != RequestGranted {
+			t.Fatalf("run %d: expected RequestGranted before timeout, got %v", run, rB.Wait.Status())
+		}
+
+		// Advance clock past 5s deadline -> CheckTimeouts must NOT timeout granted request
+		clock.Advance(10 * time.Second)
+		if timedOut := m.CheckTimeouts(); timedOut != 0 {
+			t.Fatalf("run %d: expected 0 timeouts for already granted request, got %d", run, timedOut)
+		}
+		if rB.Wait.Status() != RequestGranted {
+			t.Fatalf("run %d: granted status mutated to %v after deadline passed", run, rB.Wait.Status())
+		}
+
+		m.ReleaseOwner("root-b")
+		if m.LockTableSize() != 0 || m.Stats().ActiveOwners != 0 || m.Stats().WaitEdges != 0 || m.Stats().PendingRequests != 0 {
+			t.Fatalf("run %d: residue left after grant-before-timeout schedule", run)
+		}
+		m.Close()
+	}
+}
+
+func TestT063TimeoutAndGrantConcurrentRaceStress100Runs(t *testing.T) {
+	for run := 0; run < 100; run++ {
+		clock := NewFakeClock(time.Unix(1000, 0))
+		m, err := NewManager(BudgetLimits{}, 1, clock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+
+		_, _ = m.RegisterOwner("root-a", 1, 0, 10)
+		_, _ = m.RegisterOwner("root-b", 1, 0, 10)
+		sA, _ := m.OpenScope("root-a", "s-a", 0, ScopeStatement, time.Time{})
+		sB, _ := m.OpenScope("root-b", "s-b", 0, ScopeStatement, clock.Now().Add(5*time.Second))
+
+		tiX := t063TableIntentRef("row/t1", "t1", ModeIX)
+		r1 := t063RowRef("row/t1", "t1", "k1", ModeX)
+
+		_, _ = m.Acquire(ctx, "root-a", sA.ID, []ResourceRef{tiX, r1})
+		rB, _ := m.Acquire(ctx, "root-b", sB.ID, []ResourceRef{tiX, r1})
+
+		clock.Advance(5*time.Second + time.Millisecond)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = m.CheckTimeouts()
+		}()
+		go func() {
+			defer wg.Done()
+			m.ReleaseOwner("root-a")
+		}()
+		wg.Wait()
+
+		st := rB.Wait.Status()
+		if st != RequestGranted && st != RequestTimedOut {
+			t.Fatalf("run %d: invalid terminal status: %v", run, st)
+		}
+		if rB.Wait.Status() != st {
+			t.Fatalf("run %d: status mutated from %v to %v", run, st, rB.Wait.Status())
+		}
+
+		m.ReleaseOwner("root-b")
+		if m.LockTableSize() != 0 || m.Stats().ActiveOwners != 0 || m.Stats().WaitEdges != 0 || m.Stats().PendingRequests != 0 {
+			t.Fatalf("run %d: residue left after concurrent timeout and grant race", run)
+		}
 		m.Close()
 	}
 }

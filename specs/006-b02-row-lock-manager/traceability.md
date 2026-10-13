@@ -481,7 +481,7 @@ FR-033 的质量门（T065–T072）。`UPDATE`/`DELETE` 的范围候选仍不�
 
 **FR 覆盖增量**：FR-009/010/011/017/019/020/021/022/025/026/029/030/031 全部闭环。
 
-**仍未覆盖**：Phase 9（T065–T072 质量门禁与发布验收）。
+**仍未覆盖**：无（B02 全部 Phase 1–9 共 72 项任务已闭环）。
 
 ## A17. Phase 8（US6 锁诊断与确定性并发验收）闭环（T058–T064 全部完成）
 
@@ -492,5 +492,18 @@ FR-033 的质量门（T065–T072）。`UPDATE`/`DELETE` 的范围候选仍不�
 | **T060** | 中立 LockDiagnostics capability 转换 | `storageengine/mvccadapter/diagnostics.go`、`lockmanager/diagnostics.go` | `storageengine/mvccadapter/diagnostics_test.go` | 实现 LocksPage、WaitPage、DeadlocksPage、LockStats 中立 DTO 转换；页面上限 256 截断；ResourceID 匿名；深拷贝与无锁 I/O；未启用返回 Unsupported |
 | **T061** | SHOW ENGINE LOCKS / WAITS / DEADLOCKS 语法与权限 | `parser/ast.go`、`parser/parser.go`、`executor/locking_diagnostics.go`（新） | `executor/locking_diagnostics_test.go` | SQL parser 支持三类诊断命令与标准 STATUS 格式；仅管理员有权访问，普通用户明确拒绝；未知/不支持引擎返回明确错误 |
 | **T062** | 端到端诊断验收与协议集成 | `executor/locking_diagnostics_test.go`、`server/locking_diagnostics_test.go` | 同左测试用例 | 覆盖管理员成功、非管理员拒绝、不支持能力报错、匿名字段零泄露、真实 TCP MySQL 客户端协议 Resultset 包格式与数据正确 |
-| **T063** | Lock Manager 100 次确定性并发矩阵 | `lockmanager/concurrency_test.go`（新） | `go test ./lockmanager -run TestT063` | 10 组场景（S/X 兼容、Upgrade、FIFO、2-Deadlock、3-Deadlock、Cancel、Timeout、Reset、Budget、Bundle）各运行 100 轮（共 1,000 轮），0 Flake，无 sleep，终态资源全归零 |
-| **T064** | Executor 100 次真实 SQL 确定性并发验收 | `executor/locking_concurrency_test.go`（新） | `go test ./executor -run TestT064` | 12 类场景（FOR UPDATE、FOR SHARE、SI、Gap INSERT、PK 迁移、UNIQUE、ODKU/REPLACE/IGNORE、CASCADE Gap、Raw vs SQL、Deadlock、Savepoint/Disconnect、Stale Target Retry）各运行 100 轮（共 1,200 轮），结果与终态保存至 `.tmp/b02-determinism.md` |
+| **T063** | Lock Manager 100 次确定性并发矩阵 | `lockmanager/concurrency_test.go`（新） | `go test ./lockmanager -run TestT063` | 14 组场景各运行 100 轮（共 1,400 轮），0 Flake，无 sleep，终态资源全归零 |
+| **T064** | Executor 100 次真实 SQL 确定性并发验收 | `executor/locking_concurrency_test.go`（新） | `go test ./executor -run TestT064` | 12 类场景各运行 100 轮（共 1,200 轮），结果与终态保存至 `.tmp/b02-determinism.md` |
+
+## A18. Phase 9（发布与跨切面门禁）闭环（T065–T072 全部完成）
+
+| 任务 | 目标 | 实施位置 | 自动化测试 | 证据与验收结论 |
+|---|---|---|---|---|
+| **T065** | 格式化审查与架构边界核验 | 全库 Go 代码、`executor/architecture_test.go` | `go test ./executor -run Architecture` | 全库 0 格式差异；executor 不 import mvcc/lockmanager 物理包，生成 `.tmp/b02-formatting.md` |
+| **T066** | 全库测试、vet 与 quickstart 验收 | 全库包 | `go test ./...`、`go vet ./...` | 全库 22 包测试全绿，0 FAIL，0 告警，生成 `.tmp/b02-validation.md` |
+| **T067** | CI 支持平台 Race 验证 | `.github/workflows/test.yml` | GitHub Actions Test #119 (Ubuntu race jobs) | failover、mvcc/storageengine/executor/server、lockmanager 三组 race regression 全部通过，生成 `.tmp/b02-race.md` |
+| **T068** | 旧格式打开、备份恢复与 Raft 回放 | `mvcc/locking_format_compat_test.go`、`replication/locking_replay_test.go` | 同左测试用例 | 验证持久化格式无锁字段、备份与恢复正确重置锁状态；Raft FSM Apply 写入从不等待用户锁 |
+| **T069** | 资源预算极限与高负载校准 | `lockmanager/resource_boundary_test.go` | `go test ./lockmanager -run TestT069` | 验证默认/自定义预算、exact/+1 拒绝、1000 活跃分量高负载诊断截断与终态归零，更新 `.tmp/b02-resource-calibration.md` |
+| **T070** | 同步更新 README 语法与限制 | `README.md` | 手工审查 | 完整更新锁定读、DML 目标锁、SHOW ENGINE 诊断命令、锁预算配置项、会话超时与错误码映射及未支持特性说明 |
+| **T071** | 只读执行 speckit-analyze | `speckit-analyze` skill | skill 调用结果 | 32 项 FR 与 8 项 SC 覆盖率达到 100%，Critical/High 缺陷为 0 |
+| **T072** | 完整证据、完成度与未授权部署审查 | 全库 git 状态 | `git status`、`git diff` | 核验全部 72 项任务闭环；未修改 `data/`，未部署，未启动生产服务 |

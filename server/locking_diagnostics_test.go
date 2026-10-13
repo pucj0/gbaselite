@@ -73,10 +73,10 @@ func TestT062ServerShowEngineDiagnosticsProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(colsLocks) != 11 {
-		t.Fatalf("expected 11 columns for SHOW ENGINE LOCKS, got %d: %v", len(colsLocks), colsLocks)
+	if len(colsLocks) != 12 {
+		t.Fatalf("expected 12 columns for SHOW ENGINE LOCKS, got %d: %v", len(colsLocks), colsLocks)
 	}
-	expectedLocksCols := []string{"GrantID", "RootID", "ScopeID", "Generation", "Term", "Mode", "ResourceKind", "OpaqueResourceID", "GrantedAt", "SnapshotRevision", "Truncated"}
+	expectedLocksCols := []string{"GrantID", "RootID", "ScopeID", "Generation", "Term", "Mode", "ResourceKind", "OpaqueResourceID", "GrantedAt", "SnapshotRevision", "Truncated", "NextCursor"}
 	for i, col := range expectedLocksCols {
 		if colsLocks[i] != col {
 			t.Fatalf("column %d: expected %s, got %s", i, col, colsLocks[i])
@@ -93,10 +93,10 @@ func TestT062ServerShowEngineDiagnosticsProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(colsWaits) != 11 {
-		t.Fatalf("expected 11 columns for SHOW ENGINE LOCK WAITS, got %d: %v", len(colsWaits), colsWaits)
+	if len(colsWaits) != 12 {
+		t.Fatalf("expected 12 columns for SHOW ENGINE LOCK WAITS, got %d: %v", len(colsWaits), colsWaits)
 	}
-	expectedWaitsCols := []string{"RequestID", "RootID", "ScopeID", "RequestedMode", "OpaqueResourceID", "BlockerRootIDs", "Reason", "WaitMilliseconds", "Deadline", "SnapshotRevision", "Truncated"}
+	expectedWaitsCols := []string{"RequestID", "RootID", "ScopeID", "RequestedMode", "OpaqueResourceID", "BlockerRootIDs", "Reason", "WaitMilliseconds", "Deadline", "SnapshotRevision", "Truncated", "NextCursor"}
 	for i, col := range expectedWaitsCols {
 		if colsWaits[i] != col {
 			t.Fatalf("waits column %d: expected %s, got %s", i, col, colsWaits[i])
@@ -113,10 +113,10 @@ func TestT062ServerShowEngineDiagnosticsProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(colsDeadlocks) != 7 {
-		t.Fatalf("expected 7 columns for SHOW ENGINE DEADLOCKS, got %d: %v", len(colsDeadlocks), colsDeadlocks)
+	if len(colsDeadlocks) != 8 {
+		t.Fatalf("expected 8 columns for SHOW ENGINE DEADLOCKS, got %d: %v", len(colsDeadlocks), colsDeadlocks)
 	}
-	expectedDeadlockCols := []string{"DetectedOrdinal", "GraphRevision", "VictimRootID", "CycleRootIDs", "AnonymousIDs", "Modes", "Truncated"}
+	expectedDeadlockCols := []string{"DetectedOrdinal", "GraphRevision", "VictimRootID", "CycleRootIDs", "AnonymousIDs", "Modes", "Truncated", "NextCursor"}
 	for i, col := range expectedDeadlockCols {
 		if colsDeadlocks[i] != col {
 			t.Fatalf("deadlocks column %d: expected %s, got %s", i, col, colsDeadlocks[i])
@@ -124,7 +124,17 @@ func TestT062ServerShowEngineDiagnosticsProtocol(t *testing.T) {
 	}
 	rowsDeadlocks.Close()
 
-	// 5. SHOW ENGINE INNODB STATUS: verify 3-column MySQL standard
+	// 5. SHOW ENGINE LOCKS STATUS: returns metadata row even when lock table is empty!
+	var eng, view, snapRev, total, trunc, nextCursor, limit string
+	err = dbRoot.QueryRow("SHOW ENGINE LOCKS STATUS").Scan(&eng, &view, &snapRev, &total, &trunc, &nextCursor, &limit)
+	if err != nil {
+		t.Fatalf("SHOW ENGINE LOCKS STATUS failed: %v", err)
+	}
+	if view != "LOCKS" || snapRev == "" || nextCursor == "" {
+		t.Fatalf("unexpected empty metadata: view=%s, rev=%s, cursor=%s", view, snapRev, nextCursor)
+	}
+
+	// 6. SHOW ENGINE INNODB STATUS: verify 3-column MySQL standard
 	rowsStatus, err := dbRoot.Query("SHOW ENGINE INNODB STATUS")
 	if err != nil {
 		t.Fatalf("SHOW ENGINE INNODB STATUS failed: %v", err)
@@ -141,13 +151,13 @@ func TestT062ServerShowEngineDiagnosticsProtocol(t *testing.T) {
 		if err := rowsStatus.Scan(&statusType, &statusName, &statusText); err != nil {
 			t.Fatal(err)
 		}
-		if statusType != "INNODB" || !strings.Contains(statusText, "LOCK STATS:") {
+		if statusType != "INNODB" || !strings.Contains(statusText, "LOCK STATS:") || !strings.Contains(statusText, "NextCursor=") {
 			t.Fatalf("unexpected status content: type=%s, text=%s", statusType, statusText)
 		}
 	}
 	rowsStatus.Close()
 
-	// 6. Test active held locks reporting and privacy
+	// 7. Test active held locks reporting and privacy
 	tx, err := dbRoot.Begin()
 	if err != nil {
 		t.Fatal(err)
@@ -170,8 +180,8 @@ func TestT062ServerShowEngineDiagnosticsProtocol(t *testing.T) {
 	foundActive := false
 	for rowsActive.Next() {
 		foundActive = true
-		vals := make([]sql.NullString, 11)
-		ptrs := make([]any, 11)
+		vals := make([]sql.NullString, 12)
+		ptrs := make([]any, 12)
 		for i := range vals {
 			ptrs[i] = &vals[i]
 		}

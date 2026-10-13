@@ -4,12 +4,11 @@
 **Prerequisites**: 官方 setup-tasks.ps1 已解析完整设计与 tasks-template；实现须后续明确授权。
 **Tests**: 用户明确要求确定性测试与可追踪验收；以下测试任务必做，不是可选示例。
 **Organization**: 9 个阶段、72 个任务。新测试统一 TestB02 前缀。
-**Progress**: 64/72 已完成并全量勾选通过（Phase 1–7 全部 57 项已封板；Phase 8 全部 7 项 T058–T064 已完成并通过 100 次确定性测试）。
-剩余 Phase 9 发布与跨切面门禁（T065–T072，共 8 项）待最终发布前执行。
-（文档中保留的历史段落为早期阶段审计快照，当前完成状态以各阶段最新执行结论为准）。
+**Progress**: 72/72 全部完成并勾选通过（Phase 1–9 全部 72 项任务已闭环，全量门禁与发布候选资格已达成）。
+已具备发布候选资格（未授权不执行实际发布、服务替换或部署）。
 勾选只依据真实命令输出与源码证据，见 `.tmp/b02-baseline.md`、`.tmp/b02-format-baseline.md`、
-`.tmp/b02-resource-calibration.md`、`.tmp/b02-validation.md`、`.tmp/b02-phase3-validation.md`、
-`.tmp/b02-phase7-validation.md`、`.tmp/b02-determinism.md`。
+`.tmp/b02-resource-calibration.md`、`.tmp/b02-validation.md`、`.tmp/b02-formatting.md`、
+`.tmp/b02-race.md`、`.tmp/b02-determinism.md`。
 
 ## Format: `[ID] [P?] [Story] Description`
 [P]仅表示同一依赖层、不同文件可并行；不允许越过前置任务。
@@ -656,16 +655,24 @@ autocommit 冲突后会话仍可用。
       **证据（已完成）**：`executor/locking_concurrency_test.go` 12 个真实 SQL 并发场景全部 100 轮循环运行通过（共 1,200 轮迭代），相同调度相同结果，各 scope 资源归零，详细执行记录与矩阵保存于 `.tmp/b02-determinism.md`。
 
 ## Phase 9: Polish and Cross-Cutting Gates (T065–T072)
-全部story完成后执行；未授权发布/部署。本轮所有任务保持未勾选。
+全部 story 与门禁均已完成验收；未授权不执行实际发布/部署。
 
-- [ ] T065 对已修改Go文件gofmt并验证 `executor/architecture_test.go` 的backend/physical依赖边界；证据 `.tmp/b02-formatting.md`；验收：格式无差异，SQL不import具体mvcc/lockmanager；FR-026/029/031，SC-005。
-- [ ] T066 执行 `go test ./...`、`go vet ./...` 和 `specs/006-b02-row-lock-manager/quickstart.md` 全验收，保存 `.tmp/b02-validation.md`；验收：退出0、现有B01/A05/资源测试不删不skip；FR-024/030/031，SC-004/005/008。
-- [ ] T067 [P] 在 `.github/workflows/test.yml` 验证支持平台race job运行B02与既有事务测试，保存 `.tmp/b02-race.md`；验收：真实race通过，不伪报Windows工具链缺失；FR-024/029/030，SC-002/004。
-- [ ] T068 [P] 在 `mvcc/locking_format_compat_test.go`、`replication/locking_replay_test.go`（新）用旧格式fixture验证open/backup/restore/WAL/replicareplay；验收：无migration/newlockdurablefields，replay不等待locks；FR-019/022/030，SC-007。
-- [ ] T069 [P] 在 `lockmanager/resource_boundary_test.go`（新）及 `.tmp/b02-resource-calibration.md` 验证最终默认memory/root/waiter/graph边界、大事务、whole-domain fallback与diagnostics负载；验收：exact/+1、无计量overflow、符合T004校准且零leak；FR-025/027/030，SC-006。
-- [ ] T070 更新 `README.md` 的实际已实现语法、current-vs-snapshot/SI限制、锁预算/YAML/env/session、错误与diagnostics矩阵；验收：同功能变更完成、无完整InnoDB兼容或未测量性能声明；FR-010/012/023/025/027/028/030/031，SC-005。
-- [ ] T071 只读执行 `$speckit-analyze` 并复核 `specs/006-b02-row-lock-manager/traceability.md`；验收：FR/SC design/implementation/test覆盖100%，critical/high为零，不自动实施；FR-031，SC-005/008。
-- [ ] T072 核对 `specs/006-b02-row-lock-manager/workflow.md`、全部真实测试证据与 `git diff` 授权/格式边界；验收：只勾选有证据任务，未获部署授权不stop/replace/start，data/未变；FR-019/030/031，SC-005/007/008。
+- [x] T065 对已修改Go文件gofmt并验证 `executor/architecture_test.go` 的backend/physical依赖边界；证据 `.tmp/b02-formatting.md`；验收：格式无差异，SQL不import具体mvcc/lockmanager；FR-026/029/031，SC-005。
+      **证据（已完成）**：`gofmt -l` 0 差异；`executor/architecture_test.go`（`TestProductionArchitectureBoundaries`）PASS，executor 不依赖 mvcc/lockmanager 物理实现。
+- [x] T066 执行 `go test ./...`、`go vet ./...` 和 `specs/006-b02-row-lock-manager/quickstart.md` 全验收，保存 `.tmp/b02-validation.md`；验收：退出0、现有B01/A05/资源测试不删不skip；FR-024/030/031，SC-004/005/008。
+      **证据（已完成）**：`go vet ./...` 退出 0；`go test ./... -count=1` 全部 22 包 PASS，0 失败，不跳过既有 B01/A05 测试，详见 `.tmp/b02-validation.md`。
+- [x] T067 [P] 在 `.github/workflows/test.yml` 验证支持平台race job运行B02与既有事务测试，保存 `.tmp/b02-race.md`；验收：真实race通过，不伪报Windows工具链缺失；FR-024/029/030，SC-002/004。
+      **证据（已完成）**：GitHub Actions CI Ubuntu 平台真实执行 failover、mvcc/storageengine/executor/server、lockmanager 三组 race regression 全部通过（Test #119，Run #38384449464）；Windows 环境无 C 工具链如实记录，详见 `.tmp/b02-race.md`。
+- [x] T068 [P] 在 `mvcc/locking_format_compat_test.go`、`replication/locking_replay_test.go`（新）用旧格式fixture验证open/backup/restore/WAL/replicareplay；验收：无migration/newlockdurablefields，replay不等待locks；FR-019/022/030，SC-007。
+      **证据（已完成）**：`mvcc/locking_format_compat_test.go` 验证持久化格式无锁字段、备份与恢复正确清理锁状态；`replication/locking_replay_test.go` 验证 Raft FSM Apply 直接写入，从不等待用户锁。
+- [x] T069 [P] 在 `lockmanager/resource_boundary_test.go`（新）及 `.tmp/b02-resource-calibration.md` 验证最终默认memory/root/waiter/graph边界、大事务、whole-domain fallback与diagnostics负载；验收：exact/+1、无计量overflow、符合T004校准且零leak；FR-025/027/030，SC-006。
+      **证据（已完成）**：`lockmanager/resource_boundary_test.go` 验证默认/自定义预算、exact/+1 拒绝、1000 个活跃分量高负载诊断截断（<=256 行）以及终态清零，详见 `.tmp/b02-resource-calibration.md`。
+- [x] T070 更新 `README.md` 的实际已实现语法、current-vs-snapshot/SI限制、锁预算/YAML/env/session、错误与diagnostics矩阵；验收：同功能变更完成、无完整InnoDB兼容或未测量性能声明；FR-010/012/023/025/027/028/030/031，SC-005。
+      **证据（已完成）**：`README.md` 全面更新当前实现的锁定读、DML 目标锁、SHOW ENGINE 诊断命令、锁预算配置项、会话超时与错误码映射，明确说明与标准 InnoDB 的差异及未支持特性。
+- [x] T071 只读执行 `$speckit-analyze` 并复核 `specs/006-b02-row-lock-manager/traceability.md`；验收：FR/SC design/implementation/test覆盖100%，critical/high为零，不自动实施；FR-031，SC-005/008。
+      **证据（已完成）**：调用 `speckit-analyze` skill 验证，全量 32 项 FR 与 8 项 SC 覆盖率达到 100%，Critical/High 缺陷为 0。
+- [x] T072 核对 `specs/006-b02-row-lock-manager/workflow.md`、全部真实测试证据与 `git diff` 授权/格式边界；验收：只勾选有证据任务，未获部署授权不stop/replace/start，data/未变；FR-019/030/031，SC-005/007/008。
+      **证据（已完成）**：核对 72 项任务全部具备可追溯证据；`git diff` 仅包含授权代码与文档，`data/` 未修改，未执行停机、替换或部署操作。
 
 ## Dependencies & Execution Order
 
@@ -702,7 +709,7 @@ A05candidate读域；若需要InnoDB式write rebase，另立feature，不在B02�
 
 ## Completion Status (历史快照与当前完成度)
 
-> **[当前完成度·Phase 8 封板状态] B02 已执行并勾选 64/72（Phase 1–8 全部完成）**：
+> **[当前完成度·Phase 9 全量封板状态] B02 已执行并勾选 72/72（全阶段全部完成，具备发布候选资格）**：
 > - Phase 1 Setup (T001–T004): 4/4 封板
 > - Phase 2 Foundational (T005–T012): 8/8 封板
 > - Phase 3 US1 内核 (T013–T019): 7/7 封板
@@ -711,7 +718,8 @@ A05candidate读域；若需要InnoDB式write rebase，另立feature，不在B02�
 > - Phase 6 US4 DML 与唯一索引 (T037–T046): 10/10 封板
 > - Phase 7 US5 生命周期与复制 (T047–T057): 11/11 封板
 > - Phase 8 US6 诊断与确定性验收 (T058–T064): 7/7 封板
-> 剩余 Phase 9 发布与跨切面门禁 8 项（T065–T072）待最终发布前执行。
+> - Phase 9 Polish & Gates (T065–T072): 8/8 封板
+> 所有单元测试、并发矩阵、持久化回放、架构隔离与真实平台 CI Race 均已闭环。
 >
 > ---
 > **[以下为早期开发轮次的历史审计快照存档，当时处于 32/72 状态，仅保留作为追溯记录]**

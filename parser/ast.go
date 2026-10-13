@@ -252,6 +252,7 @@ type ShowEngineLocks struct {
 	Kind   string // "LOCKS", "LOCK WAITS", "DEADLOCKS", "STATUS"
 	Engine string
 	Limit  int
+	Status bool
 }
 type Use struct{ Database string }
 type Begin struct{}

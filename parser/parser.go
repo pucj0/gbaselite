@@ -1322,16 +1322,23 @@ func (p *Parser) parseShow() (Statement, error) {
 		} else {
 			return nil, p.errorf("expected LOCKS, LOCK WAITS, DEADLOCKS, or STATUS")
 		}
+		isStatus := false
+		if p.accept("STATUS") {
+			isStatus = true
+		}
 		limit := 0
 		if p.accept("LIMIT") {
 			token, err := p.expectKindValue(TokenNumber, "integer limit")
 			if err != nil {
 				return nil, err
 			}
-			lim, _ := strconv.Atoi(token.Text)
+			lim, err := strconv.Atoi(token.Text)
+			if err != nil || lim < 0 {
+				return nil, p.errorf("invalid LIMIT")
+			}
 			limit = lim
 		}
-		return ShowEngineLocks{Kind: kind, Engine: engineName, Limit: limit}, nil
+		return ShowEngineLocks{Kind: kind, Engine: engineName, Limit: limit, Status: isStatus}, nil
 	}
 	if p.accept("FULL") {
 		if p.accept("TABLES") {
