@@ -394,6 +394,7 @@ type LockStats struct {
 type LockDiagnosticsPage struct {
 	SnapshotRevision uint64
 	Limit            int
+	Total            int
 	Truncated        bool
 	NextCursor       string
 }

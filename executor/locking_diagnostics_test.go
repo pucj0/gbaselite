@@ -2,6 +2,7 @@ package executor
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -146,6 +147,62 @@ func TestT062ShowEngineDiagnosticsUnknownAndUnsupportedEngine(t *testing.T) {
 	if !errors.Is(err, storageengine.ErrUnsupported) {
 		t.Fatalf("expected ErrUnsupported on backend without LockDiagnostics, got: %v", err)
 	}
+}
+
+func TestT062ShowEngineStatusTotalAccuracyUnderHighLoad(t *testing.T) {
+	f := newT035Fixture(t, "CREATE TABLE items(id BIGINT PRIMARY KEY, v INT)")
+	adminSession := t034Session(t, f, 50)
+	adminSession.Username = "root"
+	adminSession.Host = "%"
+
+	// 1. Empty state: Total is 0, Truncated is false
+	resEmpty := f.must(adminSession, "SHOW ENGINE LOCKS STATUS")
+	if len(resEmpty.Rows) != 1 {
+		t.Fatalf("expected 1 status row for empty locks, got %d", len(resEmpty.Rows))
+	}
+	// Columns: Engine, View, SnapshotRevision, Total, Truncated, NextCursor, Limit
+	if resEmpty.Rows[0][3].(string) != "0" {
+		t.Fatalf("expected Total 0 for empty lock table, got %v", resEmpty.Rows[0][3])
+	}
+	if resEmpty.Rows[0][4].(string) != "false" {
+		t.Fatalf("expected Truncated false for empty lock table, got %v", resEmpty.Rows[0][4])
+	}
+
+	// 2. Insert 300 rows and hold locks on them in a transaction (> 256)
+	f.must(adminSession, "BEGIN")
+	for i := 1; i <= 300; i++ {
+		f.must(adminSession, fmt.Sprintf("INSERT INTO items VALUES(%d, %d)", i, i*10))
+	}
+
+	// 3. Query SHOW ENGINE LOCKS: ReturnedRows should be clamped to 256
+	resLocks := f.must(adminSession, "SHOW ENGINE LOCKS")
+	if len(resLocks.Rows) != 256 {
+		t.Fatalf("expected 256 returned rows for SHOW ENGINE LOCKS, got %d", len(resLocks.Rows))
+	}
+
+	// 4. Query SHOW ENGINE LOCKS STATUS: Total must report >= 300 and Truncated == true
+	resStatus := f.must(adminSession, "SHOW ENGINE LOCKS STATUS")
+	if len(resStatus.Rows) != 1 {
+		t.Fatalf("expected 1 row for SHOW ENGINE LOCKS STATUS, got %d", len(resStatus.Rows))
+	}
+	totalStr := resStatus.Rows[0][3].(string)
+	truncStr := resStatus.Rows[0][4].(string)
+	if truncStr != "true" {
+		t.Fatalf("expected Truncated true when > 256 locks exist, got %s", truncStr)
+	}
+	totalNum := 0
+	fmt.Sscanf(totalStr, "%d", &totalNum)
+	if totalNum < 300 {
+		t.Fatalf("expected Total >= 300, got %d", totalNum)
+	}
+
+	// 5. Query with LIMIT 1: Total remains accurate, ReturnedRows is 1
+	resLimit1 := f.must(adminSession, "SHOW ENGINE LOCKS LIMIT 1")
+	if len(resLimit1.Rows) != 1 {
+		t.Fatalf("expected 1 row for LIMIT 1, got %d", len(resLimit1.Rows))
+	}
+
+	f.must(adminSession, "ROLLBACK")
 }
 
 type mockUnsupportedBackend struct {

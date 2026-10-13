@@ -124,6 +124,7 @@ func (e *engine) LocksPage(cursor string, limit int) (storageengine.LockPage, er
 		LockDiagnosticsPage: storageengine.LockDiagnosticsPage{
 			SnapshotRevision: page.SnapshotRevision,
 			Limit:            page.Limit,
+			Total:            page.TotalGrants,
 			Truncated:        page.GrantsTruncated,
 			NextCursor:       page.NextCursor,
 		},
@@ -162,6 +163,7 @@ func (e *engine) WaitPage(cursor string, limit int) (storageengine.WaitPage, err
 		LockDiagnosticsPage: storageengine.LockDiagnosticsPage{
 			SnapshotRevision: page.SnapshotRevision,
 			Limit:            page.Limit,
+			Total:            page.TotalWaits,
 			Truncated:        page.WaitsTruncated,
 			NextCursor:       page.NextCursor,
 		},
@@ -198,6 +200,7 @@ func (e *engine) DeadlocksPage(cursor string, limit int) (storageengine.Deadlock
 		LockDiagnosticsPage: storageengine.LockDiagnosticsPage{
 			SnapshotRevision: page.SnapshotRevision,
 			Limit:            page.Limit,
+			Total:            page.TotalDeadlocks,
 			Truncated:        page.DeadlocksTruncated,
 			NextCursor:       page.NextCursor,
 		},

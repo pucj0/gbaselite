@@ -41,7 +41,7 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 			if err != nil {
 				return nil, err
 			}
-			rows := [][]any{{eng, "LOCKS", strconv.FormatUint(page.SnapshotRevision, 10), strconv.Itoa(len(page.Rows)), strconv.FormatBool(page.Truncated), page.NextCursor, strconv.Itoa(page.Limit)}}
+			rows := [][]any{{eng, "LOCKS", strconv.FormatUint(page.SnapshotRevision, 10), strconv.Itoa(page.Total), strconv.FormatBool(page.Truncated), page.NextCursor, strconv.Itoa(page.Limit)}}
 			res := &Result{Columns: cols, Rows: rows}
 			res.Message = fmt.Sprintf("SnapshotRevision: %d, Truncated: %v, NextCursor: %s", page.SnapshotRevision, page.Truncated, page.NextCursor)
 			return res, nil
@@ -50,7 +50,7 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 			if err != nil {
 				return nil, err
 			}
-			rows := [][]any{{eng, "LOCK WAITS", strconv.FormatUint(page.SnapshotRevision, 10), strconv.Itoa(len(page.Rows)), strconv.FormatBool(page.Truncated), page.NextCursor, strconv.Itoa(page.Limit)}}
+			rows := [][]any{{eng, "LOCK WAITS", strconv.FormatUint(page.SnapshotRevision, 10), strconv.Itoa(page.Total), strconv.FormatBool(page.Truncated), page.NextCursor, strconv.Itoa(page.Limit)}}
 			res := &Result{Columns: cols, Rows: rows}
 			res.Message = fmt.Sprintf("SnapshotRevision: %d, Truncated: %v, NextCursor: %s", page.SnapshotRevision, page.Truncated, page.NextCursor)
 			return res, nil
@@ -59,7 +59,7 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 			if err != nil {
 				return nil, err
 			}
-			rows := [][]any{{eng, "DEADLOCKS", strconv.FormatUint(page.SnapshotRevision, 10), strconv.Itoa(len(page.Rows)), strconv.FormatBool(page.Truncated), page.NextCursor, strconv.Itoa(page.Limit)}}
+			rows := [][]any{{eng, "DEADLOCKS", strconv.FormatUint(page.SnapshotRevision, 10), strconv.Itoa(page.Total), strconv.FormatBool(page.Truncated), page.NextCursor, strconv.Itoa(page.Limit)}}
 			res := &Result{Columns: cols, Rows: rows}
 			res.Message = fmt.Sprintf("SnapshotRevision: %d, Truncated: %v, NextCursor: %s", page.SnapshotRevision, page.Truncated, page.NextCursor)
 			return res, nil

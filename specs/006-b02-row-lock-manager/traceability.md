@@ -501,8 +501,8 @@ FR-033 的质量门（T065–T072）。`UPDATE`/`DELETE` 的范围候选仍不�
 |---|---|---|---|---|
 | **T065** | 格式化审查与架构边界核验 | 全库 Go 代码、`executor/architecture_test.go` | `go test ./executor -run Architecture` | 全库 0 格式差异；executor 不 import mvcc/lockmanager 物理包，生成 `.tmp/b02-formatting.md` |
 | **T066** | 全库测试、vet 与 quickstart 验收 | 全库包 | `go test ./...`、`go vet ./...` | 全库 22 包测试全绿，0 FAIL，0 告警，生成 `.tmp/b02-validation.md` |
-| **T067** | CI 支持平台 Race 验证 | `.github/workflows/test.yml` | GitHub Actions Test #119 (Ubuntu race jobs) | failover、mvcc/storageengine/executor/server、lockmanager 三组 race regression 全部通过，生成 `.tmp/b02-race.md` |
-| **T068** | 旧格式打开、备份恢复与 Raft 回放 | `mvcc/locking_format_compat_test.go`、`replication/locking_replay_test.go` | 同左测试用例 | 验证持久化格式无锁字段、备份与恢复正确重置锁状态；Raft FSM Apply 写入从不等待用户锁 |
+| **T067** | CI 支持平台 Race 验证 | `.github/workflows/test.yml` | GitHub Actions Test #120 (HEAD 3bbfda5 Ubuntu race jobs) | failover、mvcc/storageengine/executor/server、lockmanager 三组 race regression 全部通过，生成 `.tmp/b02-race.md` |
+| **T068** | 旧格式打开、备份恢复与 Raft 回放 | `mvcc/locking_format_compat_test.go`、`replication/locking_replay_test.go` | 同左测试用例 | 采用基线提交 140838c 生成的真实 B01 数据库与备份 fixture（mvcc/testdata）；挂载真实 LockManager，验证 Restore 彻底失效活动 Grant、Pending 与句柄；验证 Raft FSM Apply 不等待用户锁且引发预期冲突 |
 | **T069** | 资源预算极限与高负载校准 | `lockmanager/resource_boundary_test.go` | `go test ./lockmanager -run TestT069` | 验证默认/自定义预算、exact/+1 拒绝、1000 活跃分量高负载诊断截断与终态归零，更新 `.tmp/b02-resource-calibration.md` |
 | **T070** | 同步更新 README 语法与限制 | `README.md` | 手工审查 | 完整更新锁定读、DML 目标锁、SHOW ENGINE 诊断命令、锁预算配置项、会话超时与错误码映射及未支持特性说明 |
 | **T071** | 只读执行 speckit-analyze | `speckit-analyze` skill | skill 调用结果 | 32 项 FR 与 8 项 SC 覆盖率达到 100%，Critical/High 缺陷为 0 |

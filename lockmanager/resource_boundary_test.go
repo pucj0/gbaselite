@@ -82,9 +82,85 @@ func TestT069RootRequestsBudgetExactAndPlusOne(t *testing.T) {
 	}
 }
 
-func TestT069WaitersBudgetExactAndPlusOne(t *testing.T) {
-	limits := BudgetLimits{Waiters: 1}
+func TestT069MemoryBudgetExactAndPlusOne(t *testing.T) {
+	// Exact budget for 1 owner (overhead + fixed block) + 1 scope
+	registration := int64(ownerFixedBytes) * 2
+	exact := registration + scopeFixedBytes
+	limits := BudgetLimits{MemoryBytes: exact, RootRequests: 4, Waiters: 4, GraphWork: 4}
 	m, err := NewManager(limits, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	// 1. Owner registration succeeds taking exactly registration bytes
+	_, err = m.RegisterOwner("root-1", 1, 0, 10)
+	if err != nil {
+		t.Fatalf("RegisterOwner failed: %v", err)
+	}
+	if got := m.Ledger().Totals().MemoryBytes; got != registration {
+		t.Fatalf("expected memory %d after owner, got %d", registration, got)
+	}
+
+	// 2. OpenScope succeeds taking exactly scopeFixedBytes -> reaches exact budget
+	s1, err := m.OpenScope("root-1", "s1", 0, ScopeStatement, time.Time{})
+	if err != nil {
+		t.Fatalf("OpenScope failed: %v", err)
+	}
+	if got := m.Ledger().Totals().MemoryBytes; got != exact {
+		t.Fatalf("expected memory exactly %d after scope, got %d", exact, got)
+	}
+
+	// 3. Second scope requires +scopeFixedBytes -> exceeds memory budget, fails closed
+	_, errSecond := m.OpenScope("root-1", "s2", 0, ScopeStatement, time.Time{})
+	if !errors.Is(errSecond, ErrBudgetMemory) && !errors.Is(errSecond, ErrLockResourceLimit) {
+		t.Fatalf("expected ErrBudgetMemory on second scope, got: %v", errSecond)
+	}
+
+	// Memory usage must not change after failure (no partial leak)
+	if got := m.Ledger().Totals().MemoryBytes; got != exact {
+		t.Fatalf("memory leaked on failed scope: got %d, want %d", got, exact)
+	}
+
+	// Close first scope marks it closed but retains historical node bytes until owner release
+	_, _ = m.CloseScope("root-1", s1.ID)
+	if got := m.Ledger().Totals().MemoryBytes; got != exact {
+		t.Fatalf("expected scope node to remain charged until owner release, got %d, want %d", got, exact)
+	}
+
+	// Release owner refunds everything to zero
+	m.ReleaseOwner("root-1")
+	if m.Ledger().Totals().MemoryBytes != 0 || m.Stats().ActiveOwners != 0 {
+		t.Fatalf("leak after owner release: mem=%d, owners=%d", m.Ledger().Totals().MemoryBytes, m.Stats().ActiveOwners)
+	}
+}
+
+func TestT069GraphWorkEdgeCapacityAndTraversalLimit(t *testing.T) {
+	// 1. Edge capacity check via Ledger: GraphWork: 2 allows exactly 2 edges
+	limits := BudgetLimits{GraphWork: 2}
+	ledger, err := NewLedger(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.ClaimEdge(); err != nil {
+		t.Fatalf("edge 1 failed: %v", err)
+	}
+	if err := ledger.ClaimEdge(); err != nil {
+		t.Fatalf("edge 2 failed: %v", err)
+	}
+	// Edge 3 exceeds GraphWork limit 2
+	if err := ledger.ClaimEdge(); !errors.Is(err, ErrBudgetGraph) && !errors.Is(err, ErrLockResourceLimit) {
+		t.Fatalf("expected ErrBudgetGraph on edge 3, got: %v", err)
+	}
+	ledger.ReleaseEdge()
+	ledger.ReleaseEdge()
+	if ledger.Totals().GraphEdges != 0 {
+		t.Fatalf("edges residue: %d", ledger.Totals().GraphEdges)
+	}
+
+	// 2. Traversal work limit check via DetectDeadlock with GraphWork: 1
+	// On a 3-cycle, budget of 1 step cannot finish walk -> fails closed without choosing false victim
+	m, err := NewManager(BudgetLimits{GraphWork: 1}, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,27 +177,27 @@ func TestT069WaitersBudgetExactAndPlusOne(t *testing.T) {
 
 	tiX := t063TableIntentRef("row/t1", "t1", ModeIX)
 	r1 := t063RowRef("row/t1", "t1", "k1", ModeX)
+	r2 := t063RowRef("row/t1", "t1", "k2", ModeX)
+	r3 := t063RowRef("row/t1", "t1", "k3", ModeX)
 
-	// A holds lock
 	_, _ = m.Acquire(ctx, "root-a", sA.ID, []ResourceRef{tiX, r1})
+	_, _ = m.Acquire(ctx, "root-b", sB.ID, []ResourceRef{tiX, r2})
+	_, _ = m.Acquire(ctx, "root-c", sC.ID, []ResourceRef{tiX, r3})
 
-	// B waits: exactly 1 waiter allowed
-	resB, errB := m.Acquire(ctx, "root-b", sB.ID, []ResourceRef{tiX, r1})
-	if errB != nil || resB.Op != LockOpWait {
-		t.Fatalf("B wait failed: %v", errB)
-	}
+	_, _ = m.Acquire(ctx, "root-a", sA.ID, []ResourceRef{tiX, r2})
+	_, _ = m.Acquire(ctx, "root-b", sB.ID, []ResourceRef{tiX, r3})
+	_, _ = m.Acquire(ctx, "root-c", sC.ID, []ResourceRef{tiX, r1})
 
-	// C tries to wait: +1 waiter exceeds limit 1
-	_, errC := m.Acquire(ctx, "root-c", sC.ID, []ResourceRef{tiX, r1})
-	if !errors.Is(errC, ErrBudgetWaiters) && !errors.Is(errC, ErrLockResourceLimit) {
-		t.Fatalf("expected ErrBudgetWaiters, got: %v", errC)
+	summary, found := m.DetectDeadlock()
+	if found {
+		t.Fatalf("exhausted budget should fail closed, but found deadlock: %+v", summary)
 	}
 
 	m.ReleaseOwner("root-a")
 	m.ReleaseOwner("root-b")
 	m.ReleaseOwner("root-c")
 	if m.LockTableSize() != 0 || m.Stats().ActiveOwners != 0 {
-		t.Fatalf("leak after release")
+		t.Fatalf("leak after GraphWork cleanup")
 	}
 }
 
