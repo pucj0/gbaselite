@@ -73,8 +73,11 @@ func (s *Store) AttachLocks(manager *lockmanager.Manager) (*LockBinding, error) 
 		return nil, ErrLocksAttached
 	}
 	binding.epochMu.Lock()
+	if s.generation.Load() == 0 {
+		s.generation.Store(manager.Generation())
+	}
 	binding.storeGeneration = s.generation.Load()
-	binding.storeTerm = 0
+	binding.storeTerm = manager.Term()
 	binding.epochMu.Unlock()
 	s.locks = binding
 	return binding, nil

@@ -591,18 +591,66 @@ func TestT054RealLeadershipTransferWakesWaitersAndEnforcesTermFence(t *testing.T
 		t.Fatal("failed to elect a new leader after transfer")
 	}
 
-	// 4. On new leader: Barrier succeeds, Current Read succeeds, write succeeds and commits
+	// 4. On new leader: verify Raft term and leadership role transferred
 	newLeaderEng := tc.engines[newLeaderIdx]
-	txNew, err := newLeaderEng.Begin(ctx)
+	nodeOld := leaderEng.(storageengine.ReplicatedEngine).Replica().(interface{ Node() *replication.Node }).Node()
+	oldTerm := nodeOld.Term()
+	nodeNew := newLeaderEng.(storageengine.ReplicatedEngine).Replica().(interface{ Node() *replication.Node }).Node()
+	newTerm := nodeNew.Term()
+	if newTerm < oldTerm {
+		t.Fatalf("expected new leader term >= old term, got old=%d, new=%d", oldTerm, newTerm)
+	}
+	if nodeOld.Status().State == "Leader" {
+		t.Fatalf("former leader unexpectedly still has Leader state")
+	}
+	if nodeNew.Status().State != "Leader" {
+		t.Fatalf("new leader does not have Leader state: %s", nodeNew.Status().State)
+	}
+
+	lmNew := mvccadapter.LockManagerOf(newLeaderEng)
+	if lmNew == nil {
+		t.Fatal("no lock manager on new leader")
+	}
+	if lmNew.Term() != newTerm {
+		t.Fatalf("expected Manager.Term %d on new leader, got %d", newTerm, lmNew.Term())
+	}
+
+	// On new leader: Barrier succeeds, locked Current Read succeeds, write succeeds and commits
+	txRead, err := newLeaderEng.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer txNew.Rollback()
 
-	if err := txNew.Put("row/test", []byte("k1"), []byte("valNewLeader")); err != nil {
+	locksRead := txRead.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	ltxRead, _ := locksRead.LockingTxn()
+	scopeRead, err := ltxRead.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
 		t.Fatal(err)
 	}
-	seqNew, err := txNew.Commit(ctx)
+	grantRead, err := ltxRead.Acquire(ctx, scopeRead, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}})
+	if err != nil {
+		t.Fatalf("new leader Acquire failed: %v", err)
+	}
+	obsRead, err := ltxRead.ReadCurrent(ctx, grantRead, "row/test", []byte("k1"))
+	if err != nil {
+		t.Fatalf("new leader ReadCurrent failed: %v", err)
+	}
+	_ = obsRead
+	_ = txRead.Rollback()
+
+	// On new leader: write succeeds and commits
+	txWrite, err := newLeaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txWrite.Rollback()
+
+	if err := txWrite.Put("row/test", []byte("k1"), []byte("valNewLeader")); err != nil {
+		t.Fatal(err)
+	}
+	seqNew, err := txWrite.Commit(ctx)
 	if err != nil {
 		t.Fatalf("new leader commit failed: %v", err)
 	}
@@ -614,6 +662,16 @@ func TestT054RealLeadershipTransferWakesWaitersAndEnforcesTermFence(t *testing.T
 	_, err = ltxA.ReadCurrent(ctx, grantA, "row/test", []byte("k1"))
 	if err == nil {
 		t.Fatal("former leader accepted Current Read under old grant")
+	}
+
+	// 6. Former leader cannot accept writes
+	txOldFail, err := leaderEng.Begin(ctx)
+	if err == nil {
+		_ = txOldFail.Put("row/test", []byte("k_fail"), []byte("v"))
+		_, errCommit := txOldFail.Commit(ctx)
+		if errCommit == nil {
+			t.Fatal("former leader accepted write commit after losing leadership")
+		}
 	}
 }
 

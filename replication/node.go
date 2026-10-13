@@ -225,28 +225,28 @@ func (n *Node) check() error {
 }
 
 var (
-	waitStartedHookMu sync.Mutex
-	waitStartedHook   func()
+	waitHookMu sync.Mutex
+	waitHook   func()
 )
 
-// SetWaitStartedHook sets a testing hook invoked when wait begins waiting on a raft.Future.
-func SetWaitStartedHook(hook func()) func() {
-	waitStartedHookMu.Lock()
-	defer waitStartedHookMu.Unlock()
-	prev := waitStartedHook
-	waitStartedHook = hook
-	return prev
-}
-
-func wait(ctx context.Context, future raft.Future) error {
-	waitStartedHookMu.Lock()
-	hook := waitStartedHook
-	waitStartedHookMu.Unlock()
+func runWaitHook() {
+	waitHookMu.Lock()
+	hook := waitHook
+	waitHookMu.Unlock()
 	if hook != nil {
 		hook()
 	}
+}
+
+func wait(ctx context.Context, future raft.Future) error {
 	done := make(chan error, 1)
-	go func() { done <- future.Error() }()
+	started := make(chan struct{}, 1)
+	go func() {
+		started <- struct{}{}
+		done <- future.Error()
+	}()
+	<-started
+	runWaitHook()
 	select {
 	case err := <-done:
 		return err
@@ -358,11 +358,6 @@ func (n *Node) currentTenureAndTerm() (uint64, uint64) {
 	}
 	return n.tenure, term
 }
-
-// Testing helpers for deterministic event coordination
-func (n *Node) HandleLeaderLossForTesting(tenure, term uint64) { n.onLeaderLoss(tenure, term) }
-func (n *Node) HandleLeaderElectedForTesting(term uint64)      { n.onLeaderElected(term) }
-func (n *Node) CurrentTenureForTesting() (uint64, uint64)      { return n.currentTenureAndTerm() }
 
 // SyncLockEpoch synchronizes the underlying store's lock epoch with the node's current Raft term.
 func (n *Node) SyncLockEpoch() bool {
