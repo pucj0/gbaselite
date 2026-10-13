@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync"
 	"testing"
-	"time"
 
 	"gbaselite/lockmanager"
 	"gbaselite/storageengine"
@@ -132,7 +131,8 @@ func TestT054ScenarioCDelayedOldResetCannotKillNewTermRoot(t *testing.T) {
 // TestT054ScenarioDConcurrentBeginAndEpochTransitions verifies Scenario D:
 // Highly concurrent Begin, SyncLockEpoch, and ResetLockEpoch invocations maintain
 // strict lock ordering (Store.views -> LockBinding.epochMu -> LockManager.mu) without deadlocks,
-// and failed creations leave zero transaction registry or ledger residues.
+// all workers and flippers are explicitly joined, and settled state leaves zero transaction
+// registry, owner, scope, wait edges, or ledger residues.
 func TestT054ScenarioDConcurrentBeginAndEpochTransitions(t *testing.T) {
 	f := newRawLockFixture(t)
 	ctx := context.Background()
@@ -143,9 +143,11 @@ func TestT054ScenarioDConcurrentBeginAndEpochTransitions(t *testing.T) {
 	const numWorkers = 8
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
+	flipperDone := make(chan struct{})
 
-	// Background epoch flipper
+	// Background epoch flipper: explicitly joined after workers exit
 	go func() {
+		defer close(flipperDone)
 		term := initialTerm
 		for {
 			select {
@@ -154,12 +156,12 @@ func TestT054ScenarioDConcurrentBeginAndEpochTransitions(t *testing.T) {
 			default:
 				term++
 				f.store.SyncLockEpoch(term)
-				time.Sleep(2 * time.Millisecond)
 			}
 		}
 	}()
 
 	// Concurrent workers creating and rolling back transactions
+	errCh := make(chan error, numWorkers*30)
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -168,9 +170,19 @@ func TestT054ScenarioDConcurrentBeginAndEpochTransitions(t *testing.T) {
 				term := f.manager.Term()
 				prop := &termProposer{Store: f.store, term: term}
 				tx, err := f.store.Begin(ctx, prop)
-				if err == nil {
-					_ = tx.Put(rawSpace, []byte("concurrent_key"), []byte("v"))
-					_ = tx.Rollback()
+				if err != nil {
+					// Expected failure if term shifted between read and Begin
+					if !errors.Is(err, storageengine.ErrLockInvalidated) && !errors.Is(err, lockmanager.ErrLockInvalidated) && !errors.Is(err, lockmanager.ErrOwnerUnknown) {
+						errCh <- err
+					}
+					continue
+				}
+				putErr := tx.Put(rawSpace, []byte("concurrent_key"), []byte("v"))
+				if putErr != nil && !errors.Is(putErr, storageengine.ErrLockInvalidated) && !errors.Is(putErr, lockmanager.ErrLockInvalidated) && !errors.Is(putErr, lockmanager.ErrOwnerUnknown) {
+					errCh <- putErr
+				}
+				if rbErr := tx.Rollback(); rbErr != nil {
+					errCh <- rbErr
 				}
 			}
 		}(i)
@@ -178,15 +190,33 @@ func TestT054ScenarioDConcurrentBeginAndEpochTransitions(t *testing.T) {
 
 	wg.Wait()
 	close(stop)
+	<-flipperDone // Explicitly join flipper before performing any final state assertion
+	close(errCh)
 
-	// Settle and verify clean state after all workers finish
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("unexpected worker error during concurrent transitions: %v", err)
+		}
+	}
+
+	// Settle and verify clean state after all workers and flippers finish
 	finalTerm := f.manager.Term() + 1
 	f.store.ResetLockEpoch(finalTerm)
 
 	if active := len(f.store.txns.ActiveTransactions()); active != 0 {
 		t.Fatalf("residue in transaction registry: %d active", active)
 	}
-	if stats := f.manager.Stats(); stats.ActiveOwners != 0 || stats.PendingRequests != 0 {
-		t.Fatalf("residue in lock manager: %+v", stats)
+	stats := f.manager.Stats()
+	if stats.ActiveOwners != 0 {
+		t.Fatalf("residue in lock manager ActiveOwners: %d", stats.ActiveOwners)
+	}
+	if stats.PendingRequests != 0 {
+		t.Fatalf("residue in lock manager PendingRequests: %d", stats.PendingRequests)
+	}
+	if stats.WaitEdges != 0 || len(f.manager.WaitEdges()) != 0 {
+		t.Fatalf("residue in lock manager WaitEdges: %d, edges=%+v", stats.WaitEdges, f.manager.WaitEdges())
+	}
+	if totals := f.manager.Ledger().Totals(); totals.Components != 0 || totals.Waiters != 0 {
+		t.Fatalf("residue in lock ledger: %+v", totals)
 	}
 }

@@ -173,6 +173,7 @@ func (s *Store) beginLockOwner(tx *Tx) error {
 		tx.lockOwnerID = owner.RootID
 		return nil
 	}
+	s.SyncLockEpoch(tx.term)
 	if _, err := s.locks.manager.RegisterOwner(tx.ID, s.generation.Load(), tx.term, tx.Snapshot); err != nil {
 		return err
 	}

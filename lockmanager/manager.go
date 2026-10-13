@@ -959,10 +959,10 @@ func (m *manager) RegisterOwner(rootID string, generation, term, readTS uint64) 
 	if m.closed {
 		return nil, ErrOwnerUnknown
 	}
-	if generation != 0 && m.generation != 0 && generation < m.generation {
+	if generation != m.generation {
 		return nil, ErrLockInvalidated
 	}
-	if m.term != 0 && term != m.term {
+	if term != m.term {
 		return nil, ErrLockInvalidated
 	}
 	if _, exists := m.owners[rootID]; exists {
