@@ -130,13 +130,15 @@ type currentIterator struct {
 	current entry
 	err     error
 	closed  bool
+
+	termFence func() error
 }
 
 // newCurrentIterator opens one locked scan.
 //
 // The interval claim is taken here, in the caller's goroutine, before any page is read; the
 // per-record claims are taken page by page inside Next.
-func newCurrentIterator(ctx context.Context, tx *mvcc.Tx, scope uint64, request storageengine.CurrentScanRequest) (storageengine.Iterator, error) {
+func newCurrentIterator(ctx context.Context, tx *mvcc.Tx, scope uint64, request storageengine.CurrentScanRequest, termFence func() error) (storageengine.Iterator, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -171,13 +173,14 @@ func newCurrentIterator(ctx context.Context, tx *mvcc.Tx, scope uint64, request 
 		}
 	}
 	return &currentIterator{
-		ctx:    ctx,
-		tx:     tx,
-		scope:  scope,
-		space:  request.Space,
-		bounds: request.Range,
-		mode:   mode,
-		limit:  request.Limit,
+		ctx:       ctx,
+		tx:        tx,
+		scope:     scope,
+		space:     request.Space,
+		bounds:    request.Range,
+		mode:      mode,
+		limit:     request.Limit,
+		termFence: termFence,
 	}, nil
 }
 
@@ -351,6 +354,11 @@ func (i *currentIterator) Next() bool {
 // hand a lock-manager sentinel to a caller that only knows the storage contract — a caller pressing
 // `errors.Is(err, storageengine.ErrLockWaitTimeout)` would not recognise its own timeout.
 func (i *currentIterator) claimAndRead(key []byte) ([]byte, bool, error) {
+	if i.termFence != nil {
+		if err := i.termFence(); err != nil {
+			return nil, false, err
+		}
+	}
 	record := currentScanRecord(i.space, key, i.mode)
 	grant, op, wait, err := i.tx.AcquireLock(i.ctx, i.scope, []lockmanager.ResourceRef{record}, nil)
 	if err != nil {
@@ -376,6 +384,12 @@ func (i *currentIterator) claimAndRead(key []byte) ([]byte, bool, error) {
 
 // listKeys lists the next bounded page of keys into pending, in the scan's direction.
 func (i *currentIterator) listKeys() bool {
+	if i.termFence != nil {
+		if err := i.termFence(); err != nil {
+			i.fail(err)
+			return false
+		}
+	}
 	keys, exhausted, err := i.pageKeys()
 	if err != nil {
 		i.fail(err)

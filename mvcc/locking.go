@@ -2,6 +2,7 @@ package mvcc
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"gbaselite/lockmanager"
@@ -34,9 +35,12 @@ import (
 // all, which is the default and keeps B01 behaviour unchanged.
 type LockBinding struct {
 	manager *lockmanager.Manager
+	mu      sync.Mutex
 	// storeGeneration records the B01 generation the binding was last synchronised with, so a
 	// generation change is recognisable as an epoch change.
 	storeGeneration uint64
+	// storeTerm records the Raft leader term the binding was last synchronised with.
+	storeTerm uint64
 }
 
 // NewLockBinding validates and returns a binding for one manager.
@@ -68,7 +72,10 @@ func (s *Store) AttachLocks(manager *lockmanager.Manager) (*LockBinding, error) 
 	if s.locks != nil && s.locks.manager != binding.manager {
 		return nil, ErrLocksAttached
 	}
+	binding.mu.Lock()
 	binding.storeGeneration = s.generation.Load()
+	binding.storeTerm = 0
+	binding.mu.Unlock()
 	s.locks = binding
 	return binding, nil
 }
@@ -102,24 +109,32 @@ func (s *Store) ResetLockEpoch(term uint64) int {
 		return 0
 	}
 	generation := s.generation.Load()
+	binding.mu.Lock()
 	binding.storeGeneration = generation
+	binding.storeTerm = term
+	binding.mu.Unlock()
 	return binding.manager.ResetEpoch(generation, term)
 }
 
-// SyncLockEpoch synchronises the lock epoch with the store's generation when the two have
-// drifted, and reports whether it had to act.
+// SyncLockEpoch synchronises the lock epoch with the store's generation and Raft leader term
+// when either has drifted, and reports whether it had to act.
 //
-// It is the safety net for a generation change that did not go through Restore: a caller that
-// bumped the generation through some other path still cannot leave lock owners behind, because
-// the drift is detected from the generation rather than assumed.
+// It is the safety net for a generation or term change: a caller that bumped the generation
+// through some other path or stepped into a new Raft term still cannot leave lock owners behind,
+// because the drift is detected from both the generation and the term rather than assumed.
+// Repeated calls with identical generation and term are strictly idempotent and no-ops.
 func (s *Store) SyncLockEpoch(term uint64) bool {
 	binding := s.locks
 	if binding == nil {
 		return false
 	}
-	if binding.storeGeneration == s.generation.Load() {
+	generation := s.generation.Load()
+	binding.mu.Lock()
+	if binding.storeGeneration == generation && binding.storeTerm == term {
+		binding.mu.Unlock()
 		return false
 	}
+	binding.mu.Unlock()
 	s.ResetLockEpoch(term)
 	return true
 }

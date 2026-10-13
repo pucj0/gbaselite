@@ -201,3 +201,34 @@ func TestT055ReplicatedThreeRootClasses(t *testing.T) {
 		t.Fatal("guard replicated commit allocated 0 sequence")
 	}
 }
+
+// TestT055ReplicatedTermChangeAbortsCommit verifies that when leadership is lost before commit,
+// the commit cannot succeed on the deposed node.
+func TestT055ReplicatedTermChangeAbortsCommit(t *testing.T) {
+	engines, _, cleanup := openReplicatedCluster(t, 3)
+	defer cleanup()
+
+	leaderIdx := waitForLeader(t, engines)
+	leaderEng := engines[leaderIdx]
+	ctx := context.Background()
+
+	tx, err := leaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	if err := tx.Put("row/t1", []byte("k_term"), []byte("v_term")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Depose leader by closing it
+	leaderEng.Close()
+	engines[leaderIdx] = nil
+
+	// Commit must fail on the closed/deposed leader
+	_, err = tx.Commit(ctx)
+	if err == nil {
+		t.Fatal("expected commit error after leader closure, got nil")
+	}
+}

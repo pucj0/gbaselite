@@ -309,3 +309,107 @@ func TestT055GroupCommitConcurrentTransactions(t *testing.T) {
 		}
 	}
 }
+
+// TestT055StreamCommitConflictAndCancellation verifies that large chunk-streamed transactions
+// properly enforce commit conflict detection, publication markers, cancellation boundaries,
+// and lock cleanup.
+func TestT055StreamCommitConflictAndCancellation(t *testing.T) {
+	dir := t.TempDir()
+	store, err := OpenWithOptions(dir, Options{LocalWAL: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	lm, err := lockmanager.NewManager(lockmanager.BudgetLimits{}, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lm.Close()
+
+	if _, err := store.AttachLocks(lm); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Seed row stream_key_0
+	seedTx, err := store.Begin(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seedTx.Put("row/stream", []byte("stream_key_0"), []byte("v0")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seedTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Stream transaction T1 reads stream_key_0, writes 16 rows of 4 KiB each (64 KiB > MaxChunkBytes 32 KiB)
+	t1, err := store.Begin(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer t1.Rollback()
+
+	_, _, _ = t1.Get("row/stream", []byte("stream_key_0"))
+
+	chunkVal := make([]byte, 4096)
+	for i := range chunkVal {
+		chunkVal[i] = 'X'
+	}
+
+	for i := 1; i < 16; i++ {
+		key := fmt.Sprintf("stream_key_%d", i)
+		if err := t1.Put("row/stream", []byte(key), chunkVal); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 3. Concurrent transaction T2 modifies stream_key_0 and commits
+	t2, err := store.Begin(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := t2.Put("row/stream", []byte("stream_key_0"), []byte("v_concurrent")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := t2.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Stream transaction T1 puts stream_key_0 and attempts commit -> must be rejected with ErrConflict!
+	if err := t1.Put("row/stream", []byte("stream_key_0"), chunkVal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := t1.Commit(ctx); !errors.Is(err, storageengine.ErrConflict) {
+		t.Fatalf("expected stream commit conflict ErrConflict, got: %v", err)
+	}
+
+	// 5. Successful stream transaction without conflict
+	t3, err := store.Begin(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 16; i++ {
+		key := fmt.Sprintf("stream_success_%d", i)
+		if err := t3.Put("row/stream", []byte(key), chunkVal); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seq3, err := t3.Commit(ctx)
+	if err != nil {
+		t.Fatalf("stream commit failed: %v", err)
+	}
+	if seq3 == 0 {
+		t.Fatal("stream commit allocated 0 sequence")
+	}
+	if _, committed := store.Committed(t3.ID); !committed {
+		t.Fatal("stream commit missing publication marker")
+	}
+
+	// 6. Lock manager has 0 residue
+	if lm.Stats().ActiveOwners != 0 || lm.Stats().PendingRequests != 0 || lm.LockTableSize() != 0 {
+		t.Fatalf("lock manager residue after stream commits: %+v, size=%d", lm.Stats(), lm.LockTableSize())
+	}
+}

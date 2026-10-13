@@ -206,12 +206,20 @@ func (t *txn) NewCurrentIterator(ctx context.Context, scope uint64, request stor
 	if _, ok := t.LockingTxn(); !ok {
 		return nil, storageengine.ErrUnsupported
 	}
+	var termFence func() error
 	if t.engine.node != nil {
 		if err := t.engine.node.Barrier(ctx); err != nil {
 			return nil, err
 		}
+		initialTerm := t.engine.node.Term()
+		termFence = func() error {
+			if t.engine.node.Status().State != "Leader" || t.engine.node.Term() != initialTerm {
+				return storageengine.ErrLockInvalidated
+			}
+			return nil
+		}
 	}
-	it, err := newCurrentIterator(ctx, t.inner, scope, request)
+	it, err := newCurrentIterator(ctx, t.inner, scope, request, termFence)
 	if err != nil {
 		return nil, neutralLockError(err)
 	}

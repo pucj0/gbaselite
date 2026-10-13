@@ -137,10 +137,25 @@ func Open(store *mvcc.Store, options Options) (*Node, error) {
 		return nil, err
 	}
 	go func() {
-		select {
-		case <-node.fatalSignal:
-			_ = node.raft.Shutdown().Error()
-		case <-node.stopped:
+		leaderCh := node.raft.LeaderCh()
+		for {
+			select {
+			case isLeader, ok := <-leaderCh:
+				if !ok {
+					return
+				}
+				if !isLeader {
+					node.onLeaderLoss()
+				} else {
+					node.SyncLockEpoch()
+				}
+			case <-node.fatalSignal:
+				node.onLeaderLoss()
+				_ = node.raft.Shutdown().Error()
+			case <-node.stopped:
+				node.onLeaderLoss()
+				return
+			}
 		}
 	}()
 	if options.Bootstrap && !exists {
@@ -184,6 +199,7 @@ func (n *Node) check() error {
 		return n.fatal
 	}
 	if n.raft.State() != raft.Leader {
+		n.onLeaderLoss()
 		return fmt.Errorf("%w; raft leader=%s", ErrNotLeader, n.Status().Leader)
 	}
 	return nil
@@ -218,20 +234,32 @@ func (n *Node) VerifyLeader(ctx context.Context) error {
 	if err := n.check(); err != nil {
 		return err
 	}
-	return wait(ctx, n.raft.VerifyLeader())
+	if err := wait(ctx, n.raft.VerifyLeader()); err != nil {
+		n.onLeaderLoss()
+		return err
+	}
+	return nil
 }
 func (n *Node) Barrier(ctx context.Context) error {
 	if err := n.check(); err != nil {
 		return err
 	}
 	if err := wait(ctx, n.raft.VerifyLeader()); err != nil {
+		n.onLeaderLoss()
 		return err
 	}
 	if err := wait(ctx, n.raft.Barrier(timeout(ctx))); err != nil {
+		n.onLeaderLoss()
 		return err
 	}
 	n.SyncLockEpoch()
 	return nil
+}
+
+func (n *Node) onLeaderLoss() {
+	if n.store != nil {
+		n.store.ResetLockEpoch(n.Term())
+	}
 }
 
 // SyncLockEpoch synchronizes the underlying store's lock epoch with the node's current Raft term.
