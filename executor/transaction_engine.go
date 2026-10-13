@@ -359,6 +359,8 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 			return result, err
 		}
 		return executeShow(e.Store, session, value)
+	case parser.ShowEngineLocks:
+		return e.executeShowEngineLocks(ctx, session, value)
 	}
 	child, err := tx.Child()
 	if err != nil {

@@ -648,9 +648,12 @@ autocommit 冲突后会话仍可用。
       `WaitEdges` 直接取派生图大小，因此统计视图与图视图不可能不一致。
       另外修正了 `cancelRequestsLocked` 把**队列条目数**当作**请求数**回报的问题
       （pending 索引按组件条目为键，一个双组件 bundle 会出现两次）。
-- [ ] T060 [US6] 在 `storageengine/mvccadapter/diagnostics.go`、`storageengine/locking.go` 实现可选LockDiagnostics转换；验收：不污染B01TransactionDiagnostics、缺失capability明确；FR-023/026。
-- [ ] T061 [US6] 在 `parser/parser.go`、`executor/locking_diagnostics.go`（新）、`server/metadata_browse.go` 接入三类SHOWENGINE及管理员权限；验收：limit/truncated明确，普通账号拒绝；FR-023/028/031。
-- [ ] T062 [US6] 在 `executor/locking_diagnostics_test.go`、`server/locking_diagnostics_test.go`（新）验证管理员/非管理员、unsupported、匿名字段、页面与cursor；验收：零敏感数据泄露、不阻塞独立txn；FR-023/026/031，SC-006。
+- [x] T060 [US6] 在 `storageengine/mvccadapter/diagnostics.go`、`storageengine/locking.go` 实现可选LockDiagnostics转换；验收：不污染B01TransactionDiagnostics、缺失capability明确；FR-023/026。
+      **证据（已完成）**：`mvccadapter` 实现 `storageengine.LockDiagnostics`（`LocksPage`、`WaitPage`、`DeadlocksPage`、`LockStats`），使用中立 DTO，匿名 ResourceID，无锁 I/O，页面上限 256 截断；`storageengine/mvccadapter/diagnostics_test.go` (`TestT060LockDiagnosticsCapability`) 覆盖能力检测、深拷贝与独立性。
+- [x] T061 [US6] 在 `parser/parser.go`、`executor/locking_diagnostics.go`（新）、`server/metadata_browse.go` 接入三类SHOWENGINE及管理员权限；验收：limit/truncated明确，普通账号拒绝；FR-023/028/031。
+      **证据（已完成）**：`parser` 支持 `SHOW ENGINE [INNODB|GB_LOCKS] {LOCKS | LOCK WAITS | DEADLOCKS | STATUS} [LIMIT <n>]` 语法；`executor/locking_diagnostics.go` 实现三类诊断结果与标准 STATUS 格式化；权限层严格限制仅管理员可访问。
+- [x] T062 [US6] 在 `executor/locking_diagnostics_test.go`、`server/locking_diagnostics_test.go`（新）验证管理员/非管理员、unsupported、匿名字段、页面与cursor；验收：零敏感数据泄露、不阻塞独立txn；FR-023/026/031，SC-006。
+      **证据（已完成）**：`executor/locking_diagnostics_test.go` 与 `server/locking_diagnostics_test.go` 验证管理员查询成功、非管理员被拒绝（access denied）、未知/不支持引擎返回错误、匿名字段零敏感泄露、并发锁持有与等待诊断输出正确。
 - [ ] T063 [US6] 在 `lockmanager/concurrency_test.go`（新）固定barrier/fakeclock调度100次cycle/queue/upgrade/grantcancel/epoch/budget；验收：victim与结果一致、终态全零、无sleep；FR-006..010/021/022/024/025，SC-001/002/003/006。
 - [ ] T064 [US6] 在 `executor/locking_concurrency_test.go`（新）及 `.tmp/b02-determinism.md` 保存100次SQL/rawwriter/索引冲突与生命周期结果；验收：相同调度相同结果、读模式分离、各scope资源为零；FR-011..024/026/030/032，SC-002/003/004。
 

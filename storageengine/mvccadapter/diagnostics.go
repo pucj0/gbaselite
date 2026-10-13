@@ -1,6 +1,10 @@
 package mvccadapter
 
 import (
+	"strings"
+	"time"
+
+	"gbaselite/lockmanager"
 	"gbaselite/mvcc"
 	"gbaselite/storageengine"
 )
@@ -93,4 +97,128 @@ func transactionState(state mvcc.TransactionState) storageengine.TransactionStat
 	default:
 		return storageengine.TransactionUnknown
 	}
+}
+
+var _ storageengine.LockDiagnostics = (*engine)(nil)
+
+func (e *engine) LocksPage(cursor string, limit int) (storageengine.LockPage, error) {
+	if e.locks == nil {
+		return storageengine.LockPage{}, storageengine.ErrUnsupported
+	}
+	page := e.locks.Diagnostics(lockmanager.DiagnosticsOptions{Limit: limit, Cursor: cursor})
+	var rows []storageengine.LockRow
+	for _, g := range page.Grants {
+		rows = append(rows, storageengine.LockRow{
+			GrantID:    g.GrantID,
+			RootID:     g.RootID,
+			ScopeID:    g.ScopeID,
+			Generation: g.Generation,
+			Term:       g.Term,
+			Mode:       storageengine.LockMode(g.Mode),
+			Kind:       storageengine.LockComponentKind(g.Kind),
+			Resource:   storageengine.OpaqueResourceID(g.ResourceID),
+			GrantedAt:  g.GrantedAt,
+		})
+	}
+	return storageengine.LockPage{
+		LockDiagnosticsPage: storageengine.LockDiagnosticsPage{
+			SnapshotRevision: page.SnapshotRevision,
+			Limit:            page.Limit,
+			Truncated:        page.GrantsTruncated,
+			NextCursor:       page.NextCursor,
+		},
+		Rows: rows,
+	}, nil
+}
+
+func (e *engine) WaitPage(cursor string, limit int) (storageengine.WaitPage, error) {
+	if e.locks == nil {
+		return storageengine.WaitPage{}, storageengine.ErrUnsupported
+	}
+	page := e.locks.Diagnostics(lockmanager.DiagnosticsOptions{Limit: limit, Cursor: cursor, IncludeWaiters: true})
+	var rows []storageengine.WaitRow
+	for _, w := range page.Waits {
+		var reasons []string
+		for _, r := range w.Reasons {
+			reasons = append(reasons, string(r))
+		}
+		var deadline time.Time
+		if w.DeadlineMicros != 0 {
+			deadline = time.UnixMicro(w.DeadlineMicros)
+		}
+		rows = append(rows, storageengine.WaitRow{
+			RequestID:    w.RequestID,
+			RootID:       w.OwnerID,
+			ScopeID:      w.ScopeID,
+			Mode:         storageengine.LockMode(w.Mode),
+			Resource:     storageengine.OpaqueResourceID(w.ResourceID),
+			BlockerRoots: append([]string(nil), w.BlockerIDs...),
+			Reason:       strings.Join(reasons, ","),
+			WaitMillis:   uint64(w.WaitMicros / 1000),
+			Deadline:     deadline,
+		})
+	}
+	return storageengine.WaitPage{
+		LockDiagnosticsPage: storageengine.LockDiagnosticsPage{
+			SnapshotRevision: page.SnapshotRevision,
+			Limit:            page.Limit,
+			Truncated:        page.WaitsTruncated,
+			NextCursor:       page.NextCursor,
+		},
+		Rows: rows,
+	}, nil
+}
+
+func (e *engine) DeadlocksPage(cursor string, limit int) (storageengine.DeadlockPage, error) {
+	if e.locks == nil {
+		return storageengine.DeadlockPage{}, storageengine.ErrUnsupported
+	}
+	page := e.locks.Diagnostics(lockmanager.DiagnosticsOptions{Limit: limit, Cursor: cursor, IncludeDeadlocks: true})
+	var rows []storageengine.DeadlockRow
+	for _, d := range page.Deadlocks {
+		var modes []storageengine.LockMode
+		for _, m := range d.Modes {
+			modes = append(modes, storageengine.LockMode(m))
+		}
+		var anonIDs []storageengine.OpaqueResourceID
+		for _, id := range d.AnonymousIDs {
+			anonIDs = append(anonIDs, storageengine.OpaqueResourceID(id))
+		}
+		rows = append(rows, storageengine.DeadlockRow{
+			DetectedOrdinal: d.DetectedOrdinal,
+			GraphRevision:   d.GraphRevision,
+			VictimRootID:    d.VictimRootID,
+			CycleRootIDs:    append([]string(nil), d.CycleRootIDs...),
+			Resources:       anonIDs,
+			Modes:           modes,
+			Truncated:       d.Truncated,
+		})
+	}
+	return storageengine.DeadlockPage{
+		LockDiagnosticsPage: storageengine.LockDiagnosticsPage{
+			SnapshotRevision: page.SnapshotRevision,
+			Limit:            page.Limit,
+			Truncated:        page.DeadlocksTruncated,
+			NextCursor:       page.NextCursor,
+		},
+		Rows: rows,
+	}, nil
+}
+
+func (e *engine) LockStats() (storageengine.LockStats, error) {
+	if e.locks == nil {
+		return storageengine.LockStats{}, storageengine.ErrUnsupported
+	}
+	stats := e.locks.Stats()
+	return storageengine.LockStats{
+		ActiveOwners:       stats.ActiveOwners,
+		GrantedComponents:  stats.GrantedComponents,
+		PendingRequests:    stats.PendingRequests,
+		WaitEdges:          stats.WaitEdges,
+		MemoryBytes:        stats.MemoryBytes,
+		Timeouts:           stats.Timeouts,
+		Deadlocks:          stats.Deadlocks,
+		ResourceRejections: stats.ResourceRejections,
+		EpochInvalidations: stats.EpochInvalidations,
+	}, nil
 }

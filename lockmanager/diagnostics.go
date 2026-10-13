@@ -30,6 +30,8 @@ type LockDiagnosticsPage struct {
 
 	// Resources are the resources that currently have a holder or a waiter.
 	Resources []LockResourceRow
+	// Grants are the granted claims currently held across resources.
+	Grants []LockGrantRow
 	// Waits are the requests that are currently waiting.
 	Waits []LockWaitRow
 	// Deadlocks are the retained deadlock summaries, newest first.
@@ -38,13 +40,28 @@ type LockDiagnosticsPage struct {
 	// TotalResources, TotalWaits and TotalDeadlocks are the complete counts, so a truncated page
 	// still reports how much it is not showing.
 	TotalResources int
+	TotalGrants    int
 	TotalWaits     int
 	TotalDeadlocks int
 
 	// ResourcesTruncated, WaitsTruncated and DeadlocksTruncated report that a set was clipped.
 	ResourcesTruncated bool
+	GrantsTruncated    bool
 	WaitsTruncated     bool
 	DeadlocksTruncated bool
+}
+
+// LockGrantRow is one granted component of a live owner.
+type LockGrantRow struct {
+	GrantID    uint64
+	RootID     string
+	ScopeID    uint64
+	Generation uint64
+	Term       uint64
+	Mode       Mode
+	Kind       ResourceKind
+	ResourceID uint64
+	GrantedAt  time.Time
 }
 
 // LockResourceRow is one resource's observable state with anonymous identity only.
@@ -141,6 +158,11 @@ func (m *manager) Diagnostics(options DiagnosticsOptions) LockDiagnosticsPage {
 	page.TotalResources = resourcesTotal
 	page.ResourcesTruncated = resourcesTotal > len(resources)
 
+	grants, grantsTotal := m.grantRowsLocked(limit)
+	page.Grants = grants
+	page.TotalGrants = grantsTotal
+	page.GrantsTruncated = grantsTotal > len(grants)
+
 	if options.IncludeWaiters {
 		waits, waitsTotal := m.waitRowsLocked(limit, now)
 		page.Waits = waits
@@ -155,7 +177,7 @@ func (m *manager) Diagnostics(options DiagnosticsOptions) LockDiagnosticsPage {
 	}
 	m.mu.Unlock()
 
-	if page.ResourcesTruncated || page.WaitsTruncated || page.DeadlocksTruncated {
+	if page.ResourcesTruncated || page.GrantsTruncated || page.WaitsTruncated || page.DeadlocksTruncated {
 		page.Truncated = true
 	}
 	return page
@@ -200,6 +222,72 @@ func (m *manager) resourceRowsLocked(limit int, now time.Time) ([]LockResourceRo
 		rows = append(rows, row)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].ResourceID < rows[j].ResourceID })
+	total := len(rows)
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, total
+}
+
+// grantRowsLocked builds the granted lock component rows.
+func (m *manager) grantRowsLocked(limit int) ([]LockGrantRow, int) {
+	keys := make([]string, 0, len(m.locks.entries))
+	for key, entry := range m.locks.entries {
+		if entry.holderCount() == 0 {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var rows []LockGrantRow
+	for _, key := range keys {
+		entry := m.locks.entries[key]
+		resID := m.anonIDLocked(entry)
+		for ownerID, claims := range entry.claims {
+			owner := m.owners[ownerID]
+			var startedAt time.Time
+			var gen, term uint64
+			if owner != nil {
+				startedAt = owner.StartedAt
+				gen = owner.Generation
+				term = owner.Term
+			}
+			for _, claim := range claims {
+				if claim.pending {
+					continue
+				}
+				grantID := entry.grantID
+				var scopeID uint64
+				if claim.request != nil {
+					scopeID = claim.request.ScopeID
+					if claim.request.ID != 0 {
+						grantID = claim.request.ID
+					}
+				}
+				rows = append(rows, LockGrantRow{
+					GrantID:    grantID,
+					RootID:     ownerID,
+					ScopeID:    scopeID,
+					Generation: gen,
+					Term:       term,
+					Mode:       claim.mode,
+					Kind:       entry.ref.Kind,
+					ResourceID: resID,
+					GrantedAt:  startedAt,
+				})
+			}
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].ResourceID != rows[j].ResourceID {
+			return rows[i].ResourceID < rows[j].ResourceID
+		}
+		if rows[i].RootID != rows[j].RootID {
+			return rows[i].RootID < rows[j].RootID
+		}
+		return rows[i].GrantID < rows[j].GrantID
+	})
 	total := len(rows)
 	if len(rows) > limit {
 		rows = rows[:limit]

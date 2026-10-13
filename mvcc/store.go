@@ -489,6 +489,7 @@ func (s *Store) Barrier(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	s.SyncLockEpoch(0)
 	return s.AvailabilityError()
 }
 func (s *Store) Apply(index uint64, command Command) (Result, error) {

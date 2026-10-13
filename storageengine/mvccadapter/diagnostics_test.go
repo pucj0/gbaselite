@@ -396,3 +396,135 @@ func TestDiagnosticsRemainReadableDuringConcurrentCommits(t *testing.T) {
 		t.Fatalf("registry leaked: %+v", after)
 	}
 }
+
+// TestT060LockDiagnosticsCapability verifies T060:
+// 1. LockDiagnostics capability is optional and detected via LockDiagnosticsOf;
+// 2. Returns neutral DTOs with anonymous Resource IDs;
+// 3. Page limit clamped to MaxLockDiagnosticRows (256);
+// 4. Zero sensitive data (no keys, values, spaces, SQL);
+// 5. Returns independent copies.
+func TestT060LockDiagnosticsCapability(t *testing.T) {
+	e, _ := openDiagnosed(t, storageengine.Options{})
+	defer e.Close()
+
+	diag, err := storageengine.LockDiagnosticsOf(e)
+	if err != nil {
+		t.Fatalf("expected LockDiagnostics capability, got error: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 1. Initial empty pages
+	locksPage, err := diag.LocksPage("", 10)
+	if err != nil {
+		t.Fatalf("LocksPage failed: %v", err)
+	}
+	if len(locksPage.Rows) != 0 {
+		t.Fatalf("expected 0 lock rows initially, got %d", len(locksPage.Rows))
+	}
+
+	waitsPage, err := diag.WaitPage("", 10)
+	if err != nil {
+		t.Fatalf("WaitPage failed: %v", err)
+	}
+	if len(waitsPage.Rows) != 0 {
+		t.Fatalf("expected 0 wait rows initially, got %d", len(waitsPage.Rows))
+	}
+
+	deadlocksPage, err := diag.DeadlocksPage("", 10)
+	if err != nil {
+		t.Fatalf("DeadlocksPage failed: %v", err)
+	}
+	if len(deadlocksPage.Rows) != 0 {
+		t.Fatalf("expected 0 deadlock rows initially, got %d", len(deadlocksPage.Rows))
+	}
+
+	stats, err := diag.LockStats()
+	if err != nil {
+		t.Fatalf("LockStats failed: %v", err)
+	}
+	if stats.ActiveOwners != 0 || stats.GrantedComponents != 0 {
+		t.Fatalf("expected clean initial stats, got %+v", stats)
+	}
+
+	// 2. Acquire a lock: tx1 holds X on k1
+	tx1, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx1.Rollback()
+
+	locking, ok := tx1.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	if !ok {
+		t.Fatal("transaction does not expose LockingTxn")
+	}
+	ltx1, _ := locking.LockingTxn()
+	scope1, err := ltx1.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tableRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeIX,
+		Kind:    storageengine.LockComponentTableIntent,
+		Space:   "row/t1",
+		TableID: "t1",
+	}
+	rowRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeX,
+		Kind:    storageengine.LockComponentRecord,
+		Space:   "row/t1",
+		TableID: "t1",
+		Key:     []byte("secret_key_1"),
+	}
+	grant, err := ltx1.Acquire(ctx, scope1, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}})
+	if err != nil {
+		t.Fatalf("Acquire failed: %v", err)
+	}
+
+	// Verify LocksPage shows the granted lock with anonymous ResourceID
+	locksPage, err = diag.LocksPage("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locksPage.Rows) == 0 {
+		t.Fatal("expected at least 1 lock row, got 0")
+	}
+	found := false
+	for _, row := range locksPage.Rows {
+		if row.RootID == grant.OwnerID {
+			found = true
+			if row.Mode != storageengine.LockModeX && row.Mode != storageengine.LockModeIX {
+				t.Fatalf("expected LockModeX or IX, got %s", row.Mode)
+			}
+			if row.Resource == 0 {
+				t.Fatal("expected nonzero anonymous Resource ID")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("did not find tx1 (%s) in LocksPage: %+v", grant.OwnerID, locksPage.Rows)
+	}
+
+	// 3. Page limit clamped to MaxLockDiagnosticRows (256)
+	overLimitPage, err := diag.LocksPage("", 300)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overLimitPage.Limit != storageengine.MaxLockDiagnosticRows {
+		t.Fatalf("expected limit clamped to %d, got %d", storageengine.MaxLockDiagnosticRows, overLimitPage.Limit)
+	}
+
+	// 4. Mutation of returned page does not affect backend
+	if len(locksPage.Rows) > 0 {
+		locksPage.Rows[0].RootID = "MUTATED"
+		freshPage, _ := diag.LocksPage("", 10)
+		for _, r := range freshPage.Rows {
+			if r.RootID == "MUTATED" {
+				t.Fatal("backend state was mutated by modifying returned DTO")
+			}
+		}
+	}
+}

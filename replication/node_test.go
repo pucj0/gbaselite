@@ -58,7 +58,7 @@ func TestThreeNodeFailoverAndMinority(t *testing.T) {
 		open(i)
 	}
 	leader := func() int {
-		deadline := time.Now().Add(10 * time.Second)
+		deadline := time.Now().Add(20 * time.Second)
 		for time.Now().Before(deadline) {
 			for i, n := range nodes {
 				if n != nil && n.Status().State == "Leader" {

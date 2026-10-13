@@ -503,7 +503,7 @@ func (e *Engine) authorizeStatement(session *Session, statement parser.Statement
 			return fmt.Errorf("access denied for user %q@%q to %s.%s", session.Username, session.Host, database, table)
 		}
 		return nil
-	case parser.CreateUser, parser.DropUser, parser.RenameUser:
+	case parser.CreateUser, parser.DropUser, parser.RenameUser, parser.ShowEngineLocks:
 		return requireAccountAdmin()
 	case parser.AlterUser:
 		for _, user := range value.Users {

@@ -248,6 +248,11 @@ type Show struct {
 	Pattern    string
 	Where      Expr
 }
+type ShowEngineLocks struct {
+	Kind   string // "LOCKS", "LOCK WAITS", "DEADLOCKS", "STATUS"
+	Engine string
+	Limit  int
+}
 type Use struct{ Database string }
 type Begin struct{}
 type Commit struct{}
@@ -344,6 +349,7 @@ func (Update) statement()             {}
 func (Delete) statement()             {}
 func (Truncate) statement()           {}
 func (Show) statement()               {}
+func (ShowEngineLocks) statement()    {}
 func (Use) statement()                {}
 func (Begin) statement()              {}
 func (Commit) statement()             {}

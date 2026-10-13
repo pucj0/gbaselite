@@ -481,4 +481,12 @@ FR-033 的质量门（T065–T072）。`UPDATE`/`DELETE` 的范围候选仍不�
 
 **FR 覆盖增量**：FR-009/010/011/017/019/020/021/022/025/026/029/030/031 全部闭环。
 
-**仍未覆盖**：Phase 8（T060–T064 诊断与确定性验收）与 Phase 9（T065–T072 质量门禁与发布验收）。
+**仍未覆盖**：Phase 8 剩余项（T063–T064 确定性高频并发验收）与 Phase 9（T065–T072 质量门禁与发布验收）。
+
+## A17. Phase 8（US6 锁诊断接口与权限接入）进展（T060–T062 完成）
+
+| 任务 | 目标 | 实施位置 | 自动化测试 | 证据与验收结论 |
+|---|---|---|---|---|
+| **T060** | 中立 LockDiagnostics capability 转换 | `storageengine/mvccadapter/diagnostics.go`、`lockmanager/diagnostics.go` | `storageengine/mvccadapter/diagnostics_test.go` | 实现 LocksPage、WaitPage、DeadlocksPage、LockStats 中立 DTO 转换；页面上限 256 截断；ResourceID 匿名；深拷贝与无锁 I/O；未启用返回 Unsupported |
+| **T061** | SHOW ENGINE LOCKS / WAITS / DEADLOCKS 语法与权限 | `parser/ast.go`、`parser/parser.go`、`executor/locking_diagnostics.go`（新） | `executor/locking_diagnostics_test.go` | SQL parser 支持三类诊断命令与标准 STATUS 格式；仅管理员有权访问，普通用户明确拒绝；未知/不支持引擎返回明确错误 |
+| **T062** | 端到端诊断验收与协议集成 | `executor/locking_diagnostics_test.go`、`server/locking_diagnostics_test.go` | 同左测试用例 | 覆盖管理员成功、非管理员拒绝、不支持能力报错、匿名字段零泄露、MySQL 协议层 Resultset 包格式与数据正确 |
