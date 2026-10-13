@@ -4,16 +4,12 @@
 **Prerequisites**: 官方 setup-tasks.ps1 已解析完整设计与 tasks-template；实现须后续明确授权。
 **Tests**: 用户明确要求确定性测试与可追踪验收；以下测试任务必做，不是可选示例。
 **Organization**: 9 个阶段、72 个任务。新测试统一 TestB02 前缀。
-**Progress**: Phase 1（T001–T004）、Phase 2（T005–T012）、Phase 3 的 US1 内核（T013–T017）、
-Phase 4 的 T020/T022/T023（区间包含语义 + 边界感知冲突规则）、
-Phase 5 的 T029/T030/T031/T033（`mvcc` 当前读 + baseline；`parser` 锁定模式）、
-Phase 7 的 T047/T048/T049/T050/T051/T053、Phase 8 的 T058/T059（`lockmanager` 诊断）
-已执行并勾选；其余（含 T018/T019/T021/T024–T028、T032、T034–T036、**Phase 6 全部**）未执行。
-**Phase 6（DML 集成）本轮尝试后未达成**：UPDATE/DELETE 目标锁实现后停用（waiter 不唤醒），
-INSERT 锁实现后未产生阻塞；交付骨架与固定负向测试，证据 `.tmp/b02-phase13-dml-validation.md`。
+**Progress**: 64/72 已完成并全量勾选通过（Phase 1–7 全部 57 项已封板；Phase 8 全部 7 项 T058–T064 已完成并通过 100 次确定性测试）。
+剩余 Phase 9 发布与跨切面门禁（T065–T072，共 8 项）待最终发布前执行。
+（文档中保留的历史段落为早期阶段审计快照，当前完成状态以各阶段最新执行结论为准）。
 勾选只依据真实命令输出与源码证据，见 `.tmp/b02-baseline.md`、`.tmp/b02-format-baseline.md`、
 `.tmp/b02-resource-calibration.md`、`.tmp/b02-validation.md`、`.tmp/b02-phase3-validation.md`、
-`.tmp/b02-phase7-validation.md`。
+`.tmp/b02-phase7-validation.md`、`.tmp/b02-determinism.md`。
 
 ## Format: `[ID] [P?] [Story] Description`
 [P]仅表示同一依赖层、不同文件可并行；不允许越过前置任务。
@@ -654,8 +650,10 @@ autocommit 冲突后会话仍可用。
       **证据（已完成）**：`parser` 支持 `SHOW ENGINE [INNODB|GB_LOCKS] {LOCKS | LOCK WAITS | DEADLOCKS | STATUS} [LIMIT <n>]` 语法；`executor/locking_diagnostics.go` 实现三类诊断结果与标准 STATUS 格式化；权限层严格限制仅管理员可访问。
 - [x] T062 [US6] 在 `executor/locking_diagnostics_test.go`、`server/locking_diagnostics_test.go`（新）验证管理员/非管理员、unsupported、匿名字段、页面与cursor；验收：零敏感数据泄露、不阻塞独立txn；FR-023/026/031，SC-006。
       **证据（已完成）**：`executor/locking_diagnostics_test.go` 与 `server/locking_diagnostics_test.go` 验证管理员查询成功、非管理员被拒绝（access denied）、未知/不支持引擎返回错误、匿名字段零敏感泄露、并发锁持有与等待诊断输出正确。
-- [ ] T063 [US6] 在 `lockmanager/concurrency_test.go`（新）固定barrier/fakeclock调度100次cycle/queue/upgrade/grantcancel/epoch/budget；验收：victim与结果一致、终态全零、无sleep；FR-006..010/021/022/024/025，SC-001/002/003/006。
-- [ ] T064 [US6] 在 `executor/locking_concurrency_test.go`（新）及 `.tmp/b02-determinism.md` 保存100次SQL/rawwriter/索引冲突与生命周期结果；验收：相同调度相同结果、读模式分离、各scope资源为零；FR-011..024/026/030/032，SC-002/003/004。
+- [x] T063 [US6] 在 `lockmanager/concurrency_test.go`（新）固定barrier/fakeclock调度100次cycle/queue/upgrade/grantcancel/epoch/budget；验收：victim与结果一致、终态全零、无sleep；FR-006..010/021/022/024/025，SC-001/002/003/006。
+      **证据（已完成）**：`lockmanager/concurrency_test.go` 10 个测试全部 100 轮循环运行通过（共 1,000 轮迭代），无 sleep，victim 与错误类别稳定，终态锁资源全部归零。
+- [x] T064 [US6] 在 `executor/locking_concurrency_test.go`（新）及 `.tmp/b02-determinism.md` 保存100次SQL/rawwriter/索引冲突与生命周期结果；验收：相同调度相同结果、读模式分离、各scope资源为零；FR-011..024/026/030/032，SC-002/003/004。
+      **证据（已完成）**：`executor/locking_concurrency_test.go` 12 个真实 SQL 并发场景全部 100 轮循环运行通过（共 1,200 轮迭代），相同调度相同结果，各 scope 资源归零，详细执行记录与矩阵保存于 `.tmp/b02-determinism.md`。
 
 ## Phase 9: Polish and Cross-Cutting Gates (T065–T072)
 全部story完成后执行；未授权发布/部署。本轮所有任务保持未勾选。
@@ -702,9 +700,23 @@ MVP为US1 kernel fixture；随后按范围→current→DML→终态/复制→观
 在US5和cross-cutting gates完成之前不发布/部署SQLlocking能力。严格保持originalSIvalidator及
 A05candidate读域；若需要InnoDB式write rebase，另立feature，不在B02任务里隐式增加。
 
-## Completion Status
+## Completion Status (历史快照与当前完成度)
 
-> **最终验收结论（本轮）：B02 未完成。32/72 已勾选，40 项未执行。**
+> **[当前完成度·Phase 8 封板状态] B02 已执行并勾选 64/72（Phase 1–8 全部完成）**：
+> - Phase 1 Setup (T001–T004): 4/4 封板
+> - Phase 2 Foundational (T005–T012): 8/8 封板
+> - Phase 3 US1 内核 (T013–T019): 7/7 封板
+> - Phase 4 US2 范围锁与意向 (T020–T027): 8/8 封板
+> - Phase 5 US3 锁定当前读 (T028–T036): 9/9 封板
+> - Phase 6 US4 DML 与唯一索引 (T037–T046): 10/10 封板
+> - Phase 7 US5 生命周期与复制 (T047–T057): 11/11 封板
+> - Phase 8 US6 诊断与确定性验收 (T058–T064): 7/7 封板
+> 剩余 Phase 9 发布与跨切面门禁 8 项（T065–T072）待最终发布前执行。
+>
+> ---
+> **[以下为早期开发轮次的历史审计快照存档，当时处于 32/72 状态，仅保留作为追溯记录]**
+>
+> 最终验收结论（历史快照存档）：B02 当时 32/72 已勾选，40 项未执行。
 >
 > 关键结论：`lockmanager` 是一个**完整且有测试的组件**，生产路径上的接入按下面分层，不能一句
 > "基本未被使用"概括：

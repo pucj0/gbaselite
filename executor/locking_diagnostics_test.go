@@ -18,13 +18,13 @@ func TestT062ShowEngineDiagnosticsAdminAndUserPermissions(t *testing.T) {
 
 	// 1. Admin can query SHOW ENGINE LOCKS, LOCK WAITS, DEADLOCKS, STATUS
 	resLocks := f.must(adminSession, "SHOW ENGINE LOCKS")
-	if len(resLocks.Columns) != 9 {
-		t.Fatalf("expected 9 columns for SHOW ENGINE LOCKS, got %d", len(resLocks.Columns))
+	if len(resLocks.Columns) != 11 {
+		t.Fatalf("expected 11 columns for SHOW ENGINE LOCKS, got %d", len(resLocks.Columns))
 	}
 
 	resWaits := f.must(adminSession, "SHOW ENGINE LOCK WAITS")
-	if len(resWaits.Columns) != 9 {
-		t.Fatalf("expected 9 columns for SHOW ENGINE LOCK WAITS, got %d", len(resWaits.Columns))
+	if len(resWaits.Columns) != 11 {
+		t.Fatalf("expected 11 columns for SHOW ENGINE LOCK WAITS, got %d", len(resWaits.Columns))
 	}
 
 	resDeadlocks := f.must(adminSession, "SHOW ENGINE DEADLOCKS")

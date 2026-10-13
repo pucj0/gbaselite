@@ -34,7 +34,7 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 		if err != nil {
 			return nil, err
 		}
-		cols := resultColumns("GrantID", "RootID", "ScopeID", "Generation", "Term", "Mode", "ResourceKind", "OpaqueResourceID", "GrantedAt")
+		cols := resultColumns("GrantID", "RootID", "ScopeID", "Generation", "Term", "Mode", "ResourceKind", "OpaqueResourceID", "GrantedAt", "SnapshotRevision", "Truncated")
 		rows := make([][]any, 0, len(page.Rows))
 		for _, r := range page.Rows {
 			grantedAt := ""
@@ -51,16 +51,20 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 				string(r.Kind),
 				strconv.FormatUint(uint64(r.Resource), 10),
 				grantedAt,
+				strconv.FormatUint(page.SnapshotRevision, 10),
+				strconv.FormatBool(page.Truncated),
 			})
 		}
-		return &Result{Columns: cols, Rows: rows}, nil
+		res := &Result{Columns: cols, Rows: rows}
+		res.Message = fmt.Sprintf("SnapshotRevision: %d, Truncated: %v, NextCursor: %s", page.SnapshotRevision, page.Truncated, page.NextCursor)
+		return res, nil
 
 	case "LOCK WAITS":
 		page, err := diag.WaitPage("", stmt.Limit)
 		if err != nil {
 			return nil, err
 		}
-		cols := resultColumns("RequestID", "RootID", "ScopeID", "RequestedMode", "OpaqueResourceID", "BlockerRootIDs", "Reason", "WaitMilliseconds", "Deadline")
+		cols := resultColumns("RequestID", "RootID", "ScopeID", "RequestedMode", "OpaqueResourceID", "BlockerRootIDs", "Reason", "WaitMilliseconds", "Deadline", "SnapshotRevision", "Truncated")
 		rows := make([][]any, 0, len(page.Rows))
 		for _, w := range page.Rows {
 			deadlineStr := ""
@@ -77,9 +81,13 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 				w.Reason,
 				strconv.FormatUint(w.WaitMillis, 10),
 				deadlineStr,
+				strconv.FormatUint(page.SnapshotRevision, 10),
+				strconv.FormatBool(page.Truncated),
 			})
 		}
-		return &Result{Columns: cols, Rows: rows}, nil
+		res := &Result{Columns: cols, Rows: rows}
+		res.Message = fmt.Sprintf("SnapshotRevision: %d, Truncated: %v, NextCursor: %s", page.SnapshotRevision, page.Truncated, page.NextCursor)
+		return res, nil
 
 	case "DEADLOCKS":
 		page, err := diag.DeadlocksPage("", stmt.Limit)
@@ -107,7 +115,9 @@ func (e *Engine) executeShowEngineLocks(ctx context.Context, session *Session, s
 				strconv.FormatBool(d.Truncated),
 			})
 		}
-		return &Result{Columns: cols, Rows: rows}, nil
+		res := &Result{Columns: cols, Rows: rows}
+		res.Message = fmt.Sprintf("SnapshotRevision: %d, Truncated: %v, NextCursor: %s", page.SnapshotRevision, page.Truncated, page.NextCursor)
+		return res, nil
 
 	case "STATUS":
 		stats, err := diag.LockStats()

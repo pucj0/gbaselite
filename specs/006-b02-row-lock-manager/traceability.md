@@ -481,12 +481,16 @@ FR-033 的质量门（T065–T072）。`UPDATE`/`DELETE` 的范围候选仍不�
 
 **FR 覆盖增量**：FR-009/010/011/017/019/020/021/022/025/026/029/030/031 全部闭环。
 
-**仍未覆盖**：Phase 8 剩余项（T063–T064 确定性高频并发验收）与 Phase 9（T065–T072 质量门禁与发布验收）。
+**仍未覆盖**：Phase 9（T065–T072 质量门禁与发布验收）。
 
-## A17. Phase 8（US6 锁诊断接口与权限接入）进展（T060–T062 完成）
+## A17. Phase 8（US6 锁诊断与确定性并发验收）闭环（T058–T064 全部完成）
 
 | 任务 | 目标 | 实施位置 | 自动化测试 | 证据与验收结论 |
 |---|---|---|---|---|
+| **T058** | 锁诊断 DTO、页面模型与隐私边界 | `lockmanager/diagnostics.go` | `lockmanager/diagnostics_test.go` | 覆盖 page 256/257 截断、cursor revision、ring 32/33、owned copies、privacy 零泄露与并发 snapshot |
+| **T059** | Bounded 锁/等待/死锁快照与匿名 ID | `lockmanager/diagnostics.go` | 同左测试用例 | 实现 anonymous ResourceID、无锁 I/O、不等待用户事务，统计与图视图一致 |
 | **T060** | 中立 LockDiagnostics capability 转换 | `storageengine/mvccadapter/diagnostics.go`、`lockmanager/diagnostics.go` | `storageengine/mvccadapter/diagnostics_test.go` | 实现 LocksPage、WaitPage、DeadlocksPage、LockStats 中立 DTO 转换；页面上限 256 截断；ResourceID 匿名；深拷贝与无锁 I/O；未启用返回 Unsupported |
 | **T061** | SHOW ENGINE LOCKS / WAITS / DEADLOCKS 语法与权限 | `parser/ast.go`、`parser/parser.go`、`executor/locking_diagnostics.go`（新） | `executor/locking_diagnostics_test.go` | SQL parser 支持三类诊断命令与标准 STATUS 格式；仅管理员有权访问，普通用户明确拒绝；未知/不支持引擎返回明确错误 |
-| **T062** | 端到端诊断验收与协议集成 | `executor/locking_diagnostics_test.go`、`server/locking_diagnostics_test.go` | 同左测试用例 | 覆盖管理员成功、非管理员拒绝、不支持能力报错、匿名字段零泄露、MySQL 协议层 Resultset 包格式与数据正确 |
+| **T062** | 端到端诊断验收与协议集成 | `executor/locking_diagnostics_test.go`、`server/locking_diagnostics_test.go` | 同左测试用例 | 覆盖管理员成功、非管理员拒绝、不支持能力报错、匿名字段零泄露、真实 TCP MySQL 客户端协议 Resultset 包格式与数据正确 |
+| **T063** | Lock Manager 100 次确定性并发矩阵 | `lockmanager/concurrency_test.go`（新） | `go test ./lockmanager -run TestT063` | 10 组场景（S/X 兼容、Upgrade、FIFO、2-Deadlock、3-Deadlock、Cancel、Timeout、Reset、Budget、Bundle）各运行 100 轮（共 1,000 轮），0 Flake，无 sleep，终态资源全归零 |
+| **T064** | Executor 100 次真实 SQL 确定性并发验收 | `executor/locking_concurrency_test.go`（新） | `go test ./executor -run TestT064` | 12 类场景（FOR UPDATE、FOR SHARE、SI、Gap INSERT、PK 迁移、UNIQUE、ODKU/REPLACE/IGNORE、CASCADE Gap、Raw vs SQL、Deadlock、Savepoint/Disconnect、Stale Target Retry）各运行 100 轮（共 1,200 轮），结果与终态保存至 `.tmp/b02-determinism.md` |

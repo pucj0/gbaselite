@@ -1,7 +1,7 @@
 package lockmanager
 
 import (
-	"sort"
+	"container/heap"
 	"strconv"
 	"time"
 )
@@ -183,20 +183,87 @@ func (m *manager) Diagnostics(options DiagnosticsOptions) LockDiagnosticsPage {
 	return page
 }
 
-// resourceRowsLocked builds the resource rows, sorted by anonymous id so a page is deterministic.
+// resourceMaxHeap maintains a bounded max-heap of LockResourceRow by ResourceID.
+type resourceMaxHeap []LockResourceRow
+
+func (h resourceMaxHeap) Len() int           { return len(h) }
+func (h resourceMaxHeap) Less(i, j int) bool { return h[i].ResourceID > h[j].ResourceID }
+func (h resourceMaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *resourceMaxHeap) Push(x any)        { *h = append(*h, x.(LockResourceRow)) }
+func (h *resourceMaxHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// grantMaxHeap maintains a bounded max-heap of LockGrantRow by (ResourceID, RootID, GrantID).
+type grantMaxHeap []LockGrantRow
+
+func grantLess(a, b LockGrantRow) bool {
+	if a.ResourceID != b.ResourceID {
+		return a.ResourceID < b.ResourceID
+	}
+	if a.RootID != b.RootID {
+		return a.RootID < b.RootID
+	}
+	return a.GrantID < b.GrantID
+}
+
+func (h grantMaxHeap) Len() int           { return len(h) }
+func (h grantMaxHeap) Less(i, j int) bool { return !grantLess(h[i], h[j]) }
+func (h grantMaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *grantMaxHeap) Push(x any)        { *h = append(*h, x.(LockGrantRow)) }
+func (h *grantMaxHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// waitMaxHeap maintains a bounded max-heap of LockWaitRow by (EnqueueOrdinal, RequestID).
+type waitMaxHeap []LockWaitRow
+
+func waitLess(a, b LockWaitRow) bool {
+	if a.EnqueueOrdinal != b.EnqueueOrdinal {
+		return a.EnqueueOrdinal < b.EnqueueOrdinal
+	}
+	return a.RequestID < b.RequestID
+}
+
+func (h waitMaxHeap) Len() int           { return len(h) }
+func (h waitMaxHeap) Less(i, j int) bool { return !waitLess(h[i], h[j]) }
+func (h waitMaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *waitMaxHeap) Push(x any)        { *h = append(*h, x.(LockWaitRow)) }
+func (h *waitMaxHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
+// resourceRowsLocked builds the resource rows bounded by limit, without allocating unlimited slices.
 func (m *manager) resourceRowsLocked(limit int, now time.Time) ([]LockResourceRow, int) {
-	keys := make([]string, 0, len(m.locks.entries))
-	for key, entry := range m.locks.entries {
+	if limit <= 0 {
+		limit = 1
+	}
+	h := make(resourceMaxHeap, 0, min(limit, 256))
+	total := 0
+
+	for _, entry := range m.locks.entries {
 		if entry.holderCount() == 0 && entry.waiterCount() == 0 {
 			continue
 		}
-		keys = append(keys, key)
-	}
-	rows := make([]LockResourceRow, 0, len(keys))
-	for _, key := range keys {
-		entry := m.locks.entries[key]
+		total++
+		resID := m.anonIDLocked(entry)
+		if len(h) == limit && resID >= h[0].ResourceID {
+			continue
+		}
 		row := LockResourceRow{
-			ResourceID:  m.anonIDLocked(entry),
+			ResourceID:  resID,
 			Kind:        entry.ref.Kind,
 			State:       entry.state(),
 			HolderMode:  entry.holderMode(),
@@ -219,30 +286,33 @@ func (m *manager) resourceRowsLocked(limit int, now time.Time) ([]LockResourceRo
 				}
 			}
 		}
-		rows = append(rows, row)
+		if len(h) < limit {
+			heap.Push(&h, row)
+		} else {
+			h[0] = row
+			heap.Fix(&h, 0)
+		}
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].ResourceID < rows[j].ResourceID })
-	total := len(rows)
-	if len(rows) > limit {
-		rows = rows[:limit]
+
+	rows := make([]LockResourceRow, len(h))
+	for i := len(h) - 1; i >= 0; i-- {
+		rows[i] = heap.Pop(&h).(LockResourceRow)
 	}
 	return rows, total
 }
 
-// grantRowsLocked builds the granted lock component rows.
+// grantRowsLocked builds the granted lock component rows bounded by limit, without allocating unlimited slices.
 func (m *manager) grantRowsLocked(limit int) ([]LockGrantRow, int) {
-	keys := make([]string, 0, len(m.locks.entries))
-	for key, entry := range m.locks.entries {
+	if limit <= 0 {
+		limit = 1
+	}
+	h := make(grantMaxHeap, 0, min(limit, 256))
+	total := 0
+
+	for _, entry := range m.locks.entries {
 		if entry.holderCount() == 0 {
 			continue
 		}
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	var rows []LockGrantRow
-	for _, key := range keys {
-		entry := m.locks.entries[key]
 		resID := m.anonIDLocked(entry)
 		for ownerID, claims := range entry.claims {
 			owner := m.owners[ownerID]
@@ -257,6 +327,7 @@ func (m *manager) grantRowsLocked(limit int) ([]LockGrantRow, int) {
 				if claim.pending {
 					continue
 				}
+				total++
 				grantID := entry.grantID
 				var scopeID uint64
 				if claim.request != nil {
@@ -265,7 +336,7 @@ func (m *manager) grantRowsLocked(limit int) ([]LockGrantRow, int) {
 						grantID = claim.request.ID
 					}
 				}
-				rows = append(rows, LockGrantRow{
+				row := LockGrantRow{
 					GrantID:    grantID,
 					RootID:     ownerID,
 					ScopeID:    scopeID,
@@ -275,79 +346,71 @@ func (m *manager) grantRowsLocked(limit int) ([]LockGrantRow, int) {
 					Kind:       entry.ref.Kind,
 					ResourceID: resID,
 					GrantedAt:  startedAt,
-				})
+				}
+				if len(h) < limit {
+					heap.Push(&h, row)
+				} else if grantLess(row, h[0]) {
+					h[0] = row
+					heap.Fix(&h, 0)
+				}
 			}
 		}
 	}
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].ResourceID != rows[j].ResourceID {
-			return rows[i].ResourceID < rows[j].ResourceID
-		}
-		if rows[i].RootID != rows[j].RootID {
-			return rows[i].RootID < rows[j].RootID
-		}
-		return rows[i].GrantID < rows[j].GrantID
-	})
-	total := len(rows)
-	if len(rows) > limit {
-		rows = rows[:limit]
+
+	rows := make([]LockGrantRow, len(h))
+	for i := len(h) - 1; i >= 0; i-- {
+		rows[i] = heap.Pop(&h).(LockGrantRow)
 	}
 	return rows, total
 }
 
-// waitRowsLocked builds the wait rows in queue order.
+// waitRowsLocked builds the wait rows in queue order bounded by limit, without allocating unlimited slices.
 func (m *manager) waitRowsLocked(limit int, now time.Time) ([]LockWaitRow, int) {
-	type pendingWalk struct {
-		entry *lockRequest
+	if limit <= 0 {
+		limit = 1
 	}
-	var walk []pendingWalk
+	h := make(waitMaxHeap, 0, min(limit, 256))
+	total := 0
+
 	for _, requests := range m.pending {
 		for entry := range requests {
-			walk = append(walk, pendingWalk{entry: entry})
-		}
-	}
-	sort.Slice(walk, func(i, j int) bool {
-		if walk[i].entry.req.EnqueueOrdinal != walk[j].entry.req.EnqueueOrdinal {
-			return walk[i].entry.req.EnqueueOrdinal < walk[j].entry.req.EnqueueOrdinal
-		}
-		return walk[i].entry.req.ID < walk[j].entry.req.ID
-	})
-
-	rows := make([]LockWaitRow, 0, len(walk))
-	for _, item := range walk {
-		entry := item.entry
-		row := LockWaitRow{
-			RequestID:      entry.req.ID,
-			OwnerID:        entry.req.OwnerID,
-			ScopeID:        entry.req.ScopeID,
-			EnqueueOrdinal: entry.req.EnqueueOrdinal,
-			Kind:           entry.ref.Kind,
-			Mode:           entry.ref.Mode,
-			Status:         entry.req.Status,
-			BlockerIDs:     append([]string(nil), entry.bundle.blockers...),
-		}
-		if lockEntry, ok := m.locks.get(entry.ref.ResourceKey()); ok {
-			row.ResourceID = m.anonIDLocked(lockEntry)
-		}
-		if !entry.req.BlockedAt.IsZero() {
-			row.WaitMicros = now.Sub(entry.req.BlockedAt).Microseconds()
-		}
-		if !entry.req.Deadline.IsZero() {
-			row.DeadlineMicros = entry.req.Deadline.UnixMicro()
-		}
-		// The reasons are derived from the same graph the detector searches, so a row's reasons
-		// and the graph's edges for the same request always agree.
-		for _, edge := range m.graph.edgesFrom(entry.req.OwnerID) {
-			if edge.RequestID != entry.req.ID {
-				continue
+			total++
+			row := LockWaitRow{
+				RequestID:      entry.req.ID,
+				OwnerID:        entry.req.OwnerID,
+				ScopeID:        entry.req.ScopeID,
+				EnqueueOrdinal: entry.req.EnqueueOrdinal,
+				Kind:           entry.ref.Kind,
+				Mode:           entry.ref.Mode,
+				Status:         entry.req.Status,
+				BlockerIDs:     append([]string(nil), entry.bundle.blockers...),
 			}
-			row.Reasons = append(row.Reasons, edge.Reason)
+			if lockEntry, ok := m.locks.get(entry.ref.ResourceKey()); ok {
+				row.ResourceID = m.anonIDLocked(lockEntry)
+			}
+			if !entry.req.BlockedAt.IsZero() {
+				row.WaitMicros = now.Sub(entry.req.BlockedAt).Microseconds()
+			}
+			if !entry.req.Deadline.IsZero() {
+				row.DeadlineMicros = entry.req.Deadline.UnixMicro()
+			}
+			for _, edge := range m.graph.edgesFrom(entry.req.OwnerID) {
+				if edge.RequestID == entry.req.ID {
+					row.Reasons = append(row.Reasons, edge.Reason)
+				}
+			}
+			if len(h) < limit {
+				heap.Push(&h, row)
+			} else if waitLess(row, h[0]) {
+				h[0] = row
+				heap.Fix(&h, 0)
+			}
 		}
-		rows = append(rows, row)
 	}
-	total := len(rows)
-	if len(rows) > limit {
-		rows = rows[:limit]
+
+	rows := make([]LockWaitRow, len(h))
+	for i := len(h) - 1; i >= 0; i-- {
+		rows[i] = heap.Pop(&h).(LockWaitRow)
 	}
 	return rows, total
 }
