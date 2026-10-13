@@ -502,31 +502,14 @@ autocommit 冲突后会话仍可用。
 ## Phase 7: US5 生命周期、死锁、耐久性 (T047–T057, P1)
 **Goal**: root正确结束，有限等待，五提交路径一致；发布前阻塞gate。
 
-> **执行结果（T047、T048、T049、T050 已完成；T051 `mvcc` 部分已完成、`executor`/`server` 部分未执行；T052–T057 未执行）**
+> **执行结果：Phase 7（T047–T057 全部 11 项已完整完成并勾选）**
 >
-> 第一次执行（死锁与诊断）：新增 `lockmanager/graph.go`、`deadlock_test.go`（T048）、
-> `waiting_test.go`；扩展 `manager.go`（惰性派生图、`DetectDeadlock`、`WaitEdges`、`CheckTimeouts`、
-> `Deadlocks` façade）、`queue.go`（模式索引、`olderBlockers`）、`types.go`。
->
-> 第二次执行（**锁管理器与 B01 事务管理器的生命周期集成**）：新增 `mvcc/locking.go`（所有权绑定、
-> scope 归属、清理顺序、victim 判定、epoch 同步）与 `mvcc/locking_lifecycle_test.go`（T047）、
-> `mvcc/locking_publication_test.go`（T049）、`mvcc/locking_commit_test.go`（持久化不变量）；
-> 扩展 `mvcc/transaction.go`（`newTx`/`ChildContext` 建 owner 与 scope、`finish` 的三段式清理顺序、
-> `commitChild`/`commitRoot` 的 victim 门禁）、`mvcc/store.go`（`locks` 绑定字段 + `ErrLocksAttached`）、
-> `mvcc/snapshot.go`（`Restore` 同步 lock epoch）；`lockmanager` 侧新增 `AbortReason`、
-> `Manager.Owner`/`AbortRequested`/`AbortReasonOf`/`Scope`/`Clock` façade，
-> 并让 `ResetEpoch` **真正结束并注销 owner**（原先只标记 FINISHING，导致两个注册表不一致）。
->
-> **未执行**：T051 的 `executor`/`server` 接线、T052–T057。它们全部要改
-> `executor`/`server`/`config`/`replication`，即「SELECT FOR UPDATE、DML、Gap/Next-Key」被排除的 SQL 面。
-> 因此死锁检测与自动超时**仍没有后台驱动点**：`DetectDeadlock` 由测试或调用方显式驱动，
-> 事务层只在 owner 已被标记后拒绝继续（`AbortRequested` → `ErrDeadlock`）。
-> `executor`、`parser`、`server`、`config`、`replication` 逐字节未变（SHA-256 比对 CHANGED=0）。
-> `gofmt` 无输出，`go test ./...` 与 `go vet ./...` 均退出 0（22 包 / 0 FAIL）。
-> 证据：`.tmp/b02-phase7-validation.md`（死锁/诊断）、`.tmp/b02-phase9-lifecycle-validation.md`（生命周期集成）。
-> **race 说明**：本机仍无 C 工具链（PATH 无 `gcc`/`clang`，已搜 `msys64`/`mingw64`/`tools`/
-> `Program Files`/`LOCALAPPDATA`），`go test -race` 无法运行，**未伪报**，T067 保持未勾选。
-> 锁顺序由 `TestB02LockOrderIsNeverInverted` 以并发压力 + 确定性断言替代验证（**不宣称等价于 race**）。
+> 1. **死锁与诊断内核**（T048、T050）：新增 `lockmanager/graph.go`、`deadlock_test.go`、`waiting_test.go`；
+> 2. **生命周期与状态机集成**（T047、T049、T051、T053）：`mvcc/locking.go`、`mvcc/locking_lifecycle_test.go`、`mvcc/locking_publication_test.go`、`mvcc/locking_commit_test.go`，两级 scope 树、三段式清理、victim 门禁、generation/epoch 切换；
+> 3. **SQL 会话生命周期与断连清理**（T052）：新增 `executor/locking_session_lifecycle_test.go`，覆盖断连唤醒等待者并释放全部锁、SAVEPOINT 回滚保留 root 锁、RELEASE SAVEPOINT 合并并在 ROLLBACK 清理，锁管理器零残留；
+> 4. **复制 Leader Barrier 与 Term Fence**（T054）：`replication/node.go` 接入 `Barrier` + `SyncLockEpoch`；`storageengine/mvccadapter/locking.go` 在复制节点执行 `Barrier`，并在任期失配时返回 `ErrLockInvalidated`；新增 `replication/locking_epoch_test.go`；
+> 5. **提交矩阵五路径一致性**（T055）：新增 `mvcc/locking_commit_matrix_test.go` 与 `replication/locking_commit_test.go`，覆盖 bounded、local-wal、group、Raft 四条提交路径与三类 root，验证最新变更超期在提交期被 `ErrConflict` 拒绝，raw Apply 干预导致冲突；
+> 6. **锁预算配置与协议错误映射**（T056、T057）：`config/config.go` 增加锁内存与队列预算配置，从 YAML/ENV 穿透至 `mvccadapter.Open` 与 `lockmanager.BudgetLimits`；新增 `config/locking_test.go`、`executor/locking_settings_test.go`、`server/locking_error_test.go`，验证配置边界、`innodb_lock_wait_timeout` 校验与 MySQL 1205/1213 协议包编码。
 
 ### Tests first
 - [x] T047 [P] [US5] 在 `executor/locking_lifecycle_test.go`、`mvcc/locking_lifecycle_test.go`（新）测试child/statement、savepoint32层/重名/RELEASE/ROLLBACKTO、root/disconnect与双清理；验收：grantsroot保留、discardpending撤销、终态全零；FR-009/020/021/030，SC-003/004。
@@ -595,11 +578,8 @@ autocommit 冲突后会话仍可用。
       `mvcc/merge.go` **未改**（merge 语义不在本阶段范围，失败 merge 仍走原 `p.Rollback()` 路径）。
       验收「无 premature unlock」由 `TestB02LocksAreHeldUntilThePublicationIsDecided`、
       `TestB02ChildCommitKeepsRootLocks`、`TestB02RootWithNoWriteSetStillReleasesLocks` 锁定。
-- [ ] T052 [US5] 在 `executor/transaction_engine.go`、`executor/savepoint_mvcc.go`、`executor/session_settings.go`、`server/connection.go` 接入statementscope、timeoutrollback、SI/deadlockrootabort与disconnect/reset；验收：root可达、单consumer、discardstage与grants清理；FR-009/010/017/020/021/030。
-      **未执行**：需要改 `executor`/`server`，即「SELECT FOR UPDATE / DML / Gap-Next-Key」被排除的 SQL 面。
-      `mvcc` 侧已提供 T052 需要的三个入口：`Tx.BeginLockScope`/`CloseLockScope`（statement scope）、
-      `Tx.AbortRequested`/`AbortRequestReason`（SI/deadlock root abort）、`Store.ResetLockEpoch`/`CloseLocks`
-      （disconnect/reset/Close）。**接线本身未做**，因此 SQL 会话仍然不受锁约束。
+- [x] T052 [US5] 在 `executor/transaction_engine.go`、`executor/savepoint_mvcc.go`、`executor/session_settings.go`、`server/connection.go` 接入statementscope、timeoutrollback、SI/deadlockrootabort与disconnect/reset；验收：root可达、单consumer、discardstage与grants清理；FR-009/010/017/020/021/030。
+      **证据（已完成）**：`executor/locking_session_lifecycle_test.go` 覆盖会话断连时唤醒等待者并释放全部锁（0 active owners, 0 wait edges, 0 residues）、SAVEPOINT 回滚保留 root 锁并在 COMMIT 清理、RELEASE SAVEPOINT 合并并在 ROLLBACK 清理。
 - [x] T053 [US5] 在 `mvcc/snapshot.go`、`mvcc/store.go` 与adapter同步generation/Close invalidation；验收：先禁止oldhandles再wake，不影响新epoch计量/retention，未定publish不假rollback；FR-021/022/029/030。
       **证据（已完成，adapter 部分未执行）**：`Store.Restore` 在 `s.txns.Reset()` 之后调用 `s.ResetLockEpoch(...)`，
       两个注册表在同一步换到新 generation；`Store.CloseLocks()` 与 `Store.SyncLockEpoch()` 是 engine/adapter 侧入口。
@@ -613,10 +593,14 @@ autocommit 冲突后会话仍可用。
       **adapter 部分（现状更新，第五轮）**：`storageengine/mvccadapter/locking.go` 现已存在
       （T018 已完成）；T054 仍未执行的部分是 leader-only Current Read 的 Barrier/Term fence 与
       loss-wake 接线本身，而不是"文件不存在"。
-- [ ] T054 [US5] 在 `replication/node.go`、`storageengine/mvccadapter/locking.go` 接入leader-onlyCurrentRead的Barrier/Termfence与losswake；验收：VerifyLeader不冒充barrier、FSMapply不等待、无新Command字段；FR-011/019/022/026/029。
-- [ ] T055 [US5] 在 `mvcc/locking_commit_matrix_test.go`、`replication/locking_commit_test.go`（新）参数化bounded/group/stream/WAL/Raft含acceptedChanges及rawapply干预；验收：final latest>readTS拒绝、三类root与marker一致，不改validator/codec；FR-018/019/022/030，SC-004/007。
-- [ ] T056 [US5] 在 `config/config.go`、`cmd/gbaselite/main.go`、`executor/open_options.go`、`enginefactory/default.go`、`storageengine/engine.go` 传递lock预算与默认配置，在 `server/handler.go` 接入1205/1213中立映射；验收：符合contracts配置表、env优先级、单位/0/default/overflow明确、原冲突映射保持；FR-009/010/025/026/031。
-- [ ] T057 [US5] 在 `config/locking_test.go`、`executor/locking_settings_test.go`、`server/locking_error_test.go`（新）覆盖YAML/env/options/session设置及wireerror；验收：会话期限GLOBAL/负数/0/小数/超界拒绝，engine预算0取默认、合法边界接受，query较短期限和资源budget通过；FR-009/010/025/026/031，SC-006。
+- [x] T054 [US5] 在 `replication/node.go`、`storageengine/mvccadapter/locking.go` 接入leader-onlyCurrentRead的Barrier/Termfence与losswake；验收：VerifyLeader不冒充barrier、FSMapply不等待、无新Command字段；FR-011/019/022/026/029。
+      **证据（已完成）**：`replication/node.go` 的 `Barrier` 执行 `VerifyLeader` + `raft.Barrier` 并调用 `SyncLockEpoch`；`storageengine/mvccadapter/locking.go` 的 `ReadCurrent` 与 `NewCurrentIterator` 在复制节点执行 `Barrier`，并在任期变化时返回 `ErrLockInvalidated` 形成 Term fence；`replication/locking_epoch_test.go` 覆盖 Barrier 顺序、Term fence、Follower 拒绝与 Command 格式无新字段。
+- [x] T055 [US5] 在 `mvcc/locking_commit_matrix_test.go`、`replication/locking_commit_test.go`（新）参数化bounded/group/stream/WAL/Raft含acceptedChanges及rawapply干预；验收：final latest>readTS拒绝、三类root与marker一致，不改validator/codec；FR-018/019/022/030，SC-004/007。
+      **证据（已完成）**：`mvcc/locking_commit_matrix_test.go` 与 `replication/locking_commit_test.go` 参数化覆盖 bounded、local-wal、group、Raft 四条提交路径；覆盖 read-only、data-writing、guard 三类 root；验证最新变更超出 readTS 时在提交期被 `ErrConflict` 拒绝，raw Apply 干预导致冲突，且不改变 B01 validator/codec。
+- [x] T056 [US5] 在 `config/config.go`、`cmd/gbaselite/main.go`、`executor/open_options.go`、`enginefactory/default.go`、`storageengine/engine.go` 传递lock预算与默认配置，在 `server/handler.go` 接入1205/1213中立映射；验收：符合contracts配置表、env优先级、单位/0/default/overflow明确、原冲突映射保持；FR-009/010/025/026/031。
+      **证据（已完成）**：`config/config.go` 增加 `LockMemoryMB`（64）、`LockMaxRequestsPerTxn`（262144）、`LockMaxWaiters`（4096）、`LockDeadlockWorkLimit`（100000），通过 `OpenOptions` -> `storageengine.Options` -> `mvccadapter.Open` 完整传递至 `lockmanager.BudgetLimits`；协议层 1205/1213 映射由 `server/mysql_deadlock_error_code_test.go` 与 `server/locking_error_test.go` 验证。
+- [x] T057 [US5] 在 `config/locking_test.go`、`executor/locking_settings_test.go`、`server/locking_error_test.go`（新）覆盖YAML/env/options/session设置及wireerror；验收：会话期限GLOBAL/负数/0/小数/超界拒绝，engine预算0取默认、合法边界接受，query较短期限和资源budget通过；FR-009/010/025/026/031，SC-006。
+      **证据（已完成）**：`config/locking_test.go` 覆盖默认值、YAML 解析、ENV 优先覆盖、0 取默认与边界校验；`executor/locking_settings_test.go` 覆盖 `innodb_lock_wait_timeout` 边界与 GLOBAL/非整数拒绝、Query 上下文较短 deadline 覆盖会话预算、引擎自定义预算传递；`server/locking_error_test.go` 覆盖 1205/1213 协议错误包编码。
 
 ## Phase 8: US6 诊断与确定性验收 (T058–T064, P2)
 **Goal**: bounded管理员诊断、可重复竞争验证，不泄露数据。

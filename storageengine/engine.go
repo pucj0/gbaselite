@@ -148,9 +148,13 @@ type ReplicationOptions struct {
 	TLSCert, TLSKey, TLSCA         string
 }
 type Options struct {
-	LocalWAL              bool
-	TransactionWriteBytes int64
-	Replication           *ReplicationOptions
+	LocalWAL               bool
+	TransactionWriteBytes  int64
+	Replication            *ReplicationOptions
+	LockMemoryBytes        int64
+	LockMaxRequestsPerRoot int64
+	LockMaxWaiters         int64
+	LockGraphWorkLimit     int64
 }
 
 // Factory is the composition seam. Operators never select a concrete backend.

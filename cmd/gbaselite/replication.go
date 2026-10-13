@@ -9,7 +9,15 @@ import (
 )
 
 func engineOptions(cfg config.Config) (executor.OpenOptions, error) {
-	o := executor.OpenOptions{LocalWAL: cfg.Storage.LocalWAL, TransactionWriteBytes: int64(cfg.Resources.TransactionWriteMB) << 20, StorageMode: cfg.Storage.Mode}
+	o := executor.OpenOptions{
+		LocalWAL:               cfg.Storage.LocalWAL,
+		TransactionWriteBytes:  int64(cfg.Resources.TransactionWriteMB) << 20,
+		StorageMode:            cfg.Storage.Mode,
+		LockMemoryBytes:        int64(cfg.Resources.LockMemoryMB) << 20,
+		LockMaxRequestsPerRoot: int64(cfg.Resources.LockMaxRequestsPerTxn),
+		LockMaxWaiters:         int64(cfg.Resources.LockMaxWaiters),
+		LockGraphWorkLimit:     int64(cfg.Resources.LockDeadlockWorkLimit),
+	}
 	if cfg.Replication.Enabled {
 		c := cfg.Replication
 		o.Replication = &storageengine.ReplicationOptions{ID: c.ID, Bind: c.Bind, Advertise: c.Advertise, Bootstrap: c.Bootstrap, TLSCert: c.TLSCert, TLSKey: c.TLSKey, TLSCA: c.TLSCA}

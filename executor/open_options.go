@@ -20,9 +20,13 @@ type OpenOptions struct {
 	// Deprecated: only empty or mvcc is accepted. Legacy formats require migration.
 	StorageMode string
 	// Deprecated legacy settings; nonzero values are rejected by runtime opens.
-	PageCacheBytes       int64
-	ColdRead             bool
-	ColdMaterializeBytes int64
+	PageCacheBytes         int64
+	ColdRead               bool
+	ColdMaterializeBytes   int64
+	LockMemoryBytes        int64
+	LockMaxRequestsPerRoot int64
+	LockMaxWaiters         int64
+	LockGraphWorkLimit     int64
 }
 
 func OpenWithOptions(dataDir, username, password string, options OpenOptions) (*Engine, error) {
@@ -43,7 +47,15 @@ func OpenWithOptions(dataDir, username, password string, options OpenOptions) (*
 	if factory == nil {
 		factory = enginefactory.Open
 	}
-	backend, err := factory(dataDir, storageengine.Options{LocalWAL: options.LocalWAL, TransactionWriteBytes: options.TransactionWriteBytes, Replication: options.Replication})
+	backend, err := factory(dataDir, storageengine.Options{
+		LocalWAL:               options.LocalWAL,
+		TransactionWriteBytes:  options.TransactionWriteBytes,
+		Replication:            options.Replication,
+		LockMemoryBytes:        options.LockMemoryBytes,
+		LockMaxRequestsPerRoot: options.LockMaxRequestsPerRoot,
+		LockMaxWaiters:         options.LockMaxWaiters,
+		LockGraphWorkLimit:     options.LockGraphWorkLimit,
+	})
 	if err != nil {
 		return nil, err
 	}

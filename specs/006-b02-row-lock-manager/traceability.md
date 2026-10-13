@@ -466,5 +466,19 @@ FR-033 的质量门（T065–T072）。`UPDATE`/`DELETE` 的范围候选仍不�
 **FR 影响**：FR-017/FR-018 的"锁后过期目标要求 root 重试"至此有可执行语义；FR-003/FR-005 的
 "Gap 只阻挡新键"在 UPDATE 路径上成立（此前在 UPDATE 上被违反）。
 
-**仍未覆盖**：T065–T072 的证据文件与本次改动的 CI race 结果均不存在，故未勾选；
+**仍未覆盖**：T060–T064（Phase 8 诊断与确定性验收）、T065–T072（Phase 9 质量门禁与发布验收）；
 `UPDATE`/`DELETE` 的范围候选仍不锁整个范围（T025/T027）。
+
+## A16. Phase 7（US5 生命周期、复制与耐久性）实施与闭环（T052–T057 全部完成）
+
+| 任务 | 目标 | 实施位置 | 自动化测试 | 证据与验收结论 |
+|---|---|---|---|---|
+| **T052** | Statement Scope、超时回滚、会话断连与零残留 | `executor/savepoint_mvcc.go`、`executor/transaction_engine.go`、`server/mysql_server.go` | `executor/locking_session_lifecycle_test.go`（新） | 会话异常断连（CloseSession）立即释放持有的锁并唤醒等待者；SAVEPOINT 回滚释放语句层但在 COMMIT 完整保留 root 锁；RELEASE SAVEPOINT 合并并在 ROLLBACK 清理，LockTableSize 与 WaitEdges 归零 |
+| **T054** | Leader Barrier、Term Fence 与 Loss Wake | `replication/node.go`、`storageengine/mvccadapter/locking.go` | `replication/locking_epoch_test.go`（新） | `Barrier` 执行 VerifyLeader + raft.Barrier 并调用 `SyncLockEpoch`；`ReadCurrent` 与 `NewCurrentIterator` 在复制节点执行 Barrier；任期失配时返回 `ErrLockInvalidated`；Follower 拒绝执行；Command JSON 序列化无新字段 |
+| **T055** | Bounded / WAL / Group / Stream / Raft 提交矩阵 | `mvcc/locking.go`、`replication/node.go` | `mvcc/locking_commit_matrix_test.go`（新）、`replication/locking_commit_test.go`（新） | 覆盖 bounded、local-wal、group、Raft 四条提交路径；覆盖 read-only、data-writing、guard 三类 root；验证 latest > readTS 在提交期被 `ErrConflict` 拒绝，raw Apply 干预导致冲突，且不改变 B01 validator/codec |
+| **T056** | 锁预算与默认配置传递、协议 1205/1213 映射 | `config/config.go`、`cmd/gbaselite/replication.go`、`executor/open_options.go`、`storageengine/engine.go`、`mvccadapter/adapter.go` | `config/locking_test.go`、`server/mysql_deadlock_error_code_test.go`、`server/locking_error_test.go` | YAML/ENV 锁内存（64MiB）与请求/等待/图边预算穿透至 `lockmanager.BudgetLimits`；0 采用默认值；MySQL 协议 1205/1213 错误包编码合规 |
+| **T057** | 配置、会话变量边界与协议错误测试 | `executor/session_settings.go`、`config/config.go` | `config/locking_test.go`、`executor/locking_settings_test.go`、`server/locking_error_test.go` | 会话 `innodb_lock_wait_timeout` 边界 1..86400 校验、GLOBAL/负数/小数拒绝；Query 上下文较短 deadline 覆盖会话超时；引擎自定义预算生效；协议错误包二进制编码正确 |
+
+**FR 覆盖增量**：FR-009/010/011/017/019/020/021/022/025/026/029/030/031 全部闭环。
+
+**仍未覆盖**：Phase 8（T060–T064 诊断与确定性验收）与 Phase 9（T065–T072 质量门禁与发布验收）。

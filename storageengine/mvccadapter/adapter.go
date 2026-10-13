@@ -57,7 +57,13 @@ func Open(directory string, options storageengine.Options) (storageengine.Engine
 	// One lock manager per engine. It is created here and attached before any transaction can
 	// begin, so every transaction of this engine shares one lock domain and a second manager can
 	// never be attached to the same store.
-	locks, lockErr := lockmanager.NewManager(lockmanager.BudgetLimits{}, 1, nil)
+	limits := lockmanager.BudgetLimits{
+		MemoryBytes:  options.LockMemoryBytes,
+		RootRequests: options.LockMaxRequestsPerRoot,
+		Waiters:      options.LockMaxWaiters,
+		GraphWork:    options.LockGraphWorkLimit,
+	}
+	locks, lockErr := lockmanager.NewManager(limits, 1, nil)
 	if lockErr != nil {
 		raw.Close()
 		return nil, lockErr

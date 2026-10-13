@@ -227,7 +227,19 @@ func (n *Node) Barrier(ctx context.Context) error {
 	if err := wait(ctx, n.raft.VerifyLeader()); err != nil {
 		return err
 	}
-	return wait(ctx, n.raft.Barrier(timeout(ctx)))
+	if err := wait(ctx, n.raft.Barrier(timeout(ctx))); err != nil {
+		return err
+	}
+	n.SyncLockEpoch()
+	return nil
+}
+
+// SyncLockEpoch synchronizes the underlying store's lock epoch with the node's current Raft term.
+func (n *Node) SyncLockEpoch() bool {
+	if n.store == nil {
+		return false
+	}
+	return n.store.SyncLockEpoch(n.Term())
 }
 func (n *Node) Propose(ctx context.Context, command mvcc.Command) (mvcc.Result, error) {
 	// The publication marker is the durable commit point, so a commit that is

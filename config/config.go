@@ -40,6 +40,10 @@ type Config struct {
 		TransactionWriteMB     int
 		QueryTempPath          string
 		OptimisticTransactions bool
+		LockMemoryMB           int
+		LockMaxRequestsPerTxn  int
+		LockMaxWaiters         int
+		LockDeadlockWorkLimit  int
 	}
 	Storage struct {
 		LocalWAL          bool
@@ -102,6 +106,10 @@ func Default() Config {
 	cfg.Log.RetentionDays = 7
 	cfg.Audit.RetentionDays = 7
 	cfg.Binlog.RetentionDays = 7
+	cfg.Resources.LockMemoryMB = 64
+	cfg.Resources.LockMaxRequestsPerTxn = 262144
+	cfg.Resources.LockMaxWaiters = 4096
+	cfg.Resources.LockDeadlockWorkLimit = 100000
 	return cfg
 }
 
@@ -167,6 +175,14 @@ func Load(path string) (Config, error) {
 				cfg.Resources.QueryTempPath = value
 			case "resources.optimistic_transactions":
 				cfg.Resources.OptimisticTransactions, err = strconv.ParseBool(value)
+			case "resources.lock_memory_mb":
+				cfg.Resources.LockMemoryMB, err = parseNonNegativeInt(value, "lock_memory_mb")
+			case "resources.lock_max_requests_per_txn":
+				cfg.Resources.LockMaxRequestsPerTxn, err = parseNonNegativeInt(value, "lock_max_requests_per_txn")
+			case "resources.lock_max_waiters":
+				cfg.Resources.LockMaxWaiters, err = parseNonNegativeInt(value, "lock_max_waiters")
+			case "resources.lock_deadlock_work_limit":
+				cfg.Resources.LockDeadlockWorkLimit, err = parseNonNegativeInt(value, "lock_deadlock_work_limit")
 			case "replication.enabled":
 				cfg.Replication.Enabled, err = strconv.ParseBool(value)
 			case "replication.bootstrap":
@@ -291,6 +307,10 @@ func Load(path string) (Config, error) {
 		{"DB_QUERY_RESULT_MEMORY_MB", &cfg.Resources.QueryResultMemoryMB},
 		{"DB_QUERY_TEMP_MB", &cfg.Resources.QueryTempMB},
 		{"DB_TRANSACTION_WRITE_MB", &cfg.Resources.TransactionWriteMB},
+		{"DB_LOCK_MEMORY_MB", &cfg.Resources.LockMemoryMB},
+		{"DB_LOCK_MAX_REQUESTS_PER_TXN", &cfg.Resources.LockMaxRequestsPerTxn},
+		{"DB_LOCK_MAX_WAITERS", &cfg.Resources.LockMaxWaiters},
+		{"DB_LOCK_DEADLOCK_WORK_LIMIT", &cfg.Resources.LockDeadlockWorkLimit},
 		{"DB_PAGE_CACHE_MB", &cfg.Storage.PageCacheMB},
 		{"DB_COLD_MATERIALIZE_MB", &cfg.Storage.ColdMaterializeMB},
 		{"DB_MAX_PREPARED_STATEMENTS", &cfg.Server.MaxPreparedStatements},
@@ -440,6 +460,30 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Storage.PageCacheMB > 1048576 || cfg.Resources.SortMemoryMB > 1048576 || cfg.Resources.QueryResultMemoryMB > 1048576 || cfg.Resources.QueryTempMB > 1048576 {
 		return cfg, fmt.Errorf("page cache and query memory/disk settings must be 0..1048576 MB")
+	}
+	if cfg.Resources.LockMemoryMB < 0 || cfg.Resources.LockMemoryMB > 1048576 {
+		return cfg, fmt.Errorf("lock_memory_mb must be 0..1048576 MB, got %d", cfg.Resources.LockMemoryMB)
+	}
+	if cfg.Resources.LockMaxRequestsPerTxn < 0 || cfg.Resources.LockMaxRequestsPerTxn > 2147483647 {
+		return cfg, fmt.Errorf("lock_max_requests_per_txn must be 0..2147483647, got %d", cfg.Resources.LockMaxRequestsPerTxn)
+	}
+	if cfg.Resources.LockMaxWaiters < 0 || cfg.Resources.LockMaxWaiters > 2147483647 {
+		return cfg, fmt.Errorf("lock_max_waiters must be 0..2147483647, got %d", cfg.Resources.LockMaxWaiters)
+	}
+	if cfg.Resources.LockDeadlockWorkLimit < 0 || cfg.Resources.LockDeadlockWorkLimit > 2147483647 {
+		return cfg, fmt.Errorf("lock_deadlock_work_limit must be 0..2147483647, got %d", cfg.Resources.LockDeadlockWorkLimit)
+	}
+	if cfg.Resources.LockMemoryMB == 0 {
+		cfg.Resources.LockMemoryMB = 64
+	}
+	if cfg.Resources.LockMaxRequestsPerTxn == 0 {
+		cfg.Resources.LockMaxRequestsPerTxn = 262144
+	}
+	if cfg.Resources.LockMaxWaiters == 0 {
+		cfg.Resources.LockMaxWaiters = 4096
+	}
+	if cfg.Resources.LockDeadlockWorkLimit == 0 {
+		cfg.Resources.LockDeadlockWorkLimit = 100000
 	}
 	if cfg.Resources.WorkingSetLimitMB != 0 && (runtime.GOOS != "windows" || cfg.Resources.WorkingSetLimitMB < 16 || cfg.Resources.WorkingSetLimitMB > 1048576) {
 		return cfg, fmt.Errorf("working_set_limit_mb requires Windows and 16..1048576 MiB")

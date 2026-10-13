@@ -163,6 +163,14 @@ func (t *txn) ReadCurrent(ctx context.Context, grant storageengine.LockGrant, sp
 	if _, ok := t.LockingTxn(); !ok {
 		return storageengine.CurrentObservation{}, storageengine.ErrUnsupported
 	}
+	if t.engine.node != nil {
+		if err := t.engine.node.Barrier(ctx); err != nil {
+			return storageengine.CurrentObservation{}, err
+		}
+		if currentTerm := t.engine.node.Term(); grant.Term != 0 && currentTerm != 0 && grant.Term != currentTerm {
+			return storageengine.CurrentObservation{}, storageengine.ErrLockInvalidated
+		}
+	}
 	components, err := lockComponents(grant.Components)
 	if err != nil {
 		// A capability whose components cannot be translated is not a capability this backend can
@@ -197,6 +205,11 @@ func (t *txn) ReadCurrent(ctx context.Context, grant storageengine.LockGrant, sp
 func (t *txn) NewCurrentIterator(ctx context.Context, scope uint64, request storageengine.CurrentScanRequest) (storageengine.Iterator, error) {
 	if _, ok := t.LockingTxn(); !ok {
 		return nil, storageengine.ErrUnsupported
+	}
+	if t.engine.node != nil {
+		if err := t.engine.node.Barrier(ctx); err != nil {
+			return nil, err
+		}
 	}
 	it, err := newCurrentIterator(ctx, t.inner, scope, request)
 	if err != nil {
