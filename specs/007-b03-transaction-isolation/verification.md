@@ -168,3 +168,43 @@
   - T009–T018 全部完成 (PASS)；
   - 具备进入 Phase 3（Read View Foundation & GC）的前置条件。
 
+---
+
+## 10. Phase 2 审查问题修复 (P2-FIX-01 & P2-FIX-02)
+
+1. **P2-FIX-01: 隔离 SQL 误识别修复**:
+   - `server/handler.go:isIsolationSetAttempt` 原实现通过字符串全局包含关键词导致合法的用户变量赋值（如 `SET @note = 'transaction_isolation'`）被误拒；
+   - 增加红测 `server/isolation_phase2_test.go:TestP2Fix01_SetVariableStringLiteral` 证实报错；
+   - 改用 `parser.Lex` 词法结构分析：仅检测 `SET` 赋值目标字段（左侧标识符或 `@` 变量前缀），彻底避免对右侧字符串字面量误伤；合法字面量成功通过，真正非法的隔离设置（如 `SET GLOBAL transaction_isolation`）依然严格拒绝；
+   - 测试通过 (PASS)。
+2. **P2-FIX-02: 真实二进制 Prepared 协议覆盖**:
+   - 补充 `server/isolation_phase2_test.go:TestB03IsolationBinaryPreparedProtocol`，通过真实 TCP socket 和 MySQL 驱动端到端验证 `COM_STMT_PREPARE`、`COM_STMT_EXECUTE`、`COM_STMT_CLOSE`；
+   - 验证准备时为 RR、执行前修改为 RC 时，预处理语句在执行时动态读取当前 Session 变量 (`READ-COMMITTED`)；
+   - 补充 `TestB03IsolationCOMResetConnectionProtocol`，通过二进制包直接验证 `0x1f` (`COM_RESET_CONNECTION`)，证实连接重置后隔离级别恢复默认 `REPEATABLE-READ`。
+
+---
+
+## 11. Phase 3 实施与验收结果 (T019–T029)
+
+- **授权阶段**: Phase 3: Read View Foundation & GC
+- **实施内容与证据**:
+  - **T019 (Contract 红测)**: `storageengine/isolation_test.go` 验证原始 `Engine.Begin`、`Txn.Snapshot` 语义不变，可选能力缺失返回 `ErrUnsupported`，`executor` 不导入 `mvcc`；
+  - **T020 (中立 API)**: `storageengine/isolation.go` 定义 `ReadView`、`StatementViewKind`、`ViewState`、`IsolationTxn`、`IsolationEngine`；
+  - **T021 (MVCC Adapter)**: `storageengine/mvccadapter/isolation.go` 实现 `mvccReadView`，封装 MVCC 句柄，隔离底层 bbolt 与 Store 私有结构；
+  - **T022 & T023 (Pin 与所有权)**: `mvcc/transaction_manager.go` 新增 `RegisterView`、`ReleaseView`、`ActiveViews` 与 `viewsByRoot`；事务终态自动回收所属视图引用，防止泄漏；
+  - **T024 (原子快照与 GC)**: `mvcc/isolation.go:Store.BeginViewToken` 在 `views.Lock()` 临界区内原子获取 Head 并加持 `snapshotRefs`，`CompactHistory` 遵守 `OldestReadTS` 屏障；`Store.Restore` 重置 generation 并使旧视图失效；
+  - **T025 & T026 (Statement View 与流式生命周期)**: `executor/transaction_engine.go` 与 `Result.Close()` 建立所有权转移模型，流式全生命周期托管，EOF/LIMIT/提前退出/连接重置安全释放；
+  - **T027 (并发与资源边界)**: `executor/isolation_phase3_test.go:TestB03ViewConcurrency` 验证高并发创建与释放无死锁、无悬挂 Pin；
+  - **T028 (提交校验与当前读非回归)**: `executor/isolation_phase3_test.go:TestB03CommitValidationNonRegression` 验证纯快照读绝不绕过写冲突校验，防止丢失更新；
+  - **T029 (门禁验收)**: M37–M39 全绿；全量回归测试通过；README 同步修订。
+- **全量测试通过情况**:
+  - `gofmt -l .`: clean
+  - `go vet ./...`: clean
+  - `git diff --check`: clean
+  - `go test ./... -count=1`: 21 包全部通过 (0 FAIL)；
+  - 生产 `data/` 未修改，写测试全量隔离在临时目录；
+- **Phase 3 Gate 审查结论**:
+  - T019–T029 全部完成 (PASS)；
+  - 具备进入 Phase 4（REPEATABLE READ）的前置条件。
+
+

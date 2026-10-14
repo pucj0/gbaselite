@@ -256,6 +256,12 @@ func (t *Tx) ScanLatestRange(ctx context.Context, space string, r KeyRange, yiel
 	return t.scanRangeAt(ctx, space, r, head, false, yield)
 }
 
+// ScanRangeAt executes a range scan at the specified snapshot revision, merging this
+// transaction's and its ancestors' staged writes.
+func (t *Tx) ScanRangeAt(ctx context.Context, space string, r KeyRange, revision uint64, yield func([]byte, []byte) error) error {
+	return t.scanRangeAt(ctx, space, r, revision, false, yield)
+}
+
 // scanRangeAt merges the staged layers of the transaction chain with one store snapshot.
 //
 // storeSnapshot selects the published side (the transaction's readTS for a snapshot read, the store

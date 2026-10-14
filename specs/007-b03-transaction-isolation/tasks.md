@@ -1,7 +1,7 @@
 # Tasks: B03 Four Transaction Isolation Levels
 
 **Feature**: `007-b03-transaction-isolation`  
-**Status**: 18 tasks completed (Phase 1 Setup & Architectural Proof and Phase 2 SQL Grammar & Session State completed). Phase 3–9 pending user authorization.
+**Status**: 29 tasks completed (Phase 1 Setup & Proof, Phase 2 Grammar & Session, and Phase 3 Read View & GC completed). Phase 4–9 pending user authorization.
 **Format**: `[TID] [P?] [USn] text — FR/SC`. `[P]` 只表示文件独立、前置依赖满足时可并行；并不授权 AI 跳过 Phase。
 **Tests**: 必须先写失败测试，再实现；不能拿静态阅读等同运行验收。
 
@@ -63,17 +63,17 @@
 
 **Goal**: 可重用、可释放、不会被 GC 破坏的隔离 read-view 能力。
 
-- [ ] **T019** 先写 `storageengine` contract 红测：旧 `Engine/Txn` 不变；没有 IsolationEngine capability 返回 Unsupported；一个 SQL statement 一个 view。  _Trace: FR-010/016/024; SC-002/010_
-- [ ] **T020** 在 `storageengine/isolation.go`（新）定义必要最小 optional level/read-view contract；避免 import mvcc 到 executor。  _Trace: FR-024; SC-010_
-- [ ] **T021** 在 `storageengine/mvccadapter/isolation.go` 绑定事务/语句 view，把 Go minimal `txn.Get` 旧调用保持不变。  _Trace: FR-009/010/024; SC-003/010_
-- [ ] **T022** 写 `mvcc/transaction_manager_test.go` 测试 root pin / statement pin / child/rollback/GC horizon、成功与错误路径。  _Trace: FR-016/032; SC-007_
-- [ ] **T023** 在 `mvcc/{transaction_manager.go,transaction.go}` 实现 generation-aware 视图 token 与 ownership/retain/release（先保留旧 API）。  _Trace: FR-009/010/016; SC-003/007_
-- [ ] **T024** 在 `mvcc/{store.go,range.go,maintenance.go}` 确保 view sampling atomic+GC 识别所有 live pins，Restore/epoch 使旧 view 无效。  _Trace: FR-016/026/032; SC-007_
-- [ ] **T025** 在 `executor/transaction_engine.go` 引入 statement context/view owner，所有 child/subquery、iterators 与 stream 使用同一个 token。  _Trace: FR-010/015/035; SC-002_
-- [ ] **T026** 在 `executor/{physical_select.go,subquery_mvcc.go,with_mvcc.go,derived_mvcc.go}` 清点并改接所有读入口；拒绝无法保证单语句一致的 shape。  _Trace: FR-010/027; SC-002/008_
-- [ ] **T027** 补视图在 LIMIT/EOF/error/cancel/disconnect/ResetConnection 下计数精确归零测试，不允许持底层视图跨锁等待。  _Trace: FR-016/022/032; SC-007_
-- [ ] **T028** 验证 `mvcc/conflict.go`/B02 observation 与新的 token 不混用，提交校验仍在安全边界中（详见 `contracts/validation-policy.md`）。  _Trace: FR-014/018/030; SC-006_
-- [ ] **T029** Phase 3 gate：M37–M39，B01 history retention/A05 parent child/B02 lock current 全过；README 同步能力/限制。  _Trace: FR-030/031; SC-007/010_
+- [x] **T019** 先写 `storageengine` contract 红测：旧 `Engine/Txn` 不变；没有 IsolationEngine capability 返回 Unsupported；一个 SQL statement 一个 view。  _Trace: FR-010/016/024; SC-002/010_
+- [x] **T020** 在 `storageengine/isolation.go`（新）定义必要最小 optional level/read-view contract；避免 import mvcc 到 executor。  _Trace: FR-024; SC-010_
+- [x] **T021** 在 `storageengine/mvccadapter/isolation.go` 绑定事务/语句 view，把 Go minimal `txn.Get` 旧调用保持不变。  _Trace: FR-009/010/024; SC-003/010_
+- [x] **T022** 写 `mvcc/transaction_manager_test.go` 测试 root pin / statement pin / child/rollback/GC horizon、成功与错误路径。  _Trace: FR-016/032; SC-007_
+- [x] **T023** 在 `mvcc/{transaction_manager.go,transaction.go}` 实现 generation-aware 视图 token 与 ownership/retain/release（先保留旧 API）。  _Trace: FR-009/010/016; SC-003/007_
+- [x] **T024** 在 `mvcc/{store.go,range.go,maintenance.go}` 确保 view sampling atomic+GC 识别所有 live pins，Restore/epoch 使旧 view 无效。  _Trace: FR-016/026/032; SC-007_
+- [x] **T025** 在 `executor/transaction_engine.go` 引入 statement context/view owner，所有 child/subquery、iterators 与 stream 使用同一个 token。  _Trace: FR-010/015/035; SC-002_
+- [x] **T026** 在 `executor/{physical_select.go,subquery_mvcc.go,with_mvcc.go,derived_mvcc.go}` 清点并改接所有读入口；拒绝无法保证单语句一致的 shape。  _Trace: FR-010/027; SC-002/008_
+- [x] **T027** 补视图在 LIMIT/EOF/error/cancel/disconnect/ResetConnection 下计数精确归零测试，不允许持底层视图跨锁等待。  _Trace: FR-016/022/032; SC-007_
+- [x] **T028** 验证 `mvcc/conflict.go`/B02 observation 与新的 token 不混用，提交校验仍在安全边界中（详见 `contracts/validation-policy.md`）。  _Trace: FR-014/018/030; SC-006_
+- [x] **T029** Phase 3 gate：M37–M39，B01 history retention/A05 parent child/B02 lock current 全过；README 同步能力/限制。  _Trace: FR-030/031; SC-007/010_
 
 **Checkpoint P3**: 只有本阶段真实证据齐备、阻塞问题关闭且用户授权下一阶段后方可继续。
 

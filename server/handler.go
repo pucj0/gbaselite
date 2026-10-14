@@ -222,28 +222,73 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 }
 
 func isIsolationSetAttempt(query string) bool {
-	upper := strings.ToUpper(query)
-	for strings.HasPrefix(upper, "/*") {
-		end := strings.Index(upper, "*/")
-		if end < 0 {
-			break
-		}
-		upper = strings.TrimSpace(upper[end+2:])
-	}
-	if !strings.HasPrefix(upper, "SET ") && !strings.HasPrefix(upper, "SET\t") && !strings.HasPrefix(upper, "SET\n") {
+	tokens, err := parser.Lex(query)
+	if err != nil || len(tokens) == 0 {
 		return false
 	}
-	body := strings.TrimSpace(upper[3:])
-	return strings.HasPrefix(body, "TRANSACTION") ||
-		strings.HasPrefix(body, "SESSION TRANSACTION") ||
-		strings.HasPrefix(body, "LOCAL TRANSACTION") ||
-		strings.HasPrefix(body, "GLOBAL TRANSACTION") ||
-		strings.Contains(body, "TRANSACTION_ISOLATION") ||
-		strings.Contains(body, "TX_ISOLATION") ||
-		strings.HasPrefix(body, "PERSIST ") ||
-		strings.HasPrefix(body, "PERSIST_ONLY ") ||
-		strings.HasPrefix(body, "GLOBAL ") ||
-		strings.HasPrefix(body, "@@GLOBAL.")
+	pos := 0
+	if pos >= len(tokens) || !strings.EqualFold(tokens[pos].Text, "SET") {
+		return false
+	}
+	pos++
+	if pos >= len(tokens) {
+		return false
+	}
+
+	tok1 := tokens[pos]
+	upper1 := strings.ToUpper(tok1.Text)
+
+	if tok1.Kind == parser.TokenIdentifier {
+		switch upper1 {
+		case "TRANSACTION":
+			return true
+		case "PERSIST", "PERSIST_ONLY":
+			if pos+1 < len(tokens) && isIsolationVarToken(tokens[pos+1].Text) {
+				return true
+			}
+			return false
+		case "GLOBAL":
+			if pos+1 < len(tokens) {
+				if strings.EqualFold(tokens[pos+1].Text, "TRANSACTION") || isIsolationVarToken(tokens[pos+1].Text) {
+					return true
+				}
+			}
+			return false
+		case "SESSION", "LOCAL":
+			if pos+1 < len(tokens) {
+				if strings.EqualFold(tokens[pos+1].Text, "TRANSACTION") || isIsolationVarToken(tokens[pos+1].Text) {
+					return true
+				}
+			}
+			return false
+		default:
+			if isIsolationVarToken(tok1.Text) {
+				return true
+			}
+			return false
+		}
+	}
+
+	if tok1.Kind == parser.TokenAt && pos+1 < len(tokens) && tokens[pos+1].Kind == parser.TokenAt {
+		// @@
+		pos += 2
+		if pos >= len(tokens) {
+			return false
+		}
+		tok3 := tokens[pos]
+		upper3 := strings.ToUpper(tok3.Text)
+		if (upper3 == "GLOBAL" || upper3 == "SESSION" || upper3 == "LOCAL") && pos+2 < len(tokens) && tokens[pos+1].Kind == parser.TokenDot {
+			return isIsolationVarToken(tokens[pos+2].Text)
+		}
+		return isIsolationVarToken(tok3.Text)
+	}
+
+	return false
+}
+
+func isIsolationVarToken(name string) bool {
+	clean := strings.ToLower(strings.Trim(name, "`"))
+	return clean == "transaction_isolation" || clean == "tx_isolation"
 }
 
 func trimLeadingCompatibilityComments(query string) string {

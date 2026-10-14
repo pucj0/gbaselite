@@ -211,7 +211,55 @@ func loadVersionedTableInternal(tx storageengine.Txn, session *Session, name str
 var statementTxnHook func(statement parser.Statement, read, write storageengine.Txn)
 
 func (e *Engine) executeSQLStatement(session *Session, statement parser.Statement) (resultOut *Result, errOut error) {
+	var closeViewOnExit storageengine.ReadView
+	var autoRollbackTx storageengine.Txn
 	defer func() {
+		if resultOut != nil && (resultOut.StreamRows != nil || resultOut.StreamValues != nil) {
+			origStreamRows := resultOut.StreamRows
+			origStreamValues := resultOut.StreamValues
+			v := closeViewOnExit
+			closeViewOnExit = nil
+			rtx := autoRollbackTx
+			autoRollbackTx = nil
+			cleanupDone := false
+			doCleanup := func() {
+				if cleanupDone {
+					return
+				}
+				cleanupDone = true
+				if v != nil {
+					_ = v.Close()
+					v = nil
+				}
+				if rtx != nil {
+					session.ClearActiveIsolation()
+					_ = rtx.Rollback()
+					rtx = nil
+				}
+			}
+			resultOut.cleanup = doCleanup
+			if origStreamRows != nil {
+				resultOut.StreamRows = func(yield func([]any) error) error {
+					defer doCleanup()
+					return origStreamRows(yield)
+				}
+			}
+			if origStreamValues != nil {
+				resultOut.StreamValues = func(yield func(storage.Row) error) error {
+					defer doCleanup()
+					return origStreamValues(yield)
+				}
+			}
+		}
+		if closeViewOnExit != nil {
+			_ = closeViewOnExit.Close()
+			closeViewOnExit = nil
+		}
+		if autoRollbackTx != nil {
+			session.ClearActiveIsolation()
+			_ = autoRollbackTx.Rollback()
+			autoRollbackTx = nil
+		}
 		if errOut == nil {
 			return
 		}
@@ -349,10 +397,22 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 	// Results are consumed while the transaction exists. This backend bounds
 	// materialized results; sorted sources spill through the existing operators.
 	if automatic {
-		defer func() {
-			session.ClearActiveIsolation()
-			_ = tx.Rollback()
-		}()
+		autoRollbackTx = tx
+	}
+	if isoTxn, ok := tx.(storageengine.IsolationTxn); ok {
+		var viewErr error
+		if automatic {
+			view, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindStatement)
+			if err != nil {
+				return nil, err
+			}
+			closeViewOnExit = view
+		} else {
+			_, viewErr = isoTxn.BeginConsistentView(ctx)
+			if viewErr != nil {
+				return nil, viewErr
+			}
+		}
 	}
 	// Subqueries run on the statement snapshot transaction: never on the child
 	// write transaction, and never in a transaction of their own.

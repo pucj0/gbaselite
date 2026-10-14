@@ -43,6 +43,30 @@ type ChildRegistration struct {
 	StartedAt  time.Time
 }
 
+// ViewRegistration is the metadata captured when a read view registers.
+type ViewRegistration struct {
+	ID         string
+	RootID     string
+	Revision   uint64
+	Generation uint64
+}
+
+type viewEntry struct {
+	id         string
+	rootID     string
+	revision   uint64
+	generation uint64
+	pinned     bool
+}
+
+// ViewInfo is a diagnostics summary of one registered read view.
+type ViewInfo struct {
+	ID         string
+	RootID     string
+	Revision   uint64
+	Generation uint64
+}
+
 // TransitionOptions carries the optional durable outcome of a lifecycle move.
 type TransitionOptions struct {
 	// CommitTS is the published commit/version sequence. It is accepted only for
@@ -240,6 +264,8 @@ type TransactionManager struct {
 	mu           sync.RWMutex
 	activeByID   map[string]*transactionEntry
 	snapshotRefs map[uint64]uint64
+	viewsByID    map[string]*viewEntry
+	viewsByRoot  map[string]map[string]bool
 
 	committed uint64
 	aborted   uint64
@@ -251,6 +277,8 @@ func NewTransactionManager() *TransactionManager {
 	return &TransactionManager{
 		activeByID:   make(map[string]*transactionEntry),
 		snapshotRefs: make(map[uint64]uint64),
+		viewsByID:    make(map[string]*viewEntry),
+		viewsByRoot:  make(map[string]map[string]bool),
 	}
 }
 
@@ -348,6 +376,7 @@ func (m *TransactionManager) Unregister(id string) {
 func (m *TransactionManager) removeLocked(entry *transactionEntry) {
 	delete(m.activeByID, entry.id)
 	m.releaseRefLocked(entry)
+	m.releaseRootViewsLocked(entry.id)
 }
 
 func (m *TransactionManager) releaseRefLocked(entry *transactionEntry) {
@@ -355,13 +384,93 @@ func (m *TransactionManager) releaseRefLocked(entry *transactionEntry) {
 		return
 	}
 	entry.pinned = false
-	if refs := m.snapshotRefs[entry.readTS]; refs > 1 {
-		m.snapshotRefs[entry.readTS] = refs - 1
+	m.releaseRevisionRefLocked(entry.readTS)
+}
+
+func (m *TransactionManager) releaseRevisionRefLocked(revision uint64) {
+	if refs := m.snapshotRefs[revision]; refs > 1 {
+		m.snapshotRefs[revision] = refs - 1
 		return
 	}
 	// Last reference, or a defensive zero: drop the key so a count can never
 	// become negative or linger as a phantom pin.
-	delete(m.snapshotRefs, entry.readTS)
+	delete(m.snapshotRefs, revision)
+}
+
+func (m *TransactionManager) releaseRootViewsLocked(rootID string) {
+	views := m.viewsByRoot[rootID]
+	for viewID := range views {
+		if v := m.viewsByID[viewID]; v != nil && v.pinned {
+			v.pinned = false
+			m.releaseRevisionRefLocked(v.revision)
+			delete(m.viewsByID, viewID)
+		}
+	}
+	delete(m.viewsByRoot, rootID)
+}
+
+// RegisterView registers an isolated read view and pins its snapshot revision for GC retention.
+func (m *TransactionManager) RegisterView(registration ViewRegistration) error {
+	if registration.ID == "" {
+		return fmt.Errorf("%w: empty view ID", ErrInvalidRegistration)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.viewsByID[registration.ID]; exists {
+		return fmt.Errorf("mvcc: view ID %s collision", registration.ID)
+	}
+	m.viewsByID[registration.ID] = &viewEntry{
+		id:         registration.ID,
+		rootID:     registration.RootID,
+		revision:   registration.Revision,
+		generation: registration.Generation,
+		pinned:     true,
+	}
+	if registration.RootID != "" {
+		if m.viewsByRoot[registration.RootID] == nil {
+			m.viewsByRoot[registration.RootID] = make(map[string]bool)
+		}
+		m.viewsByRoot[registration.RootID][registration.ID] = true
+	}
+	m.snapshotRefs[registration.Revision]++
+	return nil
+}
+
+// ReleaseView releases the retention pin of an active read view.
+func (m *TransactionManager) ReleaseView(viewID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.viewsByID[viewID]
+	if entry == nil || !entry.pinned {
+		return
+	}
+	entry.pinned = false
+	m.releaseRevisionRefLocked(entry.revision)
+	delete(m.viewsByID, viewID)
+	if entry.rootID != "" && m.viewsByRoot[entry.rootID] != nil {
+		delete(m.viewsByRoot[entry.rootID], viewID)
+		if len(m.viewsByRoot[entry.rootID]) == 0 {
+			delete(m.viewsByRoot, entry.rootID)
+		}
+	}
+}
+
+// ActiveViews returns the currently live registered read views.
+func (m *TransactionManager) ActiveViews() []ViewInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	views := make([]ViewInfo, 0, len(m.viewsByID))
+	for _, v := range m.viewsByID {
+		if v.pinned {
+			views = append(views, ViewInfo{
+				ID:         v.id,
+				RootID:     v.rootID,
+				Revision:   v.revision,
+				Generation: v.generation,
+			})
+		}
+	}
+	return views
 }
 
 // dropDescendantsLocked removes every registered descendant of the transaction
@@ -444,6 +553,7 @@ func (m *TransactionManager) Transition(id string, to TransactionState, options 
 		// read timestamp ends here. Unregister then finds nothing left to
 		// release, which keeps the release exactly-once.
 		m.releaseRefLocked(entry)
+		m.releaseRootViewsLocked(entry.id)
 	}
 	return nil
 }
@@ -461,6 +571,8 @@ func (m *TransactionManager) Reset() {
 	defer m.mu.Unlock()
 	m.activeByID = make(map[string]*transactionEntry)
 	m.snapshotRefs = make(map[uint64]uint64)
+	m.viewsByID = make(map[string]*viewEntry)
+	m.viewsByRoot = make(map[string]map[string]bool)
 }
 
 // ActiveTransactions returns a copy of the registered transactions. Entries that

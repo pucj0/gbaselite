@@ -251,6 +251,33 @@ func (t *Tx) read(space string, rowKey []byte) ([]byte, bool, error) {
 	}
 	return v, ok, err
 }
+
+// ReadAt resolves a point read at the specified snapshot revision, merging this transaction's
+// own staged writes and its ancestors' staged writes.
+func (t *Tx) ReadAt(revision uint64, space string, rowKey []byte) ([]byte, bool, error) {
+	return t.readAt(revision, space, rowKey)
+}
+
+func (t *Tx) readAt(revision uint64, space string, rowKey []byte) ([]byte, bool, error) {
+	if err := t.checkOpen(); err != nil {
+		return nil, false, err
+	}
+	op, found, err := t.readOp(space, rowKey)
+	if err != nil {
+		return nil, false, err
+	}
+	if found && !op.Check {
+		return op.Value, !op.Delete, nil
+	}
+	if t.parent != nil {
+		return t.parent.readAt(revision, space, rowKey)
+	}
+	v, _, ok, err := t.store.Get(revision, space, rowKey)
+	if t.generation != t.store.generation.Load() {
+		return nil, false, ErrConflict
+	}
+	return v, ok, err
+}
 func (t *Tx) Put(space string, rowKey, value []byte) error {
 	return t.write(Op{Space: space, Key: rowKey, Value: value})
 }

@@ -23,8 +23,11 @@ type engine struct {
 	locks *lockmanager.Manager
 }
 type txn struct {
-	inner  *mvcc.Tx
-	engine *engine
+	inner          *mvcc.Tx
+	engine         *engine
+	isolationLevel storageengine.IsolationLevel
+	activeView     *mvccReadView
+	consistentView *mvccReadView
 }
 
 var _ storageengine.Engine = (*engine)(nil)
@@ -157,10 +160,15 @@ func (e *engine) CompactHistory(ctx context.Context) error { return e.store.Comp
 func (e *engine) Compact(ctx context.Context, path string) error {
 	return e.store.ExportLayout(ctx, path, "flat")
 }
-func (e *engine) PendingBytes() (int64, error)                     { return e.store.PendingBytes() }
-func (t *txn) ID() string                                          { return t.inner.ID }
-func (t *txn) Snapshot() uint64                                    { return t.inner.Snapshot }
-func (t *txn) Get(s string, k []byte) ([]byte, bool, error)        { return t.inner.Get(s, k) }
+func (e *engine) PendingBytes() (int64, error) { return e.store.PendingBytes() }
+func (t *txn) ID() string                      { return t.inner.ID }
+func (t *txn) Snapshot() uint64                { return t.inner.Snapshot }
+func (t *txn) Get(s string, k []byte) ([]byte, bool, error) {
+	if t.activeView != nil && t.activeView.State() == storageengine.ViewStateActive {
+		return t.activeView.Get(s, k)
+	}
+	return t.inner.Get(s, k)
+}
 func (t *txn) Put(s string, k, v []byte) error                     { return t.inner.Put(s, k, v) }
 func (t *txn) Delete(s string, k []byte) error                     { return t.inner.Delete(s, k) }
 func (t *txn) Guard(s string, k []byte) error                      { return t.inner.Guard(s, k) }
@@ -173,8 +181,28 @@ func (t *txn) Child() (storageengine.Txn, error) {
 	}
 	return &txn{inner: c, engine: t.engine}, nil
 }
-func (t *txn) Commit(ctx context.Context) (uint64, error) { return t.inner.Commit(ctx) }
-func (t *txn) Rollback() error                            { return t.inner.Rollback() }
+func (t *txn) Commit(ctx context.Context) (uint64, error) {
+	if t.consistentView != nil {
+		_ = t.consistentView.Close()
+		t.consistentView = nil
+	}
+	if t.activeView != nil {
+		_ = t.activeView.Close()
+		t.activeView = nil
+	}
+	return t.inner.Commit(ctx)
+}
+func (t *txn) Rollback() error {
+	if t.consistentView != nil {
+		_ = t.consistentView.Close()
+		t.consistentView = nil
+	}
+	if t.activeView != nil {
+		_ = t.activeView.Close()
+		t.activeView = nil
+	}
+	return t.inner.Rollback()
+}
 func (t *txn) Scan(ctx context.Context, s string, f func([]byte, []byte) error) error {
 	it, err := t.NewIterator(ctx, storageengine.ScanRequest{Space: s, Unordered: true})
 	if err != nil {
@@ -197,6 +225,9 @@ func (e *engine) Scan(ctx context.Context, revision uint64, s string, f func([]b
 	return storageengine.Consume(it, f)
 }
 func (t *txn) NewIterator(ctx context.Context, r storageengine.ScanRequest) (storageengine.Iterator, error) {
+	if t.activeView != nil && t.activeView.State() == storageengine.ViewStateActive {
+		return t.activeView.NewIterator(ctx, r)
+	}
 	return newIterator(ctx, r, func(y func([]byte, []byte) error) error {
 		if r.Unordered {
 			return t.inner.Scan(ctx, r.Space, y)
