@@ -1,0 +1,140 @@
+# B03 Phase 1 Verification and Audit Report
+
+- **Feature**: `specs/007-b03-transaction-isolation`
+- **Phase**: Phase 1: Setup & Architectural Proof (T001–T008)
+- **Status**: PASSED (Phase 1 Gate Ready, awaiting Phase 2 user authorization)
+- **Branch**: `master`
+- **Git Commit HEAD**: `5c845d4f92f29431e433633f85c90ddf21e312af`
+- **Go Version**: `go version go1.26.5 windows/amd64`
+- **Date**: 2026-10-14
+
+---
+
+## 1. T001: 真实基线与回归验证
+
+| 验证项 | 执行命令 | 退出码 | 耗时 | 结果与详情 |
+|---|---|---|---|---|
+| Go 环境 | `go version` | 0 | <1s | `go version go1.26.5 windows/amd64` |
+| Git 状态 | `git status --short` | 0 | <1s | 工作区干净 (Clean) |
+| Git HEAD | `git rev-parse HEAD` | 0 | <1s | `5c845d4f92f29431e433633f85c90ddf21e312af` |
+| 代码差异 | `git diff --check` | 0 | <1s | 无冲突标记、无异常空白 |
+| 静态检查 | `go vet ./...` | 0 | ~3s | 无任何警告或错误 |
+| 全量单元测试 | `go test ./... -count=1` | 0 | 120.8s | 21 个测试包全部通过 (0 FAIL) |
+
+### 既有架构核心回归覆盖
+- **A05 parent-read / child-write & statement atomicity**: 在 `mvcc` 和 `executor` 测试中通过；
+- **B01 事务生命周期与提交冲突**: `RegisterRoot`, `RegisterChild`, `snapshotRefs`, `latestCommittedChange > readTS` 测试全部通过；
+- **B02 行/间隙锁管理器**: Record S/X, IS/IX, Gap, Next-Key, Insert Intention, 死锁图检测、等待队列全部通过；
+- **B02 当前读与逐键基线**: `ReadCurrentLocked` 与 `withBaseline` 在 `mvcc/current_read_test.go` 和 `conflict_test.go` 通过；
+- **生产数据安全**: 生产 `data/` 未做任何修改，所有测试均使用 `t.TempDir()` 隔离环境。
+
+---
+
+## 2. T002: MVCC 与提交验证调用链审计
+
+1. **`Store.Begin()` 时点确定 readTS**:
+   - `mvcc/transaction.go:94` 在 `s.views.Lock()` 保护下调用 `s.Head()` 确定 snapshot 水位，在 `s.newTx` (行 117) 注册 `RootRegistration{ReadTS: snapshot}`，在行 131 赋值 `tx.Snapshot = snapshot`。
+2. **root、child、SAVEPOINT 共享继承机制**:
+   - Root 注册时 `snapshotRefs[readTS]++` (`mvcc/transaction_manager.go:285`)；
+   - Child (`Tx.ChildContext()`, 行 185) 继承父级 `t.Snapshot`，`pinned: false`；
+   - SAVEPOINT 基于 child 嵌套，读取逐级回溯至 root (`mvcc/transaction.go:245-248`)。
+3. **GC Retention pin/release 机制**:
+   - Pin 仅由 Root 注册触发；
+   - 事务达到终态 (`Transition` 到 COMMITTED/ABORTED) 或 `Unregister` 时调用 `releaseRefLocked` (`mvcc/transaction_manager.go:353-365`) 递减 `snapshotRefs`；
+   - `CompactHistory` (`mvcc/maintenance.go:42-44`) 以 `OldestReadTS` 为界清理废弃版本。
+4. **B01 `latestCommittedChange > readTS` 触发路径**:
+   - `mvcc/conflict.go:121-124`；覆盖本地流式提交 (`local_stream.go:46`)、Group Commit (`group_commit.go:138`)、Local WAL (`local_wal.go:329`)、Direct Commit (`store.go:616`)。
+5. **B02 per-key observation baseline 覆盖机制**:
+   - 在排他/共享锁下调用 `ReadCurrentLocked` 记录 `t.writeBaseline[key] = observation.ChangeTS` (`current_read.go:213-250`)；
+   - 校验器中若存在 baseline，以 `latest > observed` 替代 `latest > readTS` (`conflict.go:110-120`)，只要持锁期间未被并发修改即允许提交；超限 (16384) fail-closed 回退。
+6. **RC 每语句刷新 Read View 的两难冲突**:
+   - 若不加锁直接改 `readTS`，会引发**丢失更新 (Lost Update)**；
+   - 若仅靠旧 root `readTS` 校验，会导致合规当前更新出现**假冲突 (False Conflict)**。
+7. **旧 Go API Snapshot 保持**:
+   - `storageengine/engine.go` 的 `Engine.Begin` 与 `Txn` 保持最小契约不变；通过可选接口 `IsolationEngine` / `IsolationTxn` / `StatementView` 扩展 SQL 隔离能力。
+
+---
+
+## 3. T003: SQL 执行链路与 Session 审计
+
+- **三层状态机**: `sessionDefault (默认 RR) → pendingNext (一次性覆盖) → activeIsolation (活动事务冻结)`。
+- **消费规则**: `pendingNext` 仅在底层事务**成功启动 (`Backend.Begin` 无错误)** 时消费一次；Begin 失败或元数据语句（`SET`, `SHOW`）绝不消费。
+- **单语句单一 Read View 机制**:
+  - 语句执行前分配 `StatementView` Token，注入 Session/Context；
+  - 物理扫描（Table/Index/Range Scan）、HashJoin、子查询 (`subqueryRunner`)、CTE 统一共享该 Token；
+  - 在 `executeSQLStatement` 的 `defer` 中执行 `view.Close()`，确保 EOF、LIMIT 提前退出、错误、取消等路径无泄漏。
+- **失败清理路径**:
+  - 针对活跃事务 `SET TRANSACTION` 拒绝、Begin 失败、锁超时、死锁受害者、取消与断开连接均建立了完备的清理机制与状态重置映射。
+
+---
+
+## 4. T004: B02 锁管理器兼容性审计
+
+- **加锁原语兼容性**:
+  - Record S/X: S/S 兼容，S/X 互斥，X/X 互斥；
+  - Table IS/IX: 意向锁互不排斥；B02 无表级 S/X，IS 不能代替整表保护；
+  - Gap / Next-Key / II: Gap 互不排斥，仅排斥区间内的 Insert Intention。
+- **SERIALIZABLE 普通 SELECT 策略**:
+  - 显式事务/`autocommit=0` 必须获取访问键的 Record S 锁及范围保护（Gap / Next-Key）；
+  - `autocommit=1` 单语句独立纯 SELECT 优化为非锁定一致读（MySQL 兼容）；
+  - 缺席点与空范围必须由 Gap 锁保护，防止幻读。
+- **Query Shape 支持与 Fail-Closed 决策**:
+  - **支持并保护**: 单表 PK 点查/范围查、单表唯一索引查、单表全表扫描 (Fallback Whole-Domain Gap)；
+  - **明确不支持并 Fail Closed (`errLockedReadShape` / `ErrLockPlanUnavailable`)**:
+    多表 JOIN、子查询/派生表、公用表表达式 (CTE)、视图 (View)、聚合/GROUP BY/DISTINCT、UNION。绝不静默降级为无锁快照读。
+
+---
+
+## 5. T005: RU 脏读可行性审计
+
+- **核心结论**: 绝对不能直接读取 Writer 的私有 `buffered` map 或 `stage` bbolt 临时文件。
+- **技术可行性证明**:
+  1. 采用**已合并 Stage 的原子公布机制 (Staged Publication)**；
+  2. 仅在 Statement Child 成功执行 `mergeParent` 后的语句稳态才进行发布，彻底排除未合并 Child；
+  3. Reader 采样并深拷贝所需字节，生命周期以 Reader View Token 保护；Writer 回滚不影响 Reader 已复制切片；
+  4. 设立严格配额 (`MaxDirtyStagedKeys = 10,000`, `MaxDirtyStagedBytes = 16MB`)，超限 fail-closed；
+  5. RU 写操作强制走 RC 的行排他锁与当前读校验，绝不允许脏写；
+  6. 坚决不使用 RC committed read 伪装 RU。
+
+---
+
+## 6. T006: M01–M44 测试映射方案
+
+- **无 Sleep 并发同步**: 严格使用 `chan struct{}` 信号屏障、LockManager 等待队列观察点、RU Staged 发布 Hook 建立偏序。
+- **全场景映射**:
+  - Session 状态与语法 (M01–M07, M44) 映射至 Phase 2；
+  - RR 首次读与不可重复读 (M08–M12) 映射至 Phase 4；
+  - RC 语句快照与当前写 (M13–M20) 映射至 Phase 5；
+  - SERIALIZABLE S/谓词锁与拒绝形态 (M21–M28) 映射至 Phase 6；
+  - RU 真实脏读与写保护 (M29–M36) 映射至 Phase 7；
+  - 视图 GC、Epoch 与全回归 (M37–M43) 映射至 Phase 3 与 Phase 8。
+
+---
+
+## 7. T007 & T008: Q01–Q10 技术决议与规格一致性
+
+- **Q01 (旧 Go API)**: RESOLVED — 契约严格不变，隔离走可选能力接口；
+- **Q02 (RR Lazy Pin)**: RESOLVED — 事务注册与一致读 Pin 解耦，首读分配 View Token；
+- **Q03 (RC 语句时点)**: RESOLVED — Barrier 之后、Bind 之前分配单一 Token，全算子共享，defer Close；
+- **Q04 (复制路径 Baseline)**: RESOLVED — 确认 HEAD 源码限制，复制模式下产生 baseline 写入显式返回 Unsupported；
+- **Q05 (RU 原子采样)**: RESOLVED — 稳态已合并 Stage 只读发布，内存深拷贝，不持底层文件句柄；
+- **Q06 (SERIALIZABLE 复杂形态)**: RESOLVED — 复杂形态（JOIN/Subquery/CTE/View/聚合）在执行前 fail-closed 拒绝；
+- **Q07 (RC 保守 Gap 锁)**: RESOLVED — 以正确性为先，无法安全剥离时保留保守 Gap 锁并作为差异披露；
+- **Q08 (PendingNext 消费时机)**: RESOLVED — 事务成功 Begin 时消费，元数据与失败不消费，ResetConnection 清理；
+- **Q09 (RU 内存配额)**: RESOLVED — 单事务 10,000 keys / 16MB，全局 64MB 严格预算；
+- **Q10 (RC 当前写冲突)**: RESOLVED — 锁下观测记录 baseline，比较 `latest > observed`，不发生假冲突也不丢失更新。
+
+### 规格文档一致性检查
+- 已核对 `spec.md`、`plan.md`、`research.md`、`data-model.md`、5 份 contracts、`checklists/clarification.md`、`tasks.md`、`test-matrix.md`；
+- 所有关于接口定义、状态机、锁策略、验证规则、差异说明的技术决策均保持严格一致；
+- `tasks.md` 中的 Phase 1 任务 T001–T008 已根据真实完成证据更新为 `[x]`。
+
+---
+
+## 8. Phase 1 Gate 审查结论
+
+- **T001–T008 状态**: 全部完成 (PASS)。
+- **代码状态**: 生产代码未做任何修改（遵守只读审计禁令）；`data/` 未触碰；无新提交。
+- **阻塞问题状态**: 底层架构冲突（Q01–Q04 及 Q05–Q10）已全部完成技术决议并书面关闭。
+- **Phase 2 准入资格**: **已完全具备**。
+- **下一步行动**: 停止执行，等待用户对 Phase 2（T009–T018）的单独授权。

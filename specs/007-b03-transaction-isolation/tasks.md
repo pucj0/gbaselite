@@ -1,7 +1,7 @@
 # Tasks: B03 Four Transaction Isolation Levels
 
 **Feature**: `007-b03-transaction-isolation`  
-**Status**: 0 tasks completed — documents only. No code implementation is authorized by this package.
+**Status**: 8 tasks completed (Phase 1 Setup & Architectural Proof completed). Phase 2–9 pending user authorization.
 **Format**: `[TID] [P?] [USn] text — FR/SC`. `[P]` 只表示文件独立、前置依赖满足时可并行；并不授权 AI 跳过 Phase。
 **Tests**: 必须先写失败测试，再实现；不能拿静态阅读等同运行验收。
 
@@ -27,14 +27,14 @@
 
 **Goal**: 发现并书面关闭底层架构冲突；先证明 safety，再写实现。
 
-- [ ] **T001** 记录 master HEAD、用户本轮授权边界和 B01/B02/A05 baseline；在 `.tmp/b03-baseline.md` 记真实 `go test ./... -count=1`、`go vet ./...` 与已有失败（未授权不得运行）。  _Trace: FR-030/031; SC-010/012_
-- [ ] **T002** 审计 `mvcc/{transaction.go,transaction_manager.go,conflict.go,current_read.go}` 的 root/child/readTS/obs baseline 真正调用图；写 `.tmp/b03-readview.md`。  _Trace: FR-009/010/014/016; SC-006_
-- [ ] **T003** 审计 `executor/{transaction_engine.go,physical_select.go,subquery_mvcc.go}` 及 `server/{handler.go,session_settings.go}` 的所有 Begin/stream/SET 路径。  _Trace: FR-006/008/010/035; SC-001/003_
-- [ ] **T004** 审计 `lockmanager/`、`executor/{locking_read.go,dml_locking.go,lock_plan.go}` 的 S/gap/next-key、锁等待及不支持查询 shape。  _Trace: FR-012/019/021/022; SC-005/008_
-- [ ] **T005** 审计 `mvcc/` stage merge/write buffer/transaction_state、GC/Restore、replication term，证明 RU 原子只读索引插入点可行。  _Trace: FR-017/018/026; SC-004/008_
-- [ ] **T006** 建立 `test-matrix.md` M01–M44 的 Go test 命名映射和 barrier hook 方案，禁止 sleep 作为同步。  _Trace: FR-028/029/036; SC-007/009_
-- [ ] **T007** 针对 B01 root 固定 pin 与 MySQL RR lazy 的改变提交决策记录 Q01–Q04，形成可核验 validator/retention 真值表。  _Trace: FR-009/014/016/024; SC-003/006_
-- [ ] **T008** 关闭 `checklists/clarification.md` Q01–Q10 或标记明确 blocker；静态运行 Spec Kit analyze 审核 spec/plan/contracts 一致性。  _Trace: FR-027/031; SC-011/012_
+- [x] **T001** 记录 master HEAD、用户本轮授权边界和 B01/B02/A05 baseline；在 `.tmp/b03-baseline.md` 记真实 `go test ./... -count=1`、`go vet ./...` 与已有失败（未授权不得运行）。  _Trace: FR-030/031; SC-010/012_
+- [x] **T002** 审计 `mvcc/{transaction.go,transaction_manager.go,conflict.go,current_read.go}` 的 root/child/readTS/obs baseline 真正调用图；写 `.tmp/b03-readview.md`。  _Trace: FR-009/010/014/016; SC-006_
+- [x] **T003** 审计 `executor/{transaction_engine.go,physical_select.go,subquery_mvcc.go}` 及 `server/{handler.go,session_settings.go}` 的所有 Begin/stream/SET 路径。  _Trace: FR-006/008/010/035; SC-001/003_
+- [x] **T004** 审计 `lockmanager/`、`executor/{locking_read.go,dml_locking.go,lock_plan.go}` 的 S/gap/next-key、锁等待及不支持查询 shape。  _Trace: FR-012/019/021/022; SC-005/008_
+- [x] **T005** 审计 `mvcc/` stage merge/write buffer/transaction_state、GC/Restore、replication term，证明 RU 原子只读索引插入点可行。  _Trace: FR-017/018/026; SC-004/008_
+- [x] **T006** 建立 `test-matrix.md` M01–M44 的 Go test 命名映射和 barrier hook 方案，禁止 sleep 作为同步。  _Trace: FR-028/029/036; SC-007/009_
+- [x] **T007** 针对 B01 root 固定 pin 与 MySQL RR lazy 的改变提交决策记录 Q01–Q04，形成可核验 validator/retention 真值表。  _Trace: FR-009/014/016/024; SC-003/006_
+- [x] **T008** 关闭 `checklists/clarification.md` Q01–Q10 或标记明确 blocker；静态运行 Spec Kit analyze 审核 spec/plan/contracts 一致性。  _Trace: FR-027/031; SC-011/012_
 
 **Checkpoint P1**: 只有本阶段真实证据齐备、阻塞问题关闭且用户授权下一阶段后方可继续。
 
