@@ -322,12 +322,23 @@ func TestB03IsolationBinaryPreparedProtocol(t *testing.T) {
 		t.Fatalf("second prepared query = %q, want READ-COMMITTED", iso)
 	}
 
-	// 5. Data queries under unimplemented RC must return unsupported error (T017)
-	if _, err := conn.ExecContext(ctx, "CREATE TABLE t (id INT)"); err != nil {
-		// DDL in autocommit with RC must fail capability gate
-		if !strings.Contains(err.Error(), "not supported") {
-			t.Fatalf("expected unsupported isolation error, got: %v", err)
-		}
+	// 5. Data queries under RC now succeed in Phase 5
+	if _, err := conn.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "USE test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE t_rc (id INT)"); err != nil {
+		t.Fatalf("CREATE TABLE under RC failed: %v", err)
+	}
+
+	// 6. Data queries under unimplemented SERIALIZABLE must return unsupported error (T017)
+	if _, err := conn.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "CREATE TABLE t_ser (id INT)"); err == nil {
+		t.Fatalf("expected unsupported isolation error under SERIALIZABLE")
 	}
 }
 

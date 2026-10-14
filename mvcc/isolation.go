@@ -9,14 +9,16 @@ import (
 
 // ViewToken represents an atomic, pinned snapshot view token owned by a transaction or statement.
 type ViewToken struct {
-	id         string
-	rootID     string
-	revision   uint64
-	generation uint64
-	store      *Store
-	tx         *Tx
-	rw         sync.RWMutex
-	closed     bool
+	id          string
+	rootID      string
+	revision    uint64
+	generation  uint64
+	store       *Store
+	tx          *Tx
+	rw          sync.RWMutex
+	closed      bool
+	pinReleased bool
+	borrowers   int
 }
 
 // UpdateRootReadTS updates the read timestamp of an active root transaction.
@@ -135,14 +137,43 @@ func (v *ViewToken) Closed() bool {
 	return v.closed
 }
 
-func (v *ViewToken) Get(space string, rowKey []byte) ([]byte, bool, error) {
-	v.rw.RLock()
-	defer v.rw.RUnlock()
+func (v *ViewToken) BeginBorrow() error {
+	v.rw.Lock()
+	defer v.rw.Unlock()
 	if v.closed {
-		return nil, false, storageengine.ErrViewClosed
+		return storageengine.ErrViewClosed
 	}
 	if v.generation != v.store.generation.Load() {
-		return nil, false, storageengine.ErrViewInvalidated
+		return storageengine.ErrViewInvalidated
+	}
+	v.borrowers++
+	return nil
+}
+
+func (v *ViewToken) EndBorrow() {
+	v.rw.Lock()
+	defer v.rw.Unlock()
+	if v.borrowers > 0 {
+		v.borrowers--
+	}
+	if v.closed && v.borrowers == 0 && !v.pinReleased {
+		v.pinReleased = true
+		v.store.txns.ReleaseView(v.id)
+	}
+}
+
+func (v *ViewToken) Get(space string, rowKey []byte) ([]byte, bool, error) {
+	return v.GetWithTx(space, rowKey, nil)
+}
+
+func (v *ViewToken) GetWithTx(space string, rowKey []byte, tx *Tx) ([]byte, bool, error) {
+	if err := v.BeginBorrow(); err != nil {
+		return nil, false, err
+	}
+	defer v.EndBorrow()
+
+	if tx != nil {
+		return tx.readAt(v.revision, space, rowKey)
 	}
 	if v.tx != nil {
 		return v.tx.readAt(v.revision, space, rowKey)
@@ -155,13 +186,17 @@ func (v *ViewToken) Get(space string, rowKey []byte) ([]byte, bool, error) {
 }
 
 func (v *ViewToken) ScanRange(ctx context.Context, space string, r KeyRange, yield func([]byte, []byte) error) error {
-	v.rw.RLock()
-	defer v.rw.RUnlock()
-	if v.closed {
-		return storageengine.ErrViewClosed
+	return v.ScanRangeWithTx(ctx, space, r, nil, yield)
+}
+
+func (v *ViewToken) ScanRangeWithTx(ctx context.Context, space string, r KeyRange, tx *Tx, yield func([]byte, []byte) error) error {
+	if err := v.BeginBorrow(); err != nil {
+		return err
 	}
-	if v.generation != v.store.generation.Load() {
-		return storageengine.ErrViewInvalidated
+	defer v.EndBorrow()
+
+	if tx != nil {
+		return tx.scanRangeAt(ctx, space, r, v.revision, false, yield)
 	}
 	if v.tx != nil {
 		return v.tx.scanRangeAt(ctx, space, r, v.revision, false, yield)
@@ -176,7 +211,12 @@ func (v *ViewToken) Close() error {
 		return nil
 	}
 	v.closed = true
+	if v.borrowers == 0 && !v.pinReleased {
+		v.pinReleased = true
+		v.rw.Unlock()
+		v.store.txns.ReleaseView(v.id)
+		return nil
+	}
 	v.rw.Unlock()
-	v.store.txns.ReleaseView(v.id)
 	return nil
 }

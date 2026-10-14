@@ -404,3 +404,69 @@
 3. **Phase 5 准入结论**:
    - **P4-FIX-01 至 P4-FIX-05 全部彻底关闭**；
    - **GBaseLite B03 Phase 4 最终 Gate 确认通过**，已完全具备进入 Phase 5（READ COMMITTED）的技术条件。
+
+---
+
+## 18. Phase 5 实施与验收结果 (T037–T046)
+
+- **基线 Commit**: `0673a1fbdee9d8a3bca27119afcdec58249ef4e3`
+- **实施内容与证据**:
+
+### 1. 前置安全门禁修复 (PRE-01 & PRE-02)
+- **PRE-01 (ViewToken 借用与所有权协议)**:
+  - `ViewToken` 引入 `BeginBorrow()` / `EndBorrow()` 与 `borrowers` 活跃读者引用计数；
+  - `mvccReadView.Get` 与 `NewIterator` 统一经由 `ViewToken` 借用机制：活跃的扫描迭代器由 `borrowedIterator` 托管，未完成消费期间即使 `View.Close()` 被调用，底层 GC Pin 绝不提前释放；
+  - 迭代器消费完毕（EOF、LIMIT 提前退出、错误、显式 `Close`）通过 `sync.Once` 精确释放一次借用，Pin 归零；
+  - 实测证据: `storageengine/isolation_test.go:TestPRE01_ActiveIteratorProtectsAgainstEarlyViewCloseAndGC`（300 行跨分页扫描在 View 关闭与 CompactHistory 并发下稳定读取 V1，且 Child ReadView 同样受保护）。
+- **PRE-02 (Lazy Root 首次读前的 DML 与 GC 安全)**:
+  - 严密核对未分配视图时的读取退避路径：若 revision 低于 `compacted_horizon`，强制 fail-closed 报错 `ErrConflict`，绝不返回缺失历史；
+  - 证明持锁当前读（`SELECT ... FOR UPDATE` / `FOR SHARE`）与 DML（`UPDATE` / `DELETE` / `INSERT SELECT`）通过 B02 覆盖锁读取当前最新已发布数据，不受早期 GC 影响；
+  - 实测证据: `executor/isolation_p4fix_test.go:TestPRE02_LazyRootDMLAndCurrentReadAfterGC` 全部通过。
+
+### 2. T037: M13–M20 红测先行
+- **文件**: `executor/isolation_rc_test.go`
+- **红测证据**: 在未开放 RC 执行能力时，M13–M20 均捕获真实的 `storage engine capability is not supported: transaction isolation level READ COMMITTED is not supported yet` 失败证据。
+
+### 3. T038 & T039: RC 语句级快照与流式生命周期
+- **语句级快照机制**:
+  - `BeginIsolated(READ COMMITTED)` 在存储引擎层开放执行能力；
+  - `statementNeedsReadView` 策略：在 RC 下，每条读取语句（`SELECT`、`UPDATE`、`DELETE`、`INSERT SELECT`、`WITH`、`UNION`）通过 `BeginStatementView` 原子采样当前最新 Head 并 Pin，语句结束通过 `defer closeViewOnExit.Close()` 释放；
+  - 下一条语句重新获取最新已提交 Head，严格呈现非重复读与幻读；
+  - 单语句内部（包含 JOIN、子查询、CTE）共享同一个 statement view，时点绝对一致；
+  - 流式结果由 `Result.StreamRows` 托管，消费结束或连接断开后幂等释放，无孤儿 Pin。
+
+### 4. T040–T042: RC 写冲突验证与 DML 管线
+- **写冲突基准分离**:
+  - `staleTargetObservation` 在 RC 隔离级别下，以当前语句的 `StatementView.Revision()` 为基准校验目标版本，而非整个事务的起始快照；
+  - 覆盖锁保护下的当前写（M17）允许合法提交，彻底消除了“因 Root 开始早于并发提交导致的假冲突”；
+  - 无覆盖锁的写依然严格防范 Lost Update（M18），并发写同一行由行锁和观察基准严格串行化；
+  - DML parent read 读取最新已提交，child write 仅记录本语句 staged 变更，语句提交合并至 parent。
+
+### 5. T043: Gap Lock 兼容性与保守过锁声明
+- **兼容性策略**: 为保证重复键冲突检测（`TestT043_RC_GapLockingStrategy`）与外键完整性校验（M19），GBaseLite 在 RC 下保守保留必要的 Gap / Insert Intention 锁保护，防止并发写入导致唯一性或外键约束被破坏；
+- 作为已知差异（KNOWN DIFFERENCE）在文档与报告中明确披露。
+
+### 6. T044 & T045: 生命周期、异常与长事务 GC 验证
+- `TestT044_RC_LifecycleAndExceptions`: 验证 autocommit=0/1、显式 BEGIN/COMMIT/ROLLBACK、ResetConnection 恢复默认 RR 等场景；
+- `TestT045_RC_LongTransactionGCRetention`: 长事务循环执行 20 次语句读取并伴随并发提交与 CompactHistory，验证语句视图随用随释，活跃 View 数不随语句单调增长，无内存与 Pin 泄漏。
+
+### 7. T046: 100 轮压测与全量回归
+- `TestPRE01`、M08–M12 (RR)、M13–M20 (RC) 100 轮重复运行全部通过（`count=100`，EXIT: 0）；
+- 全库 21 个带测试包执行 `go test ./... -count=1` 100% 通过（总耗时 ~130s）；
+- `gofmt -l`、`go vet ./...`、`git diff --check` 全部 clean。
+
+---
+
+## 19. Phase 5 最终 Gate 审查结论
+
+- [x] **PRE-01 (ViewToken 借用/所有权与在途读锁保护)** 彻底解决并通过红绿测试；
+- [x] **PRE-02 (Lazy Root 首次读前的 DML/GC 安全)** 彻底解决并通过红绿测试；
+- [x] **PRE-03 (Phase 4 核心能力回归)** 全部通过；
+- [x] **M13–M20 (READ COMMITTED)** 红测先行并绿测通过；
+- [x] **RC Per-Statement Read View 与流式生命周期** 完整实现；
+- [x] **RC 当前写与写冲突校验** 正确对齐，无假冲突、无 Lost Update；
+- [x] **Gap Lock 策略与差异记录** 明确声明；
+- [x] **全库 21 包 100% 通过，100 轮压测全部通过**；
+- [x] **README 与 tasks.md 均已完成同步**。
+
+**结论：GBaseLite B03 Phase 5 最终 Gate 正式通过，完全具备进入 Phase 6（SERIALIZABLE）的技术前置条件。**

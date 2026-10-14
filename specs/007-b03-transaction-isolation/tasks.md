@@ -1,7 +1,7 @@
 # Tasks: B03 Four Transaction Isolation Levels
 
 **Feature**: `007-b03-transaction-isolation`  
-**Status**: 36 tasks completed (Phase 1 Setup & Proof, Phase 2 Grammar & Session, Phase 3 Read View & GC, and Phase 4 REPEATABLE READ completed). Phase 5–9 pending user authorization.
+**Status**: 46 tasks completed (Phase 1 Setup & Proof, Phase 2 Grammar & Session, Phase 3 Read View & GC, Phase 4 REPEATABLE READ, and Phase 5 READ COMMITTED completed). Phase 6–9 pending user authorization.
 **Format**: `[TID] [P?] [USn] text — FR/SC`. `[P]` 只表示文件独立、前置依赖满足时可并行；并不授权 AI 跳过 Phase。
 **Tests**: 必须先写失败测试，再实现；不能拿静态阅读等同运行验收。
 
@@ -99,16 +99,16 @@
 
 **Goal**: 真正 RC 语句级快照与安全写入。
 
-- [ ] **T037** 先编 M13–M20 红测：两条 SELECT 可见性变化、单条扫描中途 commit 不混水位、子查询共用 view。  _Trace: FR-010/028; SC-002_
-- [ ] **T038** 在 `storageengine/mvccadapter/isolation.go`、`mvcc/transaction.go` 实现 RC 每条 statement 捕获一个发布 head，closed 后重新获取。  _Trace: FR-010/016; SC-002_
-- [ ] **T039** 在 `executor/{physical_select.go,subquery_mvcc.go,with_mvcc.go}` 共享 view 到各 query source；streaming 完全 drain 才释放。  _Trace: FR-010/032; SC-002/007_
-- [ ] **T040** 先写 M17–M20 的冲突与 current-read baseline 红测，枚举当前版本/根读 TS/unique & FK 分支。  _Trace: FR-014/019; SC-006_
-- [ ] **T041** 在 `mvcc/{conflict.go,current_read.go}` 和 adapter 增 per-dependency proof/validation，RC 后续更新不得因旧根 TS 假冲突也不能丢失更新。  _Trace: FR-014/018; SC-006_
-- [ ] **T042** 在 `executor/{locking_modify.go,dml_locking.go,modify.go}` 审核 UPDATE/DELETE/UPSERT/INSERT SELECT 的 parent read、child write 与 RC 当前锁/谓词访问。  _Trace: FR-014/015/019; SC-006_
-- [ ] **T043** 为 RC 普通 gap 放宽路径做安全判定；必须保留 duplicate/FK 所需 gap/unique reserve；无法完成则记录保守过锁差异。  _Trace: FR-019/020; SC-006/008_
-- [ ] **T044** 补 RC rollback SAVEPOINT、stale target、deadlock/timeout、zero row、范围/二级索引与 autocommit 测试。  _Trace: FR-015/019/022; SC-002/006_
-- [ ] **T045** 确认 RC root 不因早期 Head pin 长期压住 GC，并进行长事务内 100 次 statement view acquire/release 计量。  _Trace: FR-016/023/032; SC-007_
-- [ ] **T046** Phase 5 gate：M13–M20 + M37/39 全过，B01/B02/A05 全量回归，README+docs 更新。  _Trace: FR-030/031; SC-002/006/010_
+- [x] **T037** 先编 M13–M20 红测：两条 SELECT 可见性变化、单条扫描中途 commit 不混水位、子查询共用 view。  _Trace: FR-010/028; SC-002_
+- [x] **T038** 在 `storageengine/mvccadapter/isolation.go`、`mvcc/transaction.go` 实现 RC 每条 statement 捕获一个发布 head，closed 后重新获取。  _Trace: FR-010/016; SC-002_
+- [x] **T039** 在 `executor/{physical_select.go,subquery_mvcc.go,with_mvcc.go}` 共享 view 到各 query source；streaming 完全 drain 才释放。  _Trace: FR-010/032; SC-002/007_
+- [x] **T040** 先写 M17–M20 的冲突与 current-read baseline 红测，枚举当前版本/根读 TS/unique & FK 分支。  _Trace: FR-014/019; SC-006_
+- [x] **T041** 在 `mvcc/{conflict.go,current_read.go}` 和 adapter 增 per-dependency proof/validation，RC 后续更新不得因旧根 TS 假冲突也不能丢失更新。  _Trace: FR-014/018; SC-006_
+- [x] **T042** 在 `executor/{locking_modify.go,dml_locking.go,modify.go}` 审核 UPDATE/DELETE/UPSERT/INSERT SELECT 的 parent read、child write 与 RC 当前锁/谓词访问。  _Trace: FR-014/015/019; SC-006_
+- [x] **T043** 为 RC 普通 gap 放宽路径做安全判定；必须保留 duplicate/FK 所需 gap/unique reserve；无法完成则记录保守过锁差异。  _Trace: FR-019/020; SC-006/008_
+- [x] **T044** 补 RC rollback SAVEPOINT、stale target、deadlock/timeout、zero row、范围/二级索引与 autocommit 测试。  _Trace: FR-015/019/022; SC-002/006_
+- [x] **T045** 确认 RC root 不因早期 Head pin 长期压住 GC，并进行长事务内 100 次 statement view acquire/release 计量。  _Trace: FR-016/023/032; SC-007_
+- [x] **T046** Phase 5 gate：M13–M20 + M37/39 全过，B01/B02/A05 全量回归，README+docs 更新。  _Trace: FR-030/031; SC-002/006/010_
 
 **Checkpoint P5**: 只有本阶段真实证据齐备、阻塞问题关闭且用户授权下一阶段后方可继续。
 

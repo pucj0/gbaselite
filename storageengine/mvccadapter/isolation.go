@@ -3,6 +3,8 @@ package mvccadapter
 import (
 	"context"
 	"fmt"
+	"sync"
+
 	"gbaselite/mvcc"
 	"gbaselite/storageengine"
 )
@@ -35,10 +37,21 @@ func (v *mvccReadView) Get(space string, key []byte) ([]byte, bool, error) {
 	case storageengine.ViewStateInvalidated:
 		return nil, false, storageengine.ErrViewInvalidated
 	}
-	if v.txn != nil && v.txn.inner != nil {
-		return v.txn.inner.ReadAt(v.Revision(), space, key)
+	var tx *mvcc.Tx
+	if v.txn != nil {
+		tx = v.txn.inner
 	}
-	return v.token.Get(space, key)
+	return v.token.GetWithTx(space, key, tx)
+}
+
+type borrowedIterator struct {
+	storageengine.Iterator
+	cleanup func()
+}
+
+func (b *borrowedIterator) Close() error {
+	defer b.cleanup()
+	return b.Iterator.Close()
 }
 
 func (v *mvccReadView) NewIterator(ctx context.Context, r storageengine.ScanRequest) (storageengine.Iterator, error) {
@@ -48,7 +61,17 @@ func (v *mvccReadView) NewIterator(ctx context.Context, r storageengine.ScanRequ
 	case storageengine.ViewStateInvalidated:
 		return nil, storageengine.ErrViewInvalidated
 	}
-	return newIterator(ctx, r, func(yield func([]byte, []byte) error) error {
+	if err := v.token.BeginBorrow(); err != nil {
+		return nil, err
+	}
+	var endOnce sync.Once
+	endBorrow := func() {
+		endOnce.Do(func() {
+			v.token.EndBorrow()
+		})
+	}
+	it, err := newIterator(ctx, r, func(yield func([]byte, []byte) error) error {
+		defer endBorrow()
 		bounds := mvcc.KeyRange{
 			Lower:          r.Range.Lower,
 			Upper:          r.Range.Upper,
@@ -56,11 +79,17 @@ func (v *mvccReadView) NewIterator(ctx context.Context, r storageengine.ScanRequ
 			UpperInclusive: r.Range.UpperInclusive,
 			Reverse:        r.Range.Reverse,
 		}
-		if v.txn != nil && v.txn.inner != nil {
-			return v.txn.inner.ScanRangeAt(ctx, r.Space, bounds, v.Revision(), yield)
+		var tx *mvcc.Tx
+		if v.txn != nil {
+			tx = v.txn.inner
 		}
-		return v.token.ScanRange(ctx, r.Space, bounds, yield)
+		return v.token.ScanRangeWithTx(ctx, r.Space, bounds, tx, yield)
 	})
+	if err != nil {
+		endBorrow()
+		return nil, err
+	}
+	return &borrowedIterator{Iterator: it, cleanup: endBorrow}, nil
 }
 
 func (v *mvccReadView) Close() error {
@@ -77,12 +106,11 @@ func (e *engine) BeginIsolated(ctx context.Context, level storageengine.Isolatio
 	if !level.Valid() {
 		return nil, fmt.Errorf("invalid isolation level: %q", level)
 	}
-	// In Phase 3, only REPEATABLE READ is executable by the storage backend.
-	// RU, RC, and SERIALIZABLE must return ErrUnsupported without registering a root transaction.
-	if level != storageengine.IsolationRepeatableRead {
+	// In Phase 5, REPEATABLE READ and READ COMMITTED are executable by the storage backend.
+	// RU and SERIALIZABLE must return ErrUnsupported without registering a root transaction.
+	if level != storageengine.IsolationRepeatableRead && level != storageengine.IsolationReadCommitted {
 		return nil, fmt.Errorf("%w: isolation level %s is not supported yet", storageengine.ErrUnsupported, level)
 	}
-	// For REPEATABLE READ in SQL, start as a lazy transaction so consistent view is pinned on first read
 	t, err := e.store.BeginLazy(ctx, e.proposer)
 	if err != nil {
 		return nil, err
@@ -116,6 +144,10 @@ func (t *txn) BeginStatementView(ctx context.Context, kind storageengine.Stateme
 	}
 	v := &mvccReadView{token: token, kind: kind, txn: t}
 	t.activeView = v
+	if t.isolationLevel == storageengine.IsolationReadCommitted && t.inner != nil {
+		t.inner.Snapshot = token.Revision()
+		t.engine.store.UpdateRootReadTS(t.inner.ID, token.Revision())
+	}
 	return v, nil
 }
 

@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"gbaselite/parser"
@@ -386,4 +387,74 @@ func TestP4Fix05_LazyRootAfterGC(t *testing.T) {
 	}
 
 	_, _ = e.Execute(sA, "COMMIT;")
+}
+
+// TestPRE02_LazyRootDMLAndCurrentReadAfterGC covers PRE-02:
+// In a Lazy Root before first plain SELECT, verify UPDATE, DELETE, INSERT SELECT,
+// SELECT FOR UPDATE, SELECT FOR SHARE, and Unique checks after concurrent commits and GC.
+func TestPRE02_LazyRootDMLAndCurrentReadAfterGC(t *testing.T) {
+	e, cleanup := newIsolationTestEngine(t)
+	defer cleanup()
+
+	sA := newRRSession("db")
+	sB := newRRSession("db")
+
+	if _, err := e.Execute(sA, "INSERT INTO t VALUES (1, 'V1'), (2, 'V1');"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	if _, err := e.Execute(sA, "CREATE TABLE dst (id INT PRIMARY KEY, v VARCHAR(50));"); err != nil {
+		t.Fatalf("CREATE TABLE dst: %v", err)
+	}
+
+	// 1. Session A begins RR (lazy root, no view established yet)
+	if _, err := e.Execute(sA, "BEGIN;"); err != nil {
+		t.Fatalf("A BEGIN: %v", err)
+	}
+
+	// 2. Session B updates rows multiple times and commits
+	for i := 2; i <= 5; i++ {
+		v := fmt.Sprintf("V%d", i)
+		if _, err := e.Execute(sB, fmt.Sprintf("UPDATE t SET v = '%s' WHERE id = 1;", v)); err != nil {
+			t.Fatalf("B update %d: %v", i, err)
+		}
+	}
+
+	// 3. CompactHistory runs, purging versions V1..V4 of row 1
+	if m, ok := e.Backend.(storageengine.Maintenance); ok {
+		if err := m.CompactHistory(context.Background()); err != nil {
+			t.Fatalf("CompactHistory: %v", err)
+		}
+	}
+
+	// 4. Test SELECT ... FOR UPDATE (Current Read under lock sees current V5)
+	resForUpdate, err := e.Execute(sA, "SELECT v FROM t WHERE id = 1 FOR UPDATE;")
+	if err != nil || len(resForUpdate.Rows) != 1 || resForUpdate.Rows[0][0] != "V5" {
+		t.Fatalf("SELECT FOR UPDATE = %v, err=%v, want V5", resForUpdate, err)
+	}
+
+	// 5. Test SELECT ... FOR SHARE (Current Read under share lock sees current V5)
+	resForShare, err := e.Execute(sA, "SELECT v FROM t WHERE id = 1 FOR SHARE;")
+	if err != nil || len(resForShare.Rows) != 1 || resForShare.Rows[0][0] != "V5" {
+		t.Fatalf("SELECT FOR SHARE = %v, err=%v, want V5", resForShare, err)
+	}
+
+	// 6. Test UPDATE (updates current V5 under covering lock)
+	if _, err := e.Execute(sA, "UPDATE t SET v = 'V_A' WHERE id = 1;"); err != nil {
+		t.Fatalf("A UPDATE: %v", err)
+	}
+
+	// 7. Test INSERT ... SELECT (source read establishes consistent view or reads valid state)
+	if _, err := e.Execute(sA, "INSERT INTO dst SELECT id+10, v FROM t WHERE id = 2;"); err != nil {
+		t.Fatalf("A INSERT SELECT: %v", err)
+	}
+
+	// 8. Test DELETE (deletes under covering lock)
+	if _, err := e.Execute(sA, "DELETE FROM t WHERE id = 2;"); err != nil {
+		t.Fatalf("A DELETE: %v", err)
+	}
+
+	// 9. Commit A successfully
+	if _, err := e.Execute(sA, "COMMIT;"); err != nil {
+		t.Fatalf("A COMMIT: %v", err)
+	}
 }

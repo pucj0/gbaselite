@@ -316,6 +316,14 @@ func staleTargetObservation(txn storageengine.Txn, observation storageengine.Cur
 	if txn == nil {
 		return true
 	}
+	if isoTxn, ok := txn.(storageengine.IsolationTxn); ok {
+		if isoTxn.IsolationLevel() == storageengine.IsolationReadCommitted {
+			if view, ok := isoTxn.ActiveView(); ok {
+				return observation.ChangeTS > view.Revision()
+			}
+			return false
+		}
+	}
 	return observation.ChangeTS > txn.Snapshot()
 }
 

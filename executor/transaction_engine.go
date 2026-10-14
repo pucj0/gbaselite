@@ -423,18 +423,16 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 	}
 	if session.IsolationEnabled() {
 		if isoTxn, ok := tx.(storageengine.IsolationTxn); ok {
-			var viewErr error
-			if automatic {
-				if isPlainConsistentRead(statement) {
+			isoLevel := isoTxn.IsolationLevel()
+			if statementNeedsReadView(statement, isoLevel) {
+				if automatic || isoLevel == storageengine.IsolationReadCommitted {
 					view, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindStatement)
 					if err != nil {
 						return nil, err
 					}
 					closeViewOnExit = view
-				}
-			} else {
-				if isPlainConsistentRead(statement) {
-					_, viewErr = isoTxn.BeginConsistentView(ctx)
+				} else {
+					_, viewErr := isoTxn.BeginConsistentView(ctx)
 					if viewErr != nil {
 						return nil, viewErr
 					}
@@ -607,7 +605,7 @@ func sqlStartsImplicitTransaction(statement parser.Statement) bool {
 }
 
 func (e *Engine) checkIsolationCapability(level parser.IsolationLevel) error {
-	if level != parser.LevelRepeatableRead {
+	if level != parser.LevelRepeatableRead && level != parser.LevelReadCommitted {
 		return fmt.Errorf("%w: transaction isolation level %s is not supported yet", storageengine.ErrUnsupported, level)
 	}
 	return nil
@@ -647,4 +645,24 @@ func isPlainConsistentRead(statement parser.Statement) bool {
 	default:
 		return false
 	}
+}
+
+func statementNeedsReadView(statement parser.Statement, level storageengine.IsolationLevel) bool {
+	if level == storageengine.IsolationReadCommitted {
+		switch s := statement.(type) {
+		case parser.Select:
+			return !s.Locking
+		case parser.Update:
+			return true
+		case parser.Delete:
+			return true
+		case parser.Insert:
+			return s.Select != nil
+		case parser.With, parser.WithRecursive, parser.Union:
+			return true
+		default:
+			return false
+		}
+	}
+	return isPlainConsistentRead(statement)
 }
