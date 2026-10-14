@@ -1,7 +1,7 @@
 # Tasks: B03 Four Transaction Isolation Levels
 
 **Feature**: `007-b03-transaction-isolation`  
-**Status**: 8 tasks completed (Phase 1 Setup & Architectural Proof completed). Phase 2–9 pending user authorization.
+**Status**: 18 tasks completed (Phase 1 Setup & Architectural Proof and Phase 2 SQL Grammar & Session State completed). Phase 3–9 pending user authorization.
 **Format**: `[TID] [P?] [USn] text — FR/SC`. `[P]` 只表示文件独立、前置依赖满足时可并行；并不授权 AI 跳过 Phase。
 **Tests**: 必须先写失败测试，再实现；不能拿静态阅读等同运行验收。
 
@@ -44,16 +44,16 @@
 
 **Goal**: 可用且不撒谎的 SQL 配置与状态。
 
-- [ ] **T009** 先在 `parser/parser_test.go` 编写支持/拒绝 `SET [SESSION] TRANSACTION ISOLATION LEVEL` 语法红测，覆盖非法 token、GLOBAL、多特征。  _Trace: FR-002/003/006/034; SC-001_
-- [ ] **T010** 在 `parser/ast.go`、`parser/parser.go` 增 IsolationLevel 和 scope AST，并让完整 parse 校验，不用字符串包含判断。  _Trace: FR-001/006/027; SC-001_
-- [ ] **T011** 在 `executor/session_settings.go`、`executor/executor.go` 添加 sessionDefault/pendingNext/activeLevel 状态与 ResetConnection 清理，单元红测先行。  _Trace: FR-007/008; SC-001_
-- [ ] **T012** 在 `executor/transaction_engine.go` 对显式 BEGIN、隐式 BEGIN、autocommit root 绑定 active level，失败不消费 pending，保留旧事务当前级别。  _Trace: FR-003/008; SC-001_
-- [ ] **T013** 在 `executor/transaction_engine.go`/session helpers 定义事务活跃期 `SET SESSION` 与 `SET TRANSACTION` 差异，禁止 root 内 NEXT。  _Trace: FR-002/003/004; SC-001_
-- [ ] **T014** 在 `server/handler.go` 把隔离 SET 走唯一 AST/state 路由，移除盲目 `TRANSACTION_ISOLATION` 文本早拒绝。  _Trace: FR-006/027; SC-001_
-- [ ] **T015** 在 `server/session_settings.go` 使 `SELECT @@SESSION/@@GLOBAL/@@tx_isolation` 和 SHOW VARIABLES 来自真实 state/default。  _Trace: FR-005; SC-001_
-- [ ] **T016** 在 `server/` prepared、COM_QUERY、重置连接路径补跨连接与执行时隔离配置测试；非法 SET 不可部分修改。  _Trace: FR-006/007/027; SC-001_
-- [ ] **T017** 确认暂未具备级别执行 capability 时不能让已设置 RU/SER 的新事务成功开始后默默执行 RR：增加 gated explicit unsupported。  _Trace: FR-027; SC-008_
-- [ ] **T018** Phase 2 gate：M01–M07、M44 和 B02 session locking 相关回归；记录真实命令、changed files、README 描述。  _Trace: FR-001..008/030/031; SC-001/010_
+- [x] **T009** 先在 `parser/parser_test.go` 编写支持/拒绝 `SET [SESSION] TRANSACTION ISOLATION LEVEL` 语法红测，覆盖非法 token、GLOBAL、多特征。  _Trace: FR-002/003/006/034; SC-001_
+- [x] **T010** 在 `parser/ast.go`、`parser/parser.go` 增 IsolationLevel 和 scope AST，并让完整 parse 校验，不用字符串包含判断。  _Trace: FR-001/006/027; SC-001_
+- [x] **T011** 在 `executor/session_settings.go`、`executor/executor.go` 添加 sessionDefault/pendingNext/activeLevel 状态与 ResetConnection 清理，单元红测先行。  _Trace: FR-007/008; SC-001_
+- [x] **T012** 在 `executor/transaction_engine.go` 对显式 BEGIN、隐式 BEGIN、autocommit root 绑定 active level，失败不消费 pending，保留旧事务当前级别。  _Trace: FR-003/008; SC-001_
+- [x] **T013** 在 `executor/transaction_engine.go`/session helpers 定义事务活跃期 `SET SESSION` 与 `SET TRANSACTION` 差异，禁止 root 内 NEXT。  _Trace: FR-002/003/004; SC-001_
+- [x] **T014** 在 `server/handler.go` 把隔离 SET 走唯一 AST/state 路由，移除盲目 `TRANSACTION_ISOLATION` 文本早拒绝。  _Trace: FR-006/027; SC-001_
+- [x] **T015** 在 `server/session_settings.go` 使 `SELECT @@SESSION/@@GLOBAL/@@tx_isolation` 和 SHOW VARIABLES 来自真实 state/default。  _Trace: FR-005; SC-001_
+- [x] **T016** 在 `server/` prepared、COM_QUERY、重置连接路径补跨连接与执行时隔离配置测试；非法 SET 不可部分修改。  _Trace: FR-006/007/027; SC-001_
+- [x] **T017** 确认暂未具备级别执行 capability 时不能让已设置 RU/SER 的新事务成功开始后默默执行 RR：增加 gated explicit unsupported。  _Trace: FR-027; SC-008_
+- [x] **T018** Phase 2 gate：M01–M07、M44 和 B02 session locking 相关回归；记录真实命令、changed files、README 描述。  _Trace: FR-001..008/030/031; SC-001/010_
 
 **Checkpoint P2**: 只有本阶段真实证据齐备、阻塞问题关闭且用户授权下一阶段后方可继续。
 

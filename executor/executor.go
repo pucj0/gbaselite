@@ -107,6 +107,11 @@ type Session struct {
 	// stale target is retryable in a different sense from a chosen victim, and neither a lock wait
 	// timeout nor a user cancellation is allowed to reach either state.
 	retryConflict error
+
+	// B03 session isolation state machine: sessionDefault, pendingNext, and activeIsolation.
+	sessionIsolationDefault parser.IsolationLevel
+	pendingIsolationNext    *parser.IsolationLevel
+	activeIsolationLevel    *parser.IsolationLevel
 }
 
 type navicatCopySource struct {

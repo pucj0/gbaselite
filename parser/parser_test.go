@@ -902,3 +902,215 @@ func TestParseCheckEnforcement(t *testing.T) {
 		t.Fatalf("alter check = %#v", statement)
 	}
 }
+
+func TestB03IsolationParser(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		wantScope  IsolationScope
+		wantLevel  IsolationLevel
+		isVariable bool
+	}{
+		{
+			name:       "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+			query:      "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;",
+			wantScope:  ScopeSession,
+			wantLevel:  LevelReadUncommitted,
+			isVariable: false,
+		},
+		{
+			name:       "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+			query:      "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;",
+			wantScope:  ScopeSession,
+			wantLevel:  LevelReadCommitted,
+			isVariable: false,
+		},
+		{
+			name:       "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+			query:      "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;",
+			wantScope:  ScopeSession,
+			wantLevel:  LevelRepeatableRead,
+			isVariable: false,
+		},
+		{
+			name:       "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+			query:      "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;",
+			wantScope:  ScopeSession,
+			wantLevel:  LevelSerializable,
+			isVariable: false,
+		},
+		{
+			name:       "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+			query:      "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;",
+			wantScope:  ScopeNextTransaction,
+			wantLevel:  LevelReadCommitted,
+			isVariable: false,
+		},
+		{
+			name:       "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+			query:      "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+			wantScope:  ScopeNextTransaction,
+			wantLevel:  LevelSerializable,
+			isVariable: false,
+		},
+		{
+			name:       "SET SESSION transaction_isolation = 'READ-COMMITTED'",
+			query:      "SET SESSION transaction_isolation = 'READ-COMMITTED';",
+			wantScope:  ScopeSession,
+			wantLevel:  LevelReadCommitted,
+			isVariable: true,
+		},
+		{
+			name:       "SET @@SESSION.transaction_isolation = 'SERIALIZABLE'",
+			query:      "SET @@SESSION.transaction_isolation = 'SERIALIZABLE';",
+			wantScope:  ScopeSession,
+			wantLevel:  LevelSerializable,
+			isVariable: true,
+		},
+		{
+			name:       "SET transaction_isolation = 'READ-COMMITTED'",
+			query:      "SET transaction_isolation = 'READ-COMMITTED';",
+			wantScope:  ScopeSession,
+			wantLevel:  LevelReadCommitted,
+			isVariable: true,
+		},
+		{
+			name:       "SET @@transaction_isolation = 'READ-UNCOMMITTED'",
+			query:      "SET @@transaction_isolation = 'READ-UNCOMMITTED';",
+			wantScope:  ScopeNextTransaction,
+			wantLevel:  LevelReadUncommitted,
+			isVariable: true,
+		},
+		{
+			name:       "case-insensitive lowercase with comments and whitespace",
+			query:      "/* comment */ set   session   transaction   isolation   level   repeatable   read ;",
+			wantScope:  ScopeSession,
+			wantLevel:  LevelRepeatableRead,
+			isVariable: false,
+		},
+		{
+			name:       "variable with double quotes and backticks",
+			query:      "SET @@session.`transaction_isolation` = \"REPEATABLE-READ\";",
+			wantScope:  ScopeSession,
+			wantLevel:  LevelRepeatableRead,
+			isVariable: true,
+		},
+		{
+			name:       "tx_isolation legacy variable alias",
+			query:      "SET @@session.tx_isolation = 'READ-COMMITTED';",
+			wantScope:  ScopeSession,
+			wantLevel:  LevelReadCommitted,
+			isVariable: true,
+		},
+		{
+			name:       "variable with unhyphenated string literal",
+			query:      "SET SESSION transaction_isolation = 'READ COMMITTED';",
+			wantScope:  ScopeSession,
+			wantLevel:  LevelReadCommitted,
+			isVariable: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := Parse(tc.query)
+			if err != nil {
+				t.Fatalf("Parse(%q) failed: %v", tc.query, err)
+			}
+			setTx, ok := stmt.(SetTransaction)
+			if !ok {
+				t.Fatalf("Parse(%q) returned %T, want SetTransaction", tc.query, stmt)
+			}
+			if setTx.Scope != tc.wantScope {
+				t.Errorf("Scope = %v, want %v", setTx.Scope, tc.wantScope)
+			}
+			if setTx.Level != tc.wantLevel {
+				t.Errorf("Level = %v, want %v", setTx.Level, tc.wantLevel)
+			}
+			if setTx.IsVariable != tc.isVariable {
+				t.Errorf("IsVariable = %v, want %v", setTx.IsVariable, tc.isVariable)
+			}
+		})
+	}
+}
+
+func TestB03IsolationInvalidSyntax(t *testing.T) {
+	invalidQueries := []struct {
+		name  string
+		query string
+	}{
+		{
+			name:  "SET GLOBAL TRANSACTION",
+			query: "SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ;",
+		},
+		{
+			name:  "SET GLOBAL transaction_isolation",
+			query: "SET GLOBAL transaction_isolation = 'REPEATABLE-READ';",
+		},
+		{
+			name:  "SET @@GLOBAL.transaction_isolation",
+			query: "SET @@GLOBAL.transaction_isolation = 'SERIALIZABLE';",
+		},
+		{
+			name:  "SET PERSIST",
+			query: "SET PERSIST transaction_isolation = 'READ-COMMITTED';",
+		},
+		{
+			name:  "SET PERSIST_ONLY",
+			query: "SET PERSIST_ONLY transaction_isolation = 'READ-COMMITTED';",
+		},
+		{
+			name:  "READ ONLY characteristic",
+			query: "SET TRANSACTION READ ONLY;",
+		},
+		{
+			name:  "READ WRITE characteristic",
+			query: "SET TRANSACTION READ WRITE;",
+		},
+		{
+			name:  "mixed isolation and read write",
+			query: "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY;",
+		},
+		{
+			name:  "incomplete SET TRANSACTION",
+			query: "SET TRANSACTION ISOLATION LEVEL;",
+		},
+		{
+			name:  "incomplete SET SESSION TRANSACTION",
+			query: "SET SESSION TRANSACTION;",
+		},
+		{
+			name:  "invalid isolation level name",
+			query: "SET TRANSACTION ISOLATION LEVEL SNAPSHOT;",
+		},
+		{
+			name:  "unknown isolation level token",
+			query: "SET TRANSACTION ISOLATION LEVEL FOOBAR;",
+		},
+		{
+			name:  "invalid variable string value",
+			query: "SET transaction_isolation = 'INVALID_LEVEL';",
+		},
+		{
+			name:  "illegal trailing token after transaction",
+			query: "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ EXTRA;",
+		},
+		{
+			name:  "illegal trailing token after variable",
+			query: "SET SESSION transaction_isolation = 'READ-COMMITTED' EXTRA;",
+		},
+		{
+			name:  "START TRANSACTION WITH CONSISTENT SNAPSHOT",
+			query: "START TRANSACTION WITH CONSISTENT SNAPSHOT;",
+		},
+	}
+
+	for _, tc := range invalidQueries {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt, err := Parse(tc.query)
+			if err == nil {
+				t.Fatalf("Parse(%q) succeeded with %T, want error", tc.query, stmt)
+			}
+		})
+	}
+}

@@ -8,6 +8,7 @@ import (
 
 	"gbaselite/executor"
 	"gbaselite/internal/mysqlcompat"
+	"gbaselite/parser"
 	"gbaselite/storage"
 )
 
@@ -321,6 +322,10 @@ func sessionVariableValues(session *executor.Session, global bool) [][]any {
 	}
 	// The lock-wait bound is reported in whole seconds, which is the unit the SQL variable uses.
 	lockWait := strconv.FormatInt(int64(session.LockWaitTimeout()/time.Second), 10)
+	isolation := session.SessionDefaultIsolation().StandardName()
+	if global {
+		isolation = parser.LevelRepeatableRead.StandardName()
+	}
 	return [][]any{
 		{"foreign_key_checks", foreignChecks},
 		{"autocommit", autocommit},
@@ -336,6 +341,8 @@ func sessionVariableValues(session *executor.Session, global bool) [][]any {
 		{"lower_case_table_names", "1"},
 		{"system_time_zone", time.Local.String()},
 		{"time_zone", timeZone},
+		{"transaction_isolation", isolation},
+		{"tx_isolation", isolation},
 		{"version", "5.7.44-GBaseLite"},
 		{"version_comment", "GBaseLite"},
 	}
@@ -365,7 +372,11 @@ func compatibilityVariables(session *executor.Session, query string) *executor.R
 		}
 		result.Columns = append(result.Columns, executor.Column{Name: label, Type: storage.TypeVarchar})
 		if variable == "tx_isolation" || variable == "transaction_isolation" {
-			result.Rows[0][index] = "REPEATABLE-READ"
+			if global {
+				result.Rows[0][index] = parser.LevelRepeatableRead.StandardName()
+			} else {
+				result.Rows[0][index] = session.SessionDefaultIsolation().StandardName()
+			}
 		} else if variable == "autocommit" {
 			result.Columns[index].Type = storage.TypeBigInt
 			value := int64(1)

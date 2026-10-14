@@ -2,12 +2,14 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
 	"gbaselite/internal/mysqlcompat"
+	"gbaselite/parser"
 )
 
 const (
@@ -68,6 +70,100 @@ func (s *Session) SetLockWaitTimeout(seconds int64) error {
 	return nil
 }
 
+// SessionDefaultIsolation reports the session's default transaction isolation level.
+func (s *Session) SessionDefaultIsolation() parser.IsolationLevel {
+	if s == nil || !s.sessionIsolationDefault.Valid() {
+		return parser.LevelRepeatableRead
+	}
+	return s.sessionIsolationDefault
+}
+
+// PendingNextIsolation reports the pending override for the next transaction, if any.
+func (s *Session) PendingNextIsolation() (parser.IsolationLevel, bool) {
+	if s == nil || s.pendingIsolationNext == nil {
+		return "", false
+	}
+	return *s.pendingIsolationNext, true
+}
+
+// ActiveIsolation reports the isolation level of the currently active transaction, if any.
+func (s *Session) ActiveIsolation() (parser.IsolationLevel, bool) {
+	if s == nil || s.activeIsolationLevel == nil {
+		return "", false
+	}
+	return *s.activeIsolationLevel, true
+}
+
+// EffectiveIsolation reports the active isolation level if in transaction, or pendingNext if set, or sessionDefault.
+func (s *Session) EffectiveIsolation() parser.IsolationLevel {
+	if s == nil {
+		return parser.LevelRepeatableRead
+	}
+	if s.activeIsolationLevel != nil {
+		return *s.activeIsolationLevel
+	}
+	if s.pendingIsolationNext != nil {
+		return *s.pendingIsolationNext
+	}
+	return s.SessionDefaultIsolation()
+}
+
+// SetSessionIsolation sets the session default isolation level.
+// Per MySQL 8.4 contract:
+// 1. Modifying session default does not change the currently running transaction.
+// 2. Modifying session default clears any pending next-transaction override.
+func (s *Session) SetSessionIsolation(level parser.IsolationLevel) error {
+	if !level.Valid() {
+		return fmt.Errorf("invalid isolation level %q", level)
+	}
+	if s == nil {
+		return errors.New("cannot set isolation level on nil session")
+	}
+	s.sessionIsolationDefault = level
+	s.pendingIsolationNext = nil
+	return nil
+}
+
+// SetNextTransactionIsolation sets an override for the next transaction.
+// Per MySQL 8.4 contract:
+// Cannot be changed when a transaction is currently active (SQLSTATE 25001 / ER_CANT_CHANGE_TX_CHARACTERISTICS).
+func (s *Session) SetNextTransactionIsolation(level parser.IsolationLevel) error {
+	if !level.Valid() {
+		return fmt.Errorf("invalid isolation level %q", level)
+	}
+	if s == nil {
+		return errors.New("cannot set isolation level on nil session")
+	}
+	if s.InTransaction() || s.activeIsolationLevel != nil {
+		return errors.New("transaction characteristics cannot be changed while a transaction is active")
+	}
+	s.pendingIsolationNext = &level
+	return nil
+}
+
+// FreezeActiveIsolation freezes the isolation level when a root transaction successfully starts.
+// It consumes pendingNext if present; otherwise uses sessionDefault.
+func (s *Session) FreezeActiveIsolation() parser.IsolationLevel {
+	if s == nil {
+		return parser.LevelRepeatableRead
+	}
+	level := s.SessionDefaultIsolation()
+	if s.pendingIsolationNext != nil {
+		level = *s.pendingIsolationNext
+		s.pendingIsolationNext = nil
+	}
+	s.activeIsolationLevel = &level
+	return level
+}
+
+// ClearActiveIsolation is called when the transaction reaches a terminal state (COMMIT / ROLLBACK).
+func (s *Session) ClearActiveIsolation() {
+	if s == nil {
+		return
+	}
+	s.activeIsolationLevel = nil
+}
+
 // lockWaitSessionContextKey carries the Session itself into the statement context.
 //
 // The lock-acquisition path (executor/dml_locking.go) opens a lock scope from a
@@ -115,6 +211,9 @@ func lockWaitTimeoutForContext(ctx context.Context) time.Duration {
 func (s *Session) InitializeSettings() {
 	if s == nil {
 		return
+	}
+	if s.sessionIsolationDefault == "" {
+		s.sessionIsolationDefault = parser.LevelRepeatableRead
 	}
 	if s.CharacterSetClient == "" {
 		s.CharacterSetClient = DefaultCharacterSet

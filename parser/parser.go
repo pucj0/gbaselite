@@ -111,6 +111,12 @@ func (p *Parser) parseStatement() (Statement, error) {
 		return Use{Database: name}, err
 	case p.accept("BEGIN") || p.accept("START"):
 		p.accept("TRANSACTION")
+		if p.accept("WITH") {
+			return nil, p.errorf("START TRANSACTION WITH CONSISTENT SNAPSHOT is not supported")
+		}
+		if p.accept("READ") {
+			return nil, p.errorf("START TRANSACTION READ ONLY/READ WRITE is not supported")
+		}
 		return Begin{}, nil
 	case p.accept("COMMIT"):
 		return Commit{}, nil
@@ -2135,26 +2141,173 @@ func (p *Parser) parseRename() (Statement, error) {
 	}
 }
 
+func isIsolationVariable(name string) bool {
+	clean := strings.ToLower(strings.Trim(name, "`"))
+	return clean == "transaction_isolation" || clean == "tx_isolation"
+}
+
 func (p *Parser) parseSet() (Statement, error) {
-	if err := p.expect("PASSWORD"); err != nil {
-		return nil, err
+	if p.accept("PASSWORD") {
+		statement := SetPassword{}
+		if p.accept("FOR") {
+			account, err := p.accountName()
+			if err != nil {
+				return nil, err
+			}
+			statement.Account = account
+		}
+		if p.current().Kind == TokenOperator && p.current().Text == "=" {
+			p.position++
+		} else {
+			p.accept("TO")
+		}
+		password, err := p.stringValue()
+		statement.Password = password
+		return statement, err
 	}
-	statement := SetPassword{}
-	if p.accept("FOR") {
-		account, err := p.accountName()
-		if err != nil {
+
+	if p.accept("PERSIST") || p.accept("PERSIST_ONLY") {
+		return nil, p.errorf("SET PERSIST is not supported")
+	}
+
+	// Check for GLOBAL scope
+	if p.accept("GLOBAL") {
+		if p.accept("TRANSACTION") {
+			return nil, p.errorf("SET GLOBAL TRANSACTION is not supported")
+		}
+		if p.current().Kind == TokenIdentifier && isIsolationVariable(p.current().Text) {
+			varName := p.current().Text
+			return nil, p.errorf("SET GLOBAL %s is not supported", varName)
+		}
+		return nil, p.errorf("SET GLOBAL is not supported")
+	}
+
+	// Check for SESSION or LOCAL
+	if p.is("SESSION") || p.is("LOCAL") {
+		p.position++
+		if p.accept("TRANSACTION") {
+			return p.parseSetTransaction(ScopeSession)
+		}
+		if p.current().Kind == TokenIdentifier && isIsolationVariable(p.current().Text) {
+			p.position++
+			return p.parseSetVariable(ScopeSession)
+		}
+		return nil, p.errorf("unsupported SET statement")
+	}
+
+	// Check for @@
+	if p.current().Kind == TokenAt && p.peekKind(1) == TokenAt {
+		p.position += 2 // consume @@
+		if p.accept("GLOBAL") {
+			if err := p.expectKind(TokenDot, "."); err != nil {
+				return nil, err
+			}
+			if p.current().Kind == TokenIdentifier && isIsolationVariable(p.current().Text) {
+				varName := p.current().Text
+				return nil, p.errorf("SET @@GLOBAL.%s is not supported", varName)
+			}
+			return nil, p.errorf("SET @@GLOBAL is not supported")
+		}
+		if p.accept("SESSION") || p.accept("LOCAL") {
+			if err := p.expectKind(TokenDot, "."); err != nil {
+				return nil, err
+			}
+			if p.current().Kind == TokenIdentifier && isIsolationVariable(p.current().Text) {
+				p.position++
+				return p.parseSetVariable(ScopeSession)
+			}
+			return nil, p.errorf("unsupported SET @@SESSION statement")
+		}
+		// @@var = val -> in MySQL, @@transaction_isolation sets NEXT transaction!
+		if p.current().Kind == TokenIdentifier && isIsolationVariable(p.current().Text) {
+			p.position++
+			return p.parseSetVariable(ScopeNextTransaction)
+		}
+		return nil, p.errorf("unsupported SET @@ statement")
+	}
+
+	// Bare `SET TRANSACTION ...`
+	if p.accept("TRANSACTION") {
+		return p.parseSetTransaction(ScopeNextTransaction)
+	}
+
+	// Bare `SET transaction_isolation = ...` -> defaults to SESSION scope in MySQL
+	if p.current().Kind == TokenIdentifier && isIsolationVariable(p.current().Text) {
+		p.position++
+		return p.parseSetVariable(ScopeSession)
+	}
+
+	return nil, p.errorf("unsupported SET statement %q", p.current().Text)
+}
+
+func (p *Parser) parseSetTransaction(scope IsolationScope) (Statement, error) {
+	if p.accept("ISOLATION") {
+		if err := p.expect("LEVEL"); err != nil {
 			return nil, err
 		}
-		statement.Account = account
+		var level IsolationLevel
+		if p.accept("READ") {
+			if p.accept("UNCOMMITTED") {
+				level = LevelReadUncommitted
+			} else if p.accept("COMMITTED") {
+				level = LevelReadCommitted
+			} else {
+				return nil, p.errorf("expected COMMITTED or UNCOMMITTED after READ, got %q", p.current().Text)
+			}
+		} else if p.accept("REPEATABLE") {
+			if err := p.expect("READ"); err != nil {
+				return nil, err
+			}
+			level = LevelRepeatableRead
+		} else if p.accept("SERIALIZABLE") {
+			level = LevelSerializable
+		} else {
+			return nil, p.errorf("invalid isolation level %q", p.current().Text)
+		}
+
+		if p.current().Kind == TokenComma {
+			return nil, p.errorf("multiple transaction characteristics in one SET are not supported")
+		}
+		return SetTransaction{Scope: scope, Level: level, IsVariable: false}, nil
 	}
-	if p.current().Kind == TokenOperator && p.current().Text == "=" {
+
+	if p.accept("READ") {
+		if p.accept("ONLY") || p.accept("WRITE") {
+			return nil, p.errorf("SET TRANSACTION READ ONLY/READ WRITE is not supported")
+		}
+		return nil, p.errorf("unexpected token after TRANSACTION READ: %q", p.current().Text)
+	}
+
+	return nil, p.errorf("expected ISOLATION LEVEL after TRANSACTION, got %q", p.current().Text)
+}
+
+func (p *Parser) parseSetVariable(scope IsolationScope) (Statement, error) {
+	if err := p.expectOperator("="); err != nil {
+		return nil, err
+	}
+	var valStr string
+	if p.current().Kind == TokenString {
+		valStr = p.current().Text
 		p.position++
+	} else if p.current().Kind == TokenIdentifier {
+		valStr = p.current().Text
+		p.position++
+		if strings.EqualFold(valStr, "READ") && (p.is("COMMITTED") || p.is("UNCOMMITTED")) {
+			valStr += " " + p.current().Text
+			p.position++
+		} else if strings.EqualFold(valStr, "REPEATABLE") && p.is("READ") {
+			valStr += " " + p.current().Text
+			p.position++
+		}
 	} else {
-		p.accept("TO")
+		return nil, p.errorf("expected isolation level value after '=', got %q", p.current().Text)
 	}
-	password, err := p.stringValue()
-	statement.Password = password
-	return statement, err
+
+	level, ok := ParseIsolationLevel(valStr)
+	if !ok {
+		return nil, p.errorf("invalid transaction_isolation value %q", valStr)
+	}
+	return SetTransaction{Scope: scope, Level: level, IsVariable: true}, nil
 }
 
 func (p *Parser) parseGrant() (Statement, error) {

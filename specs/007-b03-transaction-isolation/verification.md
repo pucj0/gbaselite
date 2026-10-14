@@ -134,7 +134,37 @@
 ## 8. Phase 1 Gate 审查结论
 
 - **T001–T008 状态**: 全部完成 (PASS)。
-- **代码状态**: 生产代码未做任何修改（遵守只读审计禁令）；`data/` 未触碰；无新提交。
+- **代码状态**: 生产代码未做任何修改（遵守只读审计禁令）；`data/` 未触碰。
 - **阻塞问题状态**: 底层架构冲突（Q01–Q04 及 Q05–Q10）已全部完成技术决议并书面关闭。
-- **Phase 2 准入资格**: **已完全具备**。
-- **下一步行动**: 停止执行，等待用户对 Phase 2（T009–T018）的单独授权。
+- **Phase 2 准入资格**: 已完全具备。
+
+---
+
+## 9. Phase 2 实施与验收结果 (T009–T018)
+
+- **授权阶段**: Phase 2: SQL Grammar & Session State
+- **起始 Commit**: `f064da3781cac9f10e80550035c40434c691cba6`
+- **实施范围**:
+  - `parser/ast.go`, `parser/parser.go`, `parser/parser_test.go`: 强类型 `IsolationLevel`, `IsolationScope`, `SetTransaction` 语法解析与红测覆盖；
+  - `executor/executor.go`, `executor/session_settings.go`: 三层会话隔离状态机 (`sessionDefault`, `pendingNext`, `activeIsolation`) 及 `ResetConnection` 清理；
+  - `executor/transaction_engine.go`: 显式/隐式/单语句事务消费 `pendingNext` 与 `activeIsolation` 绑定；
+  - `executor/savepoint_mvcc.go`: 事务提交/回滚时保证 `ClearActiveIsolation()`；
+  - `executor/isolation_phase2_test.go`: 会话状态机、未实现级别门禁及单元回归测试；
+  - `server/handler.go`: 移除文本 substring 早拒绝；统一走 AST 路由与执行器状态机；
+  - `server/session_settings.go`: 变量回显 (`SELECT @@...` 与 `SHOW VARIABLES`) 统一标准连字符字符串，不支持 GLOBAL 写入；
+  - `server/isolation_phase2_test.go`: 变量往返、协议一致性、Prepared 动态读取及兼容设置非回归测试；
+  - `README.md`: 同步功能矩阵与 Phase 2 执行能力限制。
+- **T017 安全门禁验证**:
+  - 底层存储引擎在 Phase 2 仅支持 REPEATABLE READ 执行；
+  - 若事务以 READ UNCOMMITTED、READ COMMITTED 或 SERIALIZABLE 启动，`checkIsolationCapability` 立即返回 `storageengine.ErrUnsupported`；
+  - 启动失败后 `pendingNext` 保留不消费，不生成假 active 事务，不泄漏锁与事务注册；
+- **全量测试通过情况**:
+  - `gofmt -l parser executor server`: clean
+  - `go vet ./...`: clean
+  - `git diff --check`: clean
+  - `go test ./... -count=1`: 21 包全部通过 (0 FAIL)，耗时 ~166.5s；
+  - 生产 `data/` 未修改，写测试全量隔离在临时目录；
+- **Phase 2 Gate 审查结论**:
+  - T009–T018 全部完成 (PASS)；
+  - 具备进入 Phase 3（Read View Foundation & GC）的前置条件。
+

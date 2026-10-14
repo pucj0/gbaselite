@@ -1,5 +1,7 @@
 package parser
 
+import "strings"
+
 type Statement interface{ statement() }
 type Query interface {
 	Statement
@@ -284,6 +286,75 @@ type SetPassword struct {
 	Account  Account
 	Password string
 }
+
+// IsolationLevel names one of the four transaction isolation levels.
+type IsolationLevel string
+
+const (
+	LevelReadUncommitted IsolationLevel = "READ UNCOMMITTED"
+	LevelReadCommitted   IsolationLevel = "READ COMMITTED"
+	LevelRepeatableRead  IsolationLevel = "REPEATABLE READ"
+	LevelSerializable    IsolationLevel = "SERIALIZABLE"
+)
+
+// StandardName returns the normalized hyphenated representation (e.g. READ-COMMITTED).
+func (l IsolationLevel) StandardName() string {
+	switch l {
+	case LevelReadUncommitted:
+		return "READ-UNCOMMITTED"
+	case LevelReadCommitted:
+		return "READ-COMMITTED"
+	case LevelRepeatableRead:
+		return "REPEATABLE-READ"
+	case LevelSerializable:
+		return "SERIALIZABLE"
+	default:
+		return string(l)
+	}
+}
+
+// Valid reports whether the isolation level is one of the four supported levels.
+func (l IsolationLevel) Valid() bool {
+	switch l {
+	case LevelReadUncommitted, LevelReadCommitted, LevelRepeatableRead, LevelSerializable:
+		return true
+	default:
+		return false
+	}
+}
+
+// ParseIsolationLevel parses a string (with either spaces or hyphens) into an IsolationLevel.
+func ParseIsolationLevel(s string) (IsolationLevel, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(s))
+	switch upper {
+	case "READ UNCOMMITTED", "READ-UNCOMMITTED":
+		return LevelReadUncommitted, true
+	case "READ COMMITTED", "READ-COMMITTED":
+		return LevelReadCommitted, true
+	case "REPEATABLE READ", "REPEATABLE-READ":
+		return LevelRepeatableRead, true
+	case "SERIALIZABLE":
+		return LevelSerializable, true
+	default:
+		return "", false
+	}
+}
+
+// IsolationScope identifies the scope of an isolation level change.
+type IsolationScope string
+
+const (
+	ScopeSession         IsolationScope = "SESSION"
+	ScopeNextTransaction IsolationScope = "NEXT_TRANSACTION"
+	ScopeGlobal          IsolationScope = "GLOBAL"
+)
+
+// SetTransaction represents SET [SESSION] TRANSACTION ISOLATION LEVEL or SET [SESSION|@@]transaction_isolation.
+type SetTransaction struct {
+	Scope      IsolationScope
+	Level      IsolationLevel
+	IsVariable bool
+}
 type Grant struct {
 	Privileges  []string
 	Database    string
@@ -360,6 +431,7 @@ func (AlterUser) statement()          {}
 func (DropUser) statement()           {}
 func (RenameUser) statement()         {}
 func (SetPassword) statement()        {}
+func (SetTransaction) statement()     {}
 func (Grant) statement()              {}
 func (Revoke) statement()             {}
 func (ShowGrants) statement()         {}

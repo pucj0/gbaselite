@@ -273,9 +273,17 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 				return nil, errors.New("transaction already active")
 			}
 		}
+		targetLevel := session.EffectiveIsolation()
+		if err := e.checkIsolationCapability(targetLevel); err != nil {
+			return nil, err
+		}
 		tx, err := e.Backend.Begin(ctx)
+		if err != nil {
+			return nil, err
+		}
+		session.FreezeActiveIsolation()
 		session.transaction = tx
-		return &Result{Message: "MVCC transaction started"}, err
+		return &Result{Message: "MVCC transaction started"}, nil
 	case parser.Commit:
 		if session.transaction == nil {
 			return &Result{Message: "no active transaction"}, nil
@@ -293,28 +301,58 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		return e.rollbackToSavepoint(session, value.Name)
 	case parser.ReleaseSavepoint:
 		return e.releaseSavepoint(session, value.Name)
+	case parser.SetTransaction:
+		switch value.Scope {
+		case parser.ScopeSession:
+			if err := session.SetSessionIsolation(value.Level); err != nil {
+				return nil, err
+			}
+			return &Result{Message: "session isolation level changed"}, nil
+		case parser.ScopeNextTransaction:
+			if err := session.SetNextTransactionIsolation(value.Level); err != nil {
+				return nil, err
+			}
+			return &Result{Message: "transaction isolation level changed"}, nil
+		default:
+			return nil, fmt.Errorf("unsupported isolation scope %q", value.Scope)
+		}
+	case parser.Empty:
+		return &Result{}, nil
 	}
 	tx := session.transaction
 	if tx == nil && session.AutocommitDisabled && sqlStartsImplicitTransaction(statement) {
+		targetLevel := session.EffectiveIsolation()
+		if err := e.checkIsolationCapability(targetLevel); err != nil {
+			return nil, err
+		}
 		var err error
 		tx, err = e.Backend.Begin(ctx)
 		if err != nil {
 			return nil, err
 		}
+		session.FreezeActiveIsolation()
 		session.transaction = tx
 	}
 	automatic := tx == nil
 	if automatic {
+		targetLevel := session.EffectiveIsolation()
+		if err := e.checkIsolationCapability(targetLevel); err != nil {
+			return nil, err
+		}
 		var err error
 		tx, err = e.Backend.Begin(ctx)
 		if err != nil {
 			return nil, err
 		}
+		session.FreezeActiveIsolation()
 	}
 	// Results are consumed while the transaction exists. This backend bounds
 	// materialized results; sorted sources spill through the existing operators.
 	if automatic {
-		defer tx.Rollback()
+		defer func() {
+			session.ClearActiveIsolation()
+			_ = tx.Rollback()
+		}()
 	}
 	// Subqueries run on the statement snapshot transaction: never on the child
 	// write transaction, and never in a transaction of their own.
@@ -471,7 +509,7 @@ func replicationStatusResult(s storageengine.ReplicationStatus) *Result {
 // Autocommit mode is independent of whether a lazy transaction has started.
 func sqlStartsImplicitTransaction(statement parser.Statement) bool {
 	switch s := statement.(type) {
-	case parser.Empty, parser.Use, parser.Show, parser.Explain, parser.Savepoint, parser.RollbackTo, parser.ReleaseSavepoint:
+	case parser.Empty, parser.Use, parser.Show, parser.Explain, parser.Savepoint, parser.RollbackTo, parser.ReleaseSavepoint, parser.SetTransaction:
 		return false
 	case parser.Select:
 		return s.Table != "" || s.Subquery != nil
@@ -479,6 +517,14 @@ func sqlStartsImplicitTransaction(statement parser.Statement) bool {
 		return true
 	}
 }
+
+func (e *Engine) checkIsolationCapability(level parser.IsolationLevel) error {
+	if level != parser.LevelRepeatableRead {
+		return fmt.Errorf("%w: transaction isolation level %s is not supported yet", storageengine.ErrUnsupported, level)
+	}
+	return nil
+}
+
 func (e *Engine) SetAutocommit(session *Session, enabled bool) error {
 	if enabled && session.AutocommitDisabled && session.InTransaction() {
 		if _, err := e.Execute(session, "COMMIT"); err != nil {

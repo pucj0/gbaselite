@@ -166,6 +166,7 @@ func (e *Engine) commitSessionTransaction(session *Session) error {
 	}
 	session.savepoints = nil
 	session.transaction = nil
+	session.ClearActiveIsolation()
 	return nil
 }
 
@@ -176,6 +177,7 @@ func rollbackSessionTransaction(session *Session) {
 	// a fresh transaction permanently refused or let an abandoned one be used again.
 	session.retryConflict = nil
 	if session.transaction == nil {
+		session.ClearActiveIsolation()
 		return
 	}
 	for index := len(session.savepoints) - 1; index >= 0; index-- {
@@ -184,6 +186,7 @@ func rollbackSessionTransaction(session *Session) {
 	outermost := outermostTransaction(session)
 	session.savepoints = nil
 	session.transaction = nil
+	session.ClearActiveIsolation()
 	if outermost != nil {
 		_ = outermost.Rollback()
 	}

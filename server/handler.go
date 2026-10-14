@@ -58,8 +58,12 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 		return nil, fmt.Errorf("MVCC table locking is not supported")
 	}
 	if strings.HasPrefix(upper, "SET ") {
-		if strings.Contains(upper, "TRANSACTION ISOLATION") || strings.Contains(upper, "TX_ISOLATION") || strings.Contains(upper, "TRANSACTION_ISOLATION") {
-			return nil, fmt.Errorf("MVCC currently provides snapshot isolation; changing isolation level is not supported")
+		if statement, err := parser.Parse(trimmed); err == nil {
+			if _, ok := statement.(parser.SetTransaction); ok {
+				return engine.Execute(session, trimmed)
+			}
+		} else if isIsolationSetAttempt(trimmed) {
+			return nil, err
 		}
 		assignments := splitSetAssignments(trimmed[4:])
 		for _, assignment := range assignments {
@@ -215,6 +219,31 @@ func ExecuteCompatible(engine *executor.Engine, session *executor.Session, query
 		return compatibilityVariables(session, trimmed), nil
 	}
 	return engine.Execute(session, trimmed)
+}
+
+func isIsolationSetAttempt(query string) bool {
+	upper := strings.ToUpper(query)
+	for strings.HasPrefix(upper, "/*") {
+		end := strings.Index(upper, "*/")
+		if end < 0 {
+			break
+		}
+		upper = strings.TrimSpace(upper[end+2:])
+	}
+	if !strings.HasPrefix(upper, "SET ") && !strings.HasPrefix(upper, "SET\t") && !strings.HasPrefix(upper, "SET\n") {
+		return false
+	}
+	body := strings.TrimSpace(upper[3:])
+	return strings.HasPrefix(body, "TRANSACTION") ||
+		strings.HasPrefix(body, "SESSION TRANSACTION") ||
+		strings.HasPrefix(body, "LOCAL TRANSACTION") ||
+		strings.HasPrefix(body, "GLOBAL TRANSACTION") ||
+		strings.Contains(body, "TRANSACTION_ISOLATION") ||
+		strings.Contains(body, "TX_ISOLATION") ||
+		strings.HasPrefix(body, "PERSIST ") ||
+		strings.HasPrefix(body, "PERSIST_ONLY ") ||
+		strings.HasPrefix(body, "GLOBAL ") ||
+		strings.HasPrefix(body, "@@GLOBAL.")
 }
 
 func trimLeadingCompatibilityComments(query string) string {
