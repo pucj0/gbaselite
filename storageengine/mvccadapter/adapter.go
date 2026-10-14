@@ -28,6 +28,14 @@ type txn struct {
 	isolationLevel storageengine.IsolationLevel
 	activeView     *mvccReadView
 	consistentView *mvccReadView
+	rootTxn        *txn
+}
+
+func (t *txn) root() *txn {
+	if t.rootTxn != nil {
+		return t.rootTxn
+	}
+	return t
 }
 
 var _ storageengine.Engine = (*engine)(nil)
@@ -179,26 +187,40 @@ func (t *txn) Child() (storageengine.Txn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &txn{inner: c, engine: t.engine}, nil
+	root := t.root()
+	return &txn{
+		inner:          c,
+		engine:         t.engine,
+		isolationLevel: root.isolationLevel,
+		rootTxn:        root,
+	}, nil
 }
 func (t *txn) Commit(ctx context.Context) (uint64, error) {
-	if t.consistentView != nil {
-		_ = t.consistentView.Close()
-		t.consistentView = nil
-	}
-	if t.activeView != nil {
-		_ = t.activeView.Close()
+	if t.rootTxn == nil {
+		if t.consistentView != nil {
+			_ = t.consistentView.Close()
+			t.consistentView = nil
+		}
+		if t.activeView != nil {
+			_ = t.activeView.Close()
+			t.activeView = nil
+		}
+	} else {
 		t.activeView = nil
 	}
 	return t.inner.Commit(ctx)
 }
 func (t *txn) Rollback() error {
-	if t.consistentView != nil {
-		_ = t.consistentView.Close()
-		t.consistentView = nil
-	}
-	if t.activeView != nil {
-		_ = t.activeView.Close()
+	if t.rootTxn == nil {
+		if t.consistentView != nil {
+			_ = t.consistentView.Close()
+			t.consistentView = nil
+		}
+		if t.activeView != nil {
+			_ = t.activeView.Close()
+			t.activeView = nil
+		}
+	} else {
 		t.activeView = nil
 	}
 	return t.inner.Rollback()

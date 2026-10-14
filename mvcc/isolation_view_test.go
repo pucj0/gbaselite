@@ -376,3 +376,42 @@ func TestP4Prereq_CompactHistoryPurgesUnpinnedHistory(t *testing.T) {
 		t.Fatalf("BeginViewTokenAt for purged revision 1 unexpectedly succeeded! Must be rejected.")
 	}
 }
+
+// TestP4Fix03_StartTSImmutable covers P4-FIX-03:
+// When an active root transaction establishes a lazy consistent read at a newer revision,
+// UpdateRootReadTS must update ReadTS to reflect the view revision, but must NEVER overwrite startTS!
+func TestP4Fix03_StartTSImmutable(t *testing.T) {
+	m := NewTransactionManager()
+
+	// Register lazy root at startTS = 10
+	_, err := m.RegisterRoot(RootRegistration{
+		ID:         "root-lazy",
+		ReadTS:     10,
+		Generation: 1,
+		StartedAt:  testStartedAt,
+		Lazy:       true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	infoBefore, ok := m.Info("root-lazy")
+	if !ok || infoBefore.StartTS != 10 || infoBefore.ReadTS != 10 {
+		t.Fatalf("before: StartTS=%d, ReadTS=%d", infoBefore.StartTS, infoBefore.ReadTS)
+	}
+
+	// Update root readTS to 25 (first consistent read)
+	m.UpdateRootReadTS("root-lazy", 25)
+
+	infoAfter, ok := m.Info("root-lazy")
+	if !ok {
+		t.Fatal("root-lazy not found")
+	}
+
+	if infoAfter.StartTS != 10 {
+		t.Fatalf("StartTS was modified from 10 to %d! startTS must be immutable.", infoAfter.StartTS)
+	}
+	if infoAfter.ReadTS != 25 {
+		t.Fatalf("ReadTS = %d, want 25", infoAfter.ReadTS)
+	}
+}

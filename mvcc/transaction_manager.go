@@ -516,7 +516,6 @@ func (m *TransactionManager) UpdateRootReadTS(rootID string, readTS uint64) {
 	entry := m.activeByID[rootID]
 	if entry != nil && entry.root {
 		entry.readTS = readTS
-		entry.startTS = readTS
 	}
 }
 

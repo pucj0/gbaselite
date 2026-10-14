@@ -19,6 +19,8 @@ B01 plain snapshot validation checks `latestCommittedChange(dep) > readTS`. B02 
 
 Define a neutral per-write/per-predicate validation evidence record containing `{dependency identity, baseline kind, committed version, grant id/epoch, layer/root ownership}`. Snapshot-origin dependencies retain original proof; locked-current-origin may use B02 per-key baseline only with valid root grant. For RC where statement epoch changes, choose a formally justified baseline policy **per dependency**, not by mutating root-wide `readTS`.
 
+Establishing a newer consistent read view revision (e.g. at the first plain SELECT in RR lazy snapshot) must NOT mutate or relax `t.Snapshot` or the optimistic validation baseline for prior declared dependencies (such as `Guard`). A key guarded prior to the first read continues to validate against the transaction's true start timestamp, preventing concurrent commits from bypassing conflict validation.
+
 Write a validator truth table spanning RR/RC/RU/SER x point/range/unique/FK x locked/current/consistent x insert/update/delete x local/replicated. Reject states that cannot be proven safe. Test pre- and post-commit database state, not merely error string.
 
 ## Replication-specific gate

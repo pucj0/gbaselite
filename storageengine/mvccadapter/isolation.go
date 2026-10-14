@@ -12,9 +12,10 @@ var _ storageengine.IsolationTxn = (*txn)(nil)
 var _ storageengine.ReadView = (*mvccReadView)(nil)
 
 type mvccReadView struct {
-	token *mvcc.ViewToken
-	kind  storageengine.StatementViewKind
-	txn   *txn
+	token       *mvcc.ViewToken
+	kind        storageengine.StatementViewKind
+	txn         *txn
+	isChildView bool
 }
 
 func (v *mvccReadView) ID() string                            { return v.token.ID() }
@@ -28,10 +29,25 @@ func (v *mvccReadView) State() storageengine.ViewState {
 }
 
 func (v *mvccReadView) Get(space string, key []byte) ([]byte, bool, error) {
+	switch v.State() {
+	case storageengine.ViewStateClosed:
+		return nil, false, storageengine.ErrViewClosed
+	case storageengine.ViewStateInvalidated:
+		return nil, false, storageengine.ErrViewInvalidated
+	}
+	if v.txn != nil && v.txn.inner != nil {
+		return v.txn.inner.ReadAt(v.Revision(), space, key)
+	}
 	return v.token.Get(space, key)
 }
 
 func (v *mvccReadView) NewIterator(ctx context.Context, r storageengine.ScanRequest) (storageengine.Iterator, error) {
+	switch v.State() {
+	case storageengine.ViewStateClosed:
+		return nil, storageengine.ErrViewClosed
+	case storageengine.ViewStateInvalidated:
+		return nil, storageengine.ErrViewInvalidated
+	}
 	return newIterator(ctx, r, func(yield func([]byte, []byte) error) error {
 		bounds := mvcc.KeyRange{
 			Lower:          r.Range.Lower,
@@ -40,6 +56,9 @@ func (v *mvccReadView) NewIterator(ctx context.Context, r storageengine.ScanRequ
 			UpperInclusive: r.Range.UpperInclusive,
 			Reverse:        r.Range.Reverse,
 		}
+		if v.txn != nil && v.txn.inner != nil {
+			return v.txn.inner.ScanRangeAt(ctx, r.Space, bounds, v.Revision(), yield)
+		}
 		return v.token.ScanRange(ctx, r.Space, bounds, yield)
 	})
 }
@@ -47,6 +66,9 @@ func (v *mvccReadView) NewIterator(ctx context.Context, r storageengine.ScanRequ
 func (v *mvccReadView) Close() error {
 	if v.txn != nil && v.txn.activeView == v {
 		v.txn.activeView = nil
+	}
+	if v.isChildView {
+		return nil
 	}
 	return v.token.Close()
 }
@@ -98,14 +120,36 @@ func (t *txn) BeginStatementView(ctx context.Context, kind storageengine.Stateme
 }
 
 func (t *txn) BeginConsistentView(ctx context.Context) (storageengine.ReadView, error) {
-	if t.inner == nil || t.inner.Closed() {
-		if t.inner != nil && t.inner.DeadlockAborted() {
+	root := t.root()
+	if root.inner == nil || root.inner.Closed() {
+		if root.inner != nil && root.inner.DeadlockAborted() {
 			return nil, storageengine.ErrDeadlock
 		}
 		return nil, storageengine.ErrClosed
 	}
+
+	rootView, err := root.ensureRootConsistentView(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if t == root {
+		t.activeView = rootView
+		return rootView, nil
+	}
+
+	childView := &mvccReadView{
+		token:       rootView.token,
+		kind:        storageengine.StatementViewKindConsistent,
+		txn:         t,
+		isChildView: true,
+	}
+	t.activeView = childView
+	return childView, nil
+}
+
+func (t *txn) ensureRootConsistentView(ctx context.Context) (*mvccReadView, error) {
 	if t.consistentView != nil && t.consistentView.State() == storageengine.ViewStateActive {
-		t.activeView = t.consistentView
 		return t.consistentView, nil
 	}
 	token, err := t.engine.store.BeginViewToken(ctx, t.inner)
@@ -114,9 +158,7 @@ func (t *txn) BeginConsistentView(ctx context.Context) (storageengine.ReadView, 
 	}
 	v := &mvccReadView{token: token, kind: storageengine.StatementViewKindConsistent, txn: t}
 	t.consistentView = v
-	t.activeView = v
 	if t.inner != nil {
-		t.inner.Snapshot = token.Revision()
 		t.engine.store.UpdateRootReadTS(t.inner.ID, token.Revision())
 	}
 	return v, nil

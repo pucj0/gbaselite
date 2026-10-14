@@ -45,6 +45,14 @@ Go interface shape is not final: phase 1 must decide how `Child`, `Guard` and su
 - Even empty SELECT should create the RR first consistent read view (to prevent future phantom). Metadata SHOW and Current Read are not consistent-read triggers without an explicit documented decision.
 - RU stage overlay does not belong to `snapshotRefs`; its copy/borrow lifecycle is separately counted, with generation invalidation.
 
+## Savepoint & Child View Inheritance
+
+1. Root owns the RR consistent read view.
+2. A Child transaction created by `t.Child()` (e.g. for a SQL SAVEPOINT) inherits the root's isolation level and shares the root's consistent read view revision.
+3. Reading in a Child walks from the Child's staged writes through ancestors to root, ensuring own writes and ancestor writes take precedence over the consistent snapshot.
+4. If a consistent view was not yet established prior to SAVEPOINT, the first plain consistent read in the Child establishes the root's consistent view.
+5. Child `Commit` (savepoint release/merge) and Child `Rollback` (`ROLLBACK TO`) do not release the root's consistent view pin. Only root `Commit`, root `Rollback`, or terminal transition releases the root's consistent view pin.
+
 ## Non-negotiable close scenarios
 
 `COMMIT`, `ROLLBACK`, `ROLLBACK TO`, failed child MERGE, deadlock victim, lock wait timeout, context cancel, statement parse/bind error, iterator EOF, LIMIT early exit, stream sender error, connection reset/disconnect, store Restore/Close, Raft epoch/term change.

@@ -624,10 +624,11 @@ func (e *Engine) SetAutocommit(session *Session, enabled bool) error {
 }
 
 func (e *Engine) beginIsolatedTransaction(ctx context.Context, level parser.IsolationLevel) (storageengine.Txn, error) {
-	if isoEngine, ok := e.Backend.(storageengine.IsolationEngine); ok {
-		return isoEngine.BeginIsolated(ctx, storageengine.IsolationLevel(level))
+	isoEngine, ok := e.Backend.(storageengine.IsolationEngine)
+	if !ok {
+		return nil, fmt.Errorf("%w: backend does not support isolation capabilities", storageengine.ErrUnsupported)
 	}
-	return e.Backend.Begin(ctx)
+	return isoEngine.BeginIsolated(ctx, storageengine.IsolationLevel(level))
 }
 
 func isPlainConsistentRead(statement parser.Statement) bool {

@@ -335,3 +335,72 @@
 - [x] **README 与 tasks.md 均已完成同步**。
 
 **结论：GBaseLite B03 Phase 4 最终 Gate 正式通过，完全具备进入 Phase 5（READ COMMITTED）的技术前置条件。**
+
+---
+
+## 16. Phase 4 Review Remediation (P4-FIX-01 至 P4-FIX-05)
+
+- **基线 Commit**: `bfb08a44d27296410bdd89d86042b9a16b483c39`
+- **审查与修复项详情**:
+
+### 1. P4-FIX-01：SAVEPOINT 破坏 RR 一致性视图 (P0 - RESOLVED)
+- **原因与风险**: `mvccadapter.txn.Child()` 过去未继承 `rootTxn` 和隔离级别，导致 SQL `SAVEPOINT` 后 `session.transaction` 成为 Child 时，后续的一致性读重新采样 Head 破坏了已固定的 RR 一致性快照；且 Child 的 Commit/Rollback 存在误释放 root view 的风险。
+- **改动文件**: `storageengine/mvccadapter/adapter.go`, `storageengine/mvccadapter/isolation.go`, `contracts/snapshot-lifecycle.md`
+- **红测先行**:
+  - `TestP4Fix01_RRSavepointInheritsView`: Root 固定快照后建立 Savepoint，并发提交新版本，Child SELECT 误见新版本红测失败；
+  - `TestP4Fix01_RRSavepointNested`: 2 层嵌套 Savepoint 误见并发提交红测失败。
+- **修复方案**:
+  1. `txn.Child()` 显式继承 `rootTxn` 与隔离级别；
+  2. `BeginConsistentView` 在 Root 上统一执行 `ensureRootConsistentView`，Child 共享该 view token；
+  3. Child 的视图包装为 `isChildView: true`，且读取经由 `child.inner.ReadAt`，确保 Child 自身及祖先的未提交写集优先覆盖；
+  4. Child `Commit` / `Rollback` 绝不释放 Root 的 View Token，仅 Root 终态释放；
+- **绿测证据**:
+  - `TestP4Fix01_RRSavepointInheritsView` (Test A: PASS)
+  - `TestP4Fix01_RRSavepointBeforeFirstRead` (Test B: PASS)
+  - `TestP4Fix01_RRSavepointOwnWritesOverlay` (Test C: PASS)
+  - `TestP4Fix01_RRSavepointNested` (Test D: PASS)
+  - 100 轮重复压测全部通过（`-count=100`）。
+
+### 2. P4-FIX-02：读快照与提交校验基准严格解耦 (P0 - RESOLVED)
+- **原因与风险**: 原实现在首次一致性读时原地修改了 `t.inner.Snapshot = token.Revision()`，导致在首次读之前建立的乐观依赖（如 `Guard`）在提交校验时被按较新的 `readTS` 放宽，绕过了并发修改冲突检测。
+- **改动文件**: `storageengine/mvccadapter/isolation.go`, `contracts/validation-policy.md`
+- **红测先行**:
+  - `TestP4Fix02_GuardBeforeFirstReadConflict`: 事务开始后先 Guard 键 k1，外部更新 k1 提交，事务首次读并修改不相关键 k2，提交时意外成功未报 `ErrConflict` 的红测失败。
+- **修复方案**:
+  1. 彻底移除在 `BeginConsistentView` 中对 `t.inner.Snapshot` 的原地覆盖，保留 `Snapshot` 为事务启动时的初始真实时间戳；
+  2. 读可见性由 `ReadView.Revision()` 负责，写冲突校验由 `t.Snapshot` / `observedBaseline` 负责，两项语义绝对分离；
+  3. 首次读前声明的 `Guard` 依然严格依据起始水位验证，并发修改必报 `ErrConflict`。
+- **绿测证据**: `TestP4Fix02_GuardBeforeFirstReadConflict` 绿测通过；100 轮重复运行全部通过。
+
+### 3. P4-FIX-03：事务 startTS 不得被首次读取重写 (P1 - RESOLVED)
+- **原因与风险**: `TransactionManager.UpdateRootReadTS()` 曾错误执行 `entry.startTS = readTS`，导致事务诊断将首次读时间戳冒充事务真实开始时间戳。
+- **改动文件**: `mvcc/transaction_manager.go`
+- **红测先行**: `mvcc/isolation_view_test.go:TestP4Fix03_StartTSImmutable` 捕获到 `StartTS was modified from 10 to 25!` 的红测失败。
+- **修复措施**: 移除了对 `entry.startTS` 的修改，仅更新 `entry.readTS`。`StartTS` 永远表示事务真实起始时间戳。
+- **绿测证据**: `TestP4Fix03_StartTSImmutable` 绿测通过；100 轮重复运行全部通过。
+
+### 4. P4-FIX-04：Optional Backend 缺失必须 Fail Closed (P1 - RESOLVED)
+- **原因与风险**: `beginIsolatedTransaction()` 原实现当 Backend 不实现 `IsolationEngine` 时回退至 `Backend.Begin()`，使要求隔离的 SQL 在无能力存储引擎上静默退化。
+- **改动文件**: `executor/transaction_engine.go`
+- **红测先行**: `TestP4Fix04_MissingCapabilityFailsClosed` 使用 Mock 未实现引擎发起事务，捕获未返回 `ErrUnsupported` 的红测失败。
+- **修复措施**: 移除静默回退逻辑，当 Backend 未实现 `IsolationEngine` 时直接返回 `storageengine.ErrUnsupported`，不调用 `Backend.Begin()`，不消费 `pendingNext`。
+- **绿测证据**: `TestP4Fix04_MissingCapabilityFailsClosed` 绿测通过；100 轮重复运行全部通过。
+
+### 5. P4-FIX-05：Lazy Root 在首次 SELECT 前的历史安全性 (P1 - RESOLVED)
+- **原因与风险**: 验证 Lazy Root 在首次 SELECT 之前若经历多次外部更新与 GC，后续首次普通 SELECT、当前读与 DML 不会读到被裁剪的历史版本。
+- **新增测试**: `TestP4Fix05_LazyRootAfterGC`：验证在无 Pin 状态下 GC 发生后，后续首次 SELECT 准确建立于最新 Head，后续 DML 正常执行。
+- **绿测证据**: `TestP4Fix05_LazyRootAfterGC` 绿测通过；100 轮重复运行全部通过。
+
+---
+
+## 17. 全量回归与最终状态
+
+1. **测试结果**:
+   - `protocol`、`parser`、`server`、`mvcc`、`storageengine`、`executor` 21 个测试包全部通过（`go test ./... -count=1` 退出码 0，耗时 ~130s）；
+   - P4-FIX 相关确定性测试分别执行 100 轮（`-count=100`），全部 100% 通过（0 FAIL）；
+   - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 clean。
+2. **Race Detector 说明**:
+   - 当前 Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 NOT RUN，不伪称通过。
+3. **Phase 5 准入结论**:
+   - **P4-FIX-01 至 P4-FIX-05 全部彻底关闭**；
+   - **GBaseLite B03 Phase 4 最终 Gate 确认通过**，已完全具备进入 Phase 5（READ COMMITTED）的技术条件。
