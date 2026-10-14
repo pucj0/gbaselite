@@ -152,6 +152,9 @@ func OpenWithOptions(directory string, options Options) (*Store, error) {
 				return err
 			}
 		}
+		if v := tx.Bucket(metaBucket).Get([]byte("compacted_horizon")); v != nil {
+			s.txns.RecordCompactedHorizon(number(v))
+		}
 		s.localSeq = max(number(tx.Bucket(metaBucket).Get([]byte("applied"))), number(tx.Bucket(metaBucket).Get([]byte("allocated"))))
 		return nil
 	})

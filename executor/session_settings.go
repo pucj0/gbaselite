@@ -121,6 +121,7 @@ func (s *Session) SetSessionIsolation(level parser.IsolationLevel) error {
 	}
 	s.sessionIsolationDefault = level
 	s.pendingIsolationNext = nil
+	s.isolationEnabled = true
 	return nil
 }
 
@@ -138,6 +139,7 @@ func (s *Session) SetNextTransactionIsolation(level parser.IsolationLevel) error
 		return errors.New("transaction characteristics cannot be changed while a transaction is active")
 	}
 	s.pendingIsolationNext = &level
+	s.isolationEnabled = true
 	return nil
 }
 

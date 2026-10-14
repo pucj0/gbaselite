@@ -278,3 +278,60 @@
    - **所有 P0 与 P1 审查遗留项全部彻底关闭**；
    - 历史回退与并发安全证明确凿，零生产数据影响；
    - **GBaseLite B03 Phase 3 最终 Gate 正式通过**，已完全具备进入 Phase 4（REPEATABLE READ）的技术前置条件。
+
+---
+
+## 14. Phase 4 实施与验收结果 (T030–T036)
+
+- **基线 Commit**: `c57873cefeba44565e001d5ad0557fb838c8ef33`
+- **实施内容与证据**:
+
+### 1. 前置历史可用性漏洞修复
+- **红测先行**: `mvcc/isolation_view_test.go:TestP4Prereq_CompactHistoryPurgesUnpinnedHistory` 成功复现在无活跃 Pin 时 CompactHistory 物理裁剪旧版本后、尝试请求已回收版本导致数据缺失的漏洞。
+- **修复措施**:
+  1. `Store.CompactHistory` 在持久化 `metaBucket` 中记录 `compacted_horizon`，并在引擎启动时恢复；
+  2. `TransactionManager.RegisterView` 增加低水位强制阻断：凡 revision 低于 `compacted_horizon`，或请求非当前 Head 且无活跃 Pin 的历史 revision，均严格 fail-closed 拒绝注册（`ErrInvalidRegistration`）。
+- **绿测证据**: `go test ./mvcc -run TestP4Prereq_CompactHistoryPurgesUnpinnedHistory` 通过（1.112s）。
+
+### 2. T030: M08–M12 红测先行
+- **文件**: `executor/isolation_rr_test.go`
+- **红测证据**: 在未实现 Lazy Read View 时运行 `TestM08_RR_LazyFirstReadTiming`，捕获到真实的 `A first SELECT returned [[V1]], want 'V2' (failed MySQL RR lazy read view)` 失败证据。
+
+### 3. T031: RR Lazy Read View 实现
+- **解耦生命周期与快照 Pin**:
+  - `Store.BeginLazy` 与 `RootRegistration.Lazy`：SQL RR 事务启动时仅注册事务 ID 和锁所有者，不提前锁定 `snapshotRefs`，避免空闲事务持续压制 GC；
+  - `BeginConsistentView`：在事务执行首个普通一致性读时原子采样当前已发布 `Head`，注册 `ViewToken` 并锁定 `snapshotRefs[Head]++`，更新事务 `Snapshot` 水位；
+  - 幂等复用：事务后续的普通一致性读直接复用首个建立的 `consistentView`；
+  - 终态释放：`COMMIT`/`ROLLBACK`/Reset/错误路径统一释放快照 Pin。
+
+### 4. T032: 普通一致读与锁定读严格分离
+- **普通一致读**: 仅普通 `SELECT`、`WITH`、`UNION` 触发并复用 RR Transaction Read View；
+- **锁定读**: `SELECT ... FOR UPDATE`、`FOR SHARE`、`LOCK IN SHARE MODE` 走 B02 Current Read，加锁读取最新发布版本，不触发、不创建、不刷新普通 RR 一致性视图；
+- **DML 与元数据**: 写入走修改管线与当前读，不误套用普通 SELECT 快照。
+
+### 5. T033: 自身写覆盖、Child 与 Savepoint 验证
+- `TestM11_RR_OwnStagedWrites` 与 `TestM11_RR_SavepointRollbackOwnWrites` 验证 own writes overlay 优先级高于固定快照，INSERT/UPDATE/DELETE 及 SAVEPOINT 回滚完全符合预期。
+
+### 6. T034 & T035: 范围/空结果/提交校验兼容性
+- `TestM10_RR_PhantomFreeRange` 与 `TestM10_RR_AbsentPointLookupConsistent` 验证范围与点查在并发插入下保持一致（无幻读）；
+- `TestT035_RR_CommitValidationBaselines` 验证可见性快照不代替写冲突校验基准，无锁写入依然严格检测并发冲突，防止丢失更新。
+
+### 7. T036: 100 轮确定性压测与全量回归
+- `go test ./executor -run 'Test(M08|M09|M10|M11|M12|T035)' -count=100` 100 轮全部通过（EXIT: 0，总耗时 216s）；
+- 全库 21 个测试包执行 `go test ./... -count=1` 100% 通过（总耗时 153s）；
+- `gofmt -l`、`go vet ./...`、`git diff --check` 全部 clean。
+
+---
+
+## 15. Phase 4 最终 Gate 审查结论
+
+- [x] **P3-FIX-05 前置水位漏洞彻底修复**；
+- [x] **M08–M12 红测先行并绿测通过**；
+- [x] **RR Lazy First Consistent Read 完整实现**；
+- [x] **锁定读与普通读严格分离**；
+- [x] **自身写/保存点/范围/空结果一致性验证齐备**；
+- [x] **B01/B02/A05 零回归，全库 21 包 100% 通过**；
+- [x] **100 轮并发压测通过，无死锁、无悬挂 Pin**；
+- [x] **README 与 tasks.md 均已完成同步**。
+
+**结论：GBaseLite B03 Phase 4 最终 Gate 正式通过，完全具备进入 Phase 5（READ COMMITTED）的技术前置条件。**

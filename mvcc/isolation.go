@@ -19,6 +19,11 @@ type ViewToken struct {
 	closed     bool
 }
 
+// UpdateRootReadTS updates the read timestamp of an active root transaction.
+func (s *Store) UpdateRootReadTS(rootID string, readTS uint64) {
+	s.txns.UpdateRootReadTS(rootID, readTS)
+}
+
 // BeginViewToken captures the current published Head under views lock and pins it in TransactionManager.
 // The lock order (views -> txns.mu) ensures atomic sampling where no GC compaction can run between
 // reading Head and pinning the snapshotRefs reference.
@@ -48,6 +53,7 @@ func (s *Store) BeginViewToken(ctx context.Context, tx *Tx) (*ViewToken, error) 
 		ID:         id,
 		RootID:     rootID,
 		Revision:   revision,
+		Head:       revision,
 		Generation: generation,
 	})
 	if err != nil {
@@ -77,15 +83,20 @@ func (s *Store) BeginViewTokenAt(ctx context.Context, tx *Tx, revision uint64) (
 	s.views.Lock()
 	defer s.views.Unlock()
 	generation := s.generation.Load()
+	head, err := s.Head()
+	if err != nil {
+		return nil, err
+	}
 	id := randomID()
 	rootID := ""
 	if tx != nil {
 		rootID = tx.ID
 	}
-	err := s.txns.RegisterView(ViewRegistration{
+	err = s.txns.RegisterView(ViewRegistration{
 		ID:         id,
 		RootID:     rootID,
 		Revision:   revision,
+		Head:       head,
 		Generation: generation,
 	})
 	if err != nil {

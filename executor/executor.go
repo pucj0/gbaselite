@@ -134,6 +134,19 @@ type Session struct {
 	sessionIsolationDefault parser.IsolationLevel
 	pendingIsolationNext    *parser.IsolationLevel
 	activeIsolationLevel    *parser.IsolationLevel
+	isolationEnabled        bool
+}
+
+// EnableIsolation enables B03 transaction isolation capabilities on this session.
+func (s *Session) EnableIsolation() {
+	if s != nil {
+		s.isolationEnabled = true
+	}
+}
+
+// IsolationEnabled reports whether this session uses B03 transaction isolation semantics.
+func (s *Session) IsolationEnabled() bool {
+	return s != nil && (s.isolationEnabled || s.pendingIsolationNext != nil)
 }
 
 type navicatCopySource struct {

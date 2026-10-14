@@ -100,7 +100,30 @@ func (s *Store) Begin(ctx context.Context, p Proposer) (*Tx, error) {
 	// purges the registry under the same lock.
 	return s.newTx(ctx, p, snapshot, nil)
 }
+
+// BeginLazy starts a root transaction without pre-pinning a snapshot revision.
+// The snapshot view will be pinned on the first consistent read (MySQL RR Lazy Snapshot).
+func (s *Store) BeginLazy(ctx context.Context, p Proposer) (*Tx, error) {
+	if p == nil {
+		p = s
+	}
+	if err := p.Barrier(ctx); err != nil {
+		return nil, err
+	}
+	s.views.Lock()
+	defer s.views.Unlock()
+	snapshot, err := s.Head()
+	if err != nil {
+		return nil, err
+	}
+	return s.newTxInternal(ctx, p, snapshot, nil, true)
+}
+
 func (s *Store) newTx(ctx context.Context, p Proposer, snapshot uint64, parent *Tx) (*Tx, error) {
+	return s.newTxInternal(ctx, p, snapshot, parent, false)
+}
+
+func (s *Store) newTxInternal(ctx context.Context, p Proposer, snapshot uint64, parent *Tx, lazy bool) (*Tx, error) {
 	id := randomID()
 	path := filepath.Join(filepath.Dir(s.path), "transactions", id+".tmp")
 	var term uint64
@@ -114,7 +137,13 @@ func (s *Store) newTx(ctx context.Context, p Proposer, snapshot uint64, parent *
 		// Only a root transaction owns history retention: it pins its read
 		// timestamp so compaction cannot drop versions it may still need
 		// (FR-007 / INV-007).
-		registered, err := s.txns.RegisterRoot(RootRegistration{ID: id, ReadTS: snapshot, Generation: generation, StartedAt: startedAt})
+		registered, err := s.txns.RegisterRoot(RootRegistration{
+			ID:         id,
+			ReadTS:     snapshot,
+			Generation: generation,
+			StartedAt:  startedAt,
+			Lazy:       lazy,
+		})
 		if err != nil {
 			return nil, err
 		}

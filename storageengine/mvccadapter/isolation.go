@@ -60,7 +60,8 @@ func (e *engine) BeginIsolated(ctx context.Context, level storageengine.Isolatio
 	if level != storageengine.IsolationRepeatableRead {
 		return nil, fmt.Errorf("%w: isolation level %s is not supported yet", storageengine.ErrUnsupported, level)
 	}
-	t, err := e.store.Begin(ctx, e.proposer)
+	// For REPEATABLE READ in SQL, start as a lazy transaction so consistent view is pinned on first read
+	t, err := e.store.BeginLazy(ctx, e.proposer)
 	if err != nil {
 		return nil, err
 	}
@@ -107,13 +108,17 @@ func (t *txn) BeginConsistentView(ctx context.Context) (storageengine.ReadView, 
 		t.activeView = t.consistentView
 		return t.consistentView, nil
 	}
-	token, err := t.engine.store.BeginViewTokenAt(ctx, t.inner, t.inner.Snapshot)
+	token, err := t.engine.store.BeginViewToken(ctx, t.inner)
 	if err != nil {
 		return nil, err
 	}
 	v := &mvccReadView{token: token, kind: storageengine.StatementViewKindConsistent, txn: t}
 	t.consistentView = v
 	t.activeView = v
+	if t.inner != nil {
+		t.inner.Snapshot = token.Revision()
+		t.engine.store.UpdateRootReadTS(t.inner.ID, token.Revision())
+	}
 	return v, nil
 }
 

@@ -30,6 +30,7 @@ type RootRegistration struct {
 	ReadTS     uint64
 	Generation uint64
 	StartedAt  time.Time
+	Lazy       bool // If true, does not pin ReadTS at Begin; view is pinned on first consistent read
 }
 
 // ChildRegistration is the metadata captured when a child or savepoint
@@ -50,6 +51,7 @@ type ViewRegistration struct {
 	ID         string
 	RootID     string
 	Revision   uint64
+	Head       uint64
 	Generation uint64
 }
 
@@ -263,11 +265,12 @@ func (e *transactionEntry) info() TransactionInfo {
 // and never calls back into Store. Callers may therefore use it while holding
 // store locks, as long as they keep the store order apply -> views -> manager.mu.
 type TransactionManager struct {
-	mu           sync.RWMutex
-	activeByID   map[string]*transactionEntry
-	snapshotRefs map[uint64]uint64
-	viewsByID    map[string]*viewEntry
-	viewsByRoot  map[string]map[string]bool
+	mu               sync.RWMutex
+	activeByID       map[string]*transactionEntry
+	snapshotRefs     map[uint64]uint64
+	viewsByID        map[string]*viewEntry
+	viewsByRoot      map[string]map[string]bool
+	compactedHorizon uint64
 
 	committed uint64
 	aborted   uint64
@@ -310,9 +313,11 @@ func (m *TransactionManager) RegisterRoot(registration RootRegistration) (*trans
 		generation: registration.Generation,
 		startedAt:  registration.StartedAt,
 		counters:   counters,
-		pinned:     true,
+		pinned:     !registration.Lazy,
 	}
-	m.snapshotRefs[registration.ReadTS]++
+	if !registration.Lazy {
+		m.snapshotRefs[registration.ReadTS]++
+	}
 	return counters, nil
 }
 
@@ -450,9 +455,18 @@ func (m *TransactionManager) RegisterView(registration ViewRegistration) error {
 		}
 	}
 
-	// Historical horizon safety check (P3-FIX-05):
-	// Cannot register a view for an unpinned revision below the current GC horizon.
+	// Historical horizon and availability safety check (Section I / P3-FIX-05):
+	// 1. Revision must not be lower than the completed compaction horizon.
+	if registration.Revision < m.compactedHorizon {
+		return fmt.Errorf("%w: requested revision %d is below compacted horizon %d", ErrInvalidRegistration, registration.Revision, m.compactedHorizon)
+	}
+
+	// 2. An unpinned past revision cannot be proven safe against compaction.
+	// Only the current Head or an actively pinned revision (protected by a live root) is eligible.
 	if m.snapshotRefs[registration.Revision] == 0 {
+		if registration.Head > 0 && registration.Revision < registration.Head {
+			return fmt.Errorf("%w: unpinned past revision %d below head %d cannot be safely registered", ErrInvalidRegistration, registration.Revision, registration.Head)
+		}
 		if oldest, hasOldest := m.oldestReadTSLocked(); hasOldest && registration.Revision < oldest {
 			return fmt.Errorf("%w: requested revision %d is below GC horizon %d", ErrInvalidRegistration, registration.Revision, oldest)
 		}
@@ -491,6 +505,18 @@ func (m *TransactionManager) ReleaseView(viewID string) {
 		if len(m.viewsByRoot[entry.rootID]) == 0 {
 			delete(m.viewsByRoot, entry.rootID)
 		}
+	}
+}
+
+// UpdateRootReadTS updates the read timestamp of an active root transaction when its first
+// consistent read view is established.
+func (m *TransactionManager) UpdateRootReadTS(rootID string, readTS uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.activeByID[rootID]
+	if entry != nil && entry.root {
+		entry.readTS = readTS
+		entry.startTS = readTS
 	}
 }
 
@@ -597,6 +623,22 @@ func (m *TransactionManager) Transition(id string, to TransactionState, options 
 	return nil
 }
 
+// RecordCompactedHorizon records the latest physically completed compaction horizon under lock.
+func (m *TransactionManager) RecordCompactedHorizon(horizon uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if horizon > m.compactedHorizon {
+		m.compactedHorizon = horizon
+	}
+}
+
+// CompactedHorizon returns the latest physically completed compaction horizon.
+func (m *TransactionManager) CompactedHorizon() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.compactedHorizon
+}
+
 // Reset drops every registered transaction and every retention reference.
 //
 // It is the generation-change hook: after Store.Restore replaces the database,
@@ -612,6 +654,7 @@ func (m *TransactionManager) Reset() {
 	m.snapshotRefs = make(map[uint64]uint64)
 	m.viewsByID = make(map[string]*viewEntry)
 	m.viewsByRoot = make(map[string]map[string]bool)
+	m.compactedHorizon = 0
 }
 
 // ActiveTransactions returns a copy of the registered transactions. Entries that

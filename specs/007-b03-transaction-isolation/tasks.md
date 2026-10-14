@@ -1,7 +1,7 @@
 # Tasks: B03 Four Transaction Isolation Levels
 
 **Feature**: `007-b03-transaction-isolation`  
-**Status**: 29 tasks completed (Phase 1 Setup & Proof, Phase 2 Grammar & Session, and Phase 3 Read View & GC completed). Phase 4–9 pending user authorization.
+**Status**: 36 tasks completed (Phase 1 Setup & Proof, Phase 2 Grammar & Session, Phase 3 Read View & GC, and Phase 4 REPEATABLE READ completed). Phase 5–9 pending user authorization.
 **Format**: `[TID] [P?] [USn] text — FR/SC`. `[P]` 只表示文件独立、前置依赖满足时可并行；并不授权 AI 跳过 Phase。
 **Tests**: 必须先写失败测试，再实现；不能拿静态阅读等同运行验收。
 
@@ -83,13 +83,13 @@
 
 **Goal**: 默认 RR 首次一致读固定视图。
 
-- [ ] **T030** 先写 M08–M12 红测，特别是 BEGIN 后首次 plain SELECT 前另一个事务已经 COMMIT 与首次空结果范围。  _Trace: FR-009/035; SC-003_
-- [ ] **T031** 在 `mvcc/transaction.go` + optional adapter/SQL begin/view 里实现 RR 首个 consistent read 才 pin，且第二次复用同一个 view。  _Trace: FR-009/016; SC-003_
-- [ ] **T032** 在 `executor/transaction_engine.go` 将普通 SELECT/read source 与 B02 `FOR UPDATE/SHARE` current 分离；锁定读不提前创建 RR consistent view。  _Trace: FR-009/013/035; SC-003_
-- [ ] **T033** 给 RR own writes/tombstones/savepoint/child-inherited view 加回归，保证 A05 parent-read/child-write。  _Trace: FR-015/016; SC-003/006_
-- [ ] **T034** 补 RR range/empty predicates、rollback/commit、GC/Restore 和长事务占用的确定性测试。  _Trace: FR-009/016/032; SC-003/007_
-- [ ] **T035** 核对旧 public storageengine.Txn Snapshot、`Command.Snapshot`、B01 readTS validator 兼容或有明确安全迁移证明。  _Trace: FR-014/024/025/030; SC-010_
-- [ ] **T036** Phase 4 gate：M08–M12+M37 通过，B02 FOR UPDATE/SHARE/CurrentRead、旧备份恢复测试通过并归档。  _Trace: FR-013/030/031; SC-003/010_
+- [x] **T030** 先写 M08–M12 红测，特别是 BEGIN 后首次 plain SELECT 前另一个事务已经 COMMIT 与首次空结果范围。  _Trace: FR-009/035; SC-003_
+- [x] **T031** 在 `mvcc/transaction.go` + optional adapter/SQL begin/view 里实现 RR 首个 consistent read 才 pin，且第二次复用同一个 view。  _Trace: FR-009/016; SC-003_
+- [x] **T032** 在 `executor/transaction_engine.go` 将普通 SELECT/read source 与 B02 `FOR UPDATE/SHARE` current 分离；锁定读不提前创建 RR consistent view。  _Trace: FR-009/013/035; SC-003_
+- [x] **T033** 给 RR own writes/tombstones/savepoint/child-inherited view 加回归，保证 A05 parent-read/child-write。  _Trace: FR-015/016; SC-003/006_
+- [x] **T034** 补 RR range/empty predicates、rollback/commit、GC/Restore 和长事务占用的确定性测试。  _Trace: FR-009/016/032; SC-003/007_
+- [x] **T035** 核对旧 public storageengine.Txn Snapshot、`Command.Snapshot`、B01 readTS validator 兼容或有明确安全迁移证明。  _Trace: FR-014/024/025/030; SC-010_
+- [x] **T036** Phase 4 gate：M08–M12+M37 通过，B02 FOR UPDATE/SHARE/CurrentRead、旧备份恢复测试通过并归档。  _Trace: FR-013/030/031; SC-003/010_
 
 **Checkpoint P4**: 只有本阶段真实证据齐备、阻塞问题关闭且用户授权下一阶段后方可继续。
 

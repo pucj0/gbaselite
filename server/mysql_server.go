@@ -248,6 +248,7 @@ func (s *MySQLServer) handleConnection(raw net.Conn) {
 	packet.Capabilities = response.Capabilities & capabilities
 	s.Logger.Printf("client authenticated id=%d user=%s capabilities=0x%08x database=%s", id, response.Username, packet.Capabilities, response.Database)
 	session := &executor.Session{CurrentDatabase: response.Database, StreamResults: true, Username: account.Username, Host: account.Host, RemoteIP: remoteHost, RemotePort: remotePort, ConnectionID: id, SecureTransport: secureTransport, TLSVersion: tlsVersion, TLSCipher: tlsCipher, JournalSessionID: fmt.Sprintf("%d-%d", time.Now().UnixNano(), id)}
+	session.EnableIsolation()
 	session.ServerTimeZone = s.DefaultTimeZone
 	if s.DefaultTimeZone != "" {
 		if err := session.SetTimeZone(s.DefaultTimeZone); err != nil {

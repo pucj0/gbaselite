@@ -100,8 +100,12 @@ func (s *Store) CompactHistory(ctx context.Context) error {
 					}
 				}
 				done = true
+				_ = tx.Bucket(metaBucket).Put([]byte("compacted_horizon"), sequence(horizon))
 				return nil
 			})
+			if err == nil {
+				s.txns.RecordCompactedHorizon(horizon)
+			}
 			return done, err
 		}()
 		if err != nil {

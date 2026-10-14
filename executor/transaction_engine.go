@@ -333,7 +333,13 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		if err := e.checkIsolationCapability(targetLevel); err != nil {
 			return nil, err
 		}
-		tx, err := e.Backend.Begin(ctx)
+		var tx storageengine.Txn
+		var err error
+		if session.IsolationEnabled() {
+			tx, err = e.beginIsolatedTransaction(ctx, targetLevel)
+		} else {
+			tx, err = e.Backend.Begin(ctx)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -382,7 +388,11 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 			return nil, err
 		}
 		var err error
-		tx, err = e.Backend.Begin(ctx)
+		if session.IsolationEnabled() {
+			tx, err = e.beginIsolatedTransaction(ctx, targetLevel)
+		} else {
+			tx, err = e.Backend.Begin(ctx)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -396,7 +406,11 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 			return nil, err
 		}
 		var err error
-		tx, err = e.Backend.Begin(ctx)
+		if session.IsolationEnabled() {
+			tx, err = e.beginIsolatedTransaction(ctx, targetLevel)
+		} else {
+			tx, err = e.Backend.Begin(ctx)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -407,18 +421,24 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 	if automatic {
 		autoRollbackTx = tx
 	}
-	if isoTxn, ok := tx.(storageengine.IsolationTxn); ok {
-		var viewErr error
-		if automatic {
-			view, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindStatement)
-			if err != nil {
-				return nil, err
-			}
-			closeViewOnExit = view
-		} else {
-			_, viewErr = isoTxn.BeginConsistentView(ctx)
-			if viewErr != nil {
-				return nil, viewErr
+	if session.IsolationEnabled() {
+		if isoTxn, ok := tx.(storageengine.IsolationTxn); ok {
+			var viewErr error
+			if automatic {
+				if isPlainConsistentRead(statement) {
+					view, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindStatement)
+					if err != nil {
+						return nil, err
+					}
+					closeViewOnExit = view
+				}
+			} else {
+				if isPlainConsistentRead(statement) {
+					_, viewErr = isoTxn.BeginConsistentView(ctx)
+					if viewErr != nil {
+						return nil, viewErr
+					}
+				}
 			}
 		}
 	}
@@ -601,4 +621,29 @@ func (e *Engine) SetAutocommit(session *Session, enabled bool) error {
 	}
 	session.AutocommitDisabled = !enabled
 	return nil
+}
+
+func (e *Engine) beginIsolatedTransaction(ctx context.Context, level parser.IsolationLevel) (storageengine.Txn, error) {
+	if isoEngine, ok := e.Backend.(storageengine.IsolationEngine); ok {
+		return isoEngine.BeginIsolated(ctx, storageengine.IsolationLevel(level))
+	}
+	return e.Backend.Begin(ctx)
+}
+
+func isPlainConsistentRead(statement parser.Statement) bool {
+	switch s := statement.(type) {
+	case parser.Select:
+		return !s.Locking
+	case parser.With:
+		if sel, ok := s.Query.(parser.Select); ok {
+			return !sel.Locking
+		}
+		return true
+	case parser.WithRecursive:
+		return true
+	case parser.Union:
+		return true
+	default:
+		return false
+	}
 }

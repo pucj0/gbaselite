@@ -330,3 +330,49 @@ func TestP3Fix05_HistoryHorizonAndBudgetLimit(t *testing.T) {
 		t.Fatalf("RegisterView overflow returned %v, want ErrViewBudgetLimit", err)
 	}
 }
+
+// TestP4Prereq_CompactHistoryPurgesUnpinnedHistory demonstrates the historical snapshot availability gap:
+// after CompactHistory purges unpinned revisions 1 and 2, attempting to register a view at revision 1
+// must be rejected, rather than handing out a truncated snapshot where row1 is missing.
+func TestP4Prereq_CompactHistoryPurgesUnpinnedHistory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. Commit V1
+	tx1, _ := s.Begin(ctx, s)
+	_ = tx1.Put("data", []byte("k1"), []byte("v1"))
+	_, _ = tx1.Commit(ctx)
+
+	// 2. Commit V2
+	tx2, _ := s.Begin(ctx, s)
+	_ = tx2.Put("data", []byte("k1"), []byte("v2"))
+	_, _ = tx2.Commit(ctx)
+
+	// 3. Commit V3
+	tx3, _ := s.Begin(ctx, s)
+	_ = tx3.Put("data", []byte("k1"), []byte("v3"))
+	_, _ = tx3.Commit(ctx)
+
+	// Ensure no active transactions
+	if stats := s.txns.Stats(); stats.ActiveRoot != 0 || stats.HasOldestReadTS {
+		t.Fatalf("expected no active transactions, got %+v", stats)
+	}
+
+	// 4. Run CompactHistory. Because there are no active pins, horizon advances to Head (3)
+	// and version 1 is physically deleted from the bbolt database!
+	if err := s.CompactHistory(ctx); err != nil {
+		t.Fatalf("CompactHistory: %v", err)
+	}
+
+	// 5. Attempt to request view at revision 1: must be rejected because revision 1 was purged!
+	_, err = s.BeginViewTokenAt(ctx, nil, 1)
+	if err == nil {
+		t.Fatalf("BeginViewTokenAt for purged revision 1 unexpectedly succeeded! Must be rejected.")
+	}
+}
