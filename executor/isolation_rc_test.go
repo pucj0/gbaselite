@@ -521,7 +521,7 @@ func TestT045_RC_LongTransactionGCRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 1; i <= 20; i++ {
+	for i := 1; i <= 100; i++ {
 		// Session B commits new version
 		valB := fmt.Sprintf("V%d", i)
 		if _, err := e.Execute(sB, fmt.Sprintf("UPDATE t SET v = '%s' WHERE id = 1;", valB)); err != nil {

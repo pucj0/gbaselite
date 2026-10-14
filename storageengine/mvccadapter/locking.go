@@ -189,6 +189,10 @@ func (t *txn) ReadCurrent(ctx context.Context, grant storageengine.LockGrant, sp
 	if err != nil {
 		return storageengine.CurrentObservation{}, neutralLockError(err)
 	}
+	root := t.root()
+	if root != nil && root.inner != nil && observation.ChangeTS > root.inner.Snapshot && observation.Source != mvcc.CurrentOwnOverlay {
+		root.inner.RecordObservationBaseline(space, key, observation.ChangeTS)
+	}
 	return neutralObservation(observation), nil
 }
 

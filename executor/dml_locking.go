@@ -321,7 +321,7 @@ func staleTargetObservation(txn storageengine.Txn, observation storageengine.Cur
 			if view, ok := isoTxn.ActiveView(); ok {
 				return observation.ChangeTS > view.Revision()
 			}
-			return false
+			return true
 		}
 	}
 	return observation.ChangeTS > txn.Snapshot()

@@ -249,6 +249,34 @@ func (t *Tx) recordWriteBaseline(space string, rowKey []byte, observation Curren
 	t.writeBaseline[string(k)] = version
 }
 
+// RecordObservationBaseline records a verified observation baseline on this root transaction.
+func (t *Tx) RecordObservationBaseline(space string, rowKey []byte, version uint64) {
+	k, err := key(space, rowKey)
+	if err != nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return
+	}
+	if t.writeBaseline == nil {
+		t.writeBaseline = make(map[string]uint64, 8)
+	}
+	if current, ok := t.writeBaseline[string(k)]; ok {
+		if current > version {
+			return
+		}
+		t.writeBaseline[string(k)] = version
+		return
+	}
+	if len(t.writeBaseline) >= maxObservationBaselines {
+		t.baselineRejections++
+		return
+	}
+	t.writeBaseline[string(k)] = version
+}
+
 // maxObservationBaselines bounds the per-key observation baselines one transaction may hold.
 //
 // A baseline is only recorded for a key the transaction successfully locked, so the natural

@@ -61,6 +61,7 @@ type viewEntry struct {
 	revision   uint64
 	generation uint64
 	pinned     bool
+	borrowers  int
 }
 
 // ViewInfo is a diagnostics summary of one registered read view.
@@ -409,8 +410,10 @@ func (m *TransactionManager) releaseRootViewsLocked(rootID string) {
 	for viewID := range views {
 		if v := m.viewsByID[viewID]; v != nil && v.pinned {
 			v.pinned = false
-			m.releaseRevisionRefLocked(v.revision)
-			delete(m.viewsByID, viewID)
+			if v.borrowers <= 0 {
+				m.releaseRevisionRefLocked(v.revision)
+				delete(m.viewsByID, viewID)
+			}
 		}
 	}
 	delete(m.viewsByRoot, rootID)
@@ -498,13 +501,45 @@ func (m *TransactionManager) ReleaseView(viewID string) {
 		return
 	}
 	entry.pinned = false
-	m.releaseRevisionRefLocked(entry.revision)
-	delete(m.viewsByID, viewID)
 	if entry.rootID != "" && m.viewsByRoot[entry.rootID] != nil {
 		delete(m.viewsByRoot[entry.rootID], viewID)
 		if len(m.viewsByRoot[entry.rootID]) == 0 {
 			delete(m.viewsByRoot, entry.rootID)
 		}
+	}
+	if entry.borrowers <= 0 {
+		m.releaseRevisionRefLocked(entry.revision)
+		delete(m.viewsByID, viewID)
+	}
+}
+
+// BorrowView increments the active borrower count on a registered read view.
+func (m *TransactionManager) BorrowView(viewID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.viewsByID[viewID]
+	if entry == nil || !entry.pinned {
+		return storageengine.ErrViewClosed
+	}
+	entry.borrowers++
+	return nil
+}
+
+// ReturnView decrements the borrower count and releases the retention pin
+// if the view has already been unpinned/closed and no borrowers remain.
+func (m *TransactionManager) ReturnView(viewID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.viewsByID[viewID]
+	if entry == nil {
+		return
+	}
+	if entry.borrowers > 0 {
+		entry.borrowers--
+	}
+	if !entry.pinned && entry.borrowers <= 0 {
+		m.releaseRevisionRefLocked(entry.revision)
+		delete(m.viewsByID, viewID)
 	}
 }
 
@@ -525,7 +560,7 @@ func (m *TransactionManager) ActiveViews() []ViewInfo {
 	defer m.mu.RUnlock()
 	views := make([]ViewInfo, 0, len(m.viewsByID))
 	for _, v := range m.viewsByID {
-		if v.pinned {
+		if v.pinned || v.borrowers > 0 {
 			views = append(views, ViewInfo{
 				ID:         v.id,
 				RootID:     v.rootID,

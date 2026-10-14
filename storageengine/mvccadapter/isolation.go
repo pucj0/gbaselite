@@ -144,10 +144,6 @@ func (t *txn) BeginStatementView(ctx context.Context, kind storageengine.Stateme
 	}
 	v := &mvccReadView{token: token, kind: kind, txn: t}
 	t.activeView = v
-	if t.isolationLevel == storageengine.IsolationReadCommitted && t.inner != nil {
-		t.inner.Snapshot = token.Revision()
-		t.engine.store.UpdateRootReadTS(t.inner.ID, token.Revision())
-	}
 	return v, nil
 }
 
@@ -199,6 +195,10 @@ func (t *txn) ensureRootConsistentView(ctx context.Context) (*mvccReadView, erro
 func (t *txn) ActiveView() (storageengine.ReadView, bool) {
 	if t.activeView != nil && t.activeView.State() == storageengine.ViewStateActive {
 		return t.activeView, true
+	}
+	root := t.root()
+	if root != nil && root != t && root.activeView != nil && root.activeView.State() == storageengine.ViewStateActive {
+		return root.activeView, true
 	}
 	return nil, false
 }

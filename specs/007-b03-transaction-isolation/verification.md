@@ -470,3 +470,67 @@
 - [x] **README 与 tasks.md 均已完成同步**。
 
 **结论：GBaseLite B03 Phase 5 最终 Gate 正式通过，完全具备进入 Phase 6（SERIALIZABLE）的技术前置条件。**
+
+---
+
+## 20. Phase 5 Review Remediation (P5-FIX-01 至 P5-FIX-05)
+
+- **基线 Commit**: `cdccfe6c1911c0da03afd620db69cefc23ecdf3a`
+- **审查与修复项详情**:
+
+### 1. P5-FIX-01：RC Statement View 不得覆盖写入验证基准 (P0 - RESOLVED)
+- **原因与风险**: 原实现在 `BeginStatementView` 中执行 `t.inner.Snapshot = token.Revision()`，全局刷新了事务的快照时间戳。这导致在先前语句声明的乐观依赖（如 `Guard`）在提交校验时被按较新的读取水位放宽，使并发提交的修改被悄悄绕过；
+- **红测先行**:
+  - `TestP5Fix01_RedTestA_CrossStatementGuardBypass`: 事务在语句 1 Guard `dep`，并发事务更新 `dep` 并提交，事务在语句 2 打开新视图修改不相关键，提交时意外成功未报 `ErrConflict` 的红测失败（`txA Commit returned <nil>, want ErrConflict`）；
+- **修复方案**:
+  1. 彻底移除在 `BeginStatementView` 中对 `t.inner.Snapshot` 的修改，保证事务起始 `Snapshot` 永久不可变，乐观 `Guard` 永远基于起始水位严格校验；
+  2. 针对合法的持锁当前写（Red Test B），在 `storageengine/mvccadapter/locking.go:ReadCurrent` 中增加判断：当覆盖锁下观察到的版本 `obs.ChangeTS > root.Snapshot` 且非自身 overlay 时，显式调用 `root.inner.RecordObservationBaseline(space, key, obs.ChangeTS)` 记录观察基准；
+  3. 提交校验时，持锁写按 `v.baseline` 校验（无假冲突），乐观 Guard 校验按 `v.readTS`（无绕过）；
+- **绿测证据**:
+  - `TestP5Fix01_RedTestA_CrossStatementGuardBypass` (PASS)
+  - `TestP5Fix01_RedTestB_LegalRCCurrentWrite` (PASS)
+  - `TestP5Fix01_RedTestC_MultipleStatementViewsAccumulatingDependencies` (PASS：10 个语句视图累积依赖，早期 Guard 严格冲突拦截，合法的持锁写成功提交)。
+
+### 2. P5-FIX-02：RC staleTargetObservation 不得读取错误的事务视图 (P0 - RESOLVED)
+- **原因与风险**: DML 修改管线传入 `write`（即语句 Child 事务），而 `StatementView` 挂载在 `read`（Root 事务）上。原 `staleTargetObservation` 调用 `write.ActiveView()` 得到 nil，直接返回 false，导致等待锁期间被其他事务修改的目标行无法被识别为陈旧目标，从而以旧值覆盖新值；
+- **红测先行**: `TestP5Fix02_StaleTargetObservationOnChild`：通过 `dmlLockRequestHook` 在 A 选中候选行后暂停，B 修改同键并提交，A 随后获锁。原代码未检测出 stale target 意外成功（`A UPDATE unexpectedly succeeded! Must fail with stale target conflict`）；
+- **修复方案**:
+  1. `txn.ActiveView()` 在 Child 上自动向 `rootTxn.ActiveView()` 委托查询；
+  2. `staleTargetObservation` 在无法获取 ActiveView 时 fail-closed 返回 true；
+  3. A 获锁后对比 `observation.ChangeTS > view.Revision()` 准确判定目标过期并报错终止事务；
+- **绿测证据**: `TestP5Fix02_StaleTargetObservationOnChild` (PASS)。
+
+### 3. P5-FIX-03：Borrowed Iterator 与 Root 终态 GC Pin 冲突 (P1 - RESOLVED)
+- **原因与风险**: `TransactionManager.releaseRootViewsLocked()` 在 Root 终态（Commit/Rollback/Unregister）时无条件删除名下所有视图并释放 Pin。若此时存在借用该视图读取多页数据的活动迭代器，GC Pin 会被提前释放，并发 `CompactHistory` 随后可能物理清理迭代器尚未读取的后续页面版本；
+- **修复方案**:
+  1. `TransactionManager` 的 `viewEntry` 增加 `borrowers int` 借用计数；
+  2. `BorrowView` / `ReturnView` 在全局锁保护下原子管理借用状态；
+  3. `ReleaseView` 与 `releaseRootViewsLocked` 仅标记 `pinned = false`；若 `borrowers > 0`，保留 `snapshotRefs` Pin 直至最后一个借用者调用 `ReturnView`；
+  4. 视图 unpinned 后拒绝新的借用（返回 `ErrViewClosed`），而已持有的在途扫描受 Pin 保护安全完成；
+- **绿测证据**: `TestP5Fix03_BorrowedIteratorProtectsAgainstRootTerminalAndGC` (PASS：300 行跨分页扫描在 Root 提前提交且 `CompactHistory` 运行的情况下，迭代器借用保护生效，顺利读完 V1 数据后 Pin 归零)。
+
+### 4. P5-FIX-04：加强 M18 并发写验收 (P1 - RESOLVED)
+- **改进测试**: `TestP5Fix04_StrengthenedM18_ConcurrentUpdatesNoLostUpdate`：采用计数器累加模型（初始 10，A 累加 5，B 累加 10），验证通道同步锁等待与最终确定性断言（若串行成功则为 25；若检测过期则 A 的 15 绝不丢失）。
+- **绿测证据**: `TestP5Fix04_StrengthenedM18_ConcurrentUpdatesNoLostUpdate` (PASS)。
+
+### 5. P5-FIX-05：100 条语句与真实 GC 生命周期计量 (P1 - RESOLVED)
+- **改进测试**: `TestT045_RC_LongTransactionGCRetention` 由 20 轮扩展为 100 轮循环：每轮并发提交新版本、A 建立视图读取、触发 `CompactHistory` 推进历史；
+- **实测指标**:
+  - 每条语句结束后视图 Pin 立即精确归零；
+  - 100 轮执行期间活跃 View 数始终保持在 0，未发生内存或 Pin 单调累积；
+  - Root 事务最终正常 Commit。
+- **绿测证据**: `TestT045_RC_LongTransactionGCRetention` (PASS：耗时 3.2s)。
+
+---
+
+## 21. 全量回归与最终门禁状态
+
+1. **测试结果**:
+   - `protocol`、`parser`、`server`、`mvcc`、`storageengine`、`executor`、`failover`、`replication` 等全库 21 个测试包全部通过（`go test ./... -count=1` 退出码 0，总耗时 ~327s）；
+   - P5-FIX 相关确定性测试分别执行 100 轮（`-count=100`），全部 100% 通过（0 FAIL）；
+   - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean。
+2. **Race Detector 说明**:
+   - 当前 Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
+3. **Phase 6 准入结论**:
+   - **P5-FIX-01 至 P5-FIX-05 全部彻底关闭**；
+   - **GBaseLite B03 Phase 5 最终 Gate 确认通过**，已完全具备进入 Phase 6（SERIALIZABLE）的技术条件。

@@ -146,6 +146,9 @@ func (v *ViewToken) BeginBorrow() error {
 	if v.generation != v.store.generation.Load() {
 		return storageengine.ErrViewInvalidated
 	}
+	if err := v.store.txns.BorrowView(v.id); err != nil {
+		return err
+	}
 	v.borrowers++
 	return nil
 }
@@ -155,10 +158,7 @@ func (v *ViewToken) EndBorrow() {
 	defer v.rw.Unlock()
 	if v.borrowers > 0 {
 		v.borrowers--
-	}
-	if v.closed && v.borrowers == 0 && !v.pinReleased {
-		v.pinReleased = true
-		v.store.txns.ReleaseView(v.id)
+		v.store.txns.ReturnView(v.id)
 	}
 }
 
@@ -211,12 +211,7 @@ func (v *ViewToken) Close() error {
 		return nil
 	}
 	v.closed = true
-	if v.borrowers == 0 && !v.pinReleased {
-		v.pinReleased = true
-		v.rw.Unlock()
-		v.store.txns.ReleaseView(v.id)
-		return nil
-	}
 	v.rw.Unlock()
+	v.store.txns.ReleaseView(v.id)
 	return nil
 }
