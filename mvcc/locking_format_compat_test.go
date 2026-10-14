@@ -190,3 +190,65 @@ func TestT068GenuineB01FixtureOpenAndRestoreWithLockInvalidation(t *testing.T) {
 		t.Fatalf("commit new transaction failed: %v", err)
 	}
 }
+
+func TestT068StoreLocalWALReplayAndRestartRecovery(t *testing.T) {
+	tempDir := t.TempDir()
+	ctx := context.Background()
+
+	// 1. Open with LocalWAL enabled and attach LockManager
+	s1, err := OpenWithOptions(tempDir, Options{LocalWAL: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lm1, err := lockmanager.NewManager(lockmanager.BudgetLimits{}, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1.AttachLocks(lm1)
+
+	// 2. Commit transaction via WAL
+	tx1, err := s1.Begin(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx1.Put("wal_space", []byte("wal_k1"), []byte("wal_v1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx1.Commit(ctx); err != nil {
+		t.Fatalf("WAL commit failed: %v", err)
+	}
+	lm1.Close()
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Re-open store from same directory: triggers WAL recovery / replay
+	s2, err := OpenWithOptions(tempDir, Options{LocalWAL: true})
+	if err != nil {
+		t.Fatalf("reopening store failed: %v", err)
+	}
+	defer s2.Close()
+
+	// 4. Verify recovered data is intact
+	tx2, err := s2.Begin(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx2.Rollback()
+	val, _, err := tx2.Get("wal_space", []byte("wal_k1"))
+	if err != nil || string(val) != "wal_v1" {
+		t.Fatalf("WAL replayed data mismatch: val=%s, err=%v", string(val), err)
+	}
+
+	// 5. Attach fresh LockManager to reopened store
+	lm2, err := lockmanager.NewManager(lockmanager.BudgetLimits{}, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lm2.Close()
+	s2.AttachLocks(lm2)
+
+	if lm2.LockTableSize() != 0 || lm2.Stats().ActiveOwners != 0 {
+		t.Fatalf("fresh lock manager after reopen has residue")
+	}
+}
