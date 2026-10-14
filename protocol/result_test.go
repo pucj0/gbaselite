@@ -3,6 +3,9 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
+	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -133,4 +136,128 @@ func TestAutocommitStatusIndependentOfTransaction(t *testing.T) {
 			t.Fatal(c, got)
 		}
 	}
+}
+
+type p3MockFailConn struct {
+	net.Conn
+	failAfter int
+	written   int
+}
+
+func (c *p3MockFailConn) Write(b []byte) (int, error) {
+	c.written++
+	if c.written > c.failAfter {
+		return 0, errors.New("mock network write failure")
+	}
+	return len(b), nil
+}
+func (c *p3MockFailConn) Read(b []byte) (int, error)         { return 0, io.EOF }
+func (c *p3MockFailConn) Close() error                       { return nil }
+func (c *p3MockFailConn) LocalAddr() net.Addr                { return nil }
+func (c *p3MockFailConn) RemoteAddr() net.Addr               { return nil }
+func (c *p3MockFailConn) SetDeadline(t time.Time) error      { return nil }
+func (c *p3MockFailConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *p3MockFailConn) SetWriteDeadline(t time.Time) error { return nil }
+
+func TestP3Fix01_ProtocolWriteResultLifecycle(t *testing.T) {
+	makeResult := func(closed *bool, streamRows int) *executor.Result {
+		r := &executor.Result{
+			Columns: []executor.Column{{Name: "id", Type: storage.TypeInt}},
+		}
+		// In executor, result cleanup is wired to Result.Close() via executor.SetResultCleanup or similar
+		r.StreamRows = func(yield func([]any) error) error {
+			for i := 0; i < streamRows; i++ {
+				if err := yield([]any{int64(i)}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return r
+	}
+
+	// 1. WriteResult fails on packet 1 (column count) -> Result.Close must be called
+	t.Run("WriteResult_FailOnColumnCount", func(t *testing.T) {
+		closed := false
+		res := makeResult(&closed, 5)
+		res.SetCleanup(func() { closed = true })
+		conn := &p3MockFailConn{failAfter: 0}
+		pConn := &PacketConn{Conn: conn}
+
+		err := WriteResult(pConn, res, "db", "t")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !closed {
+			t.Fatalf("expected Result.Close() to be called on column count write failure")
+		}
+	})
+
+	// 2. WriteResult fails on packet 2 (column def) -> Result.Close must be called
+	t.Run("WriteResult_FailOnColumnDef", func(t *testing.T) {
+		closed := false
+		res := makeResult(&closed, 5)
+		res.SetCleanup(func() { closed = true })
+		conn := &p3MockFailConn{failAfter: 1}
+		pConn := &PacketConn{Conn: conn}
+
+		err := WriteResult(pConn, res, "db", "t")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !closed {
+			t.Fatalf("expected Result.Close() to be called on column def write failure")
+		}
+	})
+
+	// 3. WriteResult fails on packet 3 (EOF) -> Result.Close must be called
+	t.Run("WriteResult_FailOnEOF", func(t *testing.T) {
+		closed := false
+		res := makeResult(&closed, 5)
+		res.SetCleanup(func() { closed = true })
+		conn := &p3MockFailConn{failAfter: 2}
+		pConn := &PacketConn{Conn: conn}
+
+		err := WriteResult(pConn, res, "db", "t")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !closed {
+			t.Fatalf("expected Result.Close() to be called on EOF write failure")
+		}
+	})
+
+	// 4. WriteBinaryResult fails on packet 1 -> Result.Close must be called
+	t.Run("WriteBinaryResult_FailOnColumnCount", func(t *testing.T) {
+		closed := false
+		res := makeResult(&closed, 5)
+		res.SetCleanup(func() { closed = true })
+		conn := &p3MockFailConn{failAfter: 0}
+		pConn := &PacketConn{Conn: conn}
+
+		err := WriteBinaryResult(pConn, res, "db", "t")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !closed {
+			t.Fatalf("expected Result.Close() to be called on binary column count write failure")
+		}
+	})
+
+	// 5. Successful WriteResult -> Result.Close must be called
+	t.Run("WriteResult_SuccessFullStream", func(t *testing.T) {
+		closed := false
+		res := makeResult(&closed, 2)
+		res.SetCleanup(func() { closed = true })
+		conn := &p3MockFailConn{failAfter: 100}
+		pConn := &PacketConn{Conn: conn}
+
+		err := WriteResult(pConn, res, "db", "t")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !closed {
+			t.Fatalf("expected Result.Close() to be called on successful stream completion")
+		}
+	})
 }

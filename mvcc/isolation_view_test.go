@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"gbaselite/storageengine"
@@ -13,10 +14,10 @@ import (
 func TestViewToken_LifecycleAndPin(t *testing.T) {
 	m := NewTransactionManager()
 
-	// Register a view at revision 10
+	// Register a standalone view at revision 10
 	reg := ViewRegistration{
 		ID:         "v1",
-		RootID:     "root-1",
+		RootID:     "",
 		Revision:   10,
 		Generation: 1,
 	}
@@ -53,7 +54,7 @@ func TestViewToken_LifecycleAndPin(t *testing.T) {
 func TestViewToken_RootOwnershipAndAutoCleanup(t *testing.T) {
 	m := NewTransactionManager()
 
-	registerTestRoot(t, m, "root-1", 50)
+	registerTestRoot(t, m, "root-1", 30)
 	if err := m.RegisterView(ViewRegistration{ID: "v1", RootID: "root-1", Revision: 30, Generation: 1}); err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +62,7 @@ func TestViewToken_RootOwnershipAndAutoCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// OldestReadTS should be 30 (the oldest view pin)
+	// OldestReadTS should be 30
 	if oldest, ok := m.OldestReadTS(); !ok || oldest != 30 {
 		t.Fatalf("OldestReadTS = (%d, %v), want (30, true)", oldest, ok)
 	}
@@ -76,9 +77,6 @@ func TestViewToken_RootOwnershipAndAutoCleanup(t *testing.T) {
 	}
 	if count := managerRefCount(t, m, 40); count != 0 {
 		t.Fatalf("snapshotRefs[40] = %d, want 0 after root commit", count)
-	}
-	if count := managerRefCount(t, m, 50); count != 0 {
-		t.Fatalf("snapshotRefs[50] = %d, want 0 after root commit", count)
 	}
 	if _, ok := m.OldestReadTS(); ok {
 		t.Fatalf("OldestReadTS should be unset after all views and root are released")
@@ -226,5 +224,109 @@ func TestViewToken_EpochResetOnRestore(t *testing.T) {
 	_, _, err = view.Get("data", []byte("k"))
 	if !errors.Is(err, storageengine.ErrViewInvalidated) {
 		t.Fatalf("Get after restore returned %v, want ErrViewInvalidated", err)
+	}
+}
+
+// TestP3Fix04_ViewStateInvalidatedAndRootOwnership covers P3-FIX-04.
+func TestP3Fix04_ViewStateInvalidatedAndRootOwnership(t *testing.T) {
+	m := NewTransactionManager()
+
+	// 1. Root ownership validation: cannot register view for non-existent root
+	err := m.RegisterView(ViewRegistration{
+		ID:         "v-orphan",
+		RootID:     "non-existent-root",
+		Revision:   10,
+		Generation: 1,
+	})
+	if err == nil {
+		t.Fatalf("RegisterView with non-existent root unexpectedly succeeded")
+	}
+
+	// Cannot register view for ended root
+	registerTestRoot(t, m, "root-ended", 10)
+	_ = m.Transition("root-ended", TransactionCommitted, TransitionOptions{})
+	err = m.RegisterView(ViewRegistration{
+		ID:         "v-ended",
+		RootID:     "root-ended",
+		Revision:   10,
+		Generation: 1,
+	})
+	if err == nil {
+		t.Fatalf("RegisterView with ended root unexpectedly succeeded")
+	}
+
+	// 2. ViewToken.State() reflects ViewStateInvalidated after Restore
+	dir := filepath.Join(t.TempDir(), "store")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	tx, _ := s.Begin(ctx, s)
+	_ = tx.Put("data", []byte("k"), []byte("val"))
+	_, _ = tx.Commit(ctx)
+
+	backupPath := filepath.Join(t.TempDir(), "backup.json")
+	if _, err := s.Backup(ctx, backupPath); err != nil {
+		t.Fatal(err)
+	}
+
+	view, err := s.BeginViewToken(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+
+	if view.State() != storageengine.ViewStateActive {
+		t.Fatalf("view state before restore = %v, want ACTIVE", view.State())
+	}
+
+	if err := s.RestoreBackup(ctx, backupPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if view.State() != storageengine.ViewStateInvalidated {
+		t.Fatalf("view state after restore = %v, want INVALIDATED", view.State())
+	}
+}
+
+// TestP3Fix05_HistoryHorizonAndBudgetLimit covers P3-FIX-05:
+// cannot register unpinned view below GC horizon, and view budget limits are enforced.
+func TestP3Fix05_HistoryHorizonAndBudgetLimit(t *testing.T) {
+	m := NewTransactionManager()
+
+	// 1. Cannot register view below GC horizon if not already pinned
+	registerTestRoot(t, m, "root-1", 50) // horizon is 50
+	err := m.RegisterView(ViewRegistration{
+		ID:         "v-stale",
+		Revision:   20, // 20 is below horizon 50, and 20 has 0 refs!
+		Generation: 1,
+	})
+	if err == nil {
+		t.Fatalf("RegisterView below GC horizon unexpectedly succeeded")
+	}
+
+	// 2. Budget limit enforcement
+	for i := 0; i < DefaultMaxActiveViews; i++ {
+		err := m.RegisterView(ViewRegistration{
+			ID:         "v-budget-" + strconv.Itoa(i),
+			Revision:   50, // 50 is pinned by root-1
+			Generation: 1,
+		})
+		if err != nil {
+			t.Fatalf("RegisterView %d: %v", i, err)
+		}
+	}
+
+	// Registering one more must fail with ErrViewBudgetLimit
+	err = m.RegisterView(ViewRegistration{
+		ID:         "v-budget-overflow",
+		Revision:   50,
+		Generation: 1,
+	})
+	if !errors.Is(err, storageengine.ErrViewBudgetLimit) {
+		t.Fatalf("RegisterView overflow returned %v, want ErrViewBudgetLimit", err)
 	}
 }

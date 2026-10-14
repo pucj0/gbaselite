@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"gbaselite/storageengine"
 )
 
 // Registry errors. They are defensive invariants rather than SQL-visible
@@ -409,6 +411,13 @@ func (m *TransactionManager) releaseRootViewsLocked(rootID string) {
 	delete(m.viewsByRoot, rootID)
 }
 
+const (
+	// DefaultMaxActiveViews bounds the total number of live registered read views in this manager.
+	DefaultMaxActiveViews = 16384
+	// DefaultMaxViewsPerRoot bounds the number of live read views owned by one root transaction.
+	DefaultMaxViewsPerRoot = 256
+)
+
 // RegisterView registers an isolated read view and pins its snapshot revision for GC retention.
 func (m *TransactionManager) RegisterView(registration ViewRegistration) error {
 	if registration.ID == "" {
@@ -416,9 +425,39 @@ func (m *TransactionManager) RegisterView(registration ViewRegistration) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if len(m.viewsByID) >= DefaultMaxActiveViews {
+		return fmt.Errorf("%w: active views budget %d exceeded", storageengine.ErrViewBudgetLimit, DefaultMaxActiveViews)
+	}
+
 	if _, exists := m.viewsByID[registration.ID]; exists {
 		return fmt.Errorf("mvcc: view ID %s collision", registration.ID)
 	}
+
+	if registration.RootID != "" {
+		root := m.activeByID[registration.RootID]
+		if root == nil {
+			return fmt.Errorf("%w: root %s", ErrUnknownTransaction, registration.RootID)
+		}
+		if root.state != TransactionActive {
+			return fmt.Errorf("%w: root %s is %s, not ACTIVE", ErrInvalidRegistration, registration.RootID, root.state)
+		}
+		if root.generation != registration.Generation {
+			return fmt.Errorf("%w: root %s generation %d mismatch view generation %d", ErrInvalidRegistration, registration.RootID, root.generation, registration.Generation)
+		}
+		if len(m.viewsByRoot[registration.RootID]) >= DefaultMaxViewsPerRoot {
+			return fmt.Errorf("%w: root %s views budget %d exceeded", storageengine.ErrViewBudgetLimit, registration.RootID, DefaultMaxViewsPerRoot)
+		}
+	}
+
+	// Historical horizon safety check (P3-FIX-05):
+	// Cannot register a view for an unpinned revision below the current GC horizon.
+	if m.snapshotRefs[registration.Revision] == 0 {
+		if oldest, hasOldest := m.oldestReadTSLocked(); hasOldest && registration.Revision < oldest {
+			return fmt.Errorf("%w: requested revision %d is below GC horizon %d", ErrInvalidRegistration, registration.Revision, oldest)
+		}
+	}
+
 	m.viewsByID[registration.ID] = &viewEntry{
 		id:         registration.ID,
 		rootID:     registration.RootID,

@@ -214,6 +214,11 @@ func (t *Tx) checkOpen() error {
 	return nil
 }
 
+// DeadlockAborted reports whether this transaction was aborted as a deadlock victim.
+func (t *Tx) DeadlockAborted() bool {
+	return t.deadlockAborted()
+}
+
 // Get records one point-read observation. Only counters change: the keys a
 // transaction read are never retained, so a large SELECT cannot grow a read set.
 func (t *Tx) Get(space string, rowKey []byte) ([]byte, bool, error) {

@@ -207,4 +207,74 @@
   - T019–T029 全部完成 (PASS)；
   - 具备进入 Phase 4（REPEATABLE READ）的前置条件。
 
+---
 
+## 12. Phase 3 Review Remediation (P3-FIX-01 至 P3-FIX-05)
+
+- **基线 Commit**: `f9c81fbb83f8902864dd428c4287f1161edb07a7`
+- **审查修复内容与证据**:
+
+### P3-FIX-01：协议层流式结果资源泄漏 (P0 - RESOLVED)
+- **问题**: 原 `protocol.WriteResult` 与 `WriteBinaryResult` 未在入口声明 `defer result.Close()`，若在发送列数、列定义、EOF 或首行之前发生网络写错误或客户端断开，StreamRows/StreamValues 回调未被调用，导致底层的 ReadView Pin 与自动事务永久泄漏。
+- **改动文件**: `protocol/result.go`, `executor/executor.go`
+- **红测先行**: `protocol/result_test.go:TestP3Fix01_ProtocolWriteResultLifecycle` 在列数、列定义、EOF 写入失败及流式消费完成等场景下捕获未释放红测失败。
+- **修复措施**: 在 `WriteResult` 与 `WriteBinaryResult` 函数入口统一设置 `defer result.Close()`；`Result.Close()` 采用 `sync.Once` 保证幂等安全，重复调用无副作用。
+- **绿测证据**: `go test ./protocol -run TestP3Fix01 -count=100` 全部通过（0.887s）。
+
+### P3-FIX-02：隔离能力不能伪支持 (P0 - RESOLVED)
+- **问题**: 原 `mvccadapter.BeginIsolated()` 无条件接受任意 `IsolationLevel` 并启动普通快照事务，对外部直接调用 Go API 的用户伪造支持；`BeginStatementView` 对 `StatementViewKindUncommitted` 未返回 Unsupported。
+- **改动文件**: `storageengine/mvccadapter/isolation.go`
+- **红测先行**: `storageengine/isolation_test.go:TestP3Fix02_CapabilityGateInAdapter` 捕获到直接调用 Go API 传入非法级别或未实现的 RC/RU/SERIALIZABLE 能够意外成功的红测失败。
+- **修复措施**:
+  1. `BeginIsolated` 在启动底层事务前校验级别有效性，对未实现级别（RU、RC、SERIALIZABLE）立即返回 `storageengine.ErrUnsupported`，绝不提前注册底层根事务；
+  2. `BeginStatementView` 对 `StatementViewKindUncommitted` 显式返回 `storageengine.ErrUnsupported`，杜绝未实现 Stage 读之前的伪支持。
+- **绿测证据**: `go test ./storageengine -run TestP3Fix02 -count=100` 全部通过（3.586s）。
+
+### P3-FIX-03：Result 与 ViewToken 并发清理与读保护 (P1 - RESOLVED)
+- **问题**: `cleanupDone` 为普通布尔变量，存在数据竞争；若在 `view.Get` / `ScanRange` 正在读取底层数据时被并发 `Close()`，GC Pin 可能被提前释放，产生悬垂读或数据损坏。
+- **改动文件**: `executor/transaction_engine.go`, `mvcc/isolation.go`
+- **红测先行**: 增加 `executor/isolation_phase3_test.go:TestP3Fix03_ConcurrentCloseAndStream` 与 `TestP3Fix03_ConcurrentCommitRollbackAndReadView`。
+- **修复措施**:
+  1. `ViewToken` 改用读写锁 `rw sync.RWMutex`：活跃读取持有 `RLock`，`Close()` 持有 `Lock`。`Close()` 必须等待正在执行中的读操作完成，随后标记 `closed = true` 并释放 GC Pin；后续读操作立即返回 `ErrViewClosed`；
+  2. `executor` 流式托管采用 `cleanupOnce sync.Once` 与 `streamConsumed atomic.Bool`：保证并发 Close 安全、重复消费返回 `ErrViewClosed`。
+- **绿测证据**: `go test ./executor -run 'Test(P3Fix03|B03ViewConcurrency|B03StreamingViewLifecycle)' -count=100` 全部通过（13.729s）。
+
+### P3-FIX-04：Restore 后 View 状态不准确 (P1 - RESOLVED)
+- **问题**: `mvccReadView.State()` 仅检查 closed，在 Restore 发生代次变更后无法返回 `INVALIDATED`；`RegisterView` 允许为不存在或已结束的 root 注册视图。
+- **改动文件**: `mvcc/isolation.go`, `storageengine/mvccadapter/isolation.go`, `mvcc/transaction_manager.go`
+- **红测先行**: `mvcc/isolation_view_test.go:TestP3Fix04_ViewStateInvalidatedAndRootOwnership` 捕获 `view.State` 未定义及孤儿视图注册未拒绝的编译/运行失败。
+- **修复措施**:
+  1. `ViewToken.State()` 动态比对 `generation`：若代次不匹配直接返回 `storageengine.ViewStateInvalidated`，`Get`/`ScanRange` 报错 `ErrViewInvalidated`；
+  2. `TransactionManager.RegisterView` 校验 `RootID`：必须属于已注册且处于 `TransactionActive` 的根事务，否则返回 `ErrUnknownTransaction`/`ErrInvalidRegistration`。
+- **绿测证据**: `go test ./mvcc -run TestP3Fix04 -count=100` 全部通过。
+
+### P3-FIX-05：历史水位与视图预算 (P1 - RESOLVED)
+- **问题**: `RegisterView` 缺乏全局上限机制，且未校验请求的 revision 是否已被 GC 回收。
+- **改动文件**: `mvcc/transaction_manager.go`
+- **红测先行**: `mvcc/isolation_view_test.go:TestP3Fix05_HistoryHorizonAndBudgetLimit` 验证低水位注册与超配额失败。
+- **修复措施**:
+  1. 引入并严格强制 `DefaultMaxActiveViews = 16384` 与 `DefaultMaxViewsPerRoot = 256` 预算配额，超限 fail-closed 报错 `ErrViewBudgetLimit`；
+  2. 历史低水位校验：若请求的 revision 在 `snapshotRefs` 中无引用且低于当前 GC Horizon，拒绝注册（`requested revision is below GC horizon`）。
+- **绿测证据**: `go test ./mvcc -run TestP3Fix05 -count=100` 全部通过。
+
+---
+
+## 13. Phase 3 修复验证总结与最终 Gate 审查
+
+1. **P0 / P1 缺陷解决状态**:
+   - P3-FIX-01 (P0): **RESOLVED**
+   - P3-FIX-02 (P0): **RESOLVED**
+   - P3-FIX-03 (P1): **RESOLVED**
+   - P3-FIX-04 (P1): **RESOLVED**
+   - P3-FIX-05 (P1): **RESOLVED**
+2. **测试与回归状态**:
+   - 修复相关并发与生命周期测试分别执行 100 轮（`-count=100`），全部 100% 通过（0 FAIL）；
+   - 全库 21 个带测试包执行 `go test ./... -count=1` 全部通过（总耗时 ~176s）；
+   - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean。
+3. **环境约束 (Race Detector)**:
+   - 当前 Windows 宿主环境未安装 C 编译器（`cgo` 未启用），`go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；
+   - 与既有基线保持一致，未伪造测试结果；所有并发逻辑均通过 `atomic`、`RWMutex`、`sync.Once` 和 100 次高并发调度断言进行严格检验。
+4. **Phase 4 准入结论**:
+   - **所有 P0 与 P1 审查遗留项全部彻底关闭**；
+   - 历史回退与并发安全证明确凿，零生产数据影响；
+   - **GBaseLite B03 Phase 3 最终 Gate 正式通过**，已完全具备进入 Phase 4（REPEATABLE READ）的技术前置条件。

@@ -77,6 +77,7 @@ func ErrorPacket(code uint16, message string) []byte {
 func EOFPacket() []byte { return []byte{0xfe, 0, 0, 2, 0} }
 
 func WriteResult(connection *PacketConn, result *executor.Result, schema, table string) error {
+	defer result.Close()
 	if len(result.Columns) == 0 {
 		return writeOKResult(connection, result)
 	}
@@ -154,6 +155,7 @@ func appendLenEncTypedValue(dst []byte, value any, dataType storage.DataType) []
 }
 
 func WriteBinaryResult(connection *PacketConn, result *executor.Result, schema, table string) error {
+	defer result.Close()
 	if len(result.Columns) == 0 {
 		return writeOKResult(connection, result)
 	}

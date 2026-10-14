@@ -54,14 +54,26 @@ type Result struct {
 	LastInsertID       uint64
 	Message            string
 	MetadataChanged    bool
+	cleanupOnce        sync.Once
 	cleanup            func()
 }
 
 // Close releases any resources, such as streaming read views, associated with this Result.
 func (r *Result) Close() {
-	if r != nil && r.cleanup != nil {
-		r.cleanup()
-		r.cleanup = nil
+	if r != nil {
+		r.cleanupOnce.Do(func() {
+			if r.cleanup != nil {
+				r.cleanup()
+				r.cleanup = nil
+			}
+		})
+	}
+}
+
+// SetCleanup sets the cleanup hook for this Result, called when Close() is invoked.
+func (r *Result) SetCleanup(cleanup func()) {
+	if r != nil {
+		r.cleanup = cleanup
 	}
 }
 

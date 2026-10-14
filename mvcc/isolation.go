@@ -15,7 +15,7 @@ type ViewToken struct {
 	generation uint64
 	store      *Store
 	tx         *Tx
-	mu         sync.Mutex
+	rw         sync.RWMutex
 	closed     bool
 }
 
@@ -25,6 +25,12 @@ type ViewToken struct {
 func (s *Store) BeginViewToken(ctx context.Context, tx *Tx) (*ViewToken, error) {
 	if err := s.AvailabilityError(); err != nil {
 		return nil, err
+	}
+	if tx != nil && tx.Closed() {
+		if tx.DeadlockAborted() {
+			return nil, storageengine.ErrDeadlock
+		}
+		return nil, storageengine.ErrClosed
 	}
 	s.views.Lock()
 	defer s.views.Unlock()
@@ -62,6 +68,12 @@ func (s *Store) BeginViewTokenAt(ctx context.Context, tx *Tx, revision uint64) (
 	if err := s.AvailabilityError(); err != nil {
 		return nil, err
 	}
+	if tx != nil && tx.Closed() {
+		if tx.DeadlockAborted() {
+			return nil, storageengine.ErrDeadlock
+		}
+		return nil, storageengine.ErrClosed
+	}
 	s.views.Lock()
 	defer s.views.Unlock()
 	generation := s.generation.Load()
@@ -94,28 +106,32 @@ func (v *ViewToken) Revision() uint64   { return v.revision }
 func (v *ViewToken) Generation() uint64 { return v.generation }
 func (v *ViewToken) RootID() string     { return v.rootID }
 
+func (v *ViewToken) State() storageengine.ViewState {
+	v.rw.RLock()
+	defer v.rw.RUnlock()
+	if v.generation != v.store.generation.Load() {
+		return storageengine.ViewStateInvalidated
+	}
+	if v.closed {
+		return storageengine.ViewStateClosed
+	}
+	return storageengine.ViewStateActive
+}
+
 func (v *ViewToken) Closed() bool {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.rw.RLock()
+	defer v.rw.RUnlock()
 	return v.closed
 }
 
-func (v *ViewToken) checkOpen() error {
-	v.mu.Lock()
-	closed := v.closed
-	v.mu.Unlock()
-	if closed {
-		return storageengine.ErrViewClosed
+func (v *ViewToken) Get(space string, rowKey []byte) ([]byte, bool, error) {
+	v.rw.RLock()
+	defer v.rw.RUnlock()
+	if v.closed {
+		return nil, false, storageengine.ErrViewClosed
 	}
 	if v.generation != v.store.generation.Load() {
-		return storageengine.ErrViewInvalidated
-	}
-	return nil
-}
-
-func (v *ViewToken) Get(space string, rowKey []byte) ([]byte, bool, error) {
-	if err := v.checkOpen(); err != nil {
-		return nil, false, err
+		return nil, false, storageengine.ErrViewInvalidated
 	}
 	if v.tx != nil {
 		return v.tx.readAt(v.revision, space, rowKey)
@@ -128,8 +144,13 @@ func (v *ViewToken) Get(space string, rowKey []byte) ([]byte, bool, error) {
 }
 
 func (v *ViewToken) ScanRange(ctx context.Context, space string, r KeyRange, yield func([]byte, []byte) error) error {
-	if err := v.checkOpen(); err != nil {
-		return err
+	v.rw.RLock()
+	defer v.rw.RUnlock()
+	if v.closed {
+		return storageengine.ErrViewClosed
+	}
+	if v.generation != v.store.generation.Load() {
+		return storageengine.ErrViewInvalidated
 	}
 	if v.tx != nil {
 		return v.tx.scanRangeAt(ctx, space, r, v.revision, false, yield)
@@ -138,13 +159,13 @@ func (v *ViewToken) ScanRange(ctx context.Context, space string, r KeyRange, yie
 }
 
 func (v *ViewToken) Close() error {
-	v.mu.Lock()
+	v.rw.Lock()
 	if v.closed {
-		v.mu.Unlock()
+		v.rw.Unlock()
 		return nil
 	}
 	v.closed = true
-	v.mu.Unlock()
+	v.rw.Unlock()
 	v.store.txns.ReleaseView(v.id)
 	return nil
 }

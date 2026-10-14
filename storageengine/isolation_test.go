@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"gbaselite/storageengine"
+	"gbaselite/storageengine/mvccadapter"
 	"gbaselite/storageengine/testkit"
 )
 
@@ -100,5 +101,47 @@ func TestStorageEngineContract_NoForbiddenImports(t *testing.T) {
 				t.Fatalf("file %s imports forbidden package %s", path, pkg)
 			}
 		}
+	}
+}
+
+// TestP3Fix02_CapabilityGateInAdapter verifies P3-FIX-02:
+// Direct Go API on mvccadapter must reject invalid/unimplemented isolation levels and uncommitted view kind.
+func TestP3Fix02_CapabilityGateInAdapter(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+
+	// 1. Invalid isolation level must be rejected
+	if _, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationLevel("INVALID")); err == nil {
+		t.Fatalf("BeginIsolated with invalid level unexpectedly succeeded")
+	}
+
+	// 2. Unimplemented isolation levels must return ErrUnsupported
+	for _, lvl := range []storageengine.IsolationLevel{
+		storageengine.IsolationReadUncommitted,
+		storageengine.IsolationReadCommitted,
+		storageengine.IsolationSerializable,
+	} {
+		_, err := storageengine.BeginIsolated(ctx, e, lvl)
+		if !errors.Is(err, storageengine.ErrUnsupported) {
+			t.Fatalf("BeginIsolated(%s) returned %v, want ErrUnsupported", lvl, err)
+		}
+	}
+
+	// 3. REPEATABLE READ must succeed
+	tx, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationRepeatableRead)
+	if err != nil {
+		t.Fatalf("BeginIsolated(RR): %v", err)
+	}
+	defer tx.Rollback()
+
+	// 4. StatementViewKindUncommitted must return ErrUnsupported (not fake support)
+	isoTxn := tx.(storageengine.IsolationTxn)
+	if _, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindUncommitted); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("BeginStatementView(Uncommitted) returned %v, want ErrUnsupported", err)
 	}
 }

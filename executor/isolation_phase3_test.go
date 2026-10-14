@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"gbaselite/storageengine"
@@ -295,5 +296,142 @@ func TestB03CommitValidationNonRegression(t *testing.T) {
 	}
 	if len(resFinal.Rows) != 1 || resFinal.Rows[0][0] != "updated_by_B" {
 		t.Fatalf("final value = %v, want 'updated_by_B'", resFinal.Rows)
+	}
+}
+
+// TestP3Fix03_ConcurrentCloseAndStream covers P3-FIX-03:
+// concurrent Result.Close, repeat stream consumption, and concurrent Close with Stream.
+func TestP3Fix03_ConcurrentCloseAndStream(t *testing.T) {
+	// 1. Concurrent Close calls on same Result
+	t.Run("ConcurrentClose", func(t *testing.T) {
+		closeCount := 0
+		var mu sync.Mutex
+		res := &Result{
+			cleanup: func() {
+				mu.Lock()
+				closeCount++
+				mu.Unlock()
+			},
+		}
+
+		var wg sync.WaitGroup
+		for i := 0; i < 20; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				res.Close()
+			}()
+		}
+		wg.Wait()
+
+		mu.Lock()
+		defer mu.Unlock()
+		if closeCount != 1 {
+			t.Fatalf("cleanup was called %d times, want exactly 1", closeCount)
+		}
+	})
+
+	// 2. Repeat consumption of StreamRows rejected with ErrViewClosed
+	t.Run("RepeatStreamRejected", func(t *testing.T) {
+		e, cleanup := newIsolationTestEngine(t)
+		defer cleanup()
+
+		tx, err := storageengine.BeginIsolated(context.Background(), e.Backend, storageengine.IsolationRepeatableRead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+
+		isoTxn := tx.(storageengine.IsolationTxn)
+		view, err := isoTxn.BeginStatementView(context.Background(), storageengine.StatementViewKindStatement)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		res := &Result{
+			Columns: []Column{{Name: "id"}},
+			cleanup: func() { _ = view.Close() },
+		}
+
+		var streamConsumed atomic.Bool
+		res.StreamRows = func(yield func([]any) error) error {
+			if !streamConsumed.CompareAndSwap(false, true) {
+				return storageengine.ErrViewClosed
+			}
+			defer res.Close()
+			return yield([]any{int64(1)})
+		}
+
+		// First consumption: success
+		if err := res.StreamRows(func(row []any) error { return nil }); err != nil {
+			t.Fatalf("first stream failed: %v", err)
+		}
+
+		// Second consumption: must be rejected with ErrViewClosed
+		err = res.StreamRows(func(row []any) error { return nil })
+		if !errors.Is(err, storageengine.ErrViewClosed) {
+			t.Fatalf("second stream returned %v, want ErrViewClosed", err)
+		}
+	})
+}
+
+// TestP3Fix03_ConcurrentCommitRollbackAndReadView covers P3-FIX-03:
+// concurrent Root Commit/Rollback with ReadView.Get and ScanRange.
+func TestP3Fix03_ConcurrentCommitRollbackAndReadView(t *testing.T) {
+	e, cleanup := newIsolationTestEngine(t)
+	defer cleanup()
+
+	for _, action := range []string{"commit", "rollback"} {
+		t.Run("Concurrent_"+action, func(t *testing.T) {
+			ctx := context.Background()
+			tx, err := storageengine.BeginIsolated(ctx, e.Backend, storageengine.IsolationRepeatableRead)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			isoTxn := tx.(storageengine.IsolationTxn)
+			view, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindStatement)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			startGate := make(chan struct{})
+			var wg sync.WaitGroup
+
+			// Goroutine 1: active reads through view
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-startGate
+				for i := 0; i < 50; i++ {
+					_, _, err := view.Get("test_space", []byte("k1"))
+					if err != nil && !errors.Is(err, storageengine.ErrViewClosed) {
+						t.Errorf("Get error: %v", err)
+						return
+					}
+				}
+			}()
+
+			// Goroutine 2: concurrent commit / rollback
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-startGate
+				if action == "commit" {
+					_, _ = tx.Commit(ctx)
+				} else {
+					_ = tx.Rollback()
+				}
+			}()
+
+			close(startGate)
+			wg.Wait()
+
+			// After transaction ended, subsequent read on view must return ErrViewClosed
+			_, _, err = view.Get("test_space", []byte("k1"))
+			if !errors.Is(err, storageengine.ErrViewClosed) {
+				t.Fatalf("subsequent Get returned %v, want ErrViewClosed", err)
+			}
+		})
 	}
 }

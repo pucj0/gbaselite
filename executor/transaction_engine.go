@@ -6,13 +6,16 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"gbaselite/parser"
 	"gbaselite/physical"
 	"gbaselite/sqllayout"
 	"gbaselite/storage"
 	"gbaselite/storageengine"
-	"strings"
-	"time"
 )
 
 type versionedTable struct {
@@ -221,31 +224,36 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 			closeViewOnExit = nil
 			rtx := autoRollbackTx
 			autoRollbackTx = nil
-			cleanupDone := false
+			var cleanupOnce sync.Once
+			var streamConsumed atomic.Bool
 			doCleanup := func() {
-				if cleanupDone {
-					return
-				}
-				cleanupDone = true
-				if v != nil {
-					_ = v.Close()
-					v = nil
-				}
-				if rtx != nil {
-					session.ClearActiveIsolation()
-					_ = rtx.Rollback()
-					rtx = nil
-				}
+				cleanupOnce.Do(func() {
+					if v != nil {
+						_ = v.Close()
+						v = nil
+					}
+					if rtx != nil {
+						session.ClearActiveIsolation()
+						_ = rtx.Rollback()
+						rtx = nil
+					}
+				})
 			}
 			resultOut.cleanup = doCleanup
 			if origStreamRows != nil {
 				resultOut.StreamRows = func(yield func([]any) error) error {
+					if !streamConsumed.CompareAndSwap(false, true) {
+						return storageengine.ErrViewClosed
+					}
 					defer doCleanup()
 					return origStreamRows(yield)
 				}
 			}
 			if origStreamValues != nil {
 				resultOut.StreamValues = func(yield func(storage.Row) error) error {
+					if !streamConsumed.CompareAndSwap(false, true) {
+						return storageengine.ErrViewClosed
+					}
 					defer doCleanup()
 					return origStreamValues(yield)
 				}
