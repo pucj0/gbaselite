@@ -23,6 +23,7 @@ func (t *Tx) mergeParent(ctx context.Context) error {
 		p.stats().addWriteSet(t.stats())
 		p.stats().addDependencies(t.stats())
 		p.stats().addObservations(t.stats())
+		p.mergeGuardedKeys(t)
 		return nil
 	}
 	if err := t.WalkWrites(ctx, p.write); err != nil {
@@ -34,5 +35,22 @@ func (t *Tx) mergeParent(ctx context.Context) error {
 	// The parent's write and dependency counters were updated by re-buffering each
 	// operation above; only the child's read observations still need folding in.
 	p.stats().addObservations(t.stats())
+	p.mergeGuardedKeys(t)
 	return nil
+}
+
+func (p *Tx) mergeGuardedKeys(child *Tx) {
+	child.mu.Lock()
+	defer child.mu.Unlock()
+	if len(child.guardedKeys) == 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.guardedKeys == nil {
+		p.guardedKeys = make(map[string]bool, len(child.guardedKeys))
+	}
+	for k := range child.guardedKeys {
+		p.guardedKeys[k] = true
+	}
 }

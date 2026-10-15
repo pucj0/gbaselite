@@ -132,6 +132,9 @@ func (t *txn) BeginStatementView(ctx context.Context, kind storageengine.Stateme
 		}
 		return nil, storageengine.ErrClosed
 	}
+	if t.isolationLevel == storageengine.IsolationSerializable && !storageengine.IsInternalReader(ctx) {
+		return nil, fmt.Errorf("%w: raw StatementView on SERIALIZABLE transaction is unsupported; use LockingTxn or SQL executor", storageengine.ErrUnsupported)
+	}
 	if kind == storageengine.StatementViewKindUncommitted {
 		return nil, fmt.Errorf("%w: uncommitted statement view is not supported yet", storageengine.ErrUnsupported)
 	}
@@ -154,6 +157,9 @@ func (t *txn) BeginConsistentView(ctx context.Context) (storageengine.ReadView, 
 			return nil, storageengine.ErrDeadlock
 		}
 		return nil, storageengine.ErrClosed
+	}
+	if root.isolationLevel == storageengine.IsolationSerializable {
+		return nil, fmt.Errorf("%w: ConsistentView on SERIALIZABLE transaction is unsupported", storageengine.ErrUnsupported)
 	}
 
 	rootView, err := root.ensureRootConsistentView(ctx)

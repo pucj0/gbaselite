@@ -297,6 +297,9 @@ func (t *Tx) BaselineStats() (held int, rejected uint64) {
 func (t *Tx) writeBaselineFor(logicalKey []byte) (uint64, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.guardedKeys != nil && t.guardedKeys[string(logicalKey)] {
+		return 0, false
+	}
 	if t.writeBaseline == nil {
 		return 0, false
 	}
@@ -324,7 +327,12 @@ func (t *Tx) baselineLookup() func(logicalKey []byte) (uint64, bool) {
 func (t *Tx) HasWriteBaseline() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return len(t.writeBaseline) != 0
+	for k := range t.writeBaseline {
+		if t.guardedKeys == nil || !t.guardedKeys[k] {
+			return true
+		}
+	}
+	return false
 }
 
 // WriteBaselineSize reports how many keys carry a recorded baseline.

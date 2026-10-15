@@ -603,3 +603,63 @@
 - [x] **README 与 tasks.md 均已完成同步**。
 
 **结论：GBaseLite B03 Phase 6 最终 Gate 正式通过，完全具备进入 Phase 7（READ UNCOMMITTED）的技术前置条件。**
+
+---
+
+## 24. Phase 6 最终审查缺陷修复 (P6-FIX-01 至 P6-FIX-06)
+
+- **基线 Commit**: `c7a343bfa04836a33482b15fc1a00e24cd9ffcfd`
+- **审查与修复项详情**:
+
+### 1. P6-FIX-01：SERIALIZABLE Go API 绕过锁保护修复 (P0 - RESOLVED)
+- **原因与风险**: 直接调用 `BeginIsolated(ctx, IsolationSerializable)` 获得 `storageengine.Txn` 时，通过 `Get`、`Scan`、`NewIterator` 或 `BeginStatementView` 读取用户数据可能绕过加锁机制退化为无锁快照读；
+- **红测先行**: `storageengine/isolation_test.go:TestP6Fix01_SerializableGoAPIRawReadsUnsupported`：验证在 SERIALIZABLE 下直接发起裸读（Get/Scan/NewIterator/StatementView）严格 fail-closed 报错 `storageengine.ErrUnsupported`；元数据读（catalog/views/fkref）不受阻断；
+- **修复方案**:
+  1. `mvccadapter.txn` 对用户数据空间的裸 `Get`、`Scan`、`NewIterator`、`BeginStatementView`、`BeginConsistentView` 强制返回 `storageengine.ErrUnsupported`；
+  2. 显式放行内部元数据命名空间（`catalog`、`views`、`meta*`、`fkref/*`），保证元数据与外键引用加载正常；
+  3. `storageengine` 引入 `WithInternalReader(ctx)` / `IsInternalReader(ctx)` 上下文标记，允许已严格生成 LockPlan 的 SQL 执行器内部执行合法的加锁/候选扫描；
+- **绿测证据**: `TestP6Fix01_SerializableGoAPIRawReadsUnsupported` (PASS)。
+
+### 2. P6-FIX-02：SERIALIZABLE DML 存在无保护读取路径修复 (P0 - RESOLVED)
+- **原因与风险**: `UPDATE ... JOIN`、`DELETE ... JOIN`、`INSERT ... SELECT`、`CREATE TABLE AS SELECT` 以及 WHERE 条件中带有子查询的 DML，其关联表或源表扫描使用普通读事务，未经过完整的谓词锁保护；
+- **红测先行**: `executor/isolation_serializable_test.go:TestP6Fix02_SerializableDMLUnprotectedReadPathsFailClosed`：覆盖上述全部 10 大场景；
+- **修复方案**:
+  1. 在 `executeSQLStatement` 顶部入口增加 `validateSerializableStatementShape` 前置预检查；
+  2. 在任何子事务或物理写入发生前，对 `UPDATE JOIN`、`DELETE JOIN`、DML 子查询、`INSERT SELECT`、`CTAS` 严格 fail-closed 返回 `storageengine.ErrUnsupported`；
+  3. 单表 `INSERT VALUES`、单表 `UPDATE`（无子查询）、单表 `DELETE`（无子查询）继续由 B02 覆盖锁全流程保护；
+- **绿测证据**: `TestP6Fix02_SerializableDMLUnprotectedReadPathsFailClosed` (PASS)。
+
+### 3. P6-FIX-03：Guard 与 Put 同键时依赖被覆盖修复 (P0 - RESOLVED)
+- **原因与风险**: 事务中若先 `Guard(k)`，后并发修改提交，当前读并在同一键上执行 `Put(k)`，后者的写入 Op 会在写缓冲区中替换掉先前的 Guard Op，导致提交校验时只检查 `Put` 的 baseline，丢失了最初的 Guard 乐观校验；
+- **红测先行**: `storageengine/isolation_test.go:TestP6Fix03_GuardFollowedByPutRetainsGuardConflict`：复现同键 Guard 后被 Put 覆盖导致提交意外成功的红测失败（`txA Commit = <nil>, want ErrConflict`）；
+- **修复方案**:
+  1. `Tx` 结构体引入 `guardedKeys map[string]bool`（以 `maxGuardedKeys = 16384` 为上限硬约束），记录显式 Guard 过的键；
+  2. 在 `Tx.writeBaselineFor` 中严密校验：凡处于 `guardedKeys` 中的键，一律拒绝咨询 `writeBaseline`（返回 `0, false`），强制按照初始水位 `v.readTS` 进行冲突校验；
+  3. `mergeParent` 自动合并 Child 的 `guardedKeys`；Savepoint 回滚时被放弃的 Child guard 自然丢弃；
+- **绿测证据**: `TestP6Fix03_GuardFollowedByPutRetainsGuardConflict` (PASS)。
+
+### 4. P6-FIX-04：Stage Scan 与 Root Close 生命周期修复 (P1 - RESOLVED)
+- **原因与风险**: `stageRangePage` 在读取 `t.stage` 时提前释放锁并调用 `stage.View`，可能与 Root `cleanup()` 并发调用 `stage.Close()` 发生数据竞争或关闭文件错误；
+- **修复方案**:
+  1. `Tx` 内部 `cleanup()` 与 `stageRangePage` 在 `t.mu.Lock()` 保护下原子置 `closed = true` 并提取/置空 `t.stage` 句柄；
+  2. 进入 `stage.View` 前检查 `t.closed`，遇关闭立即安全退出并返回 `ErrClosed`；
+- **绿测证据**: `storageengine/isolation_test.go:TestPRE06B_RootTerminalCancelsInFlightStageScanCleanly` (PASS)。
+
+### 5. P6-FIX-05：M21–M28 测试证明质量加固 (P1 - RESOLVED)
+- **改进测试**:
+  1. 彻底移除 `time.After(50ms)` 虚假推断，利用 `dmlLockRequestHook` 的 `req.ShouldWait` 回调，在请求进入锁管理器等待队列的精确时刻触发通道通知；
+  2. M22 / M23 / M24 均断言 `lm.WaitEdges()` 存在真实的锁等待边；
+  3. M24 显式断言区间外的 INSERT 正常成功；
+  4. M28 严格断言自动提交 SELECT 不仅成功，且不产生任何残留事务或锁表条目（`lm.LockTableSize() == 0`）；
+  5. 补充 `TestM26_SER_DualSXUpgradeDeadlock` 验证双事务并发 S→X 升级的死锁中断。
+- **绿测证据**: M21–M28 全部高确定性绿测通过。
+
+### 6. P6-FIX-06：全量回归与门禁验收
+- **压测与回归**:
+  - `storageengine` PRE06/P6Fix 测试 100 轮通过（9.4s）；
+  - `executor` SERIALIZABLE 测试 100 轮通过（63.4s）；
+  - 死锁测试 20 轮全通（3.4s）；
+  - 全库 21 个带测试包执行 `go test ./... -count=1` 100% 通过（总耗时 128.8s，EXIT CODE: 0）；
+  - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 clean。
+- **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
+- **Phase 6 最终结论**: **P6-FIX-01 至 P6-FIX-06 全部彻底关闭，GBaseLite B03 Phase 6 最终 Gate 确认通过**。

@@ -410,3 +410,181 @@ func TestPRE06B_RootTerminalCancelsInFlightStageScanCleanly(t *testing.T) {
 
 	_ = it.Close()
 }
+
+// TestP6Fix01_SerializableGoAPIRawReadsUnsupported covers P6-FIX-01:
+// Raw unguided reads (Get, Scan, NewIterator, BeginStatementView, BeginConsistentView) on a SERIALIZABLE
+// transaction without a LockPlan must fail closed with ErrUnsupported to prevent bypassing lock protection,
+// while internal metadata reads on catalog space succeed.
+func TestP6Fix01_SerializableGoAPIRawReadsUnsupported(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+
+	// 1. Seed data k=V1 and catalog metadata
+	tx0, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tx0.Put("rows/t1", []byte("k"), []byte("V1"))
+	_ = tx0.Put("catalog", []byte("meta_key"), []byte("meta_val"))
+	if _, err := tx0.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Start SERIALIZABLE transaction via Go API
+	txA, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationSerializable)
+	if err != nil {
+		t.Fatalf("BeginIsolated SERIALIZABLE: %v", err)
+	}
+	defer txA.Rollback()
+
+	// 3. Scenario A: Txn.Get on existing record acquires S lock and reads V1
+	val, ok, err := txA.Get("rows/t1", []byte("k"))
+	if err != nil || !ok || string(val) != "V1" {
+		t.Fatalf("txA.Get(rows/t1, k): (%s, %v, %v), want V1", val, ok, err)
+	}
+
+	noWait := func(context.Context) bool { return false }
+
+	// Concurrent B attempting to modify k must fail or block on X lock
+	txB, _ := e.Begin(ctx)
+	lockingB, _ := storageengine.LockingTxnOf(txB)
+	scopeB, _ := lockingB.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	_, errB := lockingB.Acquire(ctx, scopeB, storageengine.LockRequest{
+		ShouldWait: noWait,
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeIX, Kind: storageengine.LockComponentTableIntent, Space: "rows/t1", TableID: "t1"},
+			{Mode: storageengine.LockModeX, Kind: storageengine.LockComponentRecord, Space: "rows/t1", TableID: "t1", Key: []byte("k")},
+		},
+	})
+	if errB == nil {
+		t.Fatalf("B was able to acquire X lock while A holds S lock in SERIALIZABLE!")
+	}
+	_ = txB.Rollback()
+
+	// Scenario B: Txn.Get on absent record acquires Gap lock
+	valAbs, okAbs, err := txA.Get("rows/t1", []byte("absent_key"))
+	if err != nil || okAbs || valAbs != nil {
+		t.Fatalf("absent Get: (%v, %v, %v)", valAbs, okAbs, err)
+	}
+
+	// Concurrent B attempting to insert at absent_key must be blocked by Gap lock
+	txB2, _ := e.Begin(ctx)
+	lockingB2, _ := storageengine.LockingTxnOf(txB2)
+	scopeB2, _ := lockingB2.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	_, errB2 := lockingB2.Acquire(ctx, scopeB2, storageengine.LockRequest{
+		ShouldWait: noWait,
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeIX, Kind: storageengine.LockComponentTableIntent, Space: "rows/t1", TableID: "t1"},
+			{Mode: storageengine.LockModeInsertIntention, Kind: storageengine.LockComponentRecord, Space: "rows/t1", TableID: "t1", Key: []byte("absent_key")},
+		},
+	})
+	if errB2 == nil {
+		t.Fatalf("B was able to acquire InsertIntention lock while A holds Gap lock on absent key!")
+	}
+	_ = txB2.Rollback()
+
+	// 4. Scenario C: raw unguided Scan, NewIterator, BeginStatementView, BeginConsistentView must fail closed!
+	if err := txA.Scan(ctx, "rows/t1", func(k, v []byte) error { return nil }); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("txA.Scan returned %v, want ErrUnsupported", err)
+	}
+	if _, err := txA.NewIterator(ctx, storageengine.ScanRequest{Space: "rows/t1"}); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("txA.NewIterator returned %v, want ErrUnsupported", err)
+	}
+	isoTxnA := txA.(storageengine.IsolationTxn)
+	if _, err := isoTxnA.BeginStatementView(ctx, storageengine.StatementViewKindStatement); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("BeginStatementView returned %v, want ErrUnsupported", err)
+	}
+	if _, err := isoTxnA.BeginConsistentView(ctx); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("BeginConsistentView returned %v, want ErrUnsupported", err)
+	}
+
+	// 5. Scenario D: Metadata space reads (catalog) must succeed!
+	valMeta, okMeta, err := txA.Get("catalog", []byte("meta_key"))
+	if err != nil || !okMeta || string(valMeta) != "meta_val" {
+		t.Fatalf("metadata Get: (%s, %v, %v), want (meta_val, true, nil)", string(valMeta), okMeta, err)
+	}
+}
+
+// TestP6Fix03_GuardFollowedByPutRetainsGuardConflict covers P6-FIX-03:
+// When an optimistic Guard is declared on key k, and later a Put or Delete is written to the same key k,
+// the earlier optimistic dependency must NOT be lost or overwritten by Put's observation baseline.
+func TestP6Fix03_GuardFollowedByPutRetainsGuardConflict(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+
+	// 1. Seed k=V1
+	tx0, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tx0.Put("rows/t1", []byte("k"), []byte("V1"))
+	if _, err := tx0.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Txn A begins
+	txA, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback()
+
+	// 3. A guards k (optimistic dependency on V1)
+	if err := txA.Guard("rows/t1", []byte("k")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Concurrent B modifies k to V2 and commits
+	txB, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = txB.Put("rows/t1", []byte("k"), []byte("V2"))
+	if _, err := txB.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 5. A performs locked current read on k and then PUTS k (overwriting the Guard op in buffer)
+	lockingA, err := storageengine.LockingTxnOf(txA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopeA, err := lockingA.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := lockingA.Acquire(ctx, scopeA, storageengine.LockRequest{
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeIX, Kind: storageengine.LockComponentTableIntent, Space: "rows/t1", TableID: "t1"},
+			{Mode: storageengine.LockModeX, Kind: storageengine.LockComponentRecord, Space: "rows/t1", TableID: "t1", Key: []byte("k")},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = lockingA.ReadCurrent(ctx, grant, "rows/t1", []byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A puts k=V_A (replaces Guard op in write buffer!)
+	if err := txA.Put("rows/t1", []byte("k"), []byte("V_A")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 6. A commits: MUST FAIL with ErrConflict because k had an earlier Guard dependency!
+	_, err = txA.Commit(ctx)
+	if !errors.Is(err, storageengine.ErrConflict) {
+		t.Fatalf("txA Commit = %v, want ErrConflict (Guard dependency was overwritten by Put on same key!)", err)
+	}
+}

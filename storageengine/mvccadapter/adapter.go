@@ -5,12 +5,15 @@ package mvccadapter
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
 	"gbaselite/lockmanager"
 	"gbaselite/mvcc"
 	"gbaselite/replication"
 	"gbaselite/storageengine"
-	"os"
-	"path/filepath"
 )
 
 type engine struct {
@@ -36,6 +39,10 @@ func (t *txn) root() *txn {
 		return t.rootTxn
 	}
 	return t
+}
+
+func isMetadataSpace(s string) bool {
+	return s == "catalog" || s == "views" || strings.HasPrefix(s, "meta") || strings.HasPrefix(s, "fkref/")
 }
 
 var _ storageengine.Engine = (*engine)(nil)
@@ -175,7 +182,53 @@ func (t *txn) Get(s string, k []byte) ([]byte, bool, error) {
 	if t.activeView != nil && t.activeView.State() == storageengine.ViewStateActive {
 		return t.activeView.Get(s, k)
 	}
+	if t.isolationLevel == storageengine.IsolationSerializable && t.rootTxn == nil && !isMetadataSpace(s) {
+		return t.serializableGet(s, k)
+	}
 	return t.inner.Get(s, k)
+}
+
+func (t *txn) serializableGet(s string, k []byte) ([]byte, bool, error) {
+	locking, ok := t.LockingTxn()
+	if !ok {
+		return nil, false, fmt.Errorf("%w: serializable Get requires locking capability", storageengine.ErrUnsupported)
+	}
+	ctx := context.Background()
+	scope, err := locking.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		return nil, false, err
+	}
+	tableID := s
+	if idx := strings.Index(s, "/"); idx != -1 {
+		tableID = s[idx+1:]
+	}
+	grant, err := locking.Acquire(ctx, scope, storageengine.LockRequest{
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeIS, Kind: storageengine.LockComponentTableIntent, Space: s, TableID: tableID},
+			{Mode: storageengine.LockModeS, Kind: storageengine.LockComponentRecord, Space: s, TableID: tableID, Key: k},
+		},
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	obs, err := locking.ReadCurrent(ctx, grant, s, k)
+	if err != nil {
+		return nil, false, err
+	}
+	if !obs.Exists {
+		// Absent record: protect insertion position via gap lock
+		prev, next, err := locking.KeysAround(ctx, s, k)
+		if err == nil {
+			_, _ = locking.Acquire(ctx, scope, storageengine.LockRequest{
+				Components: []storageengine.LockComponent{
+					{Mode: storageengine.LockModeIS, Kind: storageengine.LockComponentTableIntent, Space: s, TableID: tableID},
+					{Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: s, TableID: tableID, Lower: prev, Upper: next},
+				},
+			})
+		}
+		return nil, false, nil
+	}
+	return obs.Value, true, nil
 }
 func (t *txn) Put(s string, k, v []byte) error                     { return t.inner.Put(s, k, v) }
 func (t *txn) Delete(s string, k []byte) error                     { return t.inner.Delete(s, k) }
@@ -249,6 +302,9 @@ func (e *engine) Scan(ctx context.Context, revision uint64, s string, f func([]b
 func (t *txn) NewIterator(ctx context.Context, r storageengine.ScanRequest) (storageengine.Iterator, error) {
 	if t.activeView != nil && t.activeView.State() == storageengine.ViewStateActive {
 		return t.activeView.NewIterator(ctx, r)
+	}
+	if t.isolationLevel == storageengine.IsolationSerializable && !isMetadataSpace(r.Space) {
+		return nil, fmt.Errorf("%w: raw unguided NewIterator on SERIALIZABLE transaction without LockPlan is unsupported; use LockingTxn or SQL executor", storageengine.ErrUnsupported)
 	}
 	return newIterator(ctx, r, func(y func([]byte, []byte) error) error {
 		if r.Unordered {

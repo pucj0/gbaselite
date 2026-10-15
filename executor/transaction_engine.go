@@ -291,6 +291,7 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		ctx = context.Background()
 	}
 	ctx = context.WithValue(ctx, foreignChecksContextKey{}, session.ForeignKeyChecksDisabled)
+	ctx = storageengine.WithInternalReader(ctx)
 	if q := session.query; q != nil && !q.deadline.IsZero() {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithDeadline(ctx, q.deadline)
@@ -315,6 +316,9 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 			return nil, fmt.Errorf("replicated account SQL is not supported; provision matching users on stopped nodes")
 		}
 		return e.executeAccountStatement(session, statement)
+	}
+	if err := validateSerializableStatementShape(statement, session); err != nil {
+		return nil, err
 	}
 	switch value := statement.(type) {
 	case parser.Begin:
@@ -426,7 +430,7 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 			isoLevel := isoTxn.IsolationLevel()
 			inTxn := session.InTransaction() || session.AutocommitDisabled
 			if statementNeedsReadView(statement, isoLevel, inTxn) {
-				if automatic || isoLevel == storageengine.IsolationReadCommitted {
+				if automatic || isoLevel == storageengine.IsolationReadCommitted || isoLevel == storageengine.IsolationSerializable {
 					view, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindStatement)
 					if err != nil {
 						return nil, err
@@ -660,6 +664,10 @@ func isPlainConsistentRead(statement parser.Statement) bool {
 func statementNeedsReadView(statement parser.Statement, level storageengine.IsolationLevel, inTxn bool) bool {
 	if level == storageengine.IsolationSerializable {
 		if inTxn {
+			switch statement.(type) {
+			case parser.Update, parser.Delete:
+				return true
+			}
 			return false
 		}
 		return isPlainConsistentRead(statement)
@@ -681,4 +689,35 @@ func statementNeedsReadView(statement parser.Statement, level storageengine.Isol
 		}
 	}
 	return isPlainConsistentRead(statement)
+}
+
+func validateSerializableStatementShape(statement parser.Statement, session *Session) error {
+	if session.EffectiveIsolation() != parser.LevelSerializable || (!session.InTransaction() && !session.AutocommitDisabled) {
+		return nil
+	}
+	switch s := statement.(type) {
+	case parser.Update:
+		if len(s.Joins) > 0 {
+			return fmt.Errorf("%w: UPDATE JOIN in SERIALIZABLE", storageengine.ErrUnsupported)
+		}
+		if expressionHasSubquery(s.Where) {
+			return fmt.Errorf("%w: subqueries in UPDATE in SERIALIZABLE", storageengine.ErrUnsupported)
+		}
+	case parser.Delete:
+		if len(s.Joins) > 0 || len(s.Targets) > 0 {
+			return fmt.Errorf("%w: DELETE JOIN in SERIALIZABLE", storageengine.ErrUnsupported)
+		}
+		if expressionHasSubquery(s.Where) {
+			return fmt.Errorf("%w: subqueries in DELETE in SERIALIZABLE", storageengine.ErrUnsupported)
+		}
+	case parser.Insert:
+		if s.Select != nil {
+			return fmt.Errorf("%w: INSERT SELECT in SERIALIZABLE", storageengine.ErrUnsupported)
+		}
+	case parser.CreateTableAs:
+		return fmt.Errorf("%w: CREATE TABLE AS SELECT in SERIALIZABLE", storageengine.ErrUnsupported)
+	case parser.With, parser.WithRecursive, parser.Union:
+		return fmt.Errorf("%w: CTE and UNION in SERIALIZABLE", storageengine.ErrUnsupported)
+	}
+	return nil
 }

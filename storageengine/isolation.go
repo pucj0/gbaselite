@@ -90,3 +90,20 @@ func BeginIsolated(ctx context.Context, e Engine, level IsolationLevel) (Txn, er
 	}
 	return iso.BeginIsolated(ctx, level)
 }
+
+type internalReaderKey struct{}
+
+// WithInternalReader marks a context as originating from a verified query planner/executor,
+// allowing internal schema/candidate scans on SERIALIZABLE transactions.
+func WithInternalReader(ctx context.Context) context.Context {
+	return context.WithValue(ctx, internalReaderKey{}, true)
+}
+
+// IsInternalReader reports whether ctx was marked with WithInternalReader.
+func IsInternalReader(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(internalReaderKey{}).(bool)
+	return v
+}

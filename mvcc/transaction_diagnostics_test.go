@@ -538,6 +538,8 @@ func requireBoundedDiagnosticsState(t *testing.T) {
 		"buffered": "the bounded write buffer",
 		// bounded by maxObservationBaselines and by the lock budget
 		"writeBaseline": "the bounded locked-read observation baseline",
+		// bounded by maxGuardedKeys
+		"guardedKeys": "the bounded optimistic guard keys",
 	}
 	for i := 0; i < reflect.TypeOf(Tx{}).NumField(); i++ {
 		field := reflect.TypeOf(Tx{}).Field(i)

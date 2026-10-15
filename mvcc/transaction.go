@@ -73,6 +73,10 @@ type Tx struct {
 	// is a counter rather than another collection, so a transaction that read more locked keys
 	// than the bound costs a fixed amount of state.
 	baselineRejections uint64
+
+	// guardedKeys tracks keys that had an explicit optimistic Guard dependency declared.
+	// An optimistic guard on a key must never be relaxed by a subsequent write baseline on the same key.
+	guardedKeys map[string]bool
 }
 
 func randomID() string {
@@ -793,7 +797,20 @@ func (t *Tx) State() TransactionState {
 	return t.state
 }
 
+const maxGuardedKeys = 16384
+
 func (t *Tx) Guard(space string, rowKey []byte) error {
+	k, err := key(space, rowKey)
+	if err == nil {
+		t.mu.Lock()
+		if len(t.guardedKeys) < maxGuardedKeys {
+			if t.guardedKeys == nil {
+				t.guardedKeys = make(map[string]bool, 4)
+			}
+			t.guardedKeys[string(k)] = true
+		}
+		t.mu.Unlock()
+	}
 	return t.write(Op{Space: space, Key: rowKey, Check: true})
 }
 

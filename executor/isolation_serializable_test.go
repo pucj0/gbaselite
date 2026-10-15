@@ -1,7 +1,9 @@
 package executor
 
 import (
+	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -88,14 +90,14 @@ func TestM22_SER_SXConflict(t *testing.T) {
 	}
 
 	bWaiting := make(chan struct{})
+	var closeOnce sync.Once
 	bDone := make(chan error, 1)
 
-	// Hook into dmlLockRequestHook to observe B entering lock request
+	// Hook into dmlLockRequestHook: ShouldWait is called exactly when B must wait for A's lock
 	dmlLockRequestHook = func(req storageengine.LockRequest) storageengine.LockRequest {
-		select {
-		case <-bWaiting:
-		default:
-			close(bWaiting)
+		req.ShouldWait = func(ctx context.Context) bool {
+			closeOnce.Do(func() { close(bWaiting) })
+			return true
 		}
 		return req
 	}
@@ -108,12 +110,18 @@ func TestM22_SER_SXConflict(t *testing.T) {
 
 	<-bWaiting
 
+	// Deterministically verify B has entered Lock Manager wait queue
+	if lm := engineLockManager(e.Backend); lm != nil {
+		if len(lm.WaitEdges()) == 0 {
+			t.Fatal("expected B to be in lock manager wait queue")
+		}
+	}
+
 	// Ensure B has not finished (it is waiting for A's S lock)
 	select {
 	case err := <-bDone:
 		t.Fatalf("B finished prematurely without waiting for S lock: %v", err)
-	case <-time.After(50 * time.Millisecond):
-		// Expected: B is waiting
+	default:
 	}
 
 	// A commits, releasing S lock
@@ -159,13 +167,13 @@ func TestM23_SER_AbsentPointProtection(t *testing.T) {
 
 	// B attempts to INSERT id=999: must wait for A's gap lock!
 	bWaiting := make(chan struct{})
+	var closeOnce sync.Once
 	bDone := make(chan error, 1)
 
 	dmlLockRequestHook = func(req storageengine.LockRequest) storageengine.LockRequest {
-		select {
-		case <-bWaiting:
-		default:
-			close(bWaiting)
+		req.ShouldWait = func(ctx context.Context) bool {
+			closeOnce.Do(func() { close(bWaiting) })
+			return true
 		}
 		return req
 	}
@@ -178,11 +186,17 @@ func TestM23_SER_AbsentPointProtection(t *testing.T) {
 
 	<-bWaiting
 
-	// B must be waiting
+	// Deterministically verify B has entered Lock Manager wait queue for gap lock
+	if lm := engineLockManager(e.Backend); lm != nil {
+		if len(lm.WaitEdges()) == 0 {
+			t.Fatal("expected B to be in lock manager wait queue for gap lock")
+		}
+	}
+
 	select {
 	case err := <-bDone:
 		t.Fatalf("B finished prematurely without waiting for gap lock: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 
 	// A commits, releasing gap lock
@@ -225,21 +239,20 @@ func TestM24_SER_EmptyRangeProtection(t *testing.T) {
 		t.Fatalf("A range read expected empty: %v", resA)
 	}
 
-	// C inserts outside range (id=300): should proceed without waiting on [100, 200]
-	// (or with conservative table intent if range is covered)
+	// C inserts outside range (id=300): must succeed without error!
 	if _, err := e.Execute(sC, "INSERT INTO t VALUES (300, 'outside');"); err != nil {
-		// If conservative domain locking is active, this may wait or succeed
+		t.Fatalf("C insert outside range failed: %v", err)
 	}
 
 	// B inserts inside range (id=150): MUST wait on A's range lock
 	bWaiting := make(chan struct{})
+	var closeOnce sync.Once
 	bDone := make(chan error, 1)
 
 	dmlLockRequestHook = func(req storageengine.LockRequest) storageengine.LockRequest {
-		select {
-		case <-bWaiting:
-		default:
-			close(bWaiting)
+		req.ShouldWait = func(ctx context.Context) bool {
+			closeOnce.Do(func() { close(bWaiting) })
+			return true
 		}
 		return req
 	}
@@ -252,11 +265,17 @@ func TestM24_SER_EmptyRangeProtection(t *testing.T) {
 
 	<-bWaiting
 
-	// Verify B is waiting
+	// Deterministically verify B has entered Lock Manager wait queue for range lock
+	if lm := engineLockManager(e.Backend); lm != nil {
+		if len(lm.WaitEdges()) == 0 {
+			t.Fatal("expected B to be in lock manager wait queue for range lock")
+		}
+	}
+
 	select {
 	case err := <-bDone:
 		t.Fatalf("B finished prematurely without waiting for range lock: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 
 	// A commits, releasing range lock
@@ -384,6 +403,66 @@ func TestM26_SER_SXUpgrade(t *testing.T) {
 	}
 }
 
+// TestM26_SER_DualSXUpgradeDeadlock tests M26:
+// Two transactions in SERIALIZABLE both read row 1 (both hold S).
+// Both subsequently attempt to update row 1 (both request X -> deadlock cycle!).
+// Deadlock detector breaks cycle, exactly one is aborted as deadlock victim, the other commits.
+func TestM26_SER_DualSXUpgradeDeadlock(t *testing.T) {
+	e, cleanup := newIsolationTestEngine(t)
+	defer cleanup()
+
+	sA := newSerializableSession("db")
+	sB := newSerializableSession("db")
+
+	if _, err := e.Execute(sA, "INSERT INTO t VALUES (1, 'V1');"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := e.Execute(sA, "BEGIN;"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Execute(sB, "BEGIN;"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both read row 1 (acquire S lock on row 1)
+	_, _ = e.Execute(sA, "SELECT v FROM t WHERE id = 1;")
+	_, _ = e.Execute(sB, "SELECT v FROM t WHERE id = 1;")
+
+	aDone := make(chan error, 1)
+	go func() {
+		_, err := e.Execute(sA, "UPDATE t SET v = 'V_A' WHERE id = 1;")
+		aDone <- err
+	}()
+
+	bDone := make(chan error, 1)
+	go func() {
+		_, err := e.Execute(sB, "UPDATE t SET v = 'V_B' WHERE id = 1;")
+		bDone <- err
+	}()
+
+	var errA, errB error
+	select {
+	case errA = <-aDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock detector did not fire in time")
+	}
+
+	select {
+	case errB = <-bDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("other transaction never unblocked")
+	}
+
+	oneDeadlock := errors.Is(errA, storageengine.ErrDeadlock) || errors.Is(errB, storageengine.ErrDeadlock)
+	if !oneDeadlock {
+		t.Fatalf("neither transaction aborted: errA=%v, errB=%v", errA, errB)
+	}
+
+	_, _ = e.Execute(sA, "ROLLBACK;")
+	_, _ = e.Execute(sB, "ROLLBACK;")
+}
+
 // TestM27_SER_UnsupportedQueries tests M27:
 // Complex query shapes without proven predicate locking in SERIALIZABLE long transaction
 // must fail closed with ErrUnsupported.
@@ -433,6 +512,14 @@ func TestM28_SER_AutocommitOptimization(t *testing.T) {
 	res, err := e.Execute(sA, "SELECT v FROM t WHERE id = 1;")
 	if err != nil || len(res.Rows) != 1 || res.Rows[0][0] != "V1" {
 		t.Fatalf("autocommit=1 SELECT in SERIALIZABLE failed: %v, %v", res, err)
+	}
+
+	// Must NOT hold active transaction or residual lock grants
+	if sA.InTransaction() {
+		t.Fatal("autocommit=1 SELECT must not leave an active transaction")
+	}
+	if lm := engineLockManager(e.Backend); lm != nil && lm.LockTableSize() != 0 {
+		t.Fatalf("autocommit=1 SELECT left residual locks in table: %d", lm.LockTableSize())
 	}
 }
 
@@ -639,4 +726,79 @@ func TestT054_SER_AutocommitModeMatrix(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("B never finished")
 	}
+}
+
+// TestP6Fix02_SerializableDMLUnprotectedReadPathsFailClosed covers P6-FIX-02:
+// DML statements with unprotected read paths (UPDATE JOIN, DELETE JOIN, subqueries in WHERE,
+// INSERT SELECT, CTAS) must fail closed with ErrUnsupported in SERIALIZABLE transactions.
+func TestP6Fix02_SerializableDMLUnprotectedReadPathsFailClosed(t *testing.T) {
+	e, cleanup := newIsolationTestEngine(t)
+	defer cleanup()
+
+	s := newSerializableSession("db")
+
+	if _, err := e.Execute(s, "CREATE TABLE t2 (id INT PRIMARY KEY, v VARCHAR(50));"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := e.Execute(s, "BEGIN;"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. UPDATE JOIN: must fail closed
+	_, err := e.Execute(s, "UPDATE t JOIN t2 ON t.id = t2.id SET t.v = 'new';")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("UPDATE JOIN in SERIALIZABLE returned %v, want ErrUnsupported", err)
+	}
+
+	// 2. DELETE JOIN: must fail closed
+	_, err = e.Execute(s, "DELETE t FROM t JOIN t2 ON t.id = t2.id;")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("DELETE JOIN in SERIALIZABLE returned %v, want ErrUnsupported", err)
+	}
+
+	// 3. UPDATE with subquery in WHERE: must fail closed
+	_, err = e.Execute(s, "UPDATE t SET v = 'new' WHERE id IN (SELECT id FROM t2);")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("UPDATE with subquery in SERIALIZABLE returned %v, want ErrUnsupported", err)
+	}
+
+	// 4. DELETE with subquery in WHERE: must fail closed
+	_, err = e.Execute(s, "DELETE FROM t WHERE id IN (SELECT id FROM t2);")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("DELETE with subquery in SERIALIZABLE returned %v, want ErrUnsupported", err)
+	}
+
+	// 5. INSERT SELECT: must fail closed
+	_, err = e.Execute(s, "INSERT INTO t2 SELECT id, v FROM t;")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("INSERT SELECT in SERIALIZABLE returned %v, want ErrUnsupported", err)
+	}
+
+	// 6. CREATE TABLE AS SELECT: must fail closed
+	_, err = e.Execute(s, "CREATE TABLE t3 AS SELECT id, v FROM t;")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("CTAS in SERIALIZABLE returned %v, want ErrUnsupported", err)
+	}
+
+	// 7. Inside Savepoint Child: must also fail closed
+	_, _ = e.Execute(s, "SAVEPOINT sp1;")
+	_, err = e.Execute(s, "INSERT INTO t2 SELECT id, v FROM t;")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("INSERT SELECT in Savepoint child returned %v, want ErrUnsupported", err)
+	}
+	_, _ = e.Execute(s, "ROLLBACK TO sp1;")
+
+	// 8. Plain single-table INSERT VALUES, UPDATE, DELETE (without join/subquery) must succeed!
+	if _, err := e.Execute(s, "INSERT INTO t VALUES (50, 'val50');"); err != nil {
+		t.Fatalf("plain INSERT VALUES failed: %v", err)
+	}
+	if _, err := e.Execute(s, "UPDATE t SET v = 'val50_updated' WHERE id = 50;"); err != nil {
+		t.Fatalf("plain UPDATE failed: %v", err)
+	}
+	if _, err := e.Execute(s, "DELETE FROM t WHERE id = 50;"); err != nil {
+		t.Fatalf("plain DELETE failed: %v", err)
+	}
+
+	_, _ = e.Execute(s, "COMMIT;")
 }
