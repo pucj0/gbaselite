@@ -715,16 +715,23 @@ func (t *Tx) applyTransition(state TransactionState, options TransitionOptions) 
 // separate from the lifecycle state: a successful commit and an abort release the
 // same resources the same way, and cleanup never changes a decided outcome.
 func (t *Tx) cleanup() error {
+	t.mu.Lock()
 	if t.closed {
+		t.mu.Unlock()
 		return nil
 	}
 	t.closed = true
 	t.buffered = nil
 	t.bufferBytes = 0
+	stage := t.stage
+	t.stage = nil
+	path := t.path
+	t.mu.Unlock()
+
 	var err, removeErr error
-	if t.stage != nil {
-		err = t.stage.Close()
-		removeErr = os.Remove(t.path)
+	if stage != nil {
+		err = stage.Close()
+		removeErr = os.Remove(path)
 	}
 	return errors.Join(err, removeErr)
 }

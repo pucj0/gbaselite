@@ -424,7 +424,8 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 	if session.IsolationEnabled() {
 		if isoTxn, ok := tx.(storageengine.IsolationTxn); ok {
 			isoLevel := isoTxn.IsolationLevel()
-			if statementNeedsReadView(statement, isoLevel) {
+			inTxn := session.InTransaction() || session.AutocommitDisabled
+			if statementNeedsReadView(statement, isoLevel, inTxn) {
 				if automatic || isoLevel == storageengine.IsolationReadCommitted {
 					view, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindStatement)
 					if err != nil {
@@ -460,11 +461,20 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 	case parser.Select:
 		return executePhysicalSelect(ctx, tx, session, value)
 	case parser.With:
+		if session.EffectiveIsolation() == parser.LevelSerializable && (session.InTransaction() || session.AutocommitDisabled) {
+			return nil, fmt.Errorf("%w: common table expressions in SERIALIZABLE", storageengine.ErrUnsupported)
+		}
 		return e.executeWithSQL(ctx, tx, session, value)
 	case parser.WithRecursive:
+		if session.EffectiveIsolation() == parser.LevelSerializable && (session.InTransaction() || session.AutocommitDisabled) {
+			return nil, fmt.Errorf("%w: recursive common table expressions in SERIALIZABLE", storageengine.ErrUnsupported)
+		}
 		return e.executeWithRecursiveSQL(ctx, tx, session, value)
 
 	case parser.Union:
+		if session.EffectiveIsolation() == parser.LevelSerializable && (session.InTransaction() || session.AutocommitDisabled) {
+			return nil, fmt.Errorf("%w: UNION in SERIALIZABLE", storageengine.ErrUnsupported)
+		}
 		query, err := bindUnionWithSelect(session, value, func(s parser.Select) (*boundQuery, error) { return bindPhysicalSelect(ctx, tx, session, s) })
 		if err != nil {
 			return nil, err
@@ -605,7 +615,7 @@ func sqlStartsImplicitTransaction(statement parser.Statement) bool {
 }
 
 func (e *Engine) checkIsolationCapability(level parser.IsolationLevel) error {
-	if level != parser.LevelRepeatableRead && level != parser.LevelReadCommitted {
+	if level != parser.LevelRepeatableRead && level != parser.LevelReadCommitted && level != parser.LevelSerializable {
 		return fmt.Errorf("%w: transaction isolation level %s is not supported yet", storageengine.ErrUnsupported, level)
 	}
 	return nil
@@ -647,7 +657,13 @@ func isPlainConsistentRead(statement parser.Statement) bool {
 	}
 }
 
-func statementNeedsReadView(statement parser.Statement, level storageengine.IsolationLevel) bool {
+func statementNeedsReadView(statement parser.Statement, level storageengine.IsolationLevel, inTxn bool) bool {
+	if level == storageengine.IsolationSerializable {
+		if inTxn {
+			return false
+		}
+		return isPlainConsistentRead(statement)
+	}
 	if level == storageengine.IsolationReadCommitted {
 		switch s := statement.(type) {
 		case parser.Select:

@@ -124,7 +124,6 @@ func TestP3Fix02_CapabilityGateInAdapter(t *testing.T) {
 	// 2. Unimplemented isolation levels must return ErrUnsupported
 	for _, lvl := range []storageengine.IsolationLevel{
 		storageengine.IsolationReadUncommitted,
-		storageengine.IsolationSerializable,
 	} {
 		_, err := storageengine.BeginIsolated(ctx, e, lvl)
 		if !errors.Is(err, storageengine.ErrUnsupported) {
@@ -132,10 +131,11 @@ func TestP3Fix02_CapabilityGateInAdapter(t *testing.T) {
 		}
 	}
 
-	// 3. REPEATABLE READ and READ COMMITTED must succeed
+	// 3. REPEATABLE READ, READ COMMITTED, and SERIALIZABLE must succeed
 	for _, lvl := range []storageengine.IsolationLevel{
 		storageengine.IsolationRepeatableRead,
 		storageengine.IsolationReadCommitted,
+		storageengine.IsolationSerializable,
 	} {
 		tx, err := storageengine.BeginIsolated(ctx, e, lvl)
 		if err != nil {
@@ -278,4 +278,135 @@ func TestPRE01_ActiveIteratorProtectsAgainstEarlyViewCloseAndGC(t *testing.T) {
 		t.Fatalf("child scan count = %d, want %d", childCount, totalRows)
 	}
 	_ = childIt.Close()
+}
+
+// TestPRE06A_OptimisticGuardNotOverwrittenByLockedRead covers PRE-06A:
+// An optimistic Guard declared on key k cannot be relaxed or overwritten
+// by a subsequent locked current read on the same key k.
+func TestPRE06A_OptimisticGuardNotOverwrittenByLockedRead(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+
+	const testSpace = "rows/test-pre06a"
+
+	// 1. Seed k=V1
+	tx0, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tx0.Put(testSpace, []byte("k"), []byte("V1"))
+	_ = tx0.Put(testSpace, []byte("k2"), []byte("V1"))
+	if _, err := tx0.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. A begins RC
+	txA, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback()
+
+	// 3. A declares Guard on k (optimistic dependency on V1)
+	if err := txA.Guard(testSpace, []byte("k")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. B modifies k to V2 and commits
+	txB, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = txB.Put(testSpace, []byte("k"), []byte("V2"))
+	if _, err := txB.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 5. A subsequently performs a locked current read on k
+	lockingA, ok := txA.(storageengine.LockingTxn)
+	if !ok {
+		t.Fatal("txA missing LockingTxn capability")
+	}
+	scope, err := lockingA.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := lockingA.Acquire(ctx, scope, storageengine.LockRequest{
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeIX, Kind: storageengine.LockComponentTableIntent, Space: testSpace, TableID: "t1"},
+			{Mode: storageengine.LockModeX, Kind: storageengine.LockComponentRecord, Space: testSpace, TableID: "t1", Key: []byte("k")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	obs, err := lockingA.ReadCurrent(ctx, grant, testSpace, []byte("k"))
+	if err != nil {
+		t.Fatalf("ReadCurrent: %v", err)
+	}
+	if string(obs.Value) != "V2" {
+		t.Fatalf("obs value = %s, want V2", obs.Value)
+	}
+
+	// 6. A writes unrelated key k2
+	if err := txA.Put(testSpace, []byte("k2"), []byte("V_A")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 7. A commits: MUST FAIL with ErrConflict because k had an earlier Guard dependency!
+	_, err = txA.Commit(ctx)
+	if !errors.Is(err, storageengine.ErrConflict) {
+		t.Fatalf("txA Commit = %v, want ErrConflict (Guard dependency was overwritten by subsequent locked read!)", err)
+	}
+}
+
+// TestPRE06B_RootTerminalCancelsInFlightStageScanCleanly covers PRE-06B:
+// When an in-flight iterator is reading through multi-page uncommitted staged writes,
+// a concurrent root Rollback must not panic, crash, or access a closed stage database.
+func TestPRE06B_RootTerminalCancelsInFlightStageScanCleanly(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+	const totalRows = 300
+
+	tx, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stage 300 rows (exceeds single page buffer so it flushes to t.stage file)
+	for i := 0; i < totalRows; i++ {
+		key := fmt.Sprintf("k_%04d", i)
+		_ = tx.Put("staged_space", []byte(key), []byte("val"))
+	}
+
+	it, err := tx.NewIterator(ctx, storageengine.ScanRequest{Space: "staged_space"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read first 10 rows
+	for i := 0; i < 10; i++ {
+		if !it.Next() {
+			t.Fatalf("read %d failed: %v", i, it.Err())
+		}
+	}
+
+	// Concurrently rollback transaction
+	_ = tx.Rollback()
+
+	// Continue reading: must cleanly terminate or fail without panic or closed database crash
+	for it.Next() {
+	}
+
+	_ = it.Close()
 }

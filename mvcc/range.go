@@ -162,11 +162,19 @@ func (s *Store) ScanRange(ctx context.Context, snapshot uint64, space string, r 
 }
 func (t *Tx) stageRangePage(ctx context.Context, prefix []byte, r KeyRange, after []byte) (rangePage, error) {
 	page := rangePage{}
-	if t.stage == nil {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return page, ErrClosed
+	}
+	stage := t.stage
+	t.mu.Unlock()
+
+	if stage == nil {
 		page.done = true
 		return page, nil
 	}
-	err := t.stage.View(func(tx *bolt.Tx) error {
+	err := stage.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket([]byte("writes")).Cursor()
 		k := rangeCursor(c, prefix, r, after)
 		size, count := 0, 0

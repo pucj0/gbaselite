@@ -1,7 +1,7 @@
 # Tasks: B03 Four Transaction Isolation Levels
 
 **Feature**: `007-b03-transaction-isolation`  
-**Status**: 46 tasks completed (Phase 1 Setup & Proof, Phase 2 Grammar & Session, Phase 3 Read View & GC, Phase 4 REPEATABLE READ, and Phase 5 READ COMMITTED completed). Phase 6–9 pending user authorization.
+**Status**: 56 tasks completed (Phase 1 Setup & Proof, Phase 2 Grammar & Session, Phase 3 Read View & GC, Phase 4 REPEATABLE READ, Phase 5 READ COMMITTED, and Phase 6 SERIALIZABLE completed). Phase 7–9 pending user authorization.
 **Format**: `[TID] [P?] [USn] text — FR/SC`. `[P]` 只表示文件独立、前置依赖满足时可并行；并不授权 AI 跳过 Phase。
 **Tests**: 必须先写失败测试，再实现；不能拿静态阅读等同运行验收。
 
@@ -118,16 +118,16 @@
 
 **Goal**: SER root-held 共享读锁与谓词保护。
 
-- [ ] **T047** 先写 M21–M28 SER S/S、S/X、absent point、empty range、write skew、upgrade/deadlock 与 unsupported 查询红测。  _Trace: FR-012/020/021/033; SC-005_
-- [ ] **T048** 在 `executor/transaction_engine.go`、`executor/locking_read.go` 将 long transaction 普通 SELECT 绑定 S-equivalent 模式；禁止返回普通 RR snapshot 代替。  _Trace: FR-012/013/033; SC-005_
-- [ ] **T049** 在 `executor/{lock_plan.go,physical_binding.go,locking_read.go}` 给点、唯一、范围、全表读证明 predicate lock 边界。  _Trace: FR-020/021; SC-005_
-- [ ] **T050** 在 `lockmanager` 使用既有 Record S + gap/next-key root grants 覆盖空结果与插入位置，不改 B02 等待公平契约。  _Trace: FR-020/021/022; SC-005_
-- [ ] **T051** 为 JOIN/CTE/VIEW/UNION/聚合/子查询做 base-read plan 审计，能安全扩展则加锁，否则在执行前 Unsupported；测试无泄漏。  _Trace: FR-012/027; SC-005/008_
-- [ ] **T052** 验证 FULL SCAN / secondary index 与唯一键使用的谓词 lock plan 不漏插入、不扩大成不必要的数据库全局锁。  _Trace: FR-020/021; SC-005_
-- [ ] **T053** 核对 S→X、write skew、当前读与自身写的串行性，处理死锁 victim/超时后的正确 session rollback state。  _Trace: FR-015/022; SC-005_
-- [ ] **T054** 验证 autocommit=1 独立纯 SELECT 优化与 BEGIN/autocommit=0 的边界，遇到 long txn 不可放松加锁。  _Trace: FR-008/033; SC-005_
-- [ ] **T055** 在 server/adapter 对 unsupported backend、missing LockingTxn、unsupported shapes 返回可预测错误与 SQLSTATE 类别。  _Trace: FR-024/027; SC-008_
-- [ ] **T056** Phase 6 gate：M21–M28 100 轮确定性调度、B02 gap/fairness/diagnostics/相邻范围回归与 README shape matrix。  _Trace: FR-030/031; SC-005/007/010_
+- [x] **T047** 先写 M21–M28 SER S/S、S/X、absent point、empty range、write skew、upgrade/deadlock 与 unsupported 查询红测。  _Trace: FR-012/020/021/033; SC-005_
+- [x] **T048** 在 `executor/transaction_engine.go`、`executor/locking_read.go` 将 long transaction 普通 SELECT 绑定 S-equivalent 模式；禁止返回普通 RR snapshot 代替。  _Trace: FR-012/013/033; SC-005_
+- [x] **T049** 在 `executor/{lock_plan.go,physical_binding.go,locking_read.go}` 给点、唯一、范围、全表读证明 predicate lock 边界。  _Trace: FR-020/021; SC-005_
+- [x] **T050** 在 `lockmanager` 使用既有 Record S + gap/next-key root grants 覆盖空结果与插入位置，不改 B02 等待公平契约。  _Trace: FR-020/021/022; SC-005_
+- [x] **T051** 为 JOIN/CTE/VIEW/UNION/聚合/子查询做 base-read plan 审计，能安全扩展则加锁，否则在执行前 Unsupported；测试无泄漏。  _Trace: FR-012/027; SC-005/008_
+- [x] **T052** 验证 FULL SCAN / secondary index 与唯一键使用的谓词 lock plan 不漏插入、不扩大成不必要的数据库全局锁。  _Trace: FR-020/021; SC-005_
+- [x] **T053** 核对 S→X、write skew、当前读与自身写的串行性，处理死锁 victim/超时后的正确 session rollback state。  _Trace: FR-015/022; SC-005_
+- [x] **T054** 验证 autocommit=1 独立纯 SELECT 优化与 BEGIN/autocommit=0 的边界，遇到 long txn 不可放松加锁。  _Trace: FR-008/033; SC-005_
+- [x] **T055** 在 server/adapter 对 unsupported backend、missing LockingTxn、unsupported shapes 返回可预测错误与 SQLSTATE 类别。  _Trace: FR-024/027; SC-008_
+- [x] **T056** Phase 6 gate：M21–M28 100 轮确定性调度、B02 gap/fairness/diagnostics/相邻范围回归与 README shape matrix。  _Trace: FR-030/031; SC-005/007/010_
 
 **Checkpoint P6**: 只有本阶段真实证据齐备、阻塞问题关闭且用户授权下一阶段后方可继续。
 

@@ -27,7 +27,8 @@ func bindPhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Sess
 	// select) is materialized by earlier code that reads the statement snapshot, so a locking read of
 	// one of them has to be refused here — before that code runs — rather than quietly served as if it
 	// held the locks its statement asked for.
-	if statement.Locking {
+	isSerializableLong := session.EffectiveIsolation() == parser.LevelSerializable && (session.InTransaction() || session.AutocommitDisabled)
+	if statement.Locking || isSerializableLong {
 		if err := validateLockedReadShape(statement); err != nil {
 			return nil, err
 		}

@@ -32,7 +32,7 @@ var errLockedReadUnavailable = fmt.Errorf("%w: this locking read cannot be serve
 
 // errLockedReadShape reports a locking read on a statement shape whose locking semantics are not
 // implemented yet.
-var errLockedReadShape = fmt.Errorf("%w: this statement shape does not support row locking yet", ErrLockPlanUnavailable)
+var errLockedReadShape = fmt.Errorf("%w: this statement shape does not support row locking yet", storageengine.ErrUnsupported)
 
 // lockedReadWaitHook, when set, is consulted the moment a locking read discovers it has to wait for a
 // conflicting claim. It mirrors the mutation path's request hook: it turns "this statement is
@@ -53,6 +53,10 @@ func lockedReadWaitDecision(space string) func(context.Context) bool {
 // A plain read keeps the snapshot scan it always had; a locking read is served by the locked path,
 // which either protects what it reads or returns an error.
 func readSourceOperator(ctx context.Context, tx storageengine.Txn, session *Session, statement parser.Select, table versionedTable, plan sqlAccessPlan, decode func([]byte) (storage.Row, error)) (physical.Operator[storage.Row], error) {
+	if session.EffectiveIsolation() == parser.LevelSerializable && (session.InTransaction() || session.AutocommitDisabled) {
+		statement.Locking = true
+		statement.LockMode = parser.LockModeShare
+	}
 	if !statement.Locking {
 		return bindScan(tx, table, plan, decode), nil
 	}
@@ -77,6 +81,8 @@ func validateLockedReadShape(statement parser.Select) error {
 		return fmt.Errorf("%w: aggregation or DISTINCT", errLockedReadShape)
 	case selectHasAggregate(statement.Items):
 		return fmt.Errorf("%w: aggregation", errLockedReadShape)
+	case expressionHasSubquery(statement.Where):
+		return fmt.Errorf("%w: subqueries", errLockedReadShape)
 	}
 	return nil
 }

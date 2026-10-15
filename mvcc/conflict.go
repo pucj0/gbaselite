@@ -132,6 +132,14 @@ func (v conflictValidator) validateOps(ops []Op) error {
 		if err != nil {
 			return err
 		}
+		if op.Check {
+			// A Guard is an explicit optimistic dependency on the key not changing since readTS.
+			// It must never be relaxed by a subsequent locked current read on the same key.
+			if v.latest(logicalKey) > v.readTS {
+				return ErrConflict
+			}
+			continue
+		}
 		if err := v.validateKey(logicalKey); err != nil {
 			return err
 		}

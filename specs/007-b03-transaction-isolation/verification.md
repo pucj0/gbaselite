@@ -534,3 +534,72 @@
 3. **Phase 6 准入结论**:
    - **P5-FIX-01 至 P5-FIX-05 全部彻底关闭**；
    - **GBaseLite B03 Phase 5 最终 Gate 确认通过**，已完全具备进入 Phase 6（SERIALIZABLE）的技术条件。
+
+---
+
+## 22. Phase 6 实施与验收结果 (T047–T056)
+
+- **基线 Commit**: `57fc82233026e80a399624cb3c8adab3b44bcc59`
+- **实施内容与证据**:
+
+### 1. 前置安全门禁修复 (PRE-06A & PRE-06B)
+- **PRE-06A (乐观 Guard 依赖防覆盖)**:
+  - `mvcc/conflict.go:validateOps`: 显式判断 `op.Check == true`（乐观 Guard），强制比对 `latest > v.readTS`，绝不受后续持锁当前读记录的 `v.baseline` 放宽；
+  - 实测证据: `storageengine/isolation_test.go:TestPRE06A_OptimisticGuardNotOverwrittenByLockedRead` 绿测通过（1.176s）。
+- **PRE-06B (Root 终态与未提交 Stage 扫描保护)**:
+  - `mvcc/transaction.go:cleanup()` 在 `t.mu.Lock()` 保护下原子置 `closed = true` 并提取/置空 `t.stage`；
+  - `mvcc/range.go:stageRangePage()` 在进入 bbolt 前检查 `t.closed` 并返回 `ErrClosed`；
+  - 彻底杜绝对已关闭 Stage 临时文件的并发访问、数据竞争与 crash；
+  - 实测证据: `storageengine/isolation_test.go:TestPRE06B_RootTerminalCancelsInFlightStageScanCleanly` 绿测通过（1.229s）。
+
+### 2. T047: M21–M28 红测先行
+- **文件**: `executor/isolation_serializable_test.go`
+- **红测证据**: 在未开放 SERIALIZABLE 执行能力时，M21–M28 均捕获真实的 `storage engine capability is not supported: transaction isolation level SERIALIZABLE is not supported yet` 失败证据。
+
+### 3. T048–T050: 普通读转共享锁与 B02 Lock Manager 复用
+- **共享锁读取机制**:
+  - `readSourceOperator` 在 SERIALIZABLE 且处于长事务（显式 `BEGIN` 或 `autocommit=0`）时，将普通 SELECT 转换为等效的 `SELECT ... FOR SHARE`（`LockMode = LockModeShare`）；
+  - `bindLockedRead` 生成 `storageengine.LockModeS`（共享记录锁）与 `LockModeIS`（意向共享表锁）；
+  - 缺席点通过 `protectInsertionPosition` 获取 Gap 锁，空区间与范围读通过 `lockPlanRange` 获取 Next-Key / Interval 锁；
+  - 锁生命周期持续至根事务终态，由 B02 锁管理器统一管理。
+
+### 4. T051 & T052: 复杂 SQL 形态安全门禁与谓词 LockPlan
+- **复杂查询形态门禁**:
+  - `bindPhysicalSelect`、`validateLockedReadShape` 与执行层统一对缺少基表谓词保护的查询形态在执行前 fail-closed 报错 `storageengine.ErrUnsupported`；
+  - 拦截形态涵盖：`JOIN`、`CTE`、`VIEW`、`UNION`、`GROUP BY/HAVING/DISTINCT`、聚合函数以及 `WHERE` / `Items` 中的子查询；
+  - 实测证据: `TestM27_SER_UnsupportedQueries`。
+
+### 5. T053: Write Skew 防范与死锁升级
+- **跨行与聚合约束保护**:
+  - 事务读取数据时持 S 锁，后续修改请求 X 锁时形成互斥或 S→X 升级等待；
+  - 并发事务同时升级触发 B02 死锁图检测，选出 Victim 回滚，阻止两个违反约束的事务同时提交；
+  - 实测证据: `TestM25_SER_WriteSkew` 与 `TestT053_SER_WriteSkewAggregateConstraint`。
+
+### 6. T054 & T055: 自动提交优化与能力门禁
+- **Autocommit 模式边界**:
+  - 独立纯只读 `autocommit=1` SELECT 保留 MySQL 8.4 规范的非锁定一致读优化；
+  - 显式 `BEGIN` 或 `autocommit=0` 长事务严格执行加锁读取；
+  - 实测证据: `TestM28_SER_AutocommitOptimization` 与 `TestT054_SER_AutocommitModeMatrix`。
+
+### 7. T056: 100 轮确定性压测与全量回归
+- SERIALIZABLE 确定性测试执行 100 轮全部通过（`count=100`，EXIT: 0，总耗时 89.4s）；
+- 死锁用例执行 20 轮全通；
+- 全库 21 个带测试包执行 `go test ./... -count=1` 100% 通过（总耗时 162.1s）；
+- `gofmt -l`、`go vet ./...`、`git diff --check` 全部 clean。
+
+---
+
+## 23. Phase 6 最终 Gate 审查结论
+
+- [x] **PRE-06A (乐观 Guard 依赖防覆盖)** 彻底解决并通过红绿测试；
+- [x] **PRE-06B (Root 终态与未提交 Stage 扫描安全)** 彻底解决并通过红绿测试；
+- [x] **M21–M28 (SERIALIZABLE)** 全部红测先行并绿测通过；
+- [x] **普通 SELECT 转共享锁读取 (S 锁 + Current Read)** 完整实现；
+- [x] **复用 B02 Lock Manager (Record S, Gap, Next-Key, Table IS/IX, Deadlock)**；
+- [x] **复杂无谓词保护查询 (JOIN/CTE/VIEW/UNION/Subquery) fail-closed**；
+- [x] **Write Skew 与 S→X 升级死锁检测验证完备**；
+- [x] **autocommit=1 非锁定只读优化与长事务加锁边界明确**；
+- [x] **全库 21 包 100% 通过，100 轮压测全部通过**；
+- [x] **README 与 tasks.md 均已完成同步**。
+
+**结论：GBaseLite B03 Phase 6 最终 Gate 正式通过，完全具备进入 Phase 7（READ UNCOMMITTED）的技术前置条件。**

@@ -142,7 +142,7 @@ func (t *Tx) readCurrent(space string, rowKey []byte) (CurrentObservation, error
 		if err != nil {
 			return CurrentObservation{}, err
 		}
-		if found {
+		if found && !op.Check {
 			return overlayObservation(op), nil
 		}
 		return t.parent.readCurrent(space, rowKey)
@@ -151,7 +151,7 @@ func (t *Tx) readCurrent(space string, rowKey []byte) (CurrentObservation, error
 	if err != nil {
 		return CurrentObservation{}, err
 	}
-	if found {
+	if found && !op.Check {
 		return overlayObservation(op), nil
 	}
 	value, version, exists, err := t.store.latestPublished(space, rowKey)

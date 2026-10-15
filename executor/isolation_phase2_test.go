@@ -237,7 +237,7 @@ func TestB03IsolationUnsupportedCapability(t *testing.T) {
 	defer cleanup()
 	s := &Session{CurrentDatabase: "db"}
 
-	for _, level := range []string{"READ UNCOMMITTED", "SERIALIZABLE"} {
+	for _, level := range []string{"READ UNCOMMITTED"} {
 		t.Run("Explicit_"+level, func(t *testing.T) {
 			if _, err := e.Execute(s, "SET TRANSACTION ISOLATION LEVEL "+level+";"); err != nil {
 				t.Fatalf("SET TRANSACTION %s: %v", level, err)

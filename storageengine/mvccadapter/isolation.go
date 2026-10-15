@@ -106,9 +106,9 @@ func (e *engine) BeginIsolated(ctx context.Context, level storageengine.Isolatio
 	if !level.Valid() {
 		return nil, fmt.Errorf("invalid isolation level: %q", level)
 	}
-	// In Phase 5, REPEATABLE READ and READ COMMITTED are executable by the storage backend.
-	// RU and SERIALIZABLE must return ErrUnsupported without registering a root transaction.
-	if level != storageengine.IsolationRepeatableRead && level != storageengine.IsolationReadCommitted {
+	// In Phase 6, REPEATABLE READ, READ COMMITTED, and SERIALIZABLE are executable by the storage backend.
+	// RU must return ErrUnsupported without registering a root transaction.
+	if level != storageengine.IsolationRepeatableRead && level != storageengine.IsolationReadCommitted && level != storageengine.IsolationSerializable {
 		return nil, fmt.Errorf("%w: isolation level %s is not supported yet", storageengine.ErrUnsupported, level)
 	}
 	t, err := e.store.BeginLazy(ctx, e.proposer)
