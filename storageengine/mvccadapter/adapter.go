@@ -182,7 +182,7 @@ func (t *txn) Get(s string, k []byte) ([]byte, bool, error) {
 	if t.activeView != nil && t.activeView.State() == storageengine.ViewStateActive {
 		return t.activeView.Get(s, k)
 	}
-	if t.isolationLevel == storageengine.IsolationSerializable && t.rootTxn == nil && !isMetadataSpace(s) {
+	if t.root().isolationLevel == storageengine.IsolationSerializable && !isMetadataSpace(s) {
 		return t.serializableGet(s, k)
 	}
 	return t.inner.Get(s, k)
@@ -198,6 +198,8 @@ func (t *txn) serializableGet(s string, k []byte) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
+	defer func() { _ = locking.CloseLockScope(ctx, scope) }()
+
 	tableID := s
 	if idx := strings.Index(s, "/"); idx != -1 {
 		tableID = s[idx+1:]
@@ -218,13 +220,17 @@ func (t *txn) serializableGet(s string, k []byte) ([]byte, bool, error) {
 	if !obs.Exists {
 		// Absent record: protect insertion position via gap lock
 		prev, next, err := locking.KeysAround(ctx, s, k)
-		if err == nil {
-			_, _ = locking.Acquire(ctx, scope, storageengine.LockRequest{
-				Components: []storageengine.LockComponent{
-					{Mode: storageengine.LockModeIS, Kind: storageengine.LockComponentTableIntent, Space: s, TableID: tableID},
-					{Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: s, TableID: tableID, Lower: prev, Upper: next},
-				},
-			})
+		if err != nil {
+			return nil, false, err
+		}
+		_, err = locking.Acquire(ctx, scope, storageengine.LockRequest{
+			Components: []storageengine.LockComponent{
+				{Mode: storageengine.LockModeIS, Kind: storageengine.LockComponentTableIntent, Space: s, TableID: tableID},
+				{Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: s, TableID: tableID, Lower: prev, Upper: next},
+			},
+		})
+		if err != nil {
+			return nil, false, err
 		}
 		return nil, false, nil
 	}
@@ -303,7 +309,7 @@ func (t *txn) NewIterator(ctx context.Context, r storageengine.ScanRequest) (sto
 	if t.activeView != nil && t.activeView.State() == storageengine.ViewStateActive {
 		return t.activeView.NewIterator(ctx, r)
 	}
-	if t.isolationLevel == storageengine.IsolationSerializable && !isMetadataSpace(r.Space) {
+	if t.root().isolationLevel == storageengine.IsolationSerializable && !isMetadataSpace(r.Space) {
 		return nil, fmt.Errorf("%w: raw unguided NewIterator on SERIALIZABLE transaction without LockPlan is unsupported; use LockingTxn or SQL executor", storageengine.ErrUnsupported)
 	}
 	return newIterator(ctx, r, func(y func([]byte, []byte) error) error {

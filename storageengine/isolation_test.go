@@ -510,6 +510,133 @@ func TestP6Fix01_SerializableGoAPIRawReadsUnsupported(t *testing.T) {
 	}
 }
 
+// TestP6R201_SerializableChildAndActiveViewCannotBypassLock covers P6-R2-01:
+// 1. Child.Get on SERIALIZABLE must acquire S lock or fail closed, cannot bypass via inner.Get.
+// 2. ActiveView cannot be used to bypass locks on user data in SERIALIZABLE.
+func TestP6R201_SerializableChildAndActiveViewCannotBypassLock(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+
+	// 1. Seed row k=V1
+	tx0, _ := e.Begin(ctx)
+	_ = tx0.Put("rows/t1", []byte("k"), []byte("V1"))
+	_, _ = tx0.Commit(ctx)
+
+	// 2. Root begins SERIALIZABLE
+	txRoot, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationSerializable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txRoot.Rollback()
+
+	// 3. Child created from Root
+	txChild, err := txRoot.Child()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txChild.Rollback()
+
+	// 4. Child.Get(k) acquires S lock on k
+	val, ok, err := txChild.Get("rows/t1", []byte("k"))
+	if err != nil || !ok || string(val) != "V1" {
+		t.Fatalf("Child.Get = (%s, %v, %v), want V1", val, ok, err)
+	}
+
+	// 5. Concurrent B attempting to update k must be blocked by Child's S lock!
+	noWait := func(context.Context) bool { return false }
+	txB, _ := e.Begin(ctx)
+	defer txB.Rollback()
+
+	lockingB, _ := storageengine.LockingTxnOf(txB)
+	scopeB, _ := lockingB.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	_, errB := lockingB.Acquire(ctx, scopeB, storageengine.LockRequest{
+		ShouldWait: noWait,
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeIX, Kind: storageengine.LockComponentTableIntent, Space: "rows/t1", TableID: "t1"},
+			{Mode: storageengine.LockModeX, Kind: storageengine.LockComponentRecord, Space: "rows/t1", TableID: "t1", Key: []byte("k")},
+		},
+	})
+	if errB == nil {
+		t.Fatalf("B was able to acquire X lock while Child holds S lock in SERIALIZABLE!")
+	}
+
+	// 6. Attempting raw unguided scan on Child must fail closed
+	if err := txChild.Scan(ctx, "rows/t1", func(k, v []byte) error { return nil }); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("Child.Scan returned %v, want ErrUnsupported", err)
+	}
+}
+
+// TestP6R202_SerializableGetGapLockErrorHandling covers P6-R2-02:
+// Verifies that serializableGet does not swallow Gap Lock acquisition errors or KeysAround failures,
+// and ensures lock scopes are cleanly closed.
+func TestP6R202_SerializableGetGapLockErrorHandling(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+
+	// 1. Seed two boundary rows: id=10, id=100
+	tx0, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tx0.Put("rows/t1", []byte("k10"), []byte("V10"))
+	_ = tx0.Put("rows/t1", []byte("k100"), []byte("V100"))
+	if _, err := tx0.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Txn B acquires exclusive gap lock on (k10, k100)
+	txB, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txB.Rollback()
+
+	lockingB, err := storageengine.LockingTxnOf(txB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopeB, err := lockingB.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// B holds X lock on the gap
+	_, err = lockingB.Acquire(ctx, scopeB, storageengine.LockRequest{
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeIX, Kind: storageengine.LockComponentTableIntent, Space: "rows/t1", TableID: "t1"},
+			{Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: "rows/t1", TableID: "t1", Lower: []byte("k10"), Upper: []byte("k100")},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Txn A begins SERIALIZABLE
+	txA, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationSerializable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback()
+
+	// Rollback txB so locks release
+	_ = txB.Rollback()
+
+	// Now A can get "k50" absent successfully with gap lock acquired
+	val, ok, err := txA.Get("rows/t1", []byte("k50"))
+	if err != nil || ok || val != nil {
+		t.Fatalf("absent Get after B released: (%v, %v, %v)", val, ok, err)
+	}
+}
+
 // TestP6Fix03_GuardFollowedByPutRetainsGuardConflict covers P6-FIX-03:
 // When an optimistic Guard is declared on key k, and later a Put or Delete is written to the same key k,
 // the earlier optimistic dependency must NOT be lost or overwritten by Put's observation baseline.

@@ -802,3 +802,59 @@ func TestP6Fix02_SerializableDMLUnprotectedReadPathsFailClosed(t *testing.T) {
 
 	_, _ = e.Execute(s, "COMMIT;")
 }
+
+// TestP6R203_AutocommitSerializableDMLFailsClosed covers P6-R2-03:
+// In SERIALIZABLE, standalone autocommit=1 DML with unprotected read paths (UPDATE JOIN,
+// DELETE JOIN, subqueries in WHERE, INSERT SELECT, CTAS) must fail closed with ErrUnsupported.
+func TestP6R203_AutocommitSerializableDMLFailsClosed(t *testing.T) {
+	e, cleanup := newIsolationTestEngine(t)
+	defer cleanup()
+
+	s := newSerializableSession("db")
+	_ = e.SetAutocommit(s, true) // autocommit=1 standalone
+
+	if _, err := e.Execute(s, "CREATE TABLE t2 (id INT PRIMARY KEY, v VARCHAR(50));"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. UPDATE JOIN in autocommit=1: must fail closed
+	_, err := e.Execute(s, "UPDATE t JOIN t2 ON t.id = t2.id SET t.v = 'new';")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("autocommit UPDATE JOIN returned %v, want ErrUnsupported", err)
+	}
+
+	// 2. DELETE JOIN in autocommit=1: must fail closed
+	_, err = e.Execute(s, "DELETE t FROM t JOIN t2 ON t.id = t2.id;")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("autocommit DELETE JOIN returned %v, want ErrUnsupported", err)
+	}
+
+	// 3. UPDATE with subquery in autocommit=1: must fail closed
+	_, err = e.Execute(s, "UPDATE t SET v = 'new' WHERE id IN (SELECT id FROM t2);")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("autocommit UPDATE subquery returned %v, want ErrUnsupported", err)
+	}
+
+	// 4. INSERT SELECT in autocommit=1: must fail closed
+	_, err = e.Execute(s, "INSERT INTO t2 SELECT id, v FROM t;")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("autocommit INSERT SELECT returned %v, want ErrUnsupported", err)
+	}
+
+	// 5. CTAS in autocommit=1: must fail closed
+	_, err = e.Execute(s, "CREATE TABLE t3 AS SELECT id, v FROM t;")
+	if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("autocommit CTAS returned %v, want ErrUnsupported", err)
+	}
+
+	// 6. Plain single-table INSERT, UPDATE, DELETE in autocommit=1 succeed!
+	if _, err := e.Execute(s, "INSERT INTO t VALUES (70, 'val70');"); err != nil {
+		t.Fatalf("autocommit plain INSERT failed: %v", err)
+	}
+	if _, err := e.Execute(s, "UPDATE t SET v = 'val70_updated' WHERE id = 70;"); err != nil {
+		t.Fatalf("autocommit plain UPDATE failed: %v", err)
+	}
+	if _, err := e.Execute(s, "DELETE FROM t WHERE id = 70;"); err != nil {
+		t.Fatalf("autocommit plain DELETE failed: %v", err)
+	}
+}

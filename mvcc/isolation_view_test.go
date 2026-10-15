@@ -3,9 +3,11 @@ package mvcc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"gbaselite/storageengine"
 )
@@ -413,5 +415,143 @@ func TestP4Fix03_StartTSImmutable(t *testing.T) {
 	}
 	if infoAfter.ReadTS != 25 {
 		t.Fatalf("ReadTS = %d, want 25", infoAfter.ReadTS)
+	}
+}
+
+// TestP6R204_GuardCapacityOverflowAndMerge covers P6-R2-04:
+// Tests >16384 distinct guarded keys, duplicate guards, overflow error ErrWriteSetLimit,
+// and Child -> Parent merge capacity checking.
+func TestP6R204_GuardCapacityOverflowAndMerge(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	tx, err := s.Begin(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	// 1. Guard exactly 16384 distinct keys
+	for i := 0; i < maxGuardedKeys; i++ {
+		key := []byte(fmt.Sprintf("k_%05d", i))
+		if err := tx.Guard("data", key); err != nil {
+			t.Fatalf("Guard %d: %v", i, err)
+		}
+	}
+
+	// 2. Duplicate guard on already guarded key must succeed
+	if err := tx.Guard("data", []byte("k_00010")); err != nil {
+		t.Fatalf("duplicate guard failed: %v", err)
+	}
+
+	// 3. Guarding 16385th distinct key must fail with ErrWriteSetLimit
+	err = tx.Guard("data", []byte("k_overflow"))
+	if !errors.Is(err, ErrWriteSetLimit) {
+		t.Fatalf("overflow guard returned %v, want ErrWriteSetLimit", err)
+	}
+
+	_ = tx.Rollback()
+
+	// 4. Test Child -> Parent merge overflow
+	parent, _ := s.Begin(ctx, s)
+	defer parent.Rollback()
+
+	for i := 0; i < 10000; i++ {
+		_ = parent.Guard("data", []byte(fmt.Sprintf("parent_k_%05d", i)))
+	}
+
+	child, _ := parent.Child()
+	for i := 0; i < 7000; i++ {
+		_ = child.Guard("data", []byte(fmt.Sprintf("child_k_%05d", i)))
+	}
+
+	// 10000 + 7000 = 17000 > 16384 -> merge must fail with ErrWriteSetLimit
+	_, err = child.Commit(ctx)
+	if !errors.Is(err, ErrWriteSetLimit) {
+		t.Fatalf("child commit overflow returned %v, want ErrWriteSetLimit", err)
+	}
+
+	// 5. Savepoint rollback correctly discards child guards
+	parent2, _ := s.Begin(ctx, s)
+	defer parent2.Rollback()
+
+	child2, _ := parent2.Child()
+	_ = child2.Guard("data", []byte("sp_key"))
+	_ = child2.Rollback()
+
+	parent2.mu.Lock()
+	guardedCount := len(parent2.guardedKeys)
+	parent2.mu.Unlock()
+	if guardedCount != 0 {
+		t.Fatalf("parent inherited discarded child guards: %d", guardedCount)
+	}
+}
+
+// TestP6R205_StageLeaseSynchronizesWithConcurrentCleanup covers P6-R2-05:
+// Tests that stage handle leases guarantee that in-flight stage readers safely complete
+// before cleanup() closes the underlying bolt.DB, and subsequent page fetches return ErrClosed.
+func TestP6R205_StageLeaseSynchronizesWithConcurrentCleanup(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	tx, err := s.Begin(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Stage 300 rows so writes flush to t.stage bolt DB
+	const totalRows = 300
+	for i := 0; i < totalRows; i++ {
+		key := []byte(fmt.Sprintf("k_%04d", i))
+		_ = tx.Put("data", key, []byte("val"))
+	}
+
+	// 2. Start scanning staged rows
+	scanDone := make(chan error, 1)
+	read10 := make(chan struct{})
+	go func() {
+		count := 0
+		err := tx.ScanRangeAt(ctx, "data", KeyRange{}, tx.Snapshot, func(k, v []byte) error {
+			count++
+			if count == 10 {
+				close(read10)
+				time.Sleep(50 * time.Millisecond) // hold in-flight scan
+			}
+			return nil
+		})
+		scanDone <- err
+	}()
+
+	<-read10
+
+	// 3. Concurrently rollback the transaction while scan is in-flight
+	rollbackDone := make(chan error, 1)
+	go func() {
+		rollbackDone <- tx.Rollback()
+	}()
+
+	select {
+	case err := <-rollbackDone:
+		if err != nil {
+			t.Fatalf("rollback failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("rollback hung waiting for stage lease")
+	}
+
+	// 4. Scan must either safely complete or return ErrClosed, never panic
+	err = <-scanDone
+	if err != nil && !errors.Is(err, ErrClosed) {
+		t.Fatalf("unexpected error from scan: %v", err)
 	}
 }

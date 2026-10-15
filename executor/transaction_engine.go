@@ -692,8 +692,15 @@ func statementNeedsReadView(statement parser.Statement, level storageengine.Isol
 }
 
 func validateSerializableStatementShape(statement parser.Statement, session *Session) error {
-	if session.EffectiveIsolation() != parser.LevelSerializable || (!session.InTransaction() && !session.AutocommitDisabled) {
+	if session.EffectiveIsolation() != parser.LevelSerializable {
 		return nil
+	}
+	// Standalone pure read-only SELECT in autocommit=1 can use nonlocking consistent read optimization per MySQL 8.4
+	if !session.InTransaction() && !session.AutocommitDisabled {
+		switch statement.(type) {
+		case parser.Select, parser.Empty, parser.Use, parser.Show, parser.Explain, parser.SetTransaction:
+			return nil
+		}
 	}
 	switch s := statement.(type) {
 	case parser.Update:

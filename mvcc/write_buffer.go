@@ -43,11 +43,16 @@ func (t *Tx) stagedValue(k []byte) ([]byte, error) {
 	if v, ok := t.buffered[string(k)]; ok {
 		return v, nil
 	}
-	if t.stage == nil {
+	stage, release, err := t.acquireStageLease()
+	if err != nil {
+		return nil, err
+	}
+	if stage == nil {
 		return nil, nil
 	}
+	defer release()
 	var value []byte
-	err := t.stage.View(func(tx *bolt.Tx) error { value = bytes.Clone(tx.Bucket([]byte("writes")).Get(k)); return nil })
+	err = stage.View(func(tx *bolt.Tx) error { value = bytes.Clone(tx.Bucket([]byte("writes")).Get(k)); return nil })
 	return value, err
 }
 func (t *Tx) bufferWrite(op Op, k, value []byte) error {

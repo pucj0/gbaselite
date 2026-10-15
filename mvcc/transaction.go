@@ -6,13 +6,15 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"gbaselite/storageengine"
-	bolt "go.etcd.io/bbolt"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"time"
+
+	"gbaselite/storageengine"
+	bolt "go.etcd.io/bbolt"
 )
 
 // ErrWriteSetLimit reports an explicitly configured logical write-set budget.
@@ -77,6 +79,35 @@ type Tx struct {
 	// guardedKeys tracks keys that had an explicit optimistic Guard dependency declared.
 	// An optimistic guard on a key must never be relaxed by a subsequent write baseline on the same key.
 	guardedKeys map[string]bool
+
+	stageReaders int
+	stageDrained chan struct{}
+}
+
+func (t *Tx) acquireStageLease() (*bolt.DB, func(), error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, nil, ErrClosed
+	}
+	if t.stage == nil {
+		return nil, nil, nil
+	}
+	t.stageReaders++
+	stage := t.stage
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			t.mu.Lock()
+			defer t.mu.Unlock()
+			t.stageReaders--
+			if t.closed && t.stageReaders == 0 && t.stageDrained != nil {
+				close(t.stageDrained)
+				t.stageDrained = nil
+			}
+		})
+	}
+	return stage, release, nil
 }
 
 func randomID() string {
@@ -730,7 +761,17 @@ func (t *Tx) cleanup() error {
 	stage := t.stage
 	t.stage = nil
 	path := t.path
+
+	var waitCh chan struct{}
+	if t.stageReaders > 0 {
+		waitCh = make(chan struct{})
+		t.stageDrained = waitCh
+	}
 	t.mu.Unlock()
+
+	if waitCh != nil {
+		<-waitCh
+	}
 
 	var err, removeErr error
 	if stage != nil {
@@ -801,17 +842,38 @@ const maxGuardedKeys = 16384
 
 func (t *Tx) Guard(space string, rowKey []byte) error {
 	k, err := key(space, rowKey)
-	if err == nil {
-		t.mu.Lock()
-		if len(t.guardedKeys) < maxGuardedKeys {
-			if t.guardedKeys == nil {
-				t.guardedKeys = make(map[string]bool, 4)
-			}
-			t.guardedKeys[string(k)] = true
-		}
-		t.mu.Unlock()
+	if err != nil {
+		return err
 	}
-	return t.write(Op{Space: space, Key: rowKey, Check: true})
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return ErrClosed
+	}
+	if t.guardedKeys == nil {
+		t.guardedKeys = make(map[string]bool, 4)
+	}
+	sk := string(k)
+	isNew := !t.guardedKeys[sk]
+	if isNew {
+		if len(t.guardedKeys) >= maxGuardedKeys {
+			t.mu.Unlock()
+			return fmt.Errorf("%w: maximum optimistic guarded keys (%d) exceeded", ErrWriteSetLimit, maxGuardedKeys)
+		}
+		t.guardedKeys[sk] = true
+	}
+	t.mu.Unlock()
+
+	err = t.write(Op{Space: space, Key: rowKey, Check: true})
+	if err != nil {
+		if isNew {
+			t.mu.Lock()
+			delete(t.guardedKeys, sk)
+			t.mu.Unlock()
+		}
+		return err
+	}
+	return nil
 }
 
 // Closed reports whether the transaction is closed.

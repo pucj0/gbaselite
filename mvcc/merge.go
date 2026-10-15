@@ -1,6 +1,9 @@
 package mvcc
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 func (t *Tx) mergeParent(ctx context.Context) error {
 	p := t.parent
@@ -23,7 +26,10 @@ func (t *Tx) mergeParent(ctx context.Context) error {
 		p.stats().addWriteSet(t.stats())
 		p.stats().addDependencies(t.stats())
 		p.stats().addObservations(t.stats())
-		p.mergeGuardedKeys(t)
+		if err := p.mergeGuardedKeys(t); err != nil {
+			_ = p.Rollback()
+			return err
+		}
 		return nil
 	}
 	if err := t.WalkWrites(ctx, p.write); err != nil {
@@ -35,22 +41,35 @@ func (t *Tx) mergeParent(ctx context.Context) error {
 	// The parent's write and dependency counters were updated by re-buffering each
 	// operation above; only the child's read observations still need folding in.
 	p.stats().addObservations(t.stats())
-	p.mergeGuardedKeys(t)
+	if err := p.mergeGuardedKeys(t); err != nil {
+		_ = p.Rollback()
+		return err
+	}
 	return nil
 }
 
-func (p *Tx) mergeGuardedKeys(child *Tx) {
+func (p *Tx) mergeGuardedKeys(child *Tx) error {
 	child.mu.Lock()
 	defer child.mu.Unlock()
 	if len(child.guardedKeys) == 0 {
-		return
+		return nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	newKeys := 0
+	for k := range child.guardedKeys {
+		if p.guardedKeys == nil || !p.guardedKeys[k] {
+			newKeys++
+		}
+	}
+	if len(p.guardedKeys)+newKeys > maxGuardedKeys {
+		return fmt.Errorf("%w: merged guarded keys exceed limit %d", ErrWriteSetLimit, maxGuardedKeys)
+	}
 	if p.guardedKeys == nil {
 		p.guardedKeys = make(map[string]bool, len(child.guardedKeys))
 	}
 	for k := range child.guardedKeys {
 		p.guardedKeys[k] = true
 	}
+	return nil
 }

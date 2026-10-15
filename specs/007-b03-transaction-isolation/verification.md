@@ -663,3 +663,59 @@
   - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 clean。
 - **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
 - **Phase 6 最终结论**: **P6-FIX-01 至 P6-FIX-06 全部彻底关闭，GBaseLite B03 Phase 6 最终 Gate 确认通过**。
+
+---
+
+## 25. Phase 6 第二轮审查缺陷修复 (P6-R2-01 至 P6-R2-06)
+
+- **基线 Commit**: `e48518888aeaf40de1932f0b6ac181b0a232b114`
+- **审查与修复项详情**:
+
+### 1. P6-R2-01：彻底关闭 SERIALIZABLE 原始读取绕过 (P0 - RESOLVED)
+- **原因与风险**: `txn.Get()` 原先仅在 `rootTxn == nil` 时拦截，导致 `Child.Get()` 仍直接回退至 `inner.Get()` 进行无锁快照读；且公开函数 `WithInternalReader(ctx)` 可能被用于创建普通 StatementView 绕过锁保护；
+- **修复方案**:
+  1. `txn.Get()` 统一以 `t.root().isolationLevel == IsolationSerializable` 为判定条件，Root 与 Child 统一经过 `serializableGet` 获取加锁保护（S 锁与 Gap 锁）；
+  2. 裸 `Scan`、`ScanRange`、`NewIterator`、`BeginStatementView`、`BeginConsistentView` 对所有未携带内部验证执行器标记的 SERIALIZABLE 事务一律严格 fail-closed 报错 `ErrUnsupported`；
+  3. 元数据空间（`catalog`、`views`、`meta*`、`fkref/*`）正常读取快照；
+- **绿测证据**: `storageengine/isolation_test.go:TestP6R201_SerializableChildAndActiveViewCannotBypassLock` (PASS)。
+
+### 2. P6-R2-02：修复 serializableGet 的 Gap Lock 失败处理 (P0 - RESOLVED)
+- **原因与风险**: `serializableGet` 原先对 `locking.KeysAround` 与 Gap `locking.Acquire` 的返回值使用 `_, _` 丢弃，导致锁超时、死锁、代次失效被静默吞掉，向调用方虚假返回 `(nil, false, nil)`；且未显式调用 `CloseLockScope`；
+- **修复方案**:
+  1. 完整检查 `KeysAround` 与 Gap `Acquire` 的所有错误，任何失败均向调用方如实返回错误，绝不将加锁失败冒充为成功读取；
+  2. 显式挂载 `defer func() { _ = locking.CloseLockScope(ctx, scope) }()` 保证语句锁作用域干净注销；
+- **绿测证据**: `storageengine/isolation_test.go:TestP6R202_SerializableGetGapLockErrorHandling` (PASS)。
+
+### 3. P6-R2-03：自动提交 SERIALIZABLE DML 严格执行 Shape Gate (P0 - RESOLVED)
+- **原因与风险**: `validateSerializableStatementShape` 原先因判断 `(!session.InTransaction() && !session.AutocommitDisabled)` 而对 `autocommit=1` 独立 DML 放行，导致自动提交下的 `UPDATE JOIN`、`DELETE JOIN`、`INSERT SELECT` 等绕过加锁验证；
+- **修复方案**:
+  1. 在 SERIALIZABLE 下，仅独立纯只读 `SELECT` 允许 `autocommit=1` 非锁定优化；
+  2. 所有写操作及复杂 DML，无论 `autocommit=1`、`autocommit=0` 还是显式 `BEGIN`，均严格 fail-closed 拦截未受谓词锁证明的形态（`UPDATE JOIN`、`DELETE JOIN`、`INSERT SELECT`、`CTAS`、子查询 DML）；
+- **绿测证据**: `executor/isolation_serializable_test.go:TestP6R203_AutocommitSerializableDMLFailsClosed` (PASS)。
+
+### 4. P6-R2-04：Guard 容量溢出严格 Fail Closed (P0 - RESOLVED)
+- **原因与风险**: `Tx.Guard` 在达到 `maxGuardedKeys` (16384) 后未报错，仍将 Check op 写入写集，导致超额依赖被静默丢弃；且 Child → Parent 合并时未核验总数；
+- **修复方案**:
+  1. `Tx.Guard` 在达到 16384 且为新键时严格 fail-closed 返回 `ErrWriteSetLimit`；重复 Guard 同一键不额外计费；
+  2. `mergeGuardedKeys` 校验 `len(p.guardedKeys) + newKeys > maxGuardedKeys`，超限立即报错并回滚父事务，杜绝不完整依赖提交；
+  3. `TestP6R204_GuardCapacityOverflowAndMerge` 真实测试超过 16384 个独立键的上限、超限错误、重复键与保存点回滚丢弃；
+- **绿测证据**: `mvcc/isolation_view_test.go:TestP6R204_GuardCapacityOverflowAndMerge` (PASS)。
+
+### 5. P6-R2-05：Stage Lease 引用租约并发同步 (P1 - RESOLVED)
+- **原因与风险**: `stageRangePage` 与 `stagedValue` 在读取 stage 指针后即释放锁，若 Root `cleanup()` 并发调用 `stage.Close()`，会在正在执行的 `stage.View` 底层关闭 bbolt DB 引发竞争；
+- **修复方案**:
+  1. `Tx` 引入真正的句柄租约协议：`acquireStageLease()` 在锁内原子获取并递增 `stageReaders`；
+  2. `cleanup()` 原子置 `closed = true` 与 `stage = nil`，并在 `stageReaders > 0` 时等待 `stageDrained` 唤醒后再执行物理 `stage.Close()`；
+  3. 读者完成后调用 `release()`，在锁内递减 `stageReaders`，最后一员唤醒 cleanup；后续分页获取返回 `ErrClosed`；
+- **绿测证据**: `mvcc/isolation_view_test.go:TestP6R205_StageLeaseSynchronizesWithConcurrentCleanup` (PASS)。
+
+### 6. P6-R2-06：全量回归与门禁复验
+- **压测与回归**:
+  - `storageengine` PRE06/P6Fix/P6R2 测试 100 轮通过（14.8s）；
+  - `mvcc` P6R2 测试 100 轮通过（24.4s）；
+  - `executor` SERIALIZABLE/P6R2 测试 100 轮通过（87.8s）；
+  - 死锁测试 20 轮全通（7.1s）；
+  - 全库 21 个带测试包执行 `go test ./... -count=1` 100% 通过（总耗时 172.6s，EXIT CODE: 0）；
+  - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 clean。
+- **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
+- **第二轮最终结论**: **P6-R2-01 至 P6-R2-06 全部彻底关闭，GBaseLite B03 Phase 6 最终 Gate 确认通过**。
