@@ -551,17 +551,37 @@ func TestT052_SER_PredicateBoundaryLocking(t *testing.T) {
 
 	// 2. Concurrent B attempts to INSERT inside the proven interval [10, 30] at id=15:
 	// The interval must still be protected even though A used LIMIT 1!
+	bWaiting := make(chan struct{})
+	var closeOnce sync.Once
 	bDone := make(chan error, 1)
+
+	dmlLockRequestHook = func(req storageengine.LockRequest) storageengine.LockRequest {
+		req.ShouldWait = func(ctx context.Context) bool {
+			closeOnce.Do(func() { close(bWaiting) })
+			return true
+		}
+		return req
+	}
+	defer func() { dmlLockRequestHook = nil }()
+
 	go func() {
 		_, err := e.Execute(sB, "INSERT INTO items VALUES (15, 150);")
 		bDone <- err
 	}()
 
+	<-bWaiting
+
+	// Deterministically verify B has entered Lock Manager wait queue for range lock
+	if lm := engineLockManager(e.Backend); lm != nil {
+		if len(lm.WaitEdges()) == 0 {
+			t.Fatal("expected B to be in lock manager wait queue for range lock")
+		}
+	}
+
 	select {
 	case err := <-bDone:
-		t.Fatalf("B INSERT succeeded prematurely inside locked interval: %v", err)
-	case <-time.After(50 * time.Millisecond):
-		// Expected: B is waiting for A's range lock
+		t.Fatalf("B finished prematurely without waiting for range lock: %v", err)
+	default:
 	}
 
 	_, _ = e.Execute(sA, "COMMIT;")
@@ -670,17 +690,37 @@ func TestT054_SER_AutocommitModeMatrix(t *testing.T) {
 	}
 
 	// Concurrent B update must wait/timeout because A holds S lock
+	bWaiting := make(chan struct{})
+	var closeOnce sync.Once
 	bDone := make(chan error, 1)
+
+	dmlLockRequestHook = func(req storageengine.LockRequest) storageengine.LockRequest {
+		req.ShouldWait = func(ctx context.Context) bool {
+			closeOnce.Do(func() { close(bWaiting) })
+			return true
+		}
+		return req
+	}
+	defer func() { dmlLockRequestHook = nil }()
+
 	go func() {
 		_, err := e.Execute(sB, "UPDATE t SET v = 'V_b' WHERE id = 10;")
 		bDone <- err
 	}()
 
+	<-bWaiting
+
+	// Deterministically verify B has entered Lock Manager wait queue
+	if lm := engineLockManager(e.Backend); lm != nil {
+		if len(lm.WaitEdges()) == 0 {
+			t.Fatal("expected B to be in lock manager wait queue")
+		}
+	}
+
 	select {
 	case err := <-bDone:
 		t.Fatalf("B update succeeded prematurely against autocommit=0 S lock: %v", err)
-	case <-time.After(50 * time.Millisecond):
-		// Expected: B is waiting
+	default:
 	}
 
 	_, _ = e.Execute(sA, "COMMIT;")
@@ -704,15 +744,35 @@ func TestT054_SER_AutocommitModeMatrix(t *testing.T) {
 	_, _ = e.Execute(sA, "SAVEPOINT sp1;")
 
 	// Inside savepoint child: S lock still held by Root
+	bWaiting2 := make(chan struct{})
+	var closeOnce2 sync.Once
+
+	dmlLockRequestHook = func(req storageengine.LockRequest) storageengine.LockRequest {
+		req.ShouldWait = func(ctx context.Context) bool {
+			closeOnce2.Do(func() { close(bWaiting2) })
+			return true
+		}
+		return req
+	}
+
 	go func() {
 		_, err := e.Execute(sB, "UPDATE t SET v = 'V_sp' WHERE id = 10;")
 		bDone <- err
 	}()
 
+	<-bWaiting2
+
+	// Deterministically verify B has entered Lock Manager wait queue
+	if lm := engineLockManager(e.Backend); lm != nil {
+		if len(lm.WaitEdges()) == 0 {
+			t.Fatal("expected B to be in lock manager wait queue for savepoint child lock")
+		}
+	}
+
 	select {
 	case err := <-bDone:
 		t.Fatalf("B update succeeded prematurely against Savepoint child S lock: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	default:
 	}
 
 	_, _ = e.Execute(sA, "ROLLBACK TO sp1;")

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -553,5 +554,100 @@ func TestP6R205_StageLeaseSynchronizesWithConcurrentCleanup(t *testing.T) {
 	err = <-scanDone
 	if err != nil && !errors.Is(err, ErrClosed) {
 		t.Fatalf("unexpected error from scan: %v", err)
+	}
+}
+
+// TestP6Final04_StageLeaseDeterministicInterleaving covers P6-FINAL-04:
+// Uses stageLeaseTestHook to pause execution inside stage.View and stagedValue,
+// verifying that concurrent cleanup() blocks waiting for in-flight leases and never
+// closes the bolt DB under active readers.
+func TestP6Final04_StageLeaseDeterministicInterleaving(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	tx, err := s.Begin(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Stage 300 rows so writes flush to t.stage
+	const totalRows = 300
+	for i := 0; i < totalRows; i++ {
+		key := []byte(fmt.Sprintf("k_%04d", i))
+		_ = tx.Put("data", key, []byte("val"))
+	}
+
+	// 2. Set up hook to pause inside stage.View
+	inView := make(chan struct{})
+	releaseView := make(chan struct{})
+	var hookOnce sync.Once
+
+	stageLeaseTestHook = func(event string) {
+		if event == "in_view" {
+			hookOnce.Do(func() {
+				close(inView)
+				<-releaseView
+			})
+		}
+	}
+	defer func() { stageLeaseTestHook = nil }()
+
+	scanDone := make(chan error, 1)
+	go func() {
+		err := tx.ScanRangeAt(ctx, "data", KeyRange{}, tx.Snapshot, func(k, v []byte) error {
+			return nil
+		})
+		scanDone <- err
+	}()
+
+	// Wait until reader is inside stage.View
+	<-inView
+
+	// 3. Concurrently invoke Rollback: cleanup() must wait on stage lease!
+	rollbackDone := make(chan error, 1)
+	go func() {
+		rollbackDone <- tx.Rollback()
+	}()
+
+	// Verify rollback is waiting and has not finished
+	select {
+	case <-rollbackDone:
+		t.Fatal("rollback completed while reader was inside stage.View!")
+	case <-time.After(50 * time.Millisecond):
+		// Expected: cleanup is blocked waiting on lease
+	}
+
+	// 4. Now allow reader to finish stage.View
+	close(releaseView)
+
+	// Reader should complete
+	select {
+	case err := <-scanDone:
+		if err != nil && !errors.Is(err, ErrClosed) {
+			t.Fatalf("scan error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("reader never completed")
+	}
+
+	// Rollback should now complete
+	select {
+	case err := <-rollbackDone:
+		if err != nil {
+			t.Fatalf("rollback error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("rollback never completed")
+	}
+
+	// 5. Subsequent attempts to acquire lease must return ErrClosed
+	_, _, err = tx.acquireStageLease()
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("acquireStageLease after rollback = %v, want ErrClosed", err)
 	}
 }

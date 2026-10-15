@@ -160,6 +160,9 @@ func (s *Store) ScanRange(ctx context.Context, snapshot uint64, space string, r 
 		after = p.after
 	}
 }
+
+var stageLeaseTestHook func(event string)
+
 func (t *Tx) stageRangePage(ctx context.Context, prefix []byte, r KeyRange, after []byte) (rangePage, error) {
 	page := rangePage{}
 	stage, release, err := t.acquireStageLease()
@@ -172,7 +175,14 @@ func (t *Tx) stageRangePage(ctx context.Context, prefix []byte, r KeyRange, afte
 	}
 	defer release()
 
+	if stageLeaseTestHook != nil {
+		stageLeaseTestHook("before_view")
+	}
+
 	err = stage.View(func(tx *bolt.Tx) error {
+		if stageLeaseTestHook != nil {
+			stageLeaseTestHook("in_view")
+		}
 		c := tx.Bucket([]byte("writes")).Cursor()
 		k := rangeCursor(c, prefix, r, after)
 		size, count := 0, 0

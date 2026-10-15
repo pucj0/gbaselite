@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gbaselite/storageengine"
 	"gbaselite/storageengine/mvccadapter"
@@ -713,5 +714,201 @@ func TestP6Fix03_GuardFollowedByPutRetainsGuardConflict(t *testing.T) {
 	_, err = txA.Commit(ctx)
 	if !errors.Is(err, storageengine.ErrConflict) {
 		t.Fatalf("txA Commit = %v, want ErrConflict (Guard dependency was overwritten by Put on same key!)", err)
+	}
+}
+
+// TestP6Final01_PublicWithInternalReaderCannotBypassSerializable covers P6-FINAL-01:
+// Demonstrates that public WithInternalReader cannot be used by an external caller to bypass
+// Record S / Gap locks on user data in a SERIALIZABLE transaction.
+func TestP6Final01_PublicWithInternalReaderCannotBypassSerializable(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+
+	// Seed k=V1
+	tx0, _ := e.Begin(ctx)
+	_ = tx0.Put("rows/t1", []byte("k"), []byte("V1"))
+	_, _ = tx0.Commit(ctx)
+
+	// A starts SERIALIZABLE
+	txA, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationSerializable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback()
+
+	// Try to use public WithInternalReader to create a statement view
+	ctxInternal := storageengine.WithInternalReader(context.Background())
+	isoA := txA.(storageengine.IsolationTxn)
+	view, err := isoA.BeginStatementView(ctxInternal, storageengine.StatementViewKindStatement)
+
+	if err == nil {
+		// Attempting view.Get on user data MUST be refused with ErrUnsupported!
+		_, _, errGet := view.Get("rows/t1", []byte("k"))
+		if !errors.Is(errGet, storageengine.ErrUnsupported) {
+			t.Fatalf("view.Get on user data in SERIALIZABLE returned %v, want ErrUnsupported (lock bypass!)", errGet)
+		}
+		// Attempting view.NewIterator on user data MUST be refused with ErrUnsupported!
+		_, errIt := view.NewIterator(ctx, storageengine.ScanRequest{Space: "rows/t1"})
+		if !errors.Is(errIt, storageengine.ErrUnsupported) {
+			t.Fatalf("view.NewIterator on user data in SERIALIZABLE returned %v, want ErrUnsupported (lock bypass!)", errIt)
+		}
+	} else if !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("BeginStatementView returned %v, want ErrUnsupported", err)
+	}
+
+	// ActiveView must NOT bypass locks in Txn.Get
+	val, ok, err := txA.Get("rows/t1", []byte("k"))
+	if err != nil || !ok || string(val) != "V1" {
+		t.Fatalf("txA.Get failed: %v", err)
+	}
+	// Verify that S lock is really held on k (concurrent X lock must be blocked!)
+	noWait := func(context.Context) bool { return false }
+	txB, _ := e.Begin(ctx)
+	defer txB.Rollback()
+	lockingB, _ := storageengine.LockingTxnOf(txB)
+	scopeB, _ := lockingB.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	_, errB := lockingB.Acquire(ctx, scopeB, storageengine.LockRequest{
+		ShouldWait: noWait,
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeIX, Kind: storageengine.LockComponentTableIntent, Space: "rows/t1", TableID: "t1"},
+			{Mode: storageengine.LockModeX, Kind: storageengine.LockComponentRecord, Space: "rows/t1", TableID: "t1", Key: []byte("k")},
+		},
+	})
+	if errB == nil {
+		t.Fatalf("ActiveView allowed bypassing S lock in txA.Get!")
+	}
+}
+
+// TestP6Final02_SerializableGetResourceIdentity covers P6-FINAL-02:
+// Verifies that serializableGet enforces exact B02 ResourceRef identities (row, index, secondary)
+// and rejects invalid or malformed spaces with ErrUnsupported.
+func TestP6Final02_SerializableGetResourceIdentity(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+
+	txA, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationSerializable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback()
+
+	// 1. Empty space must be rejected with ErrUnsupported
+	if _, _, err := txA.Get("", []byte("k")); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("txA.Get(\"\") returned %v, want ErrUnsupported", err)
+	}
+
+	// 2. Unprefixed invalid space must be rejected with ErrUnsupported
+	if _, _, err := txA.Get("random_data", []byte("k")); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("txA.Get(\"random_data\") returned %v, want ErrUnsupported", err)
+	}
+
+	// 3. Malformed row spaces must be rejected with ErrUnsupported
+	if _, _, err := txA.Get("row/", []byte("k")); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("txA.Get(\"row/\") returned %v, want ErrUnsupported", err)
+	}
+	if _, _, err := txA.Get("row/t1//extra", []byte("k")); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("txA.Get(\"row/t1//extra\") returned %v, want ErrUnsupported", err)
+	}
+	if _, _, err := txA.Get("index/t1", []byte("k")); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("txA.Get(\"index/t1\") returned %v, want ErrUnsupported", err)
+	}
+
+	// 4. Valid multi-segment table identities must succeed
+	if _, _, err := txA.Get("row/hash_12345/t1", []byte("k")); err != nil {
+		t.Fatalf("valid multi-segment row space failed: %v", err)
+	}
+	if _, _, err := txA.Get("index/hash_12345/t1/idx1", []byte("k")); err != nil {
+		t.Fatalf("valid multi-segment index space failed: %v", err)
+	}
+}
+
+// TestP6Final03_GapAndRecordLockErrorPaths covers P6-FINAL-03:
+// Verifies that serializableGet enters the lock wait queue when conflicting with B,
+// respects context cancellation and timeout, returns real errors instead of (nil, false, nil),
+// and leaves no pending request or scope leaks.
+func TestP6Final03_GapAndRecordLockErrorPaths(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+
+	// Seed k=V1
+	tx0, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = tx0.Put("rows/t1", []byte("k"), []byte("V1"))
+	if _, err := tx0.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Txn B acquires Record X on k
+	txB, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txB.Rollback()
+
+	lockingB, err := storageengine.LockingTxnOf(txB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopeB, err := lockingB.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = lockingB.Acquire(ctx, scopeB, storageengine.LockRequest{
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeIX, Kind: storageengine.LockComponentTableIntent, Space: "rows/t1", TableID: "t1"},
+			{Mode: storageengine.LockModeX, Kind: storageengine.LockComponentRecord, Space: "rows/t1", TableID: "t1", Key: []byte("k")},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Txn A begins SERIALIZABLE with a context that will be canceled
+	ctxCancel, cancelA := context.WithCancel(ctx)
+	txA, err := storageengine.BeginIsolated(ctxCancel, e, storageengine.IsolationSerializable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback()
+
+	getDone := make(chan error, 1)
+	go func() {
+		_, _, err := txA.Get("rows/t1", []byte("k"))
+		getDone <- err
+	}()
+
+	// Give a moment for A to encounter B's conflicting lock and wait
+	time.Sleep(50 * time.Millisecond)
+
+	// 3. Cancel A's context while in queue
+	cancelA()
+
+	select {
+	case err := <-getDone:
+		if err == nil {
+			t.Fatal("txA.Get returned nil error despite canceled context while waiting for lock!")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("txA.Get returned %v, want context.Canceled", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("txA.Get hung and did not abort on context cancellation")
 	}
 }

@@ -51,6 +51,9 @@ func (t *Tx) stagedValue(k []byte) ([]byte, error) {
 		return nil, nil
 	}
 	defer release()
+	if stageLeaseTestHook != nil {
+		stageLeaseTestHook("staged_value")
+	}
 	var value []byte
 	err = stage.View(func(tx *bolt.Tx) error { value = bytes.Clone(tx.Bucket([]byte("writes")).Get(k)); return nil })
 	return value, err

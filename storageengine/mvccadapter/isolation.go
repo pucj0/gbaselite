@@ -37,6 +37,9 @@ func (v *mvccReadView) Get(space string, key []byte) ([]byte, bool, error) {
 	case storageengine.ViewStateInvalidated:
 		return nil, false, storageengine.ErrViewInvalidated
 	}
+	if v.txn != nil && v.txn.root().isolationLevel == storageengine.IsolationSerializable && !isMetadataSpace(space) {
+		return nil, false, fmt.Errorf("%w: ReadView.Get on user data in SERIALIZABLE is unsupported", storageengine.ErrUnsupported)
+	}
 	var tx *mvcc.Tx
 	if v.txn != nil {
 		tx = v.txn.inner
@@ -60,6 +63,9 @@ func (v *mvccReadView) NewIterator(ctx context.Context, r storageengine.ScanRequ
 		return nil, storageengine.ErrViewClosed
 	case storageengine.ViewStateInvalidated:
 		return nil, storageengine.ErrViewInvalidated
+	}
+	if v.txn != nil && v.txn.root().isolationLevel == storageengine.IsolationSerializable && !isMetadataSpace(r.Space) {
+		return nil, fmt.Errorf("%w: ReadView.NewIterator on user data in SERIALIZABLE is unsupported", storageengine.ErrUnsupported)
 	}
 	if err := v.token.BeginBorrow(); err != nil {
 		return nil, err
@@ -115,7 +121,7 @@ func (e *engine) BeginIsolated(ctx context.Context, level storageengine.Isolatio
 	if err != nil {
 		return nil, err
 	}
-	return &txn{inner: t, engine: e, isolationLevel: level}, nil
+	return &txn{inner: t, engine: e, isolationLevel: level, ctx: ctx}, nil
 }
 
 func (t *txn) IsolationLevel() storageengine.IsolationLevel {
@@ -132,8 +138,8 @@ func (t *txn) BeginStatementView(ctx context.Context, kind storageengine.Stateme
 		}
 		return nil, storageengine.ErrClosed
 	}
-	if t.isolationLevel == storageengine.IsolationSerializable && !storageengine.IsInternalReader(ctx) {
-		return nil, fmt.Errorf("%w: raw StatementView on SERIALIZABLE transaction is unsupported; use LockingTxn or SQL executor", storageengine.ErrUnsupported)
+	if t.root().isolationLevel == storageengine.IsolationSerializable {
+		return nil, fmt.Errorf("%w: StatementView on SERIALIZABLE transaction is unsupported; use LockingTxn or SQL executor", storageengine.ErrUnsupported)
 	}
 	if kind == storageengine.StatementViewKindUncommitted {
 		return nil, fmt.Errorf("%w: uncommitted statement view is not supported yet", storageengine.ErrUnsupported)

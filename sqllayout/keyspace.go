@@ -8,6 +8,10 @@ const Catalog = "catalog"
 const DatabasePrefix = "db/"
 const TablePrefix = "table/"
 const ViewPrefix = "view/"
+const RowPrefix = "row/"
+const RowsPrefix = "rows/"
+const IndexPrefix = "index/"
+const SecondaryPrefix = "secondary/"
 
 func Rows(id string) string                  { return "row/" + id }
 func UniqueIndex(id, name string) string     { return "index/" + id + "/" + name }

@@ -406,6 +406,9 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 	automatic := tx == nil
 	if automatic {
 		targetLevel := session.EffectiveIsolation()
+		if targetLevel == parser.LevelSerializable && isPlainConsistentRead(statement) {
+			targetLevel = parser.LevelRepeatableRead
+		}
 		if err := e.checkIsolationCapability(targetLevel); err != nil {
 			return nil, err
 		}
@@ -430,7 +433,7 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 			isoLevel := isoTxn.IsolationLevel()
 			inTxn := session.InTransaction() || session.AutocommitDisabled
 			if statementNeedsReadView(statement, isoLevel, inTxn) {
-				if automatic || isoLevel == storageengine.IsolationReadCommitted || isoLevel == storageengine.IsolationSerializable {
+				if automatic || isoLevel == storageengine.IsolationReadCommitted {
 					view, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindStatement)
 					if err != nil {
 						return nil, err
@@ -663,14 +666,7 @@ func isPlainConsistentRead(statement parser.Statement) bool {
 
 func statementNeedsReadView(statement parser.Statement, level storageengine.IsolationLevel, inTxn bool) bool {
 	if level == storageengine.IsolationSerializable {
-		if inTxn {
-			switch statement.(type) {
-			case parser.Update, parser.Delete:
-				return true
-			}
-			return false
-		}
-		return isPlainConsistentRead(statement)
+		return false
 	}
 	if level == storageengine.IsolationReadCommitted {
 		switch s := statement.(type) {

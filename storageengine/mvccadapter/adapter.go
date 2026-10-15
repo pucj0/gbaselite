@@ -13,6 +13,7 @@ import (
 	"gbaselite/lockmanager"
 	"gbaselite/mvcc"
 	"gbaselite/replication"
+	"gbaselite/sqllayout"
 	"gbaselite/storageengine"
 )
 
@@ -32,6 +33,7 @@ type txn struct {
 	activeView     *mvccReadView
 	consistentView *mvccReadView
 	rootTxn        *txn
+	ctx            context.Context
 }
 
 func (t *txn) root() *txn {
@@ -43,6 +45,52 @@ func (t *txn) root() *txn {
 
 func isMetadataSpace(s string) bool {
 	return s == "catalog" || s == "views" || strings.HasPrefix(s, "meta") || strings.HasPrefix(s, "fkref/")
+}
+
+func parseLockSpace(space string) (tableID, indexID string, err error) {
+	if len(space) == 0 {
+		return "", "", fmt.Errorf("%w: empty lock space", storageengine.ErrUnsupported)
+	}
+	switch {
+	case strings.HasPrefix(space, sqllayout.RowPrefix):
+		tid := strings.TrimPrefix(space, sqllayout.RowPrefix)
+		if tid == "" || strings.HasPrefix(tid, "/") || strings.HasSuffix(tid, "/") || strings.Contains(tid, "//") {
+			return "", "", fmt.Errorf("%w: invalid row space %q", storageengine.ErrUnsupported, space)
+		}
+		return tid, "", nil
+	case strings.HasPrefix(space, sqllayout.RowsPrefix):
+		tid := strings.TrimPrefix(space, sqllayout.RowsPrefix)
+		if tid == "" || strings.HasPrefix(tid, "/") || strings.HasSuffix(tid, "/") || strings.Contains(tid, "//") {
+			return "", "", fmt.Errorf("%w: invalid row space %q", storageengine.ErrUnsupported, space)
+		}
+		return tid, "", nil
+	case strings.HasPrefix(space, sqllayout.IndexPrefix):
+		rem := strings.TrimPrefix(space, sqllayout.IndexPrefix)
+		lastSlash := strings.LastIndex(rem, "/")
+		if lastSlash <= 0 || lastSlash >= len(rem)-1 {
+			return "", "", fmt.Errorf("%w: invalid unique index space %q", storageengine.ErrUnsupported, space)
+		}
+		tid := rem[:lastSlash]
+		iid := rem[lastSlash+1:]
+		if strings.HasPrefix(tid, "/") || strings.Contains(tid, "//") || iid == "" {
+			return "", "", fmt.Errorf("%w: invalid unique index space %q", storageengine.ErrUnsupported, space)
+		}
+		return tid, iid, nil
+	case strings.HasPrefix(space, sqllayout.SecondaryPrefix):
+		rem := strings.TrimPrefix(space, sqllayout.SecondaryPrefix)
+		lastSlash := strings.LastIndex(rem, "/")
+		if lastSlash <= 0 || lastSlash >= len(rem)-1 {
+			return "", "", fmt.Errorf("%w: invalid secondary index space %q", storageengine.ErrUnsupported, space)
+		}
+		tid := rem[:lastSlash]
+		iid := rem[lastSlash+1:]
+		if strings.HasPrefix(tid, "/") || strings.Contains(tid, "//") || iid == "" {
+			return "", "", fmt.Errorf("%w: invalid secondary index space %q", storageengine.ErrUnsupported, space)
+		}
+		return tid, iid, nil
+	default:
+		return "", "", fmt.Errorf("%w: unsupported lock space %q", storageengine.ErrUnsupported, space)
+	}
 }
 
 var _ storageengine.Engine = (*engine)(nil)
@@ -179,35 +227,44 @@ func (e *engine) PendingBytes() (int64, error) { return e.store.PendingBytes() }
 func (t *txn) ID() string                      { return t.inner.ID }
 func (t *txn) Snapshot() uint64                { return t.inner.Snapshot }
 func (t *txn) Get(s string, k []byte) ([]byte, bool, error) {
+	if t.root().isolationLevel == storageengine.IsolationSerializable {
+		if isMetadataSpace(s) {
+			return t.inner.Get(s, k)
+		}
+		return t.serializableGet(s, k)
+	}
 	if t.activeView != nil && t.activeView.State() == storageengine.ViewStateActive {
 		return t.activeView.Get(s, k)
-	}
-	if t.root().isolationLevel == storageengine.IsolationSerializable && !isMetadataSpace(s) {
-		return t.serializableGet(s, k)
 	}
 	return t.inner.Get(s, k)
 }
 
 func (t *txn) serializableGet(s string, k []byte) ([]byte, bool, error) {
+	tableID, indexID, err := parseLockSpace(s)
+	if err != nil {
+		return nil, false, err
+	}
 	locking, ok := t.LockingTxn()
 	if !ok {
 		return nil, false, fmt.Errorf("%w: serializable Get requires locking capability", storageengine.ErrUnsupported)
 	}
-	ctx := context.Background()
+	ctx := t.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	scope, err := locking.BeginLockScope(ctx, storageengine.LockScopeStatement)
 	if err != nil {
 		return nil, false, err
 	}
 	defer func() { _ = locking.CloseLockScope(ctx, scope) }()
 
-	tableID := s
-	if idx := strings.Index(s, "/"); idx != -1 {
-		tableID = s[idx+1:]
-	}
 	grant, err := locking.Acquire(ctx, scope, storageengine.LockRequest{
 		Components: []storageengine.LockComponent{
 			{Mode: storageengine.LockModeIS, Kind: storageengine.LockComponentTableIntent, Space: s, TableID: tableID},
-			{Mode: storageengine.LockModeS, Kind: storageengine.LockComponentRecord, Space: s, TableID: tableID, Key: k},
+			{Mode: storageengine.LockModeS, Kind: storageengine.LockComponentRecord, Space: s, TableID: tableID, IndexID: indexID, Key: k},
 		},
 	})
 	if err != nil {
@@ -226,7 +283,7 @@ func (t *txn) serializableGet(s string, k []byte) ([]byte, bool, error) {
 		_, err = locking.Acquire(ctx, scope, storageengine.LockRequest{
 			Components: []storageengine.LockComponent{
 				{Mode: storageengine.LockModeIS, Kind: storageengine.LockComponentTableIntent, Space: s, TableID: tableID},
-				{Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: s, TableID: tableID, Lower: prev, Upper: next},
+				{Mode: storageengine.LockModeGap, Kind: storageengine.LockComponentInterval, Space: s, TableID: tableID, IndexID: indexID, Lower: prev, Upper: next},
 			},
 		})
 		if err != nil {
@@ -252,6 +309,7 @@ func (t *txn) Child() (storageengine.Txn, error) {
 		engine:         t.engine,
 		isolationLevel: root.isolationLevel,
 		rootTxn:        root,
+		ctx:            t.ctx,
 	}, nil
 }
 func (t *txn) Commit(ctx context.Context) (uint64, error) {
@@ -306,11 +364,19 @@ func (e *engine) Scan(ctx context.Context, revision uint64, s string, f func([]b
 	return storageengine.Consume(it, f)
 }
 func (t *txn) NewIterator(ctx context.Context, r storageengine.ScanRequest) (storageengine.Iterator, error) {
+	if t.root().isolationLevel == storageengine.IsolationSerializable {
+		if isMetadataSpace(r.Space) || storageengine.IsInternalReader(ctx) {
+			return newIterator(ctx, r, func(y func([]byte, []byte) error) error {
+				if r.Unordered {
+					return t.inner.Scan(ctx, r.Space, y)
+				}
+				return t.inner.ScanRange(ctx, r.Space, r.Range, y)
+			})
+		}
+		return nil, fmt.Errorf("%w: raw unguided NewIterator on SERIALIZABLE transaction without LockPlan is unsupported; use LockingTxn or SQL executor", storageengine.ErrUnsupported)
+	}
 	if t.activeView != nil && t.activeView.State() == storageengine.ViewStateActive {
 		return t.activeView.NewIterator(ctx, r)
-	}
-	if t.root().isolationLevel == storageengine.IsolationSerializable && !isMetadataSpace(r.Space) {
-		return nil, fmt.Errorf("%w: raw unguided NewIterator on SERIALIZABLE transaction without LockPlan is unsupported; use LockingTxn or SQL executor", storageengine.ErrUnsupported)
 	}
 	return newIterator(ctx, r, func(y func([]byte, []byte) error) error {
 		if r.Unordered {

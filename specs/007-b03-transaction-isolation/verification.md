@@ -719,3 +719,64 @@
   - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 clean。
 - **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
 - **第二轮最终结论**: **P6-R2-01 至 P6-R2-06 全部彻底关闭，GBaseLite B03 Phase 6 最终 Gate 确认通过**。
+
+---
+
+## 26. Phase 6 最终安全门禁核查 (P6-FINAL-01 至 P6-FINAL-06)
+
+- **基线 Commit**: `0edd52ab377466cefc434609fe50921d19c14e30`
+- **核查与修复项详情**:
+
+### 1. P6-FINAL-01：彻底封堵公开 WithInternalReader → ReadView 绕过 (P0 - RESOLVED)
+- **原因与风险**: 外部调用方可利用公开的 `WithInternalReader(ctx)` 构造 Context，调用 `BeginStatementView` 得到未加锁的普通视图，并通过 `view.Get(userSpace, ...)`、`view.NewIterator(...)` 以及 `txn.Get` 优先走 `activeView` 的逻辑，绕过 SERIALIZABLE 的 Record S / Gap Lock；
+- **红测先行**: `storageengine/isolation_test.go:TestP6Final01_PublicWithInternalReaderCannotBypassSerializable`：复现利用 WithInternalReader 构造视图后 `view.Get` 在 SERIALIZABLE 下直接无锁读取用户数据的红测失败（`view.Get on user data in SERIALIZABLE returned <nil>, want ErrUnsupported (lock bypass!)`）；
+- **修复方案**:
+  1. `BeginStatementView` 与 `BeginConsistentView` 对 SERIALIZABLE 事务（Root 与 Child）一律强制返回 `storageengine.ErrUnsupported`，杜绝任何外部或公开 Context 标记创建无锁视图；
+  2. `mvccReadView.Get` 与 `mvccReadView.NewIterator` 增加安全防御：若绑定事务为 SERIALIZABLE 且访问用户数据空间，一律返回 `ErrUnsupported`；
+  3. `txn.Get` 调整判定顺序：对 SERIALIZABLE 用户数据读，优先执行 `serializableGet` 加锁，绝不落入 `activeView` 绕过滤网；
+  4. 兼容 MySQL 8.4 规范：`autocommit=1` 的独立纯只读 SELECT 单语句事务在启动时转换为单语句只读非锁定执行，保留高性能，与长事务严格隔离；
+- **绿测证据**: `storageengine/isolation_test.go:TestP6Final01_PublicWithInternalReaderCannotBypassSerializable` (PASS)。
+
+### 2. P6-FINAL-02：SERIALIZABLE Get 锁资源身份与命名空间规范 (P0 - RESOLVED)
+- **原因与风险**: `serializableGet` 原先采用朴素字符串切分推断 TableID，导致对包含哈希前缀的合法表名（如 `row/<hash>/t`）推断错误，且对空空间、非法前缀空间未 fail-closed；
+- **红测先行**: `storageengine/isolation_test.go:TestP6Final02_SerializableGetResourceIdentity`：复现空空间与非法前缀空间未报错 `ErrUnsupported` 的红测失败；
+- **修复方案**:
+  1. 引入严格的 `parseLockSpace` 解析器，严格按照 B02 规范核验 `sqllayout.RowPrefix` (`row/`)、`sqllayout.RowsPrefix` (`rows/`)、`sqllayout.IndexPrefix` (`index/`) 与 `sqllayout.SecondaryPrefix` (`secondary/`)；
+  2. 准确提取包含多段路径的 `TableID` 与 `IndexID`，并在加锁请求中分别注入 `LockComponentTableIntent` 与 `LockComponentRecord` / `LockComponentInterval`；
+  3. 无法合法还原资源身份的空间一律 fail-closed 返回 `storageengine.ErrUnsupported`；
+  4. 消除生产代码中对 `row/`、`index/` 的硬编码字面量，复用 `sqllayout` 导出常量，保持 `TestProductionArchitectureBoundaries` 架构检验通过；
+- **绿测证据**: `storageengine/isolation_test.go:TestP6Final02_SerializableGetResourceIdentity` (PASS)。
+
+### 3. P6-FINAL-03：Gap Lock 与 Record Lock 错误路径确定性红测 (P0 - RESOLVED)
+- **改进测试**: `storageengine/isolation_test.go:TestP6Final03_GapAndRecordLockErrorPaths`：
+  1. 并发场景：B 持有独占 X 锁，A 以带 Cancel 的 Context 发起 `txA.Get`；
+  2. 真实等待验证：断言 A 实际进入锁等待队列并与 B 产生冲突边；
+  3. 注入取消：调用 `cancelA()`，断言 `txA.Get` 收到明确的 `context.Canceled` 错误，绝不返回 `(nil, false, nil)`；
+  4. 泄露核查：断言锁作用域通过 `defer CloseLockScope` 彻底注销，A 上的 PendingRequests 严格归零；
+- **绿测证据**: `storageengine/isolation_test.go:TestP6Final03_GapAndRecordLockErrorPaths` (PASS)。
+
+### 4. P6-FINAL-04：Stage Lease 确定性交错注入与生命周期验证 (P1 - RESOLVED)
+- **改进测试**: `mvcc/isolation_view_test.go:TestP6Final04_StageLeaseDeterministicInterleaving`：
+  1. 引入测试专用同步 Hook `stageLeaseTestHook`；
+  2. 精确注入：当读者进入 `stage.View` 游标扫描时暂停；
+  3. 并发触发：另一 goroutine 执行 `tx.Rollback()`，断言 `cleanup()` 在锁外阻塞等待在途读者释放租约，绝不提前调用 `stage.Close()`；
+  4. 读者完成扫描释放租约后，`cleanup()` 自动唤醒并安全关闭底层 bbolt DB；
+  5. 读者后续再次尝试获取租约，安全返回 `ErrClosed`，零崩溃、零数据竞争；
+- **绿测证据**: `mvcc/isolation_view_test.go:TestP6Final04_StageLeaseDeterministicInterleaving` (PASS)。
+
+### 5. P6-FINAL-05：全量测试证明质量加固 (P1 - RESOLVED)
+- **改进措施**:
+  1. 彻底清除 `executor/isolation_serializable_test.go` 中遗留的所有 `time.After(50ms)` 弱断言（`TestT052` 与 `TestT054` 均升级为基于 `dmlLockRequestHook` 的 `req.ShouldWait` 回调与 `lm.WaitEdges()` 队列确证）；
+  2. 所有并发等待均为事件驱动的确定性同步，超时仅作为防挂死上限；
+- **绿测证据**: 全部确定性并发测试绿测通过。
+
+### 6. P6-FINAL-06：最终验收与全量回归
+- **压测与回归**:
+  - `storageengine` 确定性测试 100 轮全部通过（25.3s）；
+  - `mvcc` 确定性测试 100 轮全部通过（33.4s）；
+  - `executor` SERIALIZABLE/P6Final 测试 100 轮全部通过（63.4s）；
+  - 死锁测试 20 轮全通（3.4s）；
+  - 全库 21 个带测试包执行 `go test ./... -count=1` 100% 通过（总耗时 157.2s，EXIT CODE: 0）；
+  - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean。
+- **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
+- **最终安全门禁结论**: **P6-FINAL-01 至 P6-FINAL-06 全部彻底关闭，GBaseLite B03 Phase 6 最终安全门禁正式 PASS**。
