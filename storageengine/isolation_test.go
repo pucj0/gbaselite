@@ -136,19 +136,19 @@ func TestP3Fix02_CapabilityGateInAdapter(t *testing.T) {
 		defer tx.Rollback()
 	}
 
-	tx, _ := storageengine.BeginIsolated(ctx, e, storageengine.IsolationRepeatableRead)
-	defer tx.Rollback()
+	txRU, _ := storageengine.BeginIsolated(ctx, e, storageengine.IsolationReadUncommitted)
+	defer txRU.Rollback()
 
-	// 4. StatementViewKindUncommitted now succeeds in Phase 7
-	isoTxn := tx.(storageengine.IsolationTxn)
-	view, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindUncommitted)
+	// 4. StatementViewKindUncommitted succeeds for READ UNCOMMITTED in Phase 7
+	isoRU := txRU.(storageengine.IsolationTxn)
+	view, err := isoRU.BeginStatementView(ctx, storageengine.StatementViewKindUncommitted)
 	if err != nil {
 		t.Fatalf("BeginStatementView(Uncommitted) failed: %v", err)
 	}
 	_ = view.Close()
 
 	// Invalid statement view kind must return error
-	if _, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKind(99)); err == nil {
+	if _, err := isoRU.BeginStatementView(ctx, storageengine.StatementViewKind(99)); err == nil {
 		t.Fatalf("expected error for invalid statement view kind")
 	}
 }
@@ -908,5 +908,62 @@ func TestP6Final03_GapAndRecordLockErrorPaths(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("txA.Get hung and did not abort on context cancellation")
+	}
+}
+
+// TestP7Fix01_CompatibilityMatrixAndReplicationGate covers P7-FIX-01:
+// 1. RC, RR, SERIALIZABLE transactions requesting StatementViewKindUncommitted must return ErrUnsupported.
+// 2. BeginIsolated(IsolationReadUncommitted) on a replicated engine must fail closed with ErrUnsupported.
+func TestP7Fix01_CompatibilityMatrixAndReplicationGate(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+
+	// 1. RR requesting StatementViewKindUncommitted must fail closed
+	txRR, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationRepeatableRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txRR.Rollback()
+	isoRR := txRR.(storageengine.IsolationTxn)
+	if _, err := isoRR.BeginStatementView(ctx, storageengine.StatementViewKindUncommitted); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("RR.BeginStatementView(Uncommitted) returned %v, want ErrUnsupported", err)
+	}
+
+	// 2. RC requesting StatementViewKindUncommitted must fail closed
+	txRC, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txRC.Rollback()
+	isoRC := txRC.(storageengine.IsolationTxn)
+	if _, err := isoRC.BeginStatementView(ctx, storageengine.StatementViewKindUncommitted); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("RC.BeginStatementView(Uncommitted) returned %v, want ErrUnsupported", err)
+	}
+
+	// 3. SERIALIZABLE requesting StatementViewKindUncommitted must fail closed
+	txSER, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationSerializable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txSER.Rollback()
+	isoSER := txSER.(storageengine.IsolationTxn)
+	if _, err := isoSER.BeginStatementView(ctx, storageengine.StatementViewKindUncommitted); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("SER.BeginStatementView(Uncommitted) returned %v, want ErrUnsupported", err)
+	}
+
+	// 4. Child of RR requesting StatementViewKindUncommitted must fail closed
+	childRR, err := txRR.Child()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer childRR.Rollback()
+	isoChildRR := childRR.(storageengine.IsolationTxn)
+	if _, err := isoChildRR.BeginStatementView(ctx, storageengine.StatementViewKindUncommitted); !errors.Is(err, storageengine.ErrUnsupported) {
+		t.Fatalf("ChildRR.BeginStatementView(Uncommitted) returned %v, want ErrUnsupported", err)
 	}
 }

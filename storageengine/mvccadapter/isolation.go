@@ -60,9 +60,14 @@ func (it *inMemoryIterator) Value() []byte {
 	return it.curr.value
 }
 
-func (it *inMemoryIterator) Valid() bool  { return it.valid }
-func (it *inMemoryIterator) Err() error   { return nil }
-func (it *inMemoryIterator) Close() error { return nil }
+func (it *inMemoryIterator) Valid() bool { return it.valid }
+func (it *inMemoryIterator) Err() error  { return nil }
+func (it *inMemoryIterator) Close() error {
+	it.rows = nil
+	it.curr = dirtyRow{}
+	it.valid = false
+	return nil
+}
 
 func (v *mvccReadView) ID() string                            { return v.token.ID() }
 func (v *mvccReadView) Revision() uint64                      { return v.token.Revision() }
@@ -138,7 +143,21 @@ func inRange(key []byte, r storageengine.KeyRange) bool {
 	return true
 }
 
+const (
+	maxDirtyScanRows  = 65536
+	maxDirtyScanBytes = 64 * 1024 * 1024
+)
+
 func (v *mvccReadView) newDirtyIterator(ctx context.Context, r storageengine.ScanRequest) (storageengine.Iterator, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	switch v.State() {
+	case storageengine.ViewStateClosed:
+		return nil, storageengine.ErrViewClosed
+	case storageengine.ViewStateInvalidated:
+		return nil, storageengine.ErrViewInvalidated
+	}
 	if err := v.token.BeginBorrow(); err != nil {
 		return nil, err
 	}
@@ -158,19 +177,48 @@ func (v *mvccReadView) newDirtyIterator(ctx context.Context, r storageengine.Sca
 	}
 
 	combined := make(map[string]dirtyRow)
-	_ = v.token.ScanRangeWithTx(ctx, r.Space, bounds, tx, func(k, val []byte) error {
+	var totalBytes int64
+
+	err := v.token.ScanRangeWithTx(ctx, r.Space, bounds, tx, func(k, val []byte) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rowBytes := int64(len(k) + len(val) + 64)
+		if len(combined)+1 > maxDirtyScanRows {
+			return fmt.Errorf("%w: read uncommitted scan materialization row limit exceeded", storageengine.ErrViewBudgetLimit)
+		}
+		if totalBytes+rowBytes > maxDirtyScanBytes {
+			return fmt.Errorf("%w: read uncommitted scan materialization byte limit exceeded", storageengine.ErrViewBudgetLimit)
+		}
 		combined[string(k)] = dirtyRow{key: bytes.Clone(k), value: bytes.Clone(val)}
+		totalBytes += rowBytes
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	// Overlay foreign sampled dirty entries
 	if v.dirtySnapshot != nil {
 		for _, d := range v.dirtySnapshot.SpaceEntries(r.Space) {
 			if inRange(d.Key, r.Range) {
 				if d.Deleted {
-					delete(combined, string(d.Key))
+					if old, ok := combined[string(d.Key)]; ok {
+						totalBytes -= int64(len(old.key) + len(old.value) + 64)
+						delete(combined, string(d.Key))
+					}
 				} else {
+					rowBytes := int64(len(d.Key) + len(d.Value) + 64)
+					if _, ok := combined[string(d.Key)]; !ok {
+						if len(combined)+1 > maxDirtyScanRows {
+							return nil, fmt.Errorf("%w: read uncommitted scan materialization row limit exceeded", storageengine.ErrViewBudgetLimit)
+						}
+						if totalBytes+rowBytes > maxDirtyScanBytes {
+							return nil, fmt.Errorf("%w: read uncommitted scan materialization byte limit exceeded", storageengine.ErrViewBudgetLimit)
+						}
+					}
 					combined[string(d.Key)] = dirtyRow{key: bytes.Clone(d.Key), value: bytes.Clone(d.Value)}
+					totalBytes += rowBytes
 				}
 			}
 		}
@@ -178,7 +226,11 @@ func (v *mvccReadView) newDirtyIterator(ctx context.Context, r storageengine.Sca
 
 	// Overlay reader's own uncommitted writes
 	if tx != nil {
-		for _, op := range tx.CollectDirtyVersions() {
+		ownWrites, err := tx.CollectDirtyVersions()
+		if err != nil {
+			return nil, err
+		}
+		for _, op := range ownWrites {
 			if op.Space == r.Space && inRange(op.Key, r.Range) {
 				if op.Deleted {
 					delete(combined, string(op.Key))
@@ -262,6 +314,9 @@ func (e *engine) BeginIsolated(ctx context.Context, level storageengine.Isolatio
 	if !level.Valid() {
 		return nil, fmt.Errorf("invalid isolation level: %q", level)
 	}
+	if level == storageengine.IsolationReadUncommitted && (e.node != nil || e.Replica() != nil) {
+		return nil, fmt.Errorf("%w: READ UNCOMMITTED is not supported in replication mode", storageengine.ErrUnsupported)
+	}
 	t, err := e.store.BeginLazy(ctx, e.proposer)
 	if err != nil {
 		return nil, err
@@ -286,8 +341,10 @@ func (t *txn) BeginStatementView(ctx context.Context, kind storageengine.Stateme
 	if t.root().isolationLevel == storageengine.IsolationSerializable {
 		return nil, fmt.Errorf("%w: StatementView on SERIALIZABLE transaction is unsupported; use LockingTxn or SQL executor", storageengine.ErrUnsupported)
 	}
-	if kind == storageengine.StatementViewKindUncommitted || t.root().isolationLevel == storageengine.IsolationReadUncommitted {
-		kind = storageengine.StatementViewKindUncommitted
+	if kind == storageengine.StatementViewKindUncommitted {
+		if t.root().isolationLevel != storageengine.IsolationReadUncommitted {
+			return nil, fmt.Errorf("%w: StatementViewKindUncommitted is only supported in READ UNCOMMITTED", storageengine.ErrUnsupported)
+		}
 		token, err := t.engine.store.BeginViewToken(ctx, t.inner)
 		if err != nil {
 			return nil, err

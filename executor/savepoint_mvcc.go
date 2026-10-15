@@ -142,7 +142,7 @@ func (e *Engine) rollbackToSavepoint(session *Session, name string) (*Result, er
 		// is decided; only a resource release failed, and that error is reported.
 		return nil, cleanupErr
 	}
-	e.publishSessionDirtyWrites(session)
+	_ = e.publishSessionDirtyWrites(session)
 	return &Result{Message: "rolled back to savepoint"}, nil
 }
 
@@ -152,6 +152,7 @@ func (e *Engine) commitSessionTransaction(session *Session) error {
 	if session.transaction == nil {
 		return nil
 	}
+	defer e.withdrawSessionDirtyWrites(session)
 	for index := len(session.savepoints) - 1; index >= 0; index-- {
 		if _, err := session.savepoints[index].tx.Commit(operatorContext(session)); err != nil {
 			// Roll back every remaining layer and the outermost transaction so no

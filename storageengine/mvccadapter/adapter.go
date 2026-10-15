@@ -233,17 +233,25 @@ func (t *txn) PublishDirtyWrites() error {
 	if t.engine.store.DirtyRegistry() == nil {
 		return nil
 	}
-	versions := t.inner.CollectDirtyVersions()
-	rootID := t.root().inner.ID
-	return t.engine.store.DirtyRegistry().Publish(rootID, t.inner.Generation(), t.inner.Term(), versions)
+	root := t.root().inner
+	if root == nil {
+		return nil
+	}
+	versions, err := root.CollectDirtyVersions()
+	if err != nil {
+		return err
+	}
+	return t.engine.store.DirtyRegistry().Publish(root.ID, root.Generation(), root.Term(), versions)
 }
 
 func (t *txn) WithdrawDirtyWrites() {
 	if t.engine.store.DirtyRegistry() == nil {
 		return
 	}
-	rootID := t.root().inner.ID
-	t.engine.store.DirtyRegistry().Withdraw(rootID)
+	root := t.root().inner
+	if root != nil {
+		t.engine.store.DirtyRegistry().Withdraw(root.ID)
+	}
 }
 func (t *txn) Get(s string, k []byte) ([]byte, bool, error) {
 	if t.root().isolationLevel == storageengine.IsolationSerializable {

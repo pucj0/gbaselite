@@ -863,3 +863,61 @@
 - [x] **文档同步**：README、tasks.md (65/83 已勾选)、verification.md 均已完成同步。
 
 **结论：GBaseLite B03 Phase 7 (READ UNCOMMITTED) 最终 Gate 正式 PASS，任务进度推进至 65/83！**
+
+---
+
+## 29. Phase 7 P7-FIX 安全修复与最终验收 (P7-FIX-01 至 P7-FIX-06)
+
+- **基线 Commit**: `11f57752066f100b195ed1174ea3f3fa498bf2b6`
+- **核查与修复项详情**:
+
+### 1. P7-FIX-01：禁止 RC/RR/SERIALIZABLE 申请 Uncommitted View (P0 - RESOLVED)
+- **原因与风险**: `BeginStatementView` 原先仅判断 `kind == StatementViewKindUncommitted` 即返回脏视图，导致 RC/RR 事务若传入该 Kind 也能读取未提交脏数据；且 `BeginIsolated` 在存储引擎适配器层未对复制节点拦截；
+- **红测先行**: `storageengine/isolation_test.go:TestP7Fix01_CompatibilityMatrixAndReplicationGate`：复现 RR/RC/SER 事务调用 `BeginStatementView(Uncommitted)` 原先意外成功的红测失败（`RR.BeginStatementView(Uncommitted) returned <nil>, want ErrUnsupported`）；
+- **修复方案**:
+  1. `BeginStatementView` 严格限制：仅当事务根隔离级别为 `IsolationReadUncommitted` 时，才允许申请 `StatementViewKindUncommitted`；RC/RR/SERIALIZABLE（包括其 Child）申请一律严格 fail-closed 报错 `storageengine.ErrUnsupported`；
+  2. `storageengine/mvccadapter/isolation.go:BeginIsolated` 在检测到处于复制后端（`e.node != nil || e.Replica() != nil`）时，直接拒绝 `IsolationReadUncommitted`，杜绝绕过 SQL 层门禁；
+- **绿测证据**: `TestP7Fix01_CompatibilityMatrixAndReplicationGate` (PASS)。
+
+### 2. P7-FIX-02：Dirty Registry 原子替换与错误语义 (P0 - RESOLVED)
+- **原因与风险**: `DirtyRegistry.Publish` 原先先删除旧 Root 数据再校验全局预算，导致超限失败时已发布的旧数据被破坏丢失；且 `executor` 原先用 `_ = p.PublishDirtyWrites()` 吞掉错误；
+- **红测先行**: `mvcc/dirty_registry_test.go:TestP7Fix02_DirtyRegistryAtomicReplacementAndBudgets`；
+- **修复方案**:
+  1. `DirtyRegistry.Publish` 调整执行顺序：计算 netCount 和 netBytes，先完成所有预算核验，全部通过后才执行原子覆盖；发布超限时原数据 100% 完好保留；
+  2. 拒绝旧代次/任期覆盖当前活跃代次，杜绝重置当前 Registry Epoch；
+  3. `executor.publishSessionDirtyWrites` 消除忽略错误的逻辑，发布失败时立即回滚并向客户端报错 `ErrWriteSetLimit`；
+- **绿测证据**: `TestP7Fix02_DirtyRegistryAtomicReplacementAndBudgets` (PASS)。
+
+### 3. P7-FIX-03：RU DML 强制使用 Committed Baseline 候选扫描 (P0 - RESOLVED)
+- **原因与风险**: `statementNeedsReadView` 与 `executeSQLStatement` 原先使 RU 事务下的 `UPDATE` 和 `DELETE` 也申请了 `StatementViewKindUncommitted`，导致 DML 候选扫描读取到并发事务未提交的脏行（例如并发将 age=20 更新为 30，RU 执行 `UPDATE ... WHERE age=30` 错误命中并修改原本不满足 committed predicate 的行）；
+- **红测先行**: `executor/isolation_p7fix_test.go:TestP7Fix03_RUDMLUsesCommittedBaseline`；
+- **修复方案**:
+  1. `executeSQLStatement` 明确分离视图语义：在 READ UNCOMMITTED 下，**只有普通只读 SELECT**（`isPlainConsistentRead(stmt) == true`）使用 `StatementViewKindUncommitted`；
+  2. 所有 DML（`UPDATE`、`DELETE`、`INSERT`）候选扫描强制使用 `StatementViewKindStatement`（已提交基线视图），候选行选择、唯一约束与外键检查完全基于已提交数据与当前读；
+  3. 并发脏数据无法改变 DML 候选判定，并发回滚后原数据丝毫不受破坏；
+- **绿测证据**: `TestP7Fix03_RUDMLUsesCommittedBaseline` (PASS)。
+
+### 4. P7-FIX-04：newDirtyIterator 错误传播与有界物化 (P1 - RESOLVED)
+- **原因与风险**: `newDirtyIterator` 原先用 `_ = v.token.ScanRangeWithTx(...)` 吞掉了底层错误，在上下文取消、代次失效时可能返回截断的局部结果；且缺乏内存物化行数与字节数限制；
+- **修复方案**:
+  1. 完整检查并向外传播 `ScanRangeWithTx` 原始错误与 `ctx.Err()`；
+  2. 增加硬约束预算：`maxDirtyScanRows = 65536`，`maxDirtyScanBytes = 64MB`，超限立即返回 `storageengine.ErrViewBudgetLimit`；
+  3. `inMemoryIterator.Close()` 显式将 `rows` 设为 `nil`，快速释放内存；
+- **绿测证据**: `executor/isolation_p7fix_test.go:TestP7Fix04_NewDirtyIteratorErrorPropagationAndBudget` (PASS)。
+
+### 5. P7-FIX-05：Savepoint 暂存写发布隔离与 Epoch 生命周期 (P0 - RESOLVED)
+- **原因与风险**: `publishSessionDirtyWrites` 原先从当前 session transaction 提取 writes，导致未完成 Savepoint Child 中的暂存写被提前发布给其他 RU 会话；
+- **修复方案**:
+  1. `publishSessionDirtyWrites` 调整为严格从 `outermostTransaction(session)` 根层提取写集，只有完整合并至 Root 的已完成操作才对外发布，未合并的 Savepoint Child 写集对外部会话 100% 隐形；
+  2. `CollectDirtyVersions` 在访问 Stage 时必须遵守 Stage Lease 并返回错误；
+  3. `Store.Restore` 显式重置 `dirtyRegistry.Reset()`，杜绝还原后遗留 Ghost 脏版本；
+- **绿测证据**: `executor/isolation_p7fix_test.go:TestP7Fix05_SavepointChildWritesNotPublishedToOtherRoots` (PASS)。
+
+### 6. P7-FIX-06：最终验收与全量回归
+- **压测与回归**:
+  - `executor` P7 及 P7Fix 测试 100 轮全部通过（129.7s）；
+  - `mvcc` 确定性测试 100 轮全部通过（19.8s）；
+  - 全库 21 个带测试包执行 `go test ./... -count=1` 100% 通过（总耗时 199.5s，EXIT CODE: 0）；
+  - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean。
+- **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
+- **P7-FIX 最终结论**: **P7-FIX-01 至 P7-FIX-06 全部彻底关闭，GBaseLite B03 Phase 7 最终验收正式 PASS**。

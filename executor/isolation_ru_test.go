@@ -306,16 +306,17 @@ func TestM34_RU_StageLifecycleAndSavepoint(t *testing.T) {
 		t.Fatalf("B read = %v, %v, want v_merged", resB, err)
 	}
 
-	// 2. A creates savepoint and updates to 'v_sp'
+	// 2. A creates savepoint and updates to 'v_sp' inside savepoint child
+	// Per P7-FIX-05, unmerged savepoint child writes are NOT published to other roots!
 	_, _ = e.Execute(sA, "SAVEPOINT sp1;")
 	_, _ = e.Execute(sA, "UPDATE t SET v = 'v_sp' WHERE id = 1;")
 
 	resB2, err := e.Execute(sB, "SELECT v FROM t WHERE id = 1;")
-	if err != nil || len(resB2.Rows) != 1 || resB2.Rows[0][0] != "v_sp" {
-		t.Fatalf("B read = %v, %v, want v_sp", resB2, err)
+	if err != nil || len(resB2.Rows) != 1 || resB2.Rows[0][0] != "v_merged" {
+		t.Fatalf("B read = %v, %v, want v_merged (unmerged savepoint child write must not be published!)", resB2, err)
 	}
 
-	// 3. A rolls back to savepoint: 'v_sp' is undone, reverts to 'v_merged'
+	// 3. A rolls back to savepoint: savepoint child is discarded, root remains 'v_merged'
 	_, _ = e.Execute(sA, "ROLLBACK TO sp1;")
 	resB3, err := e.Execute(sB, "SELECT v FROM t WHERE id = 1;")
 	if err != nil || len(resB3.Rows) != 1 || resB3.Rows[0][0] != "v_merged" {
@@ -328,6 +329,7 @@ func TestM34_RU_StageLifecycleAndSavepoint(t *testing.T) {
 	if err != nil || len(resB4.Rows) != 1 || resB4.Rows[0][0] != "orig" {
 		t.Fatalf("B read after root rollback = %v, %v, want orig", resB4, err)
 	}
+	_, _ = e.Execute(sB, "ROLLBACK;")
 }
 
 // TestM35_RU_RollbackVsReaderConcurrency tests M35:

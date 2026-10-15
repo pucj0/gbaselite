@@ -75,12 +75,14 @@ func (r *DirtyRegistry) Publish(rootID string, generation, term uint64, versions
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if len(versions) > maxDirtyEntriesPerRoot {
-		return fmt.Errorf("%w: root %s exceeded dirty entries limit (%d > %d)", ErrWriteSetLimit, rootID, len(versions), maxDirtyEntriesPerRoot)
+	// 1. Generation/Term check:
+	// A transaction from an older epoch must be rejected and must not overwrite current epoch.
+	if generation < r.generation || (generation == r.generation && term < r.term) {
+		return fmt.Errorf("%w: stale generation/term (%d/%d < %d/%d)", ErrConflict, generation, term, r.generation, r.term)
 	}
 
-	// Invalidate if epoch changed
-	if r.generation != generation || r.term != term {
+	// If moving to a strictly newer epoch, reset registry to the new epoch
+	if generation > r.generation || (generation == r.generation && term > r.term) {
 		r.generation = generation
 		r.term = term
 		r.byRoot = make(map[string]map[string]DirtyVersion)
@@ -88,30 +90,42 @@ func (r *DirtyRegistry) Publish(rootID string, generation, term uint64, versions
 		r.globalBytes = 0
 	}
 
-	// Subtract previous contribution from this root
+	// 2. Validate per-root budget BEFORE mutating existing state
+	if len(versions) > maxDirtyEntriesPerRoot {
+		return fmt.Errorf("%w: root %s exceeded dirty entries limit (%d > %d)", ErrWriteSetLimit, rootID, len(versions), maxDirtyEntriesPerRoot)
+	}
+
+	// 3. Compute net changes BEFORE modifying existing state
+	var oldCount int
+	var oldBytes int64
 	if old, ok := r.byRoot[rootID]; ok {
-		r.globalCount -= len(old)
+		oldCount = len(old)
 		for _, ver := range old {
-			r.globalBytes -= int64(len(ver.Key) + len(ver.Value) + len(ver.Space) + 64)
+			oldBytes += int64(len(ver.Key) + len(ver.Value) + len(ver.Space) + 64)
 		}
-		delete(r.byRoot, rootID)
 	}
 
-	if len(versions) == 0 {
-		return nil
-	}
-
-	// Calculate new contribution
-	var addedBytes int64
+	var newBytes int64
 	for _, ver := range versions {
-		addedBytes += int64(len(ver.Key) + len(ver.Value) + len(ver.Space) + 64)
+		newBytes += int64(len(ver.Key) + len(ver.Value) + len(ver.Space) + 64)
 	}
 
-	if r.globalCount+len(versions) > maxGlobalDirtyEntries {
-		return fmt.Errorf("%w: global dirty entries limit exceeded", ErrWriteSetLimit)
+	netCount := r.globalCount - oldCount + len(versions)
+	netBytes := r.globalBytes - oldBytes + newBytes
+
+	if netCount > maxGlobalDirtyEntries {
+		return fmt.Errorf("%w: global dirty entries limit exceeded (%d > %d)", ErrWriteSetLimit, netCount, maxGlobalDirtyEntries)
 	}
-	if r.globalBytes+addedBytes > maxGlobalDirtyBytes {
-		return fmt.Errorf("%w: global dirty bytes limit exceeded", ErrWriteSetLimit)
+	if netBytes > maxGlobalDirtyBytes {
+		return fmt.Errorf("%w: global dirty bytes limit exceeded (%d > %d)", ErrWriteSetLimit, netBytes, maxGlobalDirtyBytes)
+	}
+
+	// 4. All checks passed: perform atomic update
+	if len(versions) == 0 {
+		delete(r.byRoot, rootID)
+		r.globalCount = netCount
+		r.globalBytes = netBytes
+		return nil
 	}
 
 	r.mergeCounter++
@@ -121,7 +135,6 @@ func (r *DirtyRegistry) Publish(rootID string, generation, term uint64, versions
 		ver.Generation = generation
 		ver.Term = term
 		ver.MergeOrdinal = r.mergeCounter
-		// Clone byte slices so caller can safely reuse or mutate its buffers
 		ver.Key = bytes.Clone(ver.Key)
 		ver.Value = bytes.Clone(ver.Value)
 		compKey := ver.Space + "\x00" + string(ver.Key)
@@ -129,8 +142,8 @@ func (r *DirtyRegistry) Publish(rootID string, generation, term uint64, versions
 	}
 
 	r.byRoot[rootID] = rootMap
-	r.globalCount += len(versions)
-	r.globalBytes += addedBytes
+	r.globalCount = netCount
+	r.globalBytes = netBytes
 	return nil
 }
 

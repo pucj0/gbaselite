@@ -435,7 +435,7 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 			if statementNeedsReadView(statement, isoLevel, inTxn) {
 				if automatic || isoLevel == storageengine.IsolationReadCommitted || isoLevel == storageengine.IsolationReadUncommitted {
 					kind := storageengine.StatementViewKindStatement
-					if isoLevel == storageengine.IsolationReadUncommitted {
+					if isoLevel == storageengine.IsolationReadUncommitted && isPlainConsistentRead(statement) {
 						kind = storageengine.StatementViewKindUncommitted
 					}
 					view, err := isoTxn.BeginStatementView(ctx, kind)
@@ -529,7 +529,10 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		rollbackSessionTransaction(session)
 		return nil, err
 	}
-	e.publishSessionDirtyWrites(session)
+	if err := e.publishSessionDirtyWrites(session); err != nil {
+		rollbackSessionTransaction(session)
+		return nil, err
+	}
 	if automatic {
 		if _, err = tx.Commit(ctx); err != nil {
 			return nil, err
@@ -738,20 +741,29 @@ func validateSerializableStatementShape(statement parser.Statement, session *Ses
 	return nil
 }
 
-func (e *Engine) publishSessionDirtyWrites(session *Session) {
+func (e *Engine) publishSessionDirtyWrites(session *Session) error {
 	if session.transaction == nil {
-		return
+		return nil
 	}
-	if p, ok := session.transaction.(storageengine.DirtyPublisher); ok {
-		_ = p.PublishDirtyWrites()
+	root := outermostTransaction(session)
+	if root == nil {
+		return nil
 	}
+	if p, ok := root.(storageengine.DirtyPublisher); ok {
+		return p.PublishDirtyWrites()
+	}
+	return nil
 }
 
 func (e *Engine) withdrawSessionDirtyWrites(session *Session) {
 	if session.transaction == nil {
 		return
 	}
-	if p, ok := session.transaction.(storageengine.DirtyPublisher); ok {
+	root := outermostTransaction(session)
+	if root == nil {
+		return
+	}
+	if p, ok := root.(storageengine.DirtyPublisher); ok {
 		p.WithdrawDirtyWrites()
 	}
 }

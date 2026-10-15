@@ -903,7 +903,7 @@ func (t *Tx) Term() uint64 {
 }
 
 // CollectDirtyVersions extracts the uncommitted writes of t and its ancestor layers.
-func (t *Tx) CollectDirtyVersions() []DirtyVersion {
+func (t *Tx) CollectDirtyVersions() ([]DirtyVersion, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -918,29 +918,18 @@ func (t *Tx) CollectDirtyVersions() []DirtyVersion {
 	collected := make(map[string]DirtyVersion)
 
 	for _, tx := range chain {
-		if tx.stage == nil {
-			for k, v := range tx.buffered {
-				op, err := decodeStagedOp([]byte(k), v)
-				if err != nil || op.Check {
-					continue
-				}
-				compKey := op.Space + "\x00" + string(op.Key)
-				collected[compKey] = DirtyVersion{
-					Space:   op.Space,
-					Key:     bytes.Clone(op.Key),
-					Value:   bytes.Clone(op.Value),
-					Deleted: op.Delete,
-				}
-			}
-		} else {
-			_ = tx.stage.View(func(btx *bolt.Tx) error {
+		if tx.stage != nil {
+			err := tx.stage.View(func(btx *bolt.Tx) error {
 				b := btx.Bucket([]byte("writes"))
 				if b == nil {
 					return nil
 				}
 				return b.ForEach(func(k, v []byte) error {
 					op, err := decodeStagedOp(k, v)
-					if err != nil || op.Check {
+					if err != nil {
+						return err
+					}
+					if op.Check {
 						return nil
 					}
 					compKey := op.Space + "\x00" + string(op.Key)
@@ -953,18 +942,24 @@ func (t *Tx) CollectDirtyVersions() []DirtyVersion {
 					return nil
 				})
 			})
-			for k, v := range tx.buffered {
-				op, err := decodeStagedOp([]byte(k), v)
-				if err != nil || op.Check {
-					continue
-				}
-				compKey := op.Space + "\x00" + string(op.Key)
-				collected[compKey] = DirtyVersion{
-					Space:   op.Space,
-					Key:     bytes.Clone(op.Key),
-					Value:   bytes.Clone(op.Value),
-					Deleted: op.Delete,
-				}
+			if err != nil {
+				return nil, err
+			}
+		}
+		for k, v := range tx.buffered {
+			op, err := decodeStagedOp([]byte(k), v)
+			if err != nil {
+				return nil, err
+			}
+			if op.Check {
+				continue
+			}
+			compKey := op.Space + "\x00" + string(op.Key)
+			collected[compKey] = DirtyVersion{
+				Space:   op.Space,
+				Key:     bytes.Clone(op.Key),
+				Value:   bytes.Clone(op.Value),
+				Deleted: op.Delete,
 			}
 		}
 	}
@@ -973,5 +968,5 @@ func (t *Tx) CollectDirtyVersions() []DirtyVersion {
 	for _, ver := range collected {
 		res = append(res, ver)
 	}
-	return res
+	return res, nil
 }
