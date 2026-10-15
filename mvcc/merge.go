@@ -7,7 +7,7 @@ import (
 
 func (t *Tx) mergeParent(ctx context.Context) error {
 	p := t.parent
-	if p.closed || p.generation != p.store.generation.Load() {
+	if p.closed.Load() || p.generation != p.store.generation.Load() {
 		return ErrClosed
 	}
 	if err := ctx.Err(); err != nil {

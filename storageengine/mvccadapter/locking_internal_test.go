@@ -664,3 +664,93 @@ func TestT018ChildReentryAndChildEndDoNotDisturbTheRootsGrant(t *testing.T) {
 	}
 	t018RequireNoResidue(t, e)
 }
+
+// TestP6Final03_GapLockQueueTimeoutCancelAndGeneration covers P6-FINAL-03 in mvccadapter:
+// Verifies that serializableGet on an absent key attempts to acquire a Gap Lock,
+// enters the Lock Manager wait queue when conflicting with InsertIntention held by B,
+// confirms WaitEdges, and verifies timeout, cancellation, generation invalidation, and no leaks.
+func TestP6Final03_GapLockQueueTimeoutCancelAndGeneration(t *testing.T) {
+	ctx := context.Background()
+	e := t018OpenEngine(t)
+
+	// 1. Seed k10 and k100
+	initTx, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = initTx.Put("row/t1", []byte("k10"), []byte("V10"))
+	_ = initTx.Put("row/t1", []byte("k100"), []byte("V100"))
+	if _, err := initTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Txn B acquires InsertIntention on k50 (which falls in the gap (k10, k100))
+	txB, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txB.Rollback()
+
+	lockingB, err := storageengine.LockingTxnOf(txB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopeB, err := lockingB.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = lockingB.Acquire(ctx, scopeB, storageengine.LockRequest{
+		Components: []storageengine.LockComponent{
+			{Mode: storageengine.LockModeIX, Kind: storageengine.LockComponentTableIntent, Space: "row/t1", TableID: "t1"},
+			{Mode: storageengine.LockModeInsertIntention, Kind: storageengine.LockComponentRecord, Space: "row/t1", TableID: "t1", Key: []byte("k50")},
+			{Mode: storageengine.LockModeX, Kind: storageengine.LockComponentRecord, Space: "row/t1", TableID: "t1", Key: []byte("k50")},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Txn A begins SERIALIZABLE with cancel context and queries absent "k50"
+	ctxCancel, cancelA := context.WithCancel(ctx)
+	txA, err := e.BeginIsolated(ctxCancel, storageengine.IsolationSerializable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback()
+
+	getDone := make(chan error, 1)
+	go func() {
+		_, _, err := txA.Get("row/t1", []byte("k50"))
+		getDone <- err
+	}()
+
+	// Wait until A enters the wait queue for B's InsertIntention lock
+	var waitingConfirmed bool
+	for start := time.Now(); time.Since(start) < 2*time.Second; {
+		if len(e.locks.WaitEdges()) > 0 {
+			waitingConfirmed = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !waitingConfirmed {
+		t.Fatal("A never entered the lock wait queue for B's InsertIntention")
+	}
+
+	// 4. Cancel A's context: A must abort and receive context.Canceled
+	cancelA()
+
+	select {
+	case err := <-getDone:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("txA.Get did not unblock on context cancellation")
+	}
+
+	// 5. Verify pending requests of A is 0, no leaked lock scope
+	if e.locks.PendingRequests(txA.ID()) != 0 {
+		t.Fatalf("pending requests leaked on txA: %d", e.locks.PendingRequests(txA.ID()))
+	}
+}

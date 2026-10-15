@@ -1,7 +1,7 @@
 # Tasks: B03 Four Transaction Isolation Levels
 
 **Feature**: `007-b03-transaction-isolation`  
-**Status**: 56 tasks completed (Phase 1 Setup & Proof, Phase 2 Grammar & Session, Phase 3 Read View & GC, Phase 4 REPEATABLE READ, Phase 5 READ COMMITTED, and Phase 6 SERIALIZABLE completed). Phase 7–9 pending user authorization.
+**Status**: 65 tasks completed (Phase 1 Setup & Proof, Phase 2 Grammar & Session, Phase 3 Read View & GC, Phase 4 REPEATABLE READ, Phase 5 READ COMMITTED, Phase 6 SERIALIZABLE, and Phase 7 READ UNCOMMITTED completed). Phase 8–9 pending user authorization.
 **Format**: `[TID] [P?] [USn] text — FR/SC`. `[P]` 只表示文件独立、前置依赖满足时可并行；并不授权 AI 跳过 Phase。
 **Tests**: 必须先写失败测试，再实现；不能拿静态阅读等同运行验收。
 
@@ -137,15 +137,15 @@
 
 **Goal**: RU 真实 staged dirty-read 与不脏写。
 
-- [ ] **T057** 先写 M29–M36 的 staging 可见性红测，明确 writer 已完成 merge、reader 可采样的信号点。  _Trace: FR-011/017/028; SC-004_
-- [ ] **T058** 在 `storageengine/isolation.go` 提供可选 read-uncommitted capability，未实现或 Raft 模式必须报 Unsupported。  _Trace: FR-011/024/026; SC-004/008_
-- [ ] **T059** 在 `mvcc/{transaction.go,write_buffer.go,transaction_state.go}` 实现 root completed-merge staged-view 原子公布（不改 WAL/stage codec）。  _Trace: FR-017/018/025; SC-004_
-- [ ] **T060** 在 mvcc RU reader 实现 atomic sampling、tombstone/insert/update、reader own-overlay 优先以及取消安全字节复制。  _Trace: FR-011/017; SC-004/007_
-- [ ] **T061** 在 `storageengine/mvccadapter/isolation.go`、executor ordinary SELECT 整合 RU stage committed overlay，按 query plan 安全重算 predicate/索引。  _Trace: FR-011/017/027; SC-004/008_
-- [ ] **T062** 在 RU DML/unique/FK/current-read 验证上强制 RC 同等锁与 committed baseline，测量无 dirty write/lost update。  _Trace: FR-018/019; SC-004/006_
-- [ ] **T063** 给 RU stage memory/row budget、owner generation/term、rollback/restore/GC/scan concurrency 加 bounded/fail-closed gate。  _Trace: FR-017/023/026/032; SC-004/007_
-- [ ] **T064** 在 replica 初始化或事务 level 切换位置拒绝无安全 dirty-read 能力的拓扑；不输出 RU OK 但执行 RC。  _Trace: FR-026/027; SC-008_
-- [ ] **T065** Phase 7 gate：M29–M36 每种 stage 三类都可观察且 rollback 安全，100 次 race，并更新 README RU 限制。  _Trace: FR-030/031; SC-004/007/010_
+- [x] **T057** 先写 M29–M36 的 staging 可见性红测，明确 writer 已完成 merge、reader 可采样的信号点。  _Trace: FR-011/017/028; SC-004_
+- [x] **T058** 在 `storageengine/isolation.go` 提供可选 read-uncommitted capability，未实现或 Raft 模式必须报 Unsupported。  _Trace: FR-011/024/026; SC-004/008_
+- [x] **T059** 在 `mvcc/{transaction.go,write_buffer.go,transaction_state.go}` 实现 root completed-merge staged-view 原子公布（不改 WAL/stage codec）。  _Trace: FR-017/018/025; SC-004_
+- [x] **T060** 在 mvcc RU reader 实现 atomic sampling、tombstone/insert/update、reader own-overlay 优先以及取消安全字节复制。  _Trace: FR-011/017; SC-004/007_
+- [x] **T061** 在 `storageengine/mvccadapter/isolation.go`、executor ordinary SELECT 整合 RU stage committed overlay，按 query plan 安全重算 predicate/索引。  _Trace: FR-011/017/027; SC-004/008_
+- [x] **T062** 在 RU DML/unique/FK/current-read 验证上强制 RC 同等锁与 committed baseline，测量无 dirty write/lost update。  _Trace: FR-018/019; SC-004/006_
+- [x] **T063** 给 RU stage memory/row budget、owner generation/term、rollback/restore/GC/scan concurrency 加 bounded/fail-closed gate。  _Trace: FR-017/023/026/032; SC-004/007_
+- [x] **T064** 在 replica 初始化或事务 level 切换位置拒绝无安全 dirty-read 能力的拓扑；不输出 RU OK 但执行 RC。  _Trace: FR-026/027; SC-008_
+- [x] **T065** Phase 7 gate：M29–M36 每种 stage 三类都可观察且 rollback 安全，100 次 race，并更新 README RU 限制。  _Trace: FR-030/031; SC-004/007/010_
 
 **Checkpoint P7**: 只有本阶段真实证据齐备、阻塞问题关闭且用户授权下一阶段后方可继续。
 

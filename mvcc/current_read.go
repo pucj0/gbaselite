@@ -223,7 +223,7 @@ func (t *Tx) recordWriteBaseline(space string, rowKey []byte, observation Curren
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed {
+	if t.closed.Load() {
 		return
 	}
 	version := observation.ChangeTS
@@ -257,7 +257,7 @@ func (t *Tx) RecordObservationBaseline(space string, rowKey []byte, version uint
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed {
+	if t.closed.Load() {
 		return
 	}
 	if t.writeBaseline == nil {

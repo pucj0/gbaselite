@@ -1,8 +1,10 @@
 package mvccadapter
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 
 	"gbaselite/mvcc"
@@ -14,11 +16,53 @@ var _ storageengine.IsolationTxn = (*txn)(nil)
 var _ storageengine.ReadView = (*mvccReadView)(nil)
 
 type mvccReadView struct {
-	token       *mvcc.ViewToken
-	kind        storageengine.StatementViewKind
-	txn         *txn
-	isChildView bool
+	token         *mvcc.ViewToken
+	kind          storageengine.StatementViewKind
+	txn           *txn
+	isChildView   bool
+	dirtySnapshot *mvcc.DirtySnapshot
 }
+
+type dirtyRow struct {
+	key   []byte
+	value []byte
+}
+
+type inMemoryIterator struct {
+	rows  []dirtyRow
+	idx   int
+	curr  dirtyRow
+	valid bool
+}
+
+func (it *inMemoryIterator) Next() bool {
+	if it.idx < len(it.rows) {
+		it.curr = it.rows[it.idx]
+		it.idx++
+		it.valid = true
+		return true
+	}
+	it.valid = false
+	return false
+}
+
+func (it *inMemoryIterator) Key() []byte {
+	if !it.valid {
+		return nil
+	}
+	return it.curr.key
+}
+
+func (it *inMemoryIterator) Value() []byte {
+	if !it.valid {
+		return nil
+	}
+	return it.curr.value
+}
+
+func (it *inMemoryIterator) Valid() bool  { return it.valid }
+func (it *inMemoryIterator) Err() error   { return nil }
+func (it *inMemoryIterator) Close() error { return nil }
 
 func (v *mvccReadView) ID() string                            { return v.token.ID() }
 func (v *mvccReadView) Revision() uint64                      { return v.token.Revision() }
@@ -40,6 +84,27 @@ func (v *mvccReadView) Get(space string, key []byte) ([]byte, bool, error) {
 	if v.txn != nil && v.txn.root().isolationLevel == storageengine.IsolationSerializable && !isMetadataSpace(space) {
 		return nil, false, fmt.Errorf("%w: ReadView.Get on user data in SERIALIZABLE is unsupported", storageengine.ErrUnsupported)
 	}
+	if v.kind == storageengine.StatementViewKindUncommitted {
+		// 1. Reader's own writes take highest priority
+		if v.txn != nil && v.txn.inner != nil {
+			obs, err := v.txn.inner.ReadCurrentUnlocked(context.Background(), space, key)
+			if err == nil && obs.Source == mvcc.CurrentOwnOverlay {
+				if obs.Tombstone {
+					return nil, false, nil
+				}
+				return obs.Value, true, nil
+			}
+		}
+		// 2. Foreign sampled dirty version
+		if v.dirtySnapshot != nil {
+			if dirty, ok := v.dirtySnapshot.Get(space, key); ok {
+				if dirty.Deleted {
+					return nil, false, nil
+				}
+				return dirty.Value, true, nil
+			}
+		}
+	}
 	var tx *mvcc.Tx
 	if v.txn != nil {
 		tx = v.txn.inner
@@ -57,6 +122,88 @@ func (b *borrowedIterator) Close() error {
 	return b.Iterator.Close()
 }
 
+func inRange(key []byte, r storageengine.KeyRange) bool {
+	if r.Lower != nil {
+		cmp := bytes.Compare(key, r.Lower)
+		if cmp < 0 || (cmp == 0 && !r.LowerInclusive) {
+			return false
+		}
+	}
+	if r.Upper != nil {
+		cmp := bytes.Compare(key, r.Upper)
+		if cmp > 0 || (cmp == 0 && !r.UpperInclusive) {
+			return false
+		}
+	}
+	return true
+}
+
+func (v *mvccReadView) newDirtyIterator(ctx context.Context, r storageengine.ScanRequest) (storageengine.Iterator, error) {
+	if err := v.token.BeginBorrow(); err != nil {
+		return nil, err
+	}
+	defer v.token.EndBorrow()
+
+	bounds := mvcc.KeyRange{
+		Lower:          r.Range.Lower,
+		Upper:          r.Range.Upper,
+		LowerInclusive: r.Range.LowerInclusive,
+		UpperInclusive: r.Range.UpperInclusive,
+		Reverse:        r.Range.Reverse,
+	}
+
+	var tx *mvcc.Tx
+	if v.txn != nil {
+		tx = v.txn.inner
+	}
+
+	combined := make(map[string]dirtyRow)
+	_ = v.token.ScanRangeWithTx(ctx, r.Space, bounds, tx, func(k, val []byte) error {
+		combined[string(k)] = dirtyRow{key: bytes.Clone(k), value: bytes.Clone(val)}
+		return nil
+	})
+
+	// Overlay foreign sampled dirty entries
+	if v.dirtySnapshot != nil {
+		for _, d := range v.dirtySnapshot.SpaceEntries(r.Space) {
+			if inRange(d.Key, r.Range) {
+				if d.Deleted {
+					delete(combined, string(d.Key))
+				} else {
+					combined[string(d.Key)] = dirtyRow{key: bytes.Clone(d.Key), value: bytes.Clone(d.Value)}
+				}
+			}
+		}
+	}
+
+	// Overlay reader's own uncommitted writes
+	if tx != nil {
+		for _, op := range tx.CollectDirtyVersions() {
+			if op.Space == r.Space && inRange(op.Key, r.Range) {
+				if op.Deleted {
+					delete(combined, string(op.Key))
+				} else {
+					combined[string(op.Key)] = dirtyRow{key: bytes.Clone(op.Key), value: bytes.Clone(op.Value)}
+				}
+			}
+		}
+	}
+
+	rows := make([]dirtyRow, 0, len(combined))
+	for _, row := range combined {
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		cmp := bytes.Compare(rows[i].key, rows[j].key)
+		if r.Range.Reverse {
+			return cmp > 0
+		}
+		return cmp < 0
+	})
+
+	return &inMemoryIterator{rows: rows}, nil
+}
+
 func (v *mvccReadView) NewIterator(ctx context.Context, r storageengine.ScanRequest) (storageengine.Iterator, error) {
 	switch v.State() {
 	case storageengine.ViewStateClosed:
@@ -66,6 +213,9 @@ func (v *mvccReadView) NewIterator(ctx context.Context, r storageengine.ScanRequ
 	}
 	if v.txn != nil && v.txn.root().isolationLevel == storageengine.IsolationSerializable && !isMetadataSpace(r.Space) {
 		return nil, fmt.Errorf("%w: ReadView.NewIterator on user data in SERIALIZABLE is unsupported", storageengine.ErrUnsupported)
+	}
+	if v.kind == storageengine.StatementViewKindUncommitted && v.dirtySnapshot != nil {
+		return v.newDirtyIterator(ctx, r)
 	}
 	if err := v.token.BeginBorrow(); err != nil {
 		return nil, err
@@ -112,11 +262,6 @@ func (e *engine) BeginIsolated(ctx context.Context, level storageengine.Isolatio
 	if !level.Valid() {
 		return nil, fmt.Errorf("invalid isolation level: %q", level)
 	}
-	// In Phase 6, REPEATABLE READ, READ COMMITTED, and SERIALIZABLE are executable by the storage backend.
-	// RU must return ErrUnsupported without registering a root transaction.
-	if level != storageengine.IsolationRepeatableRead && level != storageengine.IsolationReadCommitted && level != storageengine.IsolationSerializable {
-		return nil, fmt.Errorf("%w: isolation level %s is not supported yet", storageengine.ErrUnsupported, level)
-	}
 	t, err := e.store.BeginLazy(ctx, e.proposer)
 	if err != nil {
 		return nil, err
@@ -141,8 +286,27 @@ func (t *txn) BeginStatementView(ctx context.Context, kind storageengine.Stateme
 	if t.root().isolationLevel == storageengine.IsolationSerializable {
 		return nil, fmt.Errorf("%w: StatementView on SERIALIZABLE transaction is unsupported; use LockingTxn or SQL executor", storageengine.ErrUnsupported)
 	}
-	if kind == storageengine.StatementViewKindUncommitted {
-		return nil, fmt.Errorf("%w: uncommitted statement view is not supported yet", storageengine.ErrUnsupported)
+	if kind == storageengine.StatementViewKindUncommitted || t.root().isolationLevel == storageengine.IsolationReadUncommitted {
+		kind = storageengine.StatementViewKindUncommitted
+		token, err := t.engine.store.BeginViewToken(ctx, t.inner)
+		if err != nil {
+			return nil, err
+		}
+		var snap *mvcc.DirtySnapshot
+		if t.engine.store.DirtyRegistry() != nil {
+			rootID := ""
+			if t.root().inner != nil {
+				rootID = t.root().inner.ID
+			}
+			snap, err = t.engine.store.DirtyRegistry().Sample(rootID)
+			if err != nil {
+				_ = token.Close()
+				return nil, err
+			}
+		}
+		v := &mvccReadView{token: token, kind: kind, txn: t, dirtySnapshot: snap}
+		t.activeView = v
+		return v, nil
 	}
 	if kind > storageengine.StatementViewKindUncommitted {
 		return nil, fmt.Errorf("invalid statement view kind: %d", kind)
@@ -164,8 +328,8 @@ func (t *txn) BeginConsistentView(ctx context.Context) (storageengine.ReadView, 
 		}
 		return nil, storageengine.ErrClosed
 	}
-	if root.isolationLevel == storageengine.IsolationSerializable {
-		return nil, fmt.Errorf("%w: ConsistentView on SERIALIZABLE transaction is unsupported", storageengine.ErrUnsupported)
+	if root.isolationLevel == storageengine.IsolationSerializable || root.isolationLevel == storageengine.IsolationReadUncommitted {
+		return nil, fmt.Errorf("%w: ConsistentView on %s transaction is unsupported", storageengine.ErrUnsupported, root.isolationLevel)
 	}
 
 	rootView, err := root.ensureRootConsistentView(ctx)

@@ -290,7 +290,7 @@ func (t *Tx) scanRangeAt(ctx context.Context, space string, r KeyRange, storeSna
 			err = ErrConflict
 		}
 	}()
-	if t.closed || t.generation != t.store.generation.Load() {
+	if t.closed.Load() || t.generation != t.store.generation.Load() {
 		return ErrClosed
 	}
 	var observation transactionObservation
@@ -315,7 +315,7 @@ func (t *Tx) scanRangeAt(ctx context.Context, space string, r KeyRange, storeSna
 	}
 	var iters []*rangeIterator
 	for layer := t; layer != nil; layer = layer.parent {
-		if layer.closed {
+		if layer.closed.Load() {
 			return ErrClosed
 		}
 		if err := layer.flushWrites(); err != nil {

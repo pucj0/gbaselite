@@ -566,8 +566,8 @@ func TestLifecycleClosedMatchesTerminalState(t *testing.T) {
 		if state := tx.State(); state != probe.want {
 			t.Fatalf("%s state = %s, want %s", probe.name, state, probe.want)
 		}
-		if terminal := tx.State().Terminal(); terminal != tx.closed {
-			t.Fatalf("%s: state %s terminal=%v disagrees with closed=%v", probe.name, tx.State(), terminal, tx.closed)
+		if terminal := tx.State().Terminal(); terminal != tx.closed.Load() {
+			t.Fatalf("%s: state %s terminal=%v disagrees with closed=%v", probe.name, tx.State(), terminal, tx.closed.Load())
 		}
 		info := tx.Info()
 		if info.State != probe.want {

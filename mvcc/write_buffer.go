@@ -40,9 +40,12 @@ func (t *Tx) flushWrites() error {
 	return nil
 }
 func (t *Tx) stagedValue(k []byte) ([]byte, error) {
+	t.mu.Lock()
 	if v, ok := t.buffered[string(k)]; ok {
+		t.mu.Unlock()
 		return v, nil
 	}
+	t.mu.Unlock()
 	stage, release, err := t.acquireStageLease()
 	if err != nil {
 		return nil, err

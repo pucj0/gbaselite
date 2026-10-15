@@ -223,9 +223,28 @@ func (e *engine) CompactHistory(ctx context.Context) error { return e.store.Comp
 func (e *engine) Compact(ctx context.Context, path string) error {
 	return e.store.ExportLayout(ctx, path, "flat")
 }
+func (e *engine) Store() *mvcc.Store           { return e.store }
 func (e *engine) PendingBytes() (int64, error) { return e.store.PendingBytes() }
 func (t *txn) ID() string                      { return t.inner.ID }
 func (t *txn) Snapshot() uint64                { return t.inner.Snapshot }
+func (t *txn) InnerTx() *mvcc.Tx               { return t.inner }
+
+func (t *txn) PublishDirtyWrites() error {
+	if t.engine.store.DirtyRegistry() == nil {
+		return nil
+	}
+	versions := t.inner.CollectDirtyVersions()
+	rootID := t.root().inner.ID
+	return t.engine.store.DirtyRegistry().Publish(rootID, t.inner.Generation(), t.inner.Term(), versions)
+}
+
+func (t *txn) WithdrawDirtyWrites() {
+	if t.engine.store.DirtyRegistry() == nil {
+		return
+	}
+	rootID := t.root().inner.ID
+	t.engine.store.DirtyRegistry().Withdraw(rootID)
+}
 func (t *txn) Get(s string, k []byte) ([]byte, bool, error) {
 	if t.root().isolationLevel == storageengine.IsolationSerializable {
 		if isMetadataSpace(s) {

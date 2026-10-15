@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -609,17 +610,32 @@ func TestP6Final04_StageLeaseDeterministicInterleaving(t *testing.T) {
 	<-inView
 
 	// 3. Concurrently invoke Rollback: cleanup() must wait on stage lease!
+	cleanupEntered := make(chan struct{})
+	stageCleanupWaitHook = func() {
+		close(cleanupEntered)
+	}
+	defer func() { stageCleanupWaitHook = nil }()
+
 	rollbackDone := make(chan error, 1)
 	go func() {
 		rollbackDone <- tx.Rollback()
 	}()
 
-	// Verify rollback is waiting and has not finished
+	// Barrier: deterministically verify rollback entered cleanup and is waiting on stage lease
 	select {
-	case <-rollbackDone:
-		t.Fatal("rollback completed while reader was inside stage.View!")
-	case <-time.After(50 * time.Millisecond):
-		// Expected: cleanup is blocked waiting on lease
+	case <-cleanupEntered:
+		// Cleanup is confirmed waiting on stage lease!
+	case <-time.After(3 * time.Second):
+		t.Fatal("cleanup never entered wait on stage lease")
+	}
+
+	// Verify readers count > 0 while waiting
+	tx.mu.Lock()
+	readersWhileWaiting := tx.stageReaders
+	closedWhileWaiting := tx.closed.Load()
+	tx.mu.Unlock()
+	if readersWhileWaiting <= 0 || !closedWhileWaiting {
+		t.Fatalf("expected readers > 0 and closed true while cleanup waits: readers=%d, closed=%v", readersWhileWaiting, closedWhileWaiting)
 	}
 
 	// 4. Now allow reader to finish stage.View
@@ -645,7 +661,23 @@ func TestP6Final04_StageLeaseDeterministicInterleaving(t *testing.T) {
 		t.Fatal("rollback never completed")
 	}
 
-	// 5. Subsequent attempts to acquire lease must return ErrClosed
+	// 5. Verify lease count is zero, stage is nil, and subsequent attempts return ErrClosed
+	tx.mu.Lock()
+	finalReaders := tx.stageReaders
+	finalStage := tx.stage
+	path := tx.path
+	tx.mu.Unlock()
+
+	if finalReaders != 0 {
+		t.Fatalf("stageReaders = %d after cleanup, want 0", finalReaders)
+	}
+	if finalStage != nil {
+		t.Fatalf("stage = %v after cleanup, want nil", finalStage)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("stage file still exists after cleanup: %v", err)
+	}
+
 	_, _, err = tx.acquireStageLease()
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("acquireStageLease after rollback = %v, want ErrClosed", err)

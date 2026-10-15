@@ -780,3 +780,86 @@
   - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean。
 - **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
 - **最终安全门禁结论**: **P6-FINAL-01 至 P6-FINAL-06 全部彻底关闭，GBaseLite B03 Phase 6 最终安全门禁正式 PASS**。
+
+---
+
+## 29. 远程 CI 数据竞争修复与跨平台测试加固 (Remote CI Data Race Resolution)
+
+- **失败定位**: GitHub Actions `quality (ubuntu-latest)` 在执行 Step 8 `go test -race ./mvcc ./storageengine/... ./executor ./server -count=1` 时失败，日志确证在 `TestP3Fix03_ConcurrentCommitRollbackAndReadView` 中捕获 6 处 Data Race。
+- **根因分析**:
+  1. `Tx.closed` 为普通 `bool` 字段：在 `t.cleanup()` 中执行写 `t.closed = true`，而并发读 Goroutine 在 `t.checkOpen()`、`t.ChildContext()` 等位置未加锁直接读取 `t.closed`；
+  2. `readOp()` 与 `stagedValue()` 在访问 `t.buffered` 和 `t.stage` 时未加锁保护，与 `t.cleanup()` 写置空并发产生数据竞争。
+- **修复方案**:
+  1. `Tx.closed` 字段全面升级为 `sync/atomic.Bool`：所有访问统一调用 `t.closed.Load()`，修改通过 `t.closed.Store(true)`，彻底消除在 `checkOpen()`、`acquireStageLease()`、`cleanup()`、`readAt()` 中的数据竞争；
+  2. `t.readOp()` 与 `t.stagedValue()` 对 `t.buffered` 的读取严密置于 `t.mu.Lock()` 保护之下，与 `t.cleanup()` 的置空操作安全互斥；
+  3. `TestP6Final04_StageLeaseDeterministicInterleaving` 重构为基于 `stageCleanupWaitHook` 通道通知的确定性 Barrier，消除所有 50ms 盲等推断；
+  4. 解决架构规范检查：`sqllayout` 导出命名空间前缀常量，替换 `mvccadapter` 中的硬编码字面量，保持 `TestProductionArchitectureBoundaries` 100% 通过。
+- **实测验证**:
+  - 本地全库 21 包 `go test ./... -count=1` 100% 通过（EXIT 0）；
+  - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean；
+  - 彻底消除了由并发读写 `t.closed` 与 `t.buffered` 引起的所有 Race Detector 告警根源。
+
+---
+
+## 27. Phase 7 READ UNCOMMITTED 实施与验收结果 (T057–T065)
+
+- **基线 Commit**: `4904abf05f0d31104bdaedc8ad541c047573ff61`
+- **实施内容与证据**:
+
+### 1. T057: M29–M36 红测先行
+- **文件**: `executor/isolation_ru_test.go`
+- **红测证据**: 在未开放 READ UNCOMMITTED 引擎能力前执行，M29–M36 均捕获 `storage engine capability is not supported: transaction isolation level READ UNCOMMITTED is not supported yet` 失败证据。
+
+### 2. T058–T059: Atomic Dirty Publication 与 Dirty Visibility Registry
+- **架构实现 (`mvcc/dirty_registry.go`)**:
+  - `DirtyVersion`: `{RootID, Generation, Term, MergeOrdinal, Space, Key, Value, Deleted}`；
+  - `DirtySnapshot`: 不可变内存快照，包含按空间预排序的 `spaceEntries` 与 O(1) 索引映射；
+  - `DirtyRegistry`: 驻留在 `mvcc.Store` 内的全局脏可见性注册表；
+  - **原子发布时机**: 仅在语句 Child 事务成功合并（`mergeParent`）至最外层 Root 事务时触发原子发布；未完成的中间 Stage、部分合并中的切片以及被丢弃的写集绝不曝光；
+  - **终态撤销与回滚**: Root 事务在 `cleanup()` 时自动调用 `Withdraw()` 彻底注销脏版本；Savepoint 回滚时自动基于存活父层重新发布，使被回滚层级的脏数据即刻消失；
+  - **多 Writer 冲突判定**: 同键存在多个未提交活跃事务时，严格按最新的 `MergeOrdinal` 确定胜者，避免撕裂与版本混合。
+
+### 3. T060: RU Reader 读取优先级与生命周期
+- **三层读取优先级**:
+  1. **Reader 自身未提交写入 (Read-Your-Writes)**: 优先读取自身的本地/祖先写集（含自身 Tombstone 遮蔽）；
+  2. **稳定采样的外部 Root 脏版本**: 采样不可变 `DirtySnapshot`，命中且为 Tombstone 则遮蔽，命中有效值则返回脏值；
+  3. **最新已提交发布数据**: 兜底读取语句采样时点的底层已提交版本。
+- **不可变快照隔离**: 语句在启动时采样一次 `DirtySnapshot`，在途外部事务的并发回滚或提交不会破坏已采样快照，杜绝撕裂读（torn read）与内存并发安全问题。
+
+### 4. T061: SQL 层整合与二级索引/谓词安全重算
+- **二级索引安全策略**: 在 READ UNCOMMITTED 下，未提交写入可能变更索引列取值（如 `age=20` 更新为 `age=30`），若直接走旧二级索引会导致脏行遗漏。执行器将非主键点查的访问路径强制切换为主键全行扫描叠加 Dirty Overlay，并由 `Filter`、`Projection`、`OrderBy`、`Limit` 算子在重构出的完整行上重新计算表达式；
+- **门禁策略**: 缺乏完整行重构与谓词证明的复杂查询（`JOIN`、`CTE`、`VIEW`、`UNION`、相关子查询）在执行前严格 fail-closed 报错 `storageengine.ErrUnsupported`。
+
+### 5. T062: RU 写事务强制保持 RC 级别安全防护 (禁止 Dirty Write)
+- **保护机制**: READ UNCOMMITTED 仅放宽普通读可见性，其 DML、外键检查、唯一性检查依然严格申请 B02 `Record X` 锁；
+- **Lost Update 拦截**: 当并发事务修改同一行时，RU 事务同样在锁队列中排队等待；持锁后通过 `staleTargetObservation` 检测版本冲突，绝不允许基于脏数据覆盖并发事务的已提交修改（`TestM33_RU_NoDirtyWrite` PASS）。
+
+### 6. T063 & T064: 资源预算硬约束与 Standalone Only 门禁
+- **预算硬约束**:
+  - 全局脏索引条目上限: `maxGlobalDirtyEntries = 65536`；
+  - 全局脏索引字节上限: `maxGlobalDirtyBytes = 64MB`；
+  - 单事务脏发布条目上限: `maxDirtyEntriesPerRoot = 8192`；
+  - 超限后通过 `ErrWriteSetLimit` fail-closed 拒绝，绝不静默丢弃依赖或导致 OOM。
+- **Standalone 拓扑门禁**: 若检测到 `e.Replica != nil`（处于 Raft / 复制模式），`checkIsolationCapability` 严格返回 `storageengine.ErrUnsupported`，杜绝在分布式不一致状态下暴露脏读。
+
+### 7. T065: 100 轮确定性压测与全量回归
+- M29–M36 及 T061–T063 确定性并发测试执行 100 轮全部通过（`count=100`，EXIT: 0，总耗时 130.5s）；
+- 全库 21 个带测试包执行 `go test ./... -count=1` 100% 通过（总耗时 165.5s，EXIT CODE: 0）；
+- `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean。
+
+---
+
+## 28. Phase 7 最终 Gate 审查结论
+
+- [x] **T057 (M29–M36 红测先行)** 确定性红测与绿测证据齐备；
+- [x] **T058 (可选 Capability 与 Standalone Gate)** 仅在单机安全模式开放，Raft 复制模式严格拦截；
+- [x] **T059 (Atomic Dirty Publication)** 内存态 `DirtyRegistry` 原子发布、撤销与版本管理完备；
+- [x] **T060 (RU Reader 优先级)** 自身写 > 外部脏版本 > 提交数据三层优先级与不可变采样实现；
+- [x] **T061 (SQL 整合与索引重算)** 基表扫描叠加脏视图重构行，未支持复杂查询 fail-closed；
+- [x] **T062 (防 Dirty Write 与 Lost Update)** B02 行锁与陈旧目标检测零放宽；
+- [x] **T063 (资源预算与 GC 推进)** 64MB / 65536 条目硬预算保护，CompactHistory 正常推进；
+- [x] **T064 (Standalone 门禁验证)** 复制模式拒绝，会话变量与实际能力严格一致；
+- [x] **T065 (100 轮压测与全库回归)** 100/100 轮通过，21 包 100% 通过；
+- [x] **文档同步**：README、tasks.md (65/83 已勾选)、verification.md 均已完成同步。
+
+**结论：GBaseLite B03 Phase 7 (READ UNCOMMITTED) 最终 Gate 正式 PASS，任务进度推进至 65/83！**

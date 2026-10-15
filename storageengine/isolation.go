@@ -77,6 +77,12 @@ type IsolationTxn interface {
 	ActiveView() (ReadView, bool)
 }
 
+// DirtyPublisher is an optional capability on a Txn for publishing uncommitted dirty writes.
+type DirtyPublisher interface {
+	PublishDirtyWrites() error
+	WithdrawDirtyWrites()
+}
+
 // IsolationEngine is an optional capability on an Engine for creating transactions with explicit isolation levels.
 type IsolationEngine interface {
 	BeginIsolated(ctx context.Context, level IsolationLevel) (Txn, error)

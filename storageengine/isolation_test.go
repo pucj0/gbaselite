@@ -122,21 +122,12 @@ func TestP3Fix02_CapabilityGateInAdapter(t *testing.T) {
 		t.Fatalf("BeginIsolated with invalid level unexpectedly succeeded")
 	}
 
-	// 2. Unimplemented isolation levels must return ErrUnsupported
-	for _, lvl := range []storageengine.IsolationLevel{
-		storageengine.IsolationReadUncommitted,
-	} {
-		_, err := storageengine.BeginIsolated(ctx, e, lvl)
-		if !errors.Is(err, storageengine.ErrUnsupported) {
-			t.Fatalf("BeginIsolated(%s) returned %v, want ErrUnsupported", lvl, err)
-		}
-	}
-
-	// 3. REPEATABLE READ, READ COMMITTED, and SERIALIZABLE must succeed
+	// 2. All four standard isolation levels must succeed
 	for _, lvl := range []storageengine.IsolationLevel{
 		storageengine.IsolationRepeatableRead,
 		storageengine.IsolationReadCommitted,
 		storageengine.IsolationSerializable,
+		storageengine.IsolationReadUncommitted,
 	} {
 		tx, err := storageengine.BeginIsolated(ctx, e, lvl)
 		if err != nil {
@@ -148,10 +139,17 @@ func TestP3Fix02_CapabilityGateInAdapter(t *testing.T) {
 	tx, _ := storageengine.BeginIsolated(ctx, e, storageengine.IsolationRepeatableRead)
 	defer tx.Rollback()
 
-	// 4. StatementViewKindUncommitted must return ErrUnsupported (not fake support)
+	// 4. StatementViewKindUncommitted now succeeds in Phase 7
 	isoTxn := tx.(storageengine.IsolationTxn)
-	if _, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindUncommitted); !errors.Is(err, storageengine.ErrUnsupported) {
-		t.Fatalf("BeginStatementView(Uncommitted) returned %v, want ErrUnsupported", err)
+	view, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindUncommitted)
+	if err != nil {
+		t.Fatalf("BeginStatementView(Uncommitted) failed: %v", err)
+	}
+	_ = view.Close()
+
+	// Invalid statement view kind must return error
+	if _, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKind(99)); err == nil {
+		t.Fatalf("expected error for invalid statement view kind")
 	}
 }
 

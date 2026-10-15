@@ -237,12 +237,15 @@ func TestB03IsolationUnsupportedCapability(t *testing.T) {
 	defer cleanup()
 	s := &Session{CurrentDatabase: "db"}
 
+	// In replication mode, READ UNCOMMITTED is unsupported
+	e.Replica = &mockReplica{}
+
 	for _, level := range []string{"READ UNCOMMITTED"} {
 		t.Run("Explicit_"+level, func(t *testing.T) {
 			if _, err := e.Execute(s, "SET TRANSACTION ISOLATION LEVEL "+level+";"); err != nil {
 				t.Fatalf("SET TRANSACTION %s: %v", level, err)
 			}
-			// Starting transaction must fail closed with ErrUnsupported in Phase 2
+			// Starting transaction must fail closed with ErrUnsupported in replication mode
 			_, err := e.Execute(s, "BEGIN;")
 			if err == nil || !errors.Is(err, storageengine.ErrUnsupported) {
 				t.Fatalf("BEGIN with %s returned %v, want ErrUnsupported", level, err)

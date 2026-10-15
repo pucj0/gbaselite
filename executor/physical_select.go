@@ -41,6 +41,11 @@ func bindPhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Sess
 			return nil, fmt.Errorf("%w: views", errLockedReadShape)
 		}
 	}
+	if session.EffectiveIsolation() == parser.LevelReadUncommitted {
+		if err := validateRUReadShape(statement); err != nil {
+			return nil, err
+		}
+	}
 	if statement.Table == "" && statement.Subquery == nil {
 		result, err := executeScalarSelect(session, statement)
 		if err != nil {
@@ -115,6 +120,10 @@ func bindPhysicalSelect(ctx context.Context, tx storageengine.Txn, session *Sess
 	}
 	needed := sqlProjectionMask(statement, schema)
 	plan := planSQLAccess(statement, definition, schema, session)
+	if session.EffectiveIsolation() == parser.LevelReadUncommitted && plan.kind != sqlAccessPoint {
+		plan.kind = sqlAccessAll
+		plan.index = ""
+	}
 	ordered := plan.ordered
 	op, err := readSourceOperator(ctx, tx, session, statement, definition, plan, func(encoded []byte) (storage.Row, error) {
 		if err := checkQuery(session); err != nil {
@@ -357,4 +366,18 @@ func bindGlobalAggregate(session *Session, statement parser.Select, schema *stor
 		result.Input = discardOutput(op)
 	}
 	return result, nil
+}
+
+func validateRUReadShape(statement parser.Select) error {
+	switch {
+	case statement.Table == "":
+		return nil
+	case len(statement.Joins) > 0:
+		return fmt.Errorf("%w: joins in READ UNCOMMITTED", storageengine.ErrUnsupported)
+	case statement.Subquery != nil:
+		return fmt.Errorf("%w: derived tables in READ UNCOMMITTED", storageengine.ErrUnsupported)
+	case expressionHasSubquery(statement.Where):
+		return fmt.Errorf("%w: subqueries in READ UNCOMMITTED", storageengine.ErrUnsupported)
+	}
+	return nil
 }

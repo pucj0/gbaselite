@@ -433,8 +433,12 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 			isoLevel := isoTxn.IsolationLevel()
 			inTxn := session.InTransaction() || session.AutocommitDisabled
 			if statementNeedsReadView(statement, isoLevel, inTxn) {
-				if automatic || isoLevel == storageengine.IsolationReadCommitted {
-					view, err := isoTxn.BeginStatementView(ctx, storageengine.StatementViewKindStatement)
+				if automatic || isoLevel == storageengine.IsolationReadCommitted || isoLevel == storageengine.IsolationReadUncommitted {
+					kind := storageengine.StatementViewKindStatement
+					if isoLevel == storageengine.IsolationReadUncommitted {
+						kind = storageengine.StatementViewKindUncommitted
+					}
+					view, err := isoTxn.BeginStatementView(ctx, kind)
 					if err != nil {
 						return nil, err
 					}
@@ -525,6 +529,7 @@ func (e *Engine) executeSQLStatement(session *Session, statement parser.Statemen
 		rollbackSessionTransaction(session)
 		return nil, err
 	}
+	e.publishSessionDirtyWrites(session)
 	if automatic {
 		if _, err = tx.Commit(ctx); err != nil {
 			return nil, err
@@ -622,6 +627,12 @@ func sqlStartsImplicitTransaction(statement parser.Statement) bool {
 }
 
 func (e *Engine) checkIsolationCapability(level parser.IsolationLevel) error {
+	if level == parser.LevelReadUncommitted {
+		if e.Replica != nil {
+			return fmt.Errorf("%w: READ UNCOMMITTED is not supported in replication mode", storageengine.ErrUnsupported)
+		}
+		return nil
+	}
 	if level != parser.LevelRepeatableRead && level != parser.LevelReadCommitted && level != parser.LevelSerializable {
 		return fmt.Errorf("%w: transaction isolation level %s is not supported yet", storageengine.ErrUnsupported, level)
 	}
@@ -668,7 +679,7 @@ func statementNeedsReadView(statement parser.Statement, level storageengine.Isol
 	if level == storageengine.IsolationSerializable {
 		return false
 	}
-	if level == storageengine.IsolationReadCommitted {
+	if level == storageengine.IsolationReadCommitted || level == storageengine.IsolationReadUncommitted {
 		switch s := statement.(type) {
 		case parser.Select:
 			return !s.Locking
@@ -688,7 +699,8 @@ func statementNeedsReadView(statement parser.Statement, level storageengine.Isol
 }
 
 func validateSerializableStatementShape(statement parser.Statement, session *Session) error {
-	if session.EffectiveIsolation() != parser.LevelSerializable {
+	iso := session.EffectiveIsolation()
+	if iso != parser.LevelSerializable && iso != parser.LevelReadUncommitted {
 		return nil
 	}
 	// Standalone pure read-only SELECT in autocommit=1 can use nonlocking consistent read optimization per MySQL 8.4
@@ -698,29 +710,48 @@ func validateSerializableStatementShape(statement parser.Statement, session *Ses
 			return nil
 		}
 	}
+	levelName := string(iso)
 	switch s := statement.(type) {
 	case parser.Update:
 		if len(s.Joins) > 0 {
-			return fmt.Errorf("%w: UPDATE JOIN in SERIALIZABLE", storageengine.ErrUnsupported)
+			return fmt.Errorf("%w: UPDATE JOIN in %s", storageengine.ErrUnsupported, levelName)
 		}
 		if expressionHasSubquery(s.Where) {
-			return fmt.Errorf("%w: subqueries in UPDATE in SERIALIZABLE", storageengine.ErrUnsupported)
+			return fmt.Errorf("%w: subqueries in UPDATE in %s", storageengine.ErrUnsupported, levelName)
 		}
 	case parser.Delete:
 		if len(s.Joins) > 0 || len(s.Targets) > 0 {
-			return fmt.Errorf("%w: DELETE JOIN in SERIALIZABLE", storageengine.ErrUnsupported)
+			return fmt.Errorf("%w: DELETE JOIN in %s", storageengine.ErrUnsupported, levelName)
 		}
 		if expressionHasSubquery(s.Where) {
-			return fmt.Errorf("%w: subqueries in DELETE in SERIALIZABLE", storageengine.ErrUnsupported)
+			return fmt.Errorf("%w: subqueries in DELETE in %s", storageengine.ErrUnsupported, levelName)
 		}
 	case parser.Insert:
 		if s.Select != nil {
-			return fmt.Errorf("%w: INSERT SELECT in SERIALIZABLE", storageengine.ErrUnsupported)
+			return fmt.Errorf("%w: INSERT SELECT in %s", storageengine.ErrUnsupported, levelName)
 		}
 	case parser.CreateTableAs:
-		return fmt.Errorf("%w: CREATE TABLE AS SELECT in SERIALIZABLE", storageengine.ErrUnsupported)
+		return fmt.Errorf("%w: CREATE TABLE AS SELECT in %s", storageengine.ErrUnsupported, levelName)
 	case parser.With, parser.WithRecursive, parser.Union:
-		return fmt.Errorf("%w: CTE and UNION in SERIALIZABLE", storageengine.ErrUnsupported)
+		return fmt.Errorf("%w: CTE and UNION in %s", storageengine.ErrUnsupported, levelName)
 	}
 	return nil
+}
+
+func (e *Engine) publishSessionDirtyWrites(session *Session) {
+	if session.transaction == nil {
+		return
+	}
+	if p, ok := session.transaction.(storageengine.DirtyPublisher); ok {
+		_ = p.PublishDirtyWrites()
+	}
+}
+
+func (e *Engine) withdrawSessionDirtyWrites(session *Session) {
+	if session.transaction == nil {
+		return
+	}
+	if p, ok := session.transaction.(storageengine.DirtyPublisher); ok {
+		p.WithdrawDirtyWrites()
+	}
 }

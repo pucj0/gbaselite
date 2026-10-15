@@ -141,7 +141,7 @@ func TestChildTransfersLargeStageAndFailedMergeClosesParent(t *testing.T) {
 	if _, err := c.Commit(ctx); !errors.Is(err, ErrWriteSetLimit) {
 		t.Fatal(err)
 	}
-	if !p.closed {
+	if !p.closed.Load() {
 		t.Fatal("partly merged parent survived")
 	}
 	if _, err := p.Commit(ctx); !errors.Is(err, ErrClosed) {

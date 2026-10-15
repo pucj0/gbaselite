@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gbaselite/storageengine"
@@ -30,7 +31,7 @@ type Tx struct {
 	ID          string
 	stage       *bolt.DB
 	path        string
-	closed      bool
+	closed      atomic.Bool
 	stagedBytes int64
 	buffered    map[string][]byte
 	bufferBytes int64
@@ -87,7 +88,7 @@ type Tx struct {
 func (t *Tx) acquireStageLease() (*bolt.DB, func(), error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.closed {
+	if t.closed.Load() {
 		return nil, nil, ErrClosed
 	}
 	if t.stage == nil {
@@ -101,7 +102,7 @@ func (t *Tx) acquireStageLease() (*bolt.DB, func(), error) {
 			t.mu.Lock()
 			defer t.mu.Unlock()
 			t.stageReaders--
-			if t.closed && t.stageReaders == 0 && t.stageDrained != nil {
+			if t.closed.Load() && t.stageReaders == 0 && t.stageDrained != nil {
 				close(t.stageDrained)
 				t.stageDrained = nil
 			}
@@ -234,7 +235,7 @@ func (t *Tx) Child() (*Tx, error) { return t.ChildContext(context.Background()) 
 // survives the child's merge. No grant is ever owned by a child, which is why a child commit
 // cannot release the root's record X even in principle.
 func (t *Tx) ChildContext(ctx context.Context) (*Tx, error) {
-	if t.closed || t.generation != t.store.generation.Load() {
+	if t.closed.Load() || t.generation != t.store.generation.Load() {
 		if t.generation != t.store.generation.Load() {
 			return nil, ErrClosed
 		}
@@ -249,13 +250,17 @@ func (t *Tx) ChildContext(ctx context.Context) (*Tx, error) {
 	return t.store.newTx(ctx, t.proposer, t.Snapshot, t)
 }
 func (t *Tx) readOp(space string, rowKey []byte) (Op, bool, error) {
-	if t.stage == nil && len(t.buffered) == 0 {
-		return Op{}, false, validateKey(space, rowKey)
-	}
 	k, err := key(space, rowKey)
 	if err != nil {
 		return Op{}, false, err
 	}
+	t.mu.Lock()
+	if t.stage == nil && len(t.buffered) == 0 {
+		t.mu.Unlock()
+		return Op{}, false, nil
+	}
+	t.mu.Unlock()
+
 	v, err := t.stagedValue(k)
 	if err != nil || v == nil {
 		return Op{}, false, err
@@ -269,7 +274,7 @@ func (t *Tx) checkOpen() error {
 	if t.generation != t.store.generation.Load() {
 		return ErrClosed
 	}
-	if t.closed {
+	if t.closed.Load() {
 		if t.deadlockAborted() {
 			return storageengine.ErrDeadlock
 		}
@@ -354,7 +359,7 @@ func (t *Tx) Delete(space string, rowKey []byte) error {
 	return t.write(Op{Space: space, Key: rowKey, Delete: true})
 }
 func (t *Tx) write(op Op) error {
-	if t.closed || t.generation != t.store.generation.Load() {
+	if t.closed.Load() || t.generation != t.store.generation.Load() {
 		return ErrClosed
 	}
 	if err := validateCommand(Command{Ops: []Op{op}}); err != nil {
@@ -515,7 +520,7 @@ func (t *Tx) Commit(ctx context.Context) (uint64, error) {
 		t.finish(TransactionAborted, TransitionOptions{Reason: "generation change"})
 		return 0, ErrConflict
 	}
-	if t.closed {
+	if t.closed.Load() {
 		if t.deadlockAborted() {
 			return 0, storageengine.ErrDeadlock
 		}
@@ -668,7 +673,7 @@ func (t *Tx) hasWriteSet() bool {
 // left exactly as it is, so a double rollback stays idempotent and a successful
 // commit can never be rewritten as an abort.
 func (t *Tx) Rollback() error {
-	if t.closed {
+	if t.closed.Load() {
 		return nil
 	}
 	return t.finish(TransactionAborted, TransitionOptions{})
@@ -679,7 +684,7 @@ func (t *Tx) Rollback() error {
 // transaction is closed, and it stays publication-aware: if the marker already
 // exists the transaction is committed whatever happened to the caller.
 func (t *Tx) finishIncomplete() {
-	if t.closed {
+	if t.closed.Load() {
 		return
 	}
 	if sequence, committed := t.store.Committed(t.ID); committed {
@@ -695,7 +700,7 @@ func (t *Tx) finishIncomplete() {
 // idempotent, which is what keeps a double rollback harmless and forbids a later
 // cleanup from rewriting COMMITTED or MERGED into ABORTED.
 func (t *Tx) finish(state TransactionState, options TransitionOptions) error {
-	if t.closed {
+	if t.closed.Load() {
 		return nil
 	}
 	if state == TransactionAborted && options.Reason == "" {
@@ -747,15 +752,17 @@ func (t *Tx) applyTransition(state TransactionState, options TransitionOptions) 
 }
 
 // cleanup releases the transaction's resources exactly once. It is deliberately
+var stageCleanupWaitHook func()
+
 // separate from the lifecycle state: a successful commit and an abort release the
 // same resources the same way, and cleanup never changes a decided outcome.
 func (t *Tx) cleanup() error {
 	t.mu.Lock()
-	if t.closed {
+	if t.closed.Load() {
 		t.mu.Unlock()
 		return nil
 	}
-	t.closed = true
+	t.closed.Store(true)
 	t.buffered = nil
 	t.bufferBytes = 0
 	stage := t.stage
@@ -766,6 +773,9 @@ func (t *Tx) cleanup() error {
 	if t.stageReaders > 0 {
 		waitCh = make(chan struct{})
 		t.stageDrained = waitCh
+		if stageCleanupWaitHook != nil {
+			stageCleanupWaitHook()
+		}
 	}
 	t.mu.Unlock()
 
@@ -773,6 +783,9 @@ func (t *Tx) cleanup() error {
 		<-waitCh
 	}
 
+	if t.parent == nil && t.store != nil && t.store.dirtyRegistry != nil {
+		t.store.dirtyRegistry.Withdraw(t.ID)
+	}
 	var err, removeErr error
 	if stage != nil {
 		err = stage.Close()
@@ -846,7 +859,7 @@ func (t *Tx) Guard(space string, rowKey []byte) error {
 		return err
 	}
 	t.mu.Lock()
-	if t.closed {
+	if t.closed.Load() {
 		t.mu.Unlock()
 		return ErrClosed
 	}
@@ -878,5 +891,87 @@ func (t *Tx) Guard(space string, rowKey []byte) error {
 
 // Closed reports whether the transaction is closed.
 func (t *Tx) Closed() bool {
-	return t.closed
+	return t.closed.Load()
+}
+
+func (t *Tx) Generation() uint64 {
+	return t.generation
+}
+
+func (t *Tx) Term() uint64 {
+	return t.term
+}
+
+// CollectDirtyVersions extracts the uncommitted writes of t and its ancestor layers.
+func (t *Tx) CollectDirtyVersions() []DirtyVersion {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var chain []*Tx
+	for curr := t; curr != nil; curr = curr.parent {
+		chain = append(chain, curr)
+	}
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
+	}
+
+	collected := make(map[string]DirtyVersion)
+
+	for _, tx := range chain {
+		if tx.stage == nil {
+			for k, v := range tx.buffered {
+				op, err := decodeStagedOp([]byte(k), v)
+				if err != nil || op.Check {
+					continue
+				}
+				compKey := op.Space + "\x00" + string(op.Key)
+				collected[compKey] = DirtyVersion{
+					Space:   op.Space,
+					Key:     bytes.Clone(op.Key),
+					Value:   bytes.Clone(op.Value),
+					Deleted: op.Delete,
+				}
+			}
+		} else {
+			_ = tx.stage.View(func(btx *bolt.Tx) error {
+				b := btx.Bucket([]byte("writes"))
+				if b == nil {
+					return nil
+				}
+				return b.ForEach(func(k, v []byte) error {
+					op, err := decodeStagedOp(k, v)
+					if err != nil || op.Check {
+						return nil
+					}
+					compKey := op.Space + "\x00" + string(op.Key)
+					collected[compKey] = DirtyVersion{
+						Space:   op.Space,
+						Key:     bytes.Clone(op.Key),
+						Value:   bytes.Clone(op.Value),
+						Deleted: op.Delete,
+					}
+					return nil
+				})
+			})
+			for k, v := range tx.buffered {
+				op, err := decodeStagedOp([]byte(k), v)
+				if err != nil || op.Check {
+					continue
+				}
+				compKey := op.Space + "\x00" + string(op.Key)
+				collected[compKey] = DirtyVersion{
+					Space:   op.Space,
+					Key:     bytes.Clone(op.Key),
+					Value:   bytes.Clone(op.Value),
+					Deleted: op.Delete,
+				}
+			}
+		}
+	}
+
+	res := make([]DirtyVersion, 0, len(collected))
+	for _, ver := range collected {
+		res = append(res, ver)
+	}
+	return res
 }

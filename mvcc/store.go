@@ -85,19 +85,20 @@ type Proposer interface {
 	Barrier(context.Context) error
 }
 type Store struct {
-	failure      sync.Mutex
-	fatal        error
-	generation   atomic.Uint64
-	gate         sync.RWMutex
-	db           *bolt.DB
-	path         string
-	groupMu      sync.Mutex
-	groupRunning bool
-	groupQueue   []*localCommitRequest
-	groupBytes   int
-	apply        sync.Mutex
-	views        sync.Mutex
-	txns         *TransactionManager
+	failure       sync.Mutex
+	fatal         error
+	generation    atomic.Uint64
+	gate          sync.RWMutex
+	db            *bolt.DB
+	path          string
+	groupMu       sync.Mutex
+	groupRunning  bool
+	groupQueue    []*localCommitRequest
+	groupBytes    int
+	apply         sync.Mutex
+	views         sync.Mutex
+	txns          *TransactionManager
+	dirtyRegistry *DirtyRegistry
 	// locks binds this store's transactions to the B02 lock manager. It is nil unless a caller
 	// attached one, which is the B01-only configuration: with no binding the store runs exactly
 	// as it did before, with no locking at all.
@@ -137,7 +138,7 @@ func OpenWithOptions(directory string, options Options) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Store{db: db, path: path, txns: NewTransactionManager(), writeSetLimit: options.WriteSetLimitBytes, localWAL: options.LocalWAL}
+	s := &Store{db: db, path: path, txns: NewTransactionManager(), dirtyRegistry: NewDirtyRegistry(0, 0), writeSetLimit: options.WriteSetLimitBytes, localWAL: options.LocalWAL}
 	err = db.Update(func(tx *bolt.Tx) error {
 		for _, name := range [][]byte{dataBucket, metaBucket, pendingBucket, commitsBucket, countersBucket} {
 			if _, e := tx.CreateBucketIfNotExists(name); e != nil {
@@ -222,6 +223,11 @@ func (s *Store) nextSequence() (uint64, error) {
 	}
 	s.localSeq++
 	return s.localSeq, nil
+}
+
+// DirtyRegistry returns the active dirty visibility registry.
+func (s *Store) DirtyRegistry() *DirtyRegistry {
+	return s.dirtyRegistry
 }
 
 // validateCommitSequence rejects a commit sequence that may not be used as a new
