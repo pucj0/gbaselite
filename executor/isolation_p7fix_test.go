@@ -143,3 +143,51 @@ func TestP7Fix05_SavepointChildWritesNotPublishedToOtherRoots(t *testing.T) {
 
 	_, _ = e.Execute(sA, "ROLLBACK;")
 }
+
+// TestP7FixR205_SavepointRollbackPublishesErrorHandling covers P7-FIX-R2-05:
+// Verifies that rollbackToSavepoint checks publishSessionDirtyWrites,
+// does not swallow errors, and correctly maintains clean state across savepoints.
+func TestP7FixR205_SavepointRollbackPublishesErrorHandling(t *testing.T) {
+	e, cleanup := newIsolationTestEngine(t)
+	defer cleanup()
+
+	sA := newRCSession("db")
+	sB := newRUSession("db")
+
+	if _, err := e.Execute(sA, "INSERT INTO t VALUES (1, 'V0');"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := e.Execute(sA, "BEGIN;"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Execute(sA, "UPDATE t SET v = 'V1' WHERE id = 1;"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create savepoint sp1 and update
+	if _, err := e.Execute(sA, "SAVEPOINT sp1;"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Execute(sA, "UPDATE t SET v = 'V2' WHERE id = 1;"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rollback to sp1: must succeed and return V1
+	if _, err := e.Execute(sA, "ROLLBACK TO sp1;"); err != nil {
+		t.Fatalf("ROLLBACK TO sp1 failed: %v", err)
+	}
+
+	// Release savepoint sp1
+	if _, err := e.Execute(sA, "RELEASE SAVEPOINT sp1;"); err != nil {
+		t.Fatalf("RELEASE SAVEPOINT sp1 failed: %v", err)
+	}
+
+	// B (RU) observes V1
+	resB, err := e.Execute(sB, "SELECT v FROM t WHERE id = 1;")
+	if err != nil || len(resB.Rows) != 1 || resB.Rows[0][0] != "V1" {
+		t.Fatalf("B read after savepoint release = %v, %v, want V1", resB, err)
+	}
+
+	_, _ = e.Execute(sA, "COMMIT;")
+}

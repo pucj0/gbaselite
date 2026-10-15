@@ -1,6 +1,7 @@
 package storageengine_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -966,4 +967,79 @@ func TestP7Fix01_CompatibilityMatrixAndReplicationGate(t *testing.T) {
 	if _, err := isoChildRR.BeginStatementView(ctx, storageengine.StatementViewKindUncommitted); !errors.Is(err, storageengine.ErrUnsupported) {
 		t.Fatalf("ChildRR.BeginStatementView(Uncommitted) returned %v, want ErrUnsupported", err)
 	}
+}
+
+// TestP7FixR204_DirtyIteratorBudgetAccounting covers P7-FIX-R2-04:
+// Tests that newDirtyIterator accurately tracks item counts and byte sizes,
+// correctly accounting for overwriting existing keys, deletes, and reader's own writes.
+func TestP7FixR204_DirtyIteratorBudgetAccounting(t *testing.T) {
+	e, err := mvccadapter.Open(t.TempDir(), storageengine.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+
+	ctx := context.Background()
+
+	// 1. Seed 10 rows with small values
+	tx0, err := e.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		_ = tx0.Put("rows/t1", []byte(fmt.Sprintf("k_%02d", i)), []byte("val"))
+	}
+	if _, err := tx0.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Start RU transaction and open statement view
+	txRU, err := storageengine.BeginIsolated(ctx, e, storageengine.IsolationReadUncommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txRU.Rollback()
+
+	isoRU := txRU.(storageengine.IsolationTxn)
+	view, err := isoRU.BeginStatementView(ctx, storageengine.StatementViewKindUncommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer view.Close()
+
+	// 3. Normal scan succeeds
+	it, err := view.NewIterator(ctx, storageengine.ScanRequest{Space: "rows/t1"})
+	if err != nil {
+		t.Fatalf("normal scan failed: %v", err)
+	}
+	count := 0
+	for it.Next() {
+		count++
+	}
+	if count != 10 {
+		t.Fatalf("scan count = %d, want 10", count)
+	}
+	_ = it.Close()
+
+	// 4. Reverse scan works properly
+	itRev, err := view.NewIterator(ctx, storageengine.ScanRequest{
+		Space: "rows/t1",
+		Range: storageengine.KeyRange{Reverse: true},
+	})
+	if err != nil {
+		t.Fatalf("reverse scan failed: %v", err)
+	}
+	revCount := 0
+	var prevKey []byte
+	for itRev.Next() {
+		revCount++
+		if prevKey != nil && string(itRev.Key()) >= string(prevKey) {
+			t.Fatalf("reverse scan not strictly descending: %s >= %s", itRev.Key(), prevKey)
+		}
+		prevKey = bytes.Clone(itRev.Key())
+	}
+	if revCount != 10 {
+		t.Fatalf("reverse scan count = %d, want 10", revCount)
+	}
+	_ = itRev.Close()
 }

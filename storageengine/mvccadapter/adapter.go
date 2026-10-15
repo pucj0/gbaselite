@@ -237,11 +237,7 @@ func (t *txn) PublishDirtyWrites() error {
 	if root == nil {
 		return nil
 	}
-	versions, err := root.CollectDirtyVersions()
-	if err != nil {
-		return err
-	}
-	return t.engine.store.DirtyRegistry().Publish(root.ID, root.Generation(), root.Term(), versions)
+	return root.PublishDirtyWrites(t.engine.store.DirtyRegistry())
 }
 
 func (t *txn) WithdrawDirtyWrites() {

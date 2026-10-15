@@ -902,11 +902,35 @@ func (t *Tx) Term() uint64 {
 	return t.term
 }
 
+// PublishDirtyWrites atomically captures and publishes the transaction's dirty versions
+// under t.mu protection to guarantee strict linearization with concurrent Rollback/cleanup.
+func (t *Tx) PublishDirtyWrites(registry *DirtyRegistry) error {
+	if registry == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.closed.Load() || t.state.Terminal() {
+		return ErrClosed
+	}
+
+	versions, err := t.collectDirtyVersionsLocked()
+	if err != nil {
+		return err
+	}
+
+	return registry.Publish(t.ID, t.generation, t.term, versions)
+}
+
 // CollectDirtyVersions extracts the uncommitted writes of t and its ancestor layers.
 func (t *Tx) CollectDirtyVersions() ([]DirtyVersion, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.collectDirtyVersionsLocked()
+}
 
+func (t *Tx) collectDirtyVersionsLocked() ([]DirtyVersion, error) {
 	var chain []*Tx
 	for curr := t; curr != nil; curr = curr.parent {
 		chain = append(chain, curr)

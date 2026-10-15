@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+
+	"gbaselite/storageengine"
 )
 
 const (
@@ -52,21 +54,23 @@ func (s *DirtySnapshot) SpaceEntries(space string) []DirtyVersion {
 
 // DirtyRegistry manages the in-memory visibility of active uncommitted root transactions.
 type DirtyRegistry struct {
-	mu           sync.RWMutex
-	generation   uint64
-	term         uint64
-	byRoot       map[string]map[string]DirtyVersion // rootID -> (compositeKey -> DirtyVersion)
-	globalCount  int
-	globalBytes  int64
-	mergeCounter uint64
+	mu              sync.RWMutex
+	generation      uint64
+	term            uint64
+	byRoot          map[string]map[string]DirtyVersion // rootID -> (compositeKey -> DirtyVersion)
+	overflowedRoots map[string]bool
+	globalCount     int
+	globalBytes     int64
+	mergeCounter    uint64
 }
 
 // NewDirtyRegistry constructs a clean DirtyRegistry.
 func NewDirtyRegistry(generation, term uint64) *DirtyRegistry {
 	return &DirtyRegistry{
-		generation: generation,
-		term:       term,
-		byRoot:     make(map[string]map[string]DirtyVersion),
+		generation:      generation,
+		term:            term,
+		byRoot:          make(map[string]map[string]DirtyVersion),
+		overflowedRoots: make(map[string]bool),
 	}
 }
 
@@ -86,16 +90,12 @@ func (r *DirtyRegistry) Publish(rootID string, generation, term uint64, versions
 		r.generation = generation
 		r.term = term
 		r.byRoot = make(map[string]map[string]DirtyVersion)
+		r.overflowedRoots = make(map[string]bool)
 		r.globalCount = 0
 		r.globalBytes = 0
 	}
 
-	// 2. Validate per-root budget BEFORE mutating existing state
-	if len(versions) > maxDirtyEntriesPerRoot {
-		return fmt.Errorf("%w: root %s exceeded dirty entries limit (%d > %d)", ErrWriteSetLimit, rootID, len(versions), maxDirtyEntriesPerRoot)
-	}
-
-	// 3. Compute net changes BEFORE modifying existing state
+	// 2. Compute net changes BEFORE modifying existing state
 	var oldCount int
 	var oldBytes int64
 	if old, ok := r.byRoot[rootID]; ok {
@@ -113,14 +113,22 @@ func (r *DirtyRegistry) Publish(rootID string, generation, term uint64, versions
 	netCount := r.globalCount - oldCount + len(versions)
 	netBytes := r.globalBytes - oldBytes + newBytes
 
-	if netCount > maxGlobalDirtyEntries {
-		return fmt.Errorf("%w: global dirty entries limit exceeded (%d > %d)", ErrWriteSetLimit, netCount, maxGlobalDirtyEntries)
-	}
-	if netBytes > maxGlobalDirtyBytes {
-		return fmt.Errorf("%w: global dirty bytes limit exceeded (%d > %d)", ErrWriteSetLimit, netBytes, maxGlobalDirtyBytes)
+	// Check if this root exceeds dirty cache budget (decouple writer: do not fail writer transaction!)
+	if len(versions) > maxDirtyEntriesPerRoot || netCount > maxGlobalDirtyEntries || netBytes > maxGlobalDirtyBytes {
+		if _, ok := r.byRoot[rootID]; ok {
+			delete(r.byRoot, rootID)
+			r.globalCount -= oldCount
+			r.globalBytes -= oldBytes
+		}
+		if r.overflowedRoots == nil {
+			r.overflowedRoots = make(map[string]bool)
+		}
+		r.overflowedRoots[rootID] = true
+		return nil
 	}
 
-	// 4. All checks passed: perform atomic update
+	delete(r.overflowedRoots, rootID)
+
 	if len(versions) == 0 {
 		delete(r.byRoot, rootID)
 		r.globalCount = netCount
@@ -152,6 +160,7 @@ func (r *DirtyRegistry) Withdraw(rootID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	delete(r.overflowedRoots, rootID)
 	if old, ok := r.byRoot[rootID]; ok {
 		r.globalCount -= len(old)
 		for _, ver := range old {
@@ -168,6 +177,7 @@ func (r *DirtyRegistry) Reset(generation, term uint64) {
 	r.generation = generation
 	r.term = term
 	r.byRoot = make(map[string]map[string]DirtyVersion)
+	r.overflowedRoots = make(map[string]bool)
 	r.globalCount = 0
 	r.globalBytes = 0
 }
@@ -176,6 +186,12 @@ func (r *DirtyRegistry) Reset(generation, term uint64) {
 func (r *DirtyRegistry) Sample(readerRootID string) (*DirtySnapshot, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
+	for rootID := range r.overflowedRoots {
+		if rootID != readerRootID {
+			return nil, fmt.Errorf("%w: active transaction %s exceeds dirty visibility budget; cannot provide complete dirty read", storageengine.ErrViewBudgetLimit, rootID)
+		}
+	}
 
 	snap := &DirtySnapshot{
 		Generation:   r.generation,

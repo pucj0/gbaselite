@@ -125,6 +125,9 @@ func (s *Store) ResetLockEpoch(term uint64) int {
 	}
 	binding.storeGeneration = generation
 	binding.storeTerm = term
+	if s.dirtyRegistry != nil {
+		s.dirtyRegistry.Reset(generation, term)
+	}
 	return binding.manager.ResetEpoch(generation, term)
 }
 

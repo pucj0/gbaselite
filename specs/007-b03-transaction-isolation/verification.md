@@ -921,3 +921,64 @@
   - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean。
 - **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
 - **P7-FIX 最终结论**: **P7-FIX-01 至 P7-FIX-06 全部彻底关闭，GBaseLite B03 Phase 7 最终验收正式 PASS**。
+
+---
+
+## 30. Phase 7 第三轮最终验收修复 (P7-FIX-R2-01 至 P7-FIX-R2-06)
+
+- **基线 Commit**: `4ad7d9cf65d757fe53b6a19218409aa6af01e4af`
+- **核查与修复项详情**:
+
+### 1. P7-FIX-R2-01：Restore 后脏数据残留彻底修复 (P0 - RESOLVED)
+- **原因与风险**: `Store.Restore` 在递增 Generation 并重置事务管理器时，未重置 `dirtyRegistry`，导致备份还原后仍能采样到恢复前的 Ghost 脏版本；旧事务若在 Restore 后调用 Publish，可能在旧代次下重新发布脏数据；
+- **红测先行**: `mvcc/dirty_registry_test.go:TestP7FixR201_RestorePurgesDirtyRegistryAndRejectsStalePublish`：复现未提交更新在 Restore 后依然能被 RU 采样的红测失败（`ghost dirty version survived Restore!`）；
+- **修复方案**:
+  1. `Store.Restore` 在递增 Generation 后显式调用 `s.dirtyRegistry.Reset(newGen, currentTerm)`；
+  2. `Store.ResetLockEpoch` 同步调用 `s.dirtyRegistry.Reset(generation, term)`；
+  3. `DirtyRegistry.Publish` 严格单调性拦截：任何低于当前 Registry Generation/Term 的发布请求一律拒绝并报错 `ErrConflict`，绝不允许旧事务发布数据或重置 Epoch；
+- **绿测证据**: `TestP7FixR201_RestorePurgesDirtyRegistryAndRejectsStalePublish` (PASS)。
+
+### 2. P7-FIX-R2-02：Publish 与 Rollback 竞态彻底消除 (P0 - RESOLVED)
+- **原因与风险**: Publisher 收集脏版本与调用 `Publish()` 之间存在无锁窗口，若此时并发发生 `Rollback`，`cleanup()` 先行执行了 `Withdraw()`，随后 Publisher 才完成 `Publish()`，导致已回滚的事务脏数据永久泄漏在注册表中；
+- **修复方案**:
+  1. `Tx` 引入原子发布方法 `PublishDirtyWrites(registry *DirtyRegistry)`：在持有 `t.mu.Lock()` 的保护下原子完成脏版本收集与注册表发布；
+  2. 若事务已处于 `closed` 或 `Terminal()` 状态，立即返回 `ErrClosed` 终止发布；
+  3. `cleanup()` 同样在 `t.mu.Lock()` 下置 `closed = true` 并执行 `Withdraw()`；
+  4. 保证 `Publish` 与 `Rollback/Withdraw` 具有不可分割的线性化先后顺序，绝不发生撤销先于发布的倒序泄漏；
+- **绿测证据**: `mvcc/dirty_registry_test.go:TestP7FixR202_PublishAndRollbackLinearization` (PASS：50 轮并发发布与回滚交错，脏注册表泄漏次数严格为 0)。
+
+### 3. P7-FIX-R2-03：隔离级别与 Dirty Registry 容量解耦 (P0 - RESOLVED)
+- **原因与风险**: 原 Dirty Registry 针对单事务 8192 条的预算限制在 `publishSessionDirtyWrites` 中会导致写入超过 8192 个键的 RR/RC/SER 长事务被强制回滚，严重破坏 B01 大事务能力；
+- **修复方案**:
+  1. 架构解耦：Dirty Registry 仅为 READ UNCOMMITTED 提供可见性辅助缓存，绝不阻断正常 RR/RC/SER 事务的物理写入与提交；
+  2. 当单事务写入或全局脏数据超出缓存预算时，`Publish` 成功返回 `nil`，并将该 Root 标记为 `overflowedRoots[rootID] = true`；
+  3. RU Reader 在 `Sample()` 时若检测到系统内存在溢出未缓存的活跃根事务，严格 fail-closed 报错 `storageengine.ErrViewBudgetLimit`，绝不返回残缺不全的截断脏数据，绝不静默退化为 RC；
+  4. 当大事务提交或回滚后，`Withdraw(rootID)` 自动清除溢出标记，RU 读取无缝恢复；
+- **绿测证据**: `mvcc/dirty_registry_test.go:TestP7FixR203_LargeTransactionDecoupledFromDirtyBudget` (PASS)。
+
+### 4. P7-FIX-R2-04：RU Iterator 统一预算精确核算 (P1 - RESOLVED)
+- **原因与风险**: `newDirtyIterator` 原先在脏更新覆盖已有键时，未扣除旧记录占用的字节数，导致字节数虚增；且在巨大值覆盖小值或读者自身写集覆盖时缺乏严格预算防御；
+- **修复方案**:
+  1. 引入统一核算器 `dirtyBudgetTracker`：在 Committed 扫描、外部脏覆盖、自身写集覆盖中复用同一核算逻辑；
+  2. 新增键时校验 `rows + 1 <= maxRows` 与 `netBytes <= maxBytes`；
+  3. 覆盖已有键时精确计算 `netBytes = bytes - oldCost + newCost`，小值覆盖大值扣减预算，大值覆盖小值在分配前校验；
+  4. 删除键（Tombstone）时准确扣减 `oldCost` 与 `rows--`；
+  5. 任何超限立即返回 `storageengine.ErrViewBudgetLimit`；
+- **绿测证据**: `storageengine/isolation_test.go:TestP7FixR204_DirtyIteratorBudgetAccounting` (PASS)。
+
+### 5. P7-FIX-R2-05：Savepoint 回滚异常严格处理 (P0 - RESOLVED)
+- **原因与风险**: `executor/savepoint_mvcc.go:rollbackToSavepoint` 原先存在 `_ = e.publishSessionDirtyWrites(session)` 忽略返回值的隐患；
+- **修复方案**:
+  1. 显式校验 `publishSessionDirtyWrites` 返回值：若重新发布失败，立即执行 `rollbackSessionTransaction(session)` 回滚整个会话事务并向客户端返回明确错误，绝不留下不确定的脏状态；
+  2. `commitSessionTransaction` 挂载 `defer e.withdrawSessionDirtyWrites(session)` 确证注销；
+- **绿测证据**: `executor/isolation_p7fix_test.go:TestP7FixR205_SavepointRollbackPublishesErrorHandling` (PASS)。
+
+### 6. P7-FIX-R2-06：全量回归与最终验收
+- **压测与回归**:
+  - `executor` P7 及 P7Fix 测试 100 轮全部通过（151.9s）；
+  - `mvcc` 确定性测试 100 轮全部通过（35.6s）；
+  - 全库 21 个带测试包执行 `go test ./... -count=1` 100% 通过（总耗时 228.7s，EXIT CODE: 0）；
+  - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean；
+  - 架构规则测试 `TestSQLPackagesDoNotImportPhysicalBackends` 与 `TestProductionArchitectureBoundaries` 100% PASS。
+- **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
+- **第三轮最终结论**: **P7-FIX-R2-01 至 P7-FIX-R2-06 全部彻底关闭，GBaseLite B03 Phase 7 第三轮最终验收正式 PASS**。

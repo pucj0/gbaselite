@@ -148,6 +148,42 @@ const (
 	maxDirtyScanBytes = 64 * 1024 * 1024
 )
 
+type dirtyBudgetTracker struct {
+	rows     int
+	bytes    int64
+	maxRows  int
+	maxBytes int64
+}
+
+func (b *dirtyBudgetTracker) addOrUpdate(oldRow *dirtyRow, newKey, newVal []byte) error {
+	var oldCost int64
+	newCost := int64(len(newKey) + len(newVal) + 64)
+	if oldRow != nil {
+		oldCost = int64(len(oldRow.key) + len(oldRow.value) + 64)
+	} else {
+		if b.rows+1 > b.maxRows {
+			return fmt.Errorf("%w: read uncommitted scan materialization row limit exceeded (%d > %d)", storageengine.ErrViewBudgetLimit, b.rows+1, b.maxRows)
+		}
+	}
+	netBytes := b.bytes - oldCost + newCost
+	if netBytes > b.maxBytes {
+		return fmt.Errorf("%w: read uncommitted scan materialization byte limit exceeded (%d > %d)", storageengine.ErrViewBudgetLimit, netBytes, b.maxBytes)
+	}
+	if oldRow == nil {
+		b.rows++
+	}
+	b.bytes = netBytes
+	return nil
+}
+
+func (b *dirtyBudgetTracker) delete(oldRow *dirtyRow) {
+	if oldRow != nil {
+		cost := int64(len(oldRow.key) + len(oldRow.value) + 64)
+		b.bytes -= cost
+		b.rows--
+	}
+}
+
 func (v *mvccReadView) newDirtyIterator(ctx context.Context, r storageengine.ScanRequest) (storageengine.Iterator, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -176,22 +212,21 @@ func (v *mvccReadView) newDirtyIterator(ctx context.Context, r storageengine.Sca
 		tx = v.txn.inner
 	}
 
+	tracker := dirtyBudgetTracker{
+		maxRows:  maxDirtyScanRows,
+		maxBytes: maxDirtyScanBytes,
+	}
+
 	combined := make(map[string]dirtyRow)
-	var totalBytes int64
 
 	err := v.token.ScanRangeWithTx(ctx, r.Space, bounds, tx, func(k, val []byte) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		rowBytes := int64(len(k) + len(val) + 64)
-		if len(combined)+1 > maxDirtyScanRows {
-			return fmt.Errorf("%w: read uncommitted scan materialization row limit exceeded", storageengine.ErrViewBudgetLimit)
-		}
-		if totalBytes+rowBytes > maxDirtyScanBytes {
-			return fmt.Errorf("%w: read uncommitted scan materialization byte limit exceeded", storageengine.ErrViewBudgetLimit)
+		if err := tracker.addOrUpdate(nil, k, val); err != nil {
+			return err
 		}
 		combined[string(k)] = dirtyRow{key: bytes.Clone(k), value: bytes.Clone(val)}
-		totalBytes += rowBytes
 		return nil
 	})
 	if err != nil {
@@ -202,23 +237,21 @@ func (v *mvccReadView) newDirtyIterator(ctx context.Context, r storageengine.Sca
 	if v.dirtySnapshot != nil {
 		for _, d := range v.dirtySnapshot.SpaceEntries(r.Space) {
 			if inRange(d.Key, r.Range) {
+				sk := string(d.Key)
+				var oldRow *dirtyRow
+				if existing, ok := combined[sk]; ok {
+					oldRow = &existing
+				}
 				if d.Deleted {
-					if old, ok := combined[string(d.Key)]; ok {
-						totalBytes -= int64(len(old.key) + len(old.value) + 64)
-						delete(combined, string(d.Key))
+					if oldRow != nil {
+						tracker.delete(oldRow)
+						delete(combined, sk)
 					}
 				} else {
-					rowBytes := int64(len(d.Key) + len(d.Value) + 64)
-					if _, ok := combined[string(d.Key)]; !ok {
-						if len(combined)+1 > maxDirtyScanRows {
-							return nil, fmt.Errorf("%w: read uncommitted scan materialization row limit exceeded", storageengine.ErrViewBudgetLimit)
-						}
-						if totalBytes+rowBytes > maxDirtyScanBytes {
-							return nil, fmt.Errorf("%w: read uncommitted scan materialization byte limit exceeded", storageengine.ErrViewBudgetLimit)
-						}
+					if err := tracker.addOrUpdate(oldRow, d.Key, d.Value); err != nil {
+						return nil, err
 					}
-					combined[string(d.Key)] = dirtyRow{key: bytes.Clone(d.Key), value: bytes.Clone(d.Value)}
-					totalBytes += rowBytes
+					combined[sk] = dirtyRow{key: bytes.Clone(d.Key), value: bytes.Clone(d.Value)}
 				}
 			}
 		}
@@ -232,10 +265,21 @@ func (v *mvccReadView) newDirtyIterator(ctx context.Context, r storageengine.Sca
 		}
 		for _, op := range ownWrites {
 			if op.Space == r.Space && inRange(op.Key, r.Range) {
+				sk := string(op.Key)
+				var oldRow *dirtyRow
+				if existing, ok := combined[sk]; ok {
+					oldRow = &existing
+				}
 				if op.Deleted {
-					delete(combined, string(op.Key))
+					if oldRow != nil {
+						tracker.delete(oldRow)
+						delete(combined, sk)
+					}
 				} else {
-					combined[string(op.Key)] = dirtyRow{key: bytes.Clone(op.Key), value: bytes.Clone(op.Value)}
+					if err := tracker.addOrUpdate(oldRow, op.Key, op.Value); err != nil {
+						return nil, err
+					}
+					combined[sk] = dirtyRow{key: bytes.Clone(op.Key), value: bytes.Clone(op.Value)}
 				}
 			}
 		}
