@@ -194,17 +194,26 @@ func (r *DirtyRegistry) Reset(generation, term uint64) bool {
 	return true
 }
 
-// ForceReset unconditionally clears all dirty versions and resets to the given generation and term.
-// Used during RestoreBackup to purge all dirty versions from the restored-over store.
-func (r *DirtyRegistry) ForceReset(generation, term uint64) {
+// ForceReset clears all dirty versions and resets to the given generation and term,
+// provided that the requested epoch is monotonic (generation >= r.generation, and
+// if same generation, term >= r.term). A stale generation or term is rejected to
+// prevent rolling back registry state.
+func (r *DirtyRegistry) ForceReset(generation, term uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Monotonicity: an older epoch cannot roll back registry state
+	if generation < r.generation || (generation == r.generation && term < r.term) {
+		return false
+	}
+
 	r.generation = generation
 	r.term = term
 	r.byRoot = make(map[string]map[string]DirtyVersion)
 	r.overflowedRoots = make(map[string]bool)
 	r.globalCount = 0
 	r.globalBytes = 0
+	return true
 }
 
 // Sample captures an immutable point-in-time DirtySnapshot excluding readerRootID.

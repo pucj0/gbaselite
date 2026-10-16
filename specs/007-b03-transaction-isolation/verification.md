@@ -1081,3 +1081,69 @@
   - 架构规则测试 `TestSQLPackagesDoNotImportPhysicalBackends` 与 `TestProductionArchitectureBoundaries` 100% PASS。
 - **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
 - **最终结论**: **P7-FINAL-LOCK-01 至 P7-FINAL-LOCK-03 全部彻底关闭，GBaseLite B03 Phase 7 最终安全门禁正式 PASS**。
+
+---
+
+## 33. Phase 7 Raft Epoch 最终并发安全审查 (FIX-01 至 FIX-04)
+
+- **基线 Commit**: `eb3ffbce1cea6f87695cc1bb9b7a34c8c029a640`
+- **核查与修复项详情**:
+
+### 1. FIX-01：禁止旧 Term 强制重置新 Epoch 与 TOCTOU 彻底消除 (P0 - RESOLVED)
+- **原因与风险**: `mvcc/locking.go:ForceResetLockEpoch` 原实现未进行单调性校验，如果旧 Term 的领导者下台事件迟到（例如在 `replication/node.go:onLeaderLoss` 释放 `leadershipMu` 后产生调度延迟），迟到的 `ForceResetLockEpoch(oldTerm)` 会覆盖已经生效的新 Term，导致新 Leader 的活跃持锁、排队等待者和脏版本被意外清空；
+- **修复方案**:
+  1. `ForceResetLockEpoch` 在持有 `binding.epochMu.Lock()` 的互斥保护下原子执行单调性校验：
+     ```go
+     if generation < binding.storeGeneration { return 0 }
+     if generation == binding.storeGeneration && term < binding.storeTerm { return 0 }
+     ```
+     彻底消除调用方检查与存储重置之间的 TOCTOU 竞争窗口；
+  2. `mvcc/dirty_registry.go:ForceReset` 增加严格单调性拦截：若传入的 `generation/term` 小于当前 Registry Epoch，直接返回 `false`，绝不回退当前脏数据版本；
+  3. 当前任期正常下台（`term == binding.storeTerm`）仍立即终止所有旧 Root 和等待请求；备份还原（`Restore`）递增 Generation，保留无条件强制净化能力；
+- **绿测证据**: `mvcc/locking_epoch_concurrency_test.go` 全套场景测试 (PASS)。
+
+### 2. FIX-02：确定性复现新旧 Term 交错验证 (P0 - RESOLVED)
+- **新增测试文件**: `mvcc/locking_epoch_concurrency_test.go`（全流程基于事件 Barrier 与测试专用 Hook `forceResetLockEpochHook`，零 Sleep 推测）：
+  1. **场景 A (`TestP7R2_ScenarioA_DelayedLeaderLossCannotDisruptNewTerm`)**:
+     - Term 10 触发 Leader Loss，通过 Hook 在获取 `epochMu` 前暂停；
+     - 此时新 Leader 当选并在 Term 11 完成 `SyncLockEpoch(11)`；
+     - 新 Root A 在 Term 11 获取 Record X 并发布脏版本，Root B 请求同一记录进入等待队列（`WaitEdges` 确立 `B -> A`）；
+     - 恢复 Term 10 的迟到下台事件，`ForceResetLockEpoch(10)` 在 `epochMu` 内被单调性精确拦截并返回 0；
+     - 断言 Term 11 的 Lock Owner、Grant、WaitEdges、Dirty Registry 完全未受破坏；旧 Term 10 请求无法获取新锁；Root A 回滚后 Root B 正常被唤醒并提交；
+  2. **场景 B (`TestP7R2_ScenarioB_NormalLeaderLossAndRepeatedEvents`)**:
+     - Term 10 正常 Leader Loss，等待者全部被唤醒并收到 `lockmanager.ErrLockInvalidated`；
+     - 重复调用 `ForceResetLockEpoch(10)` 幂等返回 0，无任何副作用；
+  3. **场景 C (`TestP7R2_ScenarioC_RestoreGenerationProtectsAgainstDelayedForceReset`)**:
+     - 备份还原使 Generation 递增；迟到的 Generation 0 的 ForceReset 被单调性拒绝，绝不回退新 Generation；
+- **绿测证据**: `TestP7R2_ScenarioA`、`TestP7R2_ScenarioB`、`TestP7R2_ScenarioC` 全部 100% 通过。
+
+### 3. FIX-03：保留既有 B02/B03 行为与全量复验 (P0 - RESOLVED)
+- **复验项结果**:
+  - `TestP7FinalLock02_RealLockBindingIdempotentResetAndTransition`: PASS
+  - `TestP7FixR202_PublishAndRollbackLinearization`: PASS
+  - `TestP7FixR206_EpochTransitionSynchronizationAndIdempotence`: PASS
+  - `replication` 所有 Leader Loss、Term Fence、Current Read、Iterator 测试: PASS
+  - RU 在复制模式下严格报错 `storageengine.ErrUnsupported`: PASS
+- **残余状态审计**:
+  - `LockTableSize` = 0；
+  - `ActiveOwners` = 0；
+  - `PendingRequests` = 0；
+  - `WaitEdges` = 0；
+  - `StageReaders` = 0；
+  - `DirtyRegistry` 无 Ghost Version。
+
+### 4. FIX-04：全量回归与 CI 证据核查 (P0 - RESOLVED)
+- **远程 CI 真实结果**:
+  - GitHub Actions 最新 Run `38834144434`（Job IDs: `116759329753` windows-latest, `116759329808` ubuntu-latest）：
+    - `quality (windows-latest)`: **SUCCESS**（全包单机回归通过）
+    - `quality (ubuntu-latest)`: **SUCCESS**（Linux + CGO 全部 Race Detector 回归通过：`Failover race` 10 轮 PASS，`MVCC/storage/executor/server race` PASS，`Lockmanager race` 2 轮 PASS）
+    - `mysql-8-client`: **SUCCESS**
+    - `build (ubuntu-latest / windows-latest)`: **SUCCESS**
+- **本地全量测试与回归**:
+  - `mvcc` 确定性测试 100 轮全部通过（21.1s）；
+  - `executor` P7 及 P7Fix 测试 100 轮全部通过（148.6s）；
+  - 全库 21 个带测试包执行 `go test ./... -count=1` 100% 通过（总耗时 157.2s，EXIT CODE: 0）；
+  - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean；
+  - 架构规则测试 `TestSQLPackagesDoNotImportPhysicalBackends` 与 `TestProductionArchitectureBoundaries` 100% PASS。
+- **Race Detector 说明**: Windows 本地开发机缺少 C 工具链（CGO 未启用），按规则标记 **NOT RUN**；远程 CI Linux Ubuntu 虚拟机带有完整 CGO，已在上述 GitHub Actions Run `38834144434` 中取得真实通过证据。
+- **最终结论**: **FIX-01 至 FIX-04 全部彻底关闭，GBaseLite B03 Phase 7 Raft Epoch 最终并发安全审查正式 PASS**。

@@ -138,11 +138,17 @@ func (s *Store) ResetLockEpoch(term uint64) int {
 	return binding.manager.ResetEpoch(generation, term)
 }
 
+var forceResetLockEpochHook func(stage string, term uint64)
+
 // ForceResetLockEpoch unconditionally invalidates all lock owners, releases grants,
-// cancels pending requests, and resets the dirty registry for the current generation and term.
-// Used explicitly upon leader loss (step down) to clear all locks on the former leader even before
-// a new term has been established.
+// cancels pending requests, and resets the dirty registry for the current generation and term,
+// provided that the store has not already advanced to a newer generation or higher term.
+// If the store is already in a newer generation or higher term, the stale reset is rejected
+// and returns 0 without touching newer lock owners or dirty versions.
 func (s *Store) ForceResetLockEpoch(term uint64) int {
+	if forceResetLockEpochHook != nil {
+		forceResetLockEpochHook("before_acquire_epoch_mu", term)
+	}
 	generation := s.generation.Load()
 	binding := s.locks
 	if binding == nil {
@@ -153,6 +159,20 @@ func (s *Store) ForceResetLockEpoch(term uint64) int {
 	}
 	binding.epochMu.Lock()
 	defer binding.epochMu.Unlock()
+
+	if forceResetLockEpochHook != nil {
+		forceResetLockEpochHook("inside_epoch_mu", term)
+	}
+
+	// Monotonicity & Stale Event Protection:
+	// A force reset from an older generation or older term must NOT roll back or
+	// disrupt a newer generation or term that has already been established.
+	if generation < binding.storeGeneration {
+		return 0
+	}
+	if generation == binding.storeGeneration && term < binding.storeTerm {
+		return 0
+	}
 
 	binding.storeGeneration = generation
 	binding.storeTerm = term
