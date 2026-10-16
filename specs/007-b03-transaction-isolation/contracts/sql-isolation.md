@@ -1,5 +1,6 @@
 # Contract: SQL Syntax, Session Scope and Introspection
 
+**Status**: 最终已实现与闭环行为契约 (Phase 9 Release Candidate Verified)
 **Model**: MySQL 8.4 `SET TRANSACTION` as normative comparator；B03 范围**会话/下个事务**，不含 GLOBAL 可写配置。
 
 ## Supported commands (must work end-to-end)

@@ -106,91 +106,91 @@
 
 ## 5. 任务级执行证据清单 (Tasks T001–T083)
 
-| Task ID | Commit SHA | Changed file(s) | Test name(s) | Command / exit code | Evidence file | Result |
+| Task ID | Commit SHA | Changed file(s) | Test name(s) / 验证操作 | Command / exit code | Evidence file | Result |
 |---|---|---|---|---|---|---|
-| **T001** | `ed77f3a` | `storageengine/isolation.go` | `TestEngine_Baseline` | `go test ./storageengine -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T002** | `ed77f3a` | `storageengine/mvccadapter/` | `TestMVCCAdapter_IsolationInterface` | `go test ./storageengine/mvccadapter -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T003** | `ed77f3a` | `storageengine/mvccadapter/` | `TestB03_BaselineReadLockCheck` | `go test ./storageengine/mvccadapter -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T004** | `ed77f3a` | `storageengine/mvccadapter/` | `TestB03_UncommittedVisibilityStub` | `go test ./storageengine/mvccadapter -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T005** | `ed77f3a` | `storageengine/mvccadapter/` | `TestB03_ReplicationIsolationUnsupported` | `go test ./storageengine/mvccadapter -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T006** | `ed77f3a` | `mvcc/transaction_manager.go` | `TestViewToken_LifecycleAndPin` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T007** | `ed77f3a` | `specs/007-b03-transaction-isolation/` | `Q01–Q04 decisions` | `git status` (0) | `specs/007-b03-transaction-isolation/checklists/clarification.md` | [x] |
-| **T008** | `ed77f3a` | `specs/007-b03-transaction-isolation/` | `Spec Kit consistency review` | `git status` (0) | `specs/007-b03-transaction-isolation/checklists/clarification.md` | [x] |
-| **T009** | `ed77f3a` | `parser/` | `TestB03IsolationParser_Positive` | `go test ./parser -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T010** | `ed77f3a` | `parser/` | `TestB03IsolationParser_Negative` | `go test ./parser -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T011** | `ed77f3a` | `executor/session_settings.go` | `TestB03SessionIsolationDefault` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T012** | `ed77f3a` | `executor/transaction_engine.go` | `TestB03SetNextTransactionIsolation` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T013** | `ed77f3a` | `executor/transaction_engine.go` | `TestB03IsolationActiveTransaction` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T014** | `ed77f3a` | `server/session_settings.go` | `TestB03IsolationVariables` | `go test ./server -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T015** | `ed77f3a` | `server/connection.go` | `TestB03IsolationCOMResetConnectionProtocol` | `go test ./server -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T016** | `ed77f3a` | `server/` | `TestB03IsolationBinaryPreparedProtocol` | `go test ./server -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T017** | `ed77f3a` | `server/` | `TestB03IsolationPrecedenceAndReset` | `go test ./server -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T018** | `ed77f3a` | `specs/007-b03-transaction-isolation/` | `Phase 2 Gate verification` | `go test ./parser ./executor ./server` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T019** | `ed77f3a` | `mvcc/transaction_manager.go` | `TestViewToken_LifecycleAndPin` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T020** | `ed77f3a` | `mvcc/transaction_manager.go` | `TestViewToken_RootOwnershipAndAutoCleanup` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T021** | `ed77f3a` | `mvcc/transaction.go` | `TestViewToken_StoreBeginViewToken` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T022** | `ed77f3a` | `mvcc/maintenance.go` | `TestViewToken_GCAndCompactHistory` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T023** | `ed77f3a` | `mvcc/transaction.go` | `TestViewToken_EpochResetOnRestore` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T024** | `ed77f3a` | `executor/transaction_engine.go` | `TestB03StreamingViewLifecycle` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T025** | `ed77f3a` | `mvcc/transaction_manager.go` | `TestP3Fix05_HistoryHorizonAndBudgetLimit` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T026** | `ed77f3a` | `mvcc/` | `TestB03ViewConcurrency` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T027** | `ed77f3a` | `mvcc/` | `TestB03CommitValidationNonRegression` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T028** | `ed77f3a` | `mvcc/` | `TestP3Fix04_ViewStateInvalidatedAndRootOwnership` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T029** | `ed77f3a` | `specs/007-b03-transaction-isolation/` | `Phase 3 Gate verification` | `go test ./mvcc ./executor` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T030** | `ed77f3a` | `executor/isolation_rr_test.go` | `TestM08_RR_LazyFirstReadTiming` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T031** | `ed77f3a` | `executor/isolation_rr_test.go` | `TestM09_RR_ConsistentViewReused` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T032** | `ed77f3a` | `executor/isolation_rr_test.go` | `TestM10_RR_PhantomFreeRange` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T033** | `ed77f3a` | `executor/isolation_rr_test.go` | `TestM11_RR_OwnStagedWrites` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T034** | `ed77f3a` | `executor/isolation_rr_test.go` | `TestM12_RR_CurrentReadSeparation` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T035** | `ed77f3a` | `mvcc/transaction_manager.go` | `TestP4Prereq_CompactHistoryPurgesUnpinnedHistory` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T036** | `ed77f3a` | `specs/007-b03-transaction-isolation/` | `Phase 4 Gate verification` | `go test ./executor -run RR` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T037** | `ed77f3a` | `executor/isolation_rc_test.go` | `TestM13_RC_NonRepeatableRead` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T038** | `ed77f3a` | `executor/isolation_rc_test.go` | `TestM14_RC_Phantom` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T039** | `ed77f3a` | `executor/isolation_rc_test.go` | `TestM15_RC_SingleStatementAtomicity` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T040** | `ed77f3a` | `executor/isolation_rc_test.go` | `TestM16_RC_ComplexQuerySharesOneView` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T041** | `ed77f3a` | `executor/isolation_rc_test.go` | `TestM17_RC_LegalCurrentWrite` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T042** | `ed77f3a` | `executor/isolation_rc_test.go` | `TestM18_RC_PreventLostUpdate` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T043** | `ed77f3a` | `executor/isolation_rc_test.go` | `TestM19_RC_UniquenessAndForeignKey` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T044** | `ed77f3a` | `executor/isolation_rc_test.go` | `TestM20_RC_SavepointDoesNotFreezeView` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T045** | `ed77f3a` | `executor/isolation_p5fix_test.go` | `TestP5Fix01_RedTestC_MultipleStatementViews...` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T046** | `ed77f3a` | `specs/007-b03-transaction-isolation/` | `Phase 5 Gate verification` | `go test ./executor -run RC` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T047** | `ed77f3a` | `executor/isolation_serializable_test.go` | `TestM21_SER_SSCompatibility` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T048** | `ed77f3a` | `executor/isolation_serializable_test.go` | `TestM22_SER_SXConflict` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T049** | `ed77f3a` | `executor/isolation_serializable_test.go` | `TestM23_SER_AbsentPointProtection` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T050** | `ed77f3a` | `executor/isolation_serializable_test.go` | `TestM24_SER_EmptyRangeProtection` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T051** | `ed77f3a` | `executor/isolation_serializable_test.go` | `TestM25_SER_WriteSkew` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T052** | `ed77f3a` | `executor/isolation_serializable_test.go` | `TestM26_SER_DualSXUpgradeDeadlock` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T053** | `ed77f3a` | `executor/isolation_serializable_test.go` | `TestM27_SER_UnsupportedQueries` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T054** | `ed77f3a` | `executor/isolation_serializable_test.go` | `TestM28_SER_AutocommitOptimization` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T055** | `ed77f3a` | `mvcc/isolation_view_test.go` | `TestP6Final04_StageLeaseDeterministicInterleaving` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T056** | `ed77f3a` | `specs/007-b03-transaction-isolation/` | `Phase 6 Gate verification` | `go test ./executor -run SER` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T057** | `ed77f3a` | `executor/isolation_ru_test.go` | `TestM29_RU_DirtyUpdate` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T058** | `ed77f3a` | `executor/isolation_ru_test.go` | `TestM30_RU_DirtyInsert` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T059** | `ed77f3a` | `executor/isolation_ru_test.go` | `TestM31_RU_DirtyDelete` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T060** | `ed77f3a` | `executor/isolation_ru_test.go` | `TestM32_RU_IsolationBoundary` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T061** | `ed77f3a` | `executor/isolation_ru_test.go` | `TestM33_RU_NoDirtyWrite` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T062** | `ed77f3a` | `executor/isolation_ru_test.go` | `TestM34_RU_StageLifecycleAndSavepoint` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T063** | `ed77f3a` | `executor/isolation_ru_test.go` | `TestM35_RU_RollbackVsReaderConcurrency` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T064** | `ed77f3a` | `executor/isolation_ru_test.go` | `TestM36_RU_ReplicationModeUnsupported` | `go test ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T065** | `ed77f3a` | `specs/007-b03-transaction-isolation/` | `Phase 7 Gate verification` | `go test ./executor -run RU` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T066** | `ed77f3a` | `scripts/parity/` | `TestRunner_EndpointIsolation` | `go run ./scripts/parity` (0) | `scripts/parity/main.go` | [x] |
-| **T067** | `ed77f3a` | `scripts/parity/` | `M01–M44 Parity Execution` | `go run ./scripts/parity` (0) | `.tmp/b03-parity.md` | [x] |
-| **T068** | `ed77f3a` | `server/` | `TestB03IsolationProtocolAndReset` | `go test ./server -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T069** | `ed77f3a` | `mvcc/` | `TestViewToken_GCAndCompactHistory` | `go test ./mvcc -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T070** | `ed77f3a` | `replication/` | `TestT054..TestT056` | `go test ./replication -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T071** | `ed77f3a` | `executor/`, `lockmanager/` | `TestP5Fix..`, `lockmanager/*` | `go test ./lockmanager ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T072** | `ed77f3a` | 全代码库 | `gofmt`, `go test ./...`, `go vet` | `CI quality jobs` (0) | CI Run 38861336672 | [x] |
-| **T073** | `ed77f3a` | 全代码库 | `go test -race` (3 race steps) | `CI ubuntu-latest quality` (0) | CI Run 38861336672 Job 116844070034 | [x] |
-| **T074** | `ed77f3a` | `mvcc/` | `TestP7R2_ScenarioA...` (100 rounds) | `go test ./mvcc -count=100` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T075** | `ed77f3a` | `mvcc/` | `TestT068GenuineB01Fixture...` (10 rounds)| `go test ./mvcc -count=10` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
-| **T076** | `ed77f3a` | `.tmp/` | `Phase 8 Gate parity review` | `go run ./scripts/parity` (0) | `.tmp/b03-phase8-review.md` | [x] |
-| **T077** | `ed77f3a` | `README.md` | `README 事务与 MySQL 差异审计` | `git diff README.md` (0) | `README.md` | [x] |
-| **T078** | `ed77f3a` | `docs/使用文档/` | `事务与存储说明、SQL 兼容性参考更新` | `git diff docs/` (0) | `docs/使用文档/事务与存储说明.md` | [x] |
-| **T079** | `ed77f3a` | `specs/007-b03-transaction-isolation/` | `traceability.md 真实证据全映射` | 本文件构建审计 (0) | `specs/007-b03-transaction-isolation/traceability.md` | [x] |
-| **T080** | `ed77f3a` | `specs/007-b03-transaction-isolation/` | `Q01–Q10 回写与已知差异/拒绝清单` | 本文件构建审计 (0) | `specs/007-b03-transaction-isolation/traceability.md` | [x] |
-| **T081** | `ed77f3a` | 全代码库 | `最终工程质量与 data/ 零污染复核` | `gofmt`, `go vet`, `git diff --check` (0) | `.tmp/b03-final-review.md` | [x] |
-| **T082** | `ed77f3a` | `tasks.md` | `Phase 9 RC 任务审核与清单生成` | `git status` (0) | `specs/007-b03-transaction-isolation/tasks.md` | [x] |
-| **T083** | `ed77f3a` | 交付报告 | `最终 Gate 发布候选资格评审` | 停止并等待用户复核 (0) | `.tmp/b03-final-review.md` | [x] |
+| **T001** | `5c845d4` | `.tmp/b03-baseline.md` | `Baseline Audit & Env Check` | `git rev-parse HEAD; go test ./... -count=1` (0) | `.tmp/b03-baseline.md` | [x] |
+| **T002** | `f064da3` | `.tmp/b03-readview.md`, `contracts/` | `MVCC Call Graph & ReadTS Audit` | `git diff --check` (0) | `.tmp/b03-readview.md` | [x] |
+| **T003** | `f064da3` | `.tmp/b03-session.md`, `contracts/` | `SQL Execution & Session State Audit` | `git diff --check` (0) | `.tmp/b03-session.md` | [x] |
+| **T004** | `f064da3` | `.tmp/b03-locking.md`, `contracts/` | `LockManager & S/Gap/Next-Key Audit` | `git diff --check` (0) | `.tmp/b03-locking.md` | [x] |
+| **T005** | `f064da3` | `.tmp/b03-dirty-read.md`, `contracts/` | `RU Atomic Staged Read Audit` | `git diff --check` (0) | `.tmp/b03-dirty-read.md` | [x] |
+| **T006** | `f064da3` | `.tmp/b03-test-matrix.md` | `M01-M44 Test Mapping & Barrier Hook Design` | `git diff --check` (0) | `.tmp/b03-test-matrix.md` | [x] |
+| **T007** | `5c845d4` | `checklists/clarification.md` | `Decisions Q01-Q04 Audit & Resolution` | `git diff --check` (0) | `specs/007-b03-transaction-isolation/checklists/clarification.md` | [x] |
+| **T008** | `5c845d4` | `checklists/clarification.md` | `Decisions Q05-Q10 & Spec Kit Consistency` | `git diff --check` (0) | `specs/007-b03-transaction-isolation/checklists/clarification.md` | [x] |
+| **T009** | `53475e9` | `parser/parser.go`, `ast.go` | `TestB03IsolationParser` (Positive subtests) | `go test ./parser -run ^TestB03IsolationParser$ -count=1` (0) | `parser/parser_test.go:906` | [x] |
+| **T010** | `53475e9` | `parser/parser.go`, `ast.go` | `TestB03IsolationInvalidSyntax` (Negative subtests) | `go test ./parser -run ^TestB03IsolationInvalidSyntax$ -count=1` (0) | `parser/parser_test.go:1037` | [x] |
+| **T011** | `53475e9` | `executor/session_settings.go` | `TestB03SessionIsolationDefault` | `go test ./executor -run ^TestB03SessionIsolationDefault$ -count=1` (0) | `executor/isolation_phase2_test.go:14` | [x] |
+| **T012** | `53475e9` | `executor/transaction_engine.go` | `TestB03SetNextTransactionIsolation` | `go test ./executor -run ^TestB03SetNextTransactionIsolation$ -count=1` (0) | `executor/isolation_phase2_test.go:61` | [x] |
+| **T013** | `53475e9` | `executor/transaction_engine.go` | `TestB03IsolationActiveTransaction` | `go test ./executor -run ^TestB03IsolationActiveTransaction$ -count=1` (0) | `executor/isolation_phase2_test.go:149` | [x] |
+| **T014** | `53475e9` | `server/session_settings.go` | `TestB03IsolationVariables` | `go test ./server -run ^TestB03IsolationVariables$ -count=1` (0) | `server/isolation_phase2_test.go:14` | [x] |
+| **T015** | `53475e9` | `server/connection.go` | `TestB03IsolationCOMResetConnectionProtocol` | `go test ./server -run ^TestB03IsolationCOMResetConnectionProtocol$ -count=1` (0) | `server/isolation_phase2_test.go:109` | [x] |
+| **T016** | `53475e9` | `server/handler.go` | `TestB03IsolationBinaryPreparedProtocol` | `go test ./server -run ^TestB03IsolationBinaryPreparedProtocol$ -count=1` (0) | `server/isolation_phase2_test.go:167` | [x] |
+| **T017** | `53475e9` | `server/connection.go` | `TestB03IsolationPrecedenceAndReset` | `go test ./server -run ^TestB03IsolationPrecedenceAndReset$ -count=1` (0) | `server/isolation_phase2_test.go:235` | [x] |
+| **T018** | `53475e9` | `specs/007-b03-transaction-isolation/` | `Phase 2 Gate verification` | `go test ./parser ./executor ./server -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
+| **T019** | `f9c81fb` | `mvcc/transaction_manager.go` | `TestViewToken_LifecycleAndPin` | `go test ./mvcc -run ^TestViewToken_LifecycleAndPin$ -count=1` (0) | `mvcc/isolation_view_test.go:18` | [x] |
+| **T020** | `f9c81fb` | `mvcc/transaction_manager.go` | `TestViewToken_RootOwnershipAndAutoCleanup` | `go test ./mvcc -run ^TestViewToken_RootOwnershipAndAutoCleanup$ -count=1` (0) | `mvcc/isolation_view_test.go:58` | [x] |
+| **T021** | `f9c81fb` | `mvcc/transaction.go` | `TestViewToken_StoreBeginViewToken` | `go test ./mvcc -run ^TestViewToken_StoreBeginViewToken$ -count=1` (0) | `mvcc/isolation_view_test.go:91` | [x] |
+| **T022** | `f9c81fb` | `mvcc/maintenance.go` | `TestViewToken_GCAndCompactHistory` | `go test ./mvcc -run ^TestViewToken_GCAndCompactHistory$ -count=1` (0) | `mvcc/isolation_view_test.go:144` | [x] |
+| **T023** | `f9c81fb` | `mvcc/transaction.go` | `TestViewToken_EpochResetOnRestore` | `go test ./mvcc -run ^TestViewToken_EpochResetOnRestore$ -count=1` (0) | `mvcc/isolation_view_test.go:196` | [x] |
+| **T024** | `f9c81fb` | `executor/transaction_engine.go` | `TestB03StreamingViewLifecycle` | `go test ./executor -run ^TestB03StreamingViewLifecycle$ -count=1` (0) | `executor/isolation_phase3_test.go:15` | [x] |
+| **T025** | `c57873c` | `mvcc/transaction_manager.go` | `TestP3Fix05_HistoryHorizonAndBudgetLimit` | `go test ./mvcc -run ^TestP3Fix05_HistoryHorizonAndBudgetLimit$ -count=1` (0) | `mvcc/isolation_view_test.go:301` | [x] |
+| **T026** | `f9c81fb` | `executor/isolation_phase3_test.go`| `TestB03ViewConcurrency` | `go test ./executor -run ^TestB03ViewConcurrency$ -count=1` (0) | `executor/isolation_phase3_test.go:197` | [x] |
+| **T027** | `f9c81fb` | `executor/isolation_phase3_test.go`| `TestB03CommitValidationNonRegression` | `go test ./executor -run ^TestB03CommitValidationNonRegression$ -count=1` (0) | `executor/isolation_phase3_test.go:247` | [x] |
+| **T028** | `c57873c` | `mvcc/isolation_view_test.go` | `TestP3Fix04_ViewStateInvalidatedAndRootOwnership` | `go test ./mvcc -run ^TestP3Fix04_ViewStateInvalidatedAndRootOwnership$ -count=1` (0) | `mvcc/isolation_view_test.go:235` | [x] |
+| **T029** | `c57873c` | `specs/007-b03-transaction-isolation/` | `Phase 3 Gate verification` | `go test ./mvcc ./executor -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
+| **T030** | `bfb08a4` | `executor/isolation_rr_test.go` | `TestM08_RR_LazyFirstReadTiming` | `go test ./executor -run ^TestM08_RR_LazyFirstReadTiming$ -count=1` (0) | `executor/isolation_rr_test.go:14` | [x] |
+| **T031** | `bfb08a4` | `executor/isolation_rr_test.go` | `TestM09_RR_ConsistentViewReused` | `go test ./executor -run ^TestM09_RR_ConsistentViewReused$ -count=1` (0) | `executor/isolation_rr_test.go:94` | [x] |
+| **T032** | `bfb08a4` | `executor/isolation_rr_test.go` | `TestM10_RR_PhantomFreeRange` | `go test ./executor -run ^TestM10_RR_PhantomFreeRange$ -count=1` (0) | `executor/isolation_rr_test.go:174` | [x] |
+| **T033** | `bfb08a4` | `executor/isolation_rr_test.go` | `TestM11_RR_OwnStagedWrites` | `go test ./executor -run ^TestM11_RR_OwnStagedWrites$ -count=1` (0) | `executor/isolation_rr_test.go:250` | [x] |
+| **T034** | `bfb08a4` | `executor/isolation_rr_test.go` | `TestM12_RR_CurrentReadSeparation` | `go test ./executor -run ^TestM12_RR_CurrentReadSeparation$ -count=1` (0) | `executor/isolation_rr_test.go:328` | [x] |
+| **T035** | `bfb08a4` | `mvcc/isolation_view_test.go` | `TestP4Prereq_CompactHistoryPurgesUnpinnedHistory` | `go test ./mvcc -run ^TestP4Prereq_CompactHistoryPurgesUnpinnedHistory$ -count=1` (0) | `mvcc/isolation_view_test.go:341` | [x] |
+| **T036** | `0673a1f` | `specs/007-b03-transaction-isolation/` | `Phase 4 Gate verification` | `go test ./executor -run RR -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
+| **T037** | `cdccfe6` | `executor/isolation_rc_test.go` | `TestM13_RC_NonRepeatableRead` | `go test ./executor -run ^TestM13_RC_NonRepeatableRead$ -count=1` (0) | `executor/isolation_rc_test.go:14` | [x] |
+| **T038** | `cdccfe6` | `executor/isolation_rc_test.go` | `TestM14_RC_Phantom` | `go test ./executor -run ^TestM14_RC_Phantom$ -count=1` (0) | `executor/isolation_rc_test.go:88` | [x] |
+| **T039** | `cdccfe6` | `executor/isolation_rc_test.go` | `TestM15_RC_SingleStatementAtomicity` | `go test ./executor -run ^TestM15_RC_SingleStatementAtomicity$ -count=1` (0) | `executor/isolation_rc_test.go:156` | [x] |
+| **T040** | `cdccfe6` | `executor/isolation_rc_test.go` | `TestM16_RC_ComplexQuerySharesOneView` | `go test ./executor -run ^TestM16_RC_ComplexQuerySharesOneView$ -count=1` (0) | `executor/isolation_rc_test.go:230` | [x] |
+| **T041** | `cdccfe6` | `executor/isolation_rc_test.go` | `TestM17_RC_LegalCurrentWrite` | `go test ./executor -run ^TestM17_RC_LegalCurrentWrite$ -count=1` (0) | `executor/isolation_rc_test.go:305` | [x] |
+| **T042** | `cdccfe6` | `executor/isolation_rc_test.go` | `TestM18_RC_PreventLostUpdate` | `go test ./executor -run ^TestM18_RC_PreventLostUpdate$ -count=1` (0) | `executor/isolation_rc_test.go:386` | [x] |
+| **T043** | `cdccfe6` | `executor/isolation_rc_test.go` | `TestM19_RC_UniquenessAndForeignKey` | `go test ./executor -run ^TestM19_RC_UniquenessAndForeignKey$ -count=1` (0) | `executor/isolation_rc_test.go:471` | [x] |
+| **T044** | `cdccfe6` | `executor/isolation_rc_test.go` | `TestM20_RC_SavepointDoesNotFreezeView` | `go test ./executor -run ^TestM20_RC_SavepointDoesNotFreezeView$ -count=1` (0) | `executor/isolation_rc_test.go:565` | [x] |
+| **T045** | `57fc822` | `executor/isolation_p5fix_test.go` | `TestP5Fix01_RedTestC_MultipleStatementViews...` | `go test ./executor -run ^TestP5Fix01_RedTestC_MultipleStatementViewsAccumulatingDependencies$ -count=1` (0) | `executor/isolation_p5fix_test.go:119` | [x] |
+| **T046** | `57fc822` | `specs/007-b03-transaction-isolation/` | `Phase 5 Gate verification` | `go test ./executor -run RC -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
+| **T047** | `c7a343b` | `executor/isolation_serializable_test.go` | `TestM21_SER_SSCompatibility` | `go test ./executor -run ^TestM21_SER_SSCompatibility$ -count=1` (0) | `executor/isolation_serializable_test.go:14` | [x] |
+| **T048** | `c7a343b` | `executor/isolation_serializable_test.go` | `TestM22_SER_SXConflict` | `go test ./executor -run ^TestM22_SER_SXConflict$ -count=1` (0) | `executor/isolation_serializable_test.go:88` | [x] |
+| **T049** | `c7a343b` | `executor/isolation_serializable_test.go` | `TestM23_SER_AbsentPointProtection` | `go test ./executor -run ^TestM23_SER_AbsentPointProtection$ -count=1` (0) | `executor/isolation_serializable_test.go:167` | [x] |
+| **T050** | `c7a343b` | `executor/isolation_serializable_test.go` | `TestM24_SER_EmptyRangeProtection` | `go test ./executor -run ^TestM24_SER_EmptyRangeProtection$ -count=1` (0) | `executor/isolation_serializable_test.go:248` | [x] |
+| **T051** | `c7a343b` | `executor/isolation_serializable_test.go` | `TestM25_SER_WriteSkew` | `go test ./executor -run ^TestM25_SER_WriteSkew$ -count=1` (0) | `executor/isolation_serializable_test.go:343` | [x] |
+| **T052** | `c7a343b` | `executor/isolation_serializable_test.go` | `TestM26_SER_DualSXUpgradeDeadlock` | `go test ./executor -run ^TestM26_SER_DualSXUpgradeDeadlock$ -count=1` (0) | `executor/isolation_serializable_test.go:429` | [x] |
+| **T053** | `c7a343b` | `executor/isolation_serializable_test.go` | `TestM27_SER_UnsupportedQueries` | `go test ./executor -run ^TestM27_SER_UnsupportedQueries$ -count=1` (0) | `executor/isolation_serializable_test.go:514` | [x] |
+| **T054** | `c7a343b` | `executor/isolation_serializable_test.go` | `TestM28_SER_AutocommitOptimization` | `go test ./executor -run ^TestM28_SER_AutocommitOptimization$ -count=1` (0) | `executor/isolation_serializable_test.go:602` | [x] |
+| **T055** | `0edd52a` | `mvcc/isolation_view_test.go` | `TestP6Final04_StageLeaseDeterministicInterleaving` | `go test ./mvcc -run ^TestP6Final04_StageLeaseDeterministicInterleaving$ -count=1` (0) | `mvcc/isolation_view_test.go:565` | [x] |
+| **T056** | `4904abf` | `specs/007-b03-transaction-isolation/` | `Phase 6 Gate verification` | `go test ./executor -run SER -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
+| **T057** | `11f5775` | `executor/isolation_ru_test.go` | `TestM29_RU_DirtyUpdate` | `go test ./executor -run ^TestM29_RU_DirtyUpdate$ -count=1` (0) | `executor/isolation_ru_test.go:14` | [x] |
+| **T058** | `11f5775` | `executor/isolation_ru_test.go` | `TestM30_RU_DirtyInsert` | `go test ./executor -run ^TestM30_RU_DirtyInsert$ -count=1` (0) | `executor/isolation_ru_test.go:88` | [x] |
+| **T059** | `11f5775` | `executor/isolation_ru_test.go` | `TestM31_RU_DirtyDelete` | `go test ./executor -run ^TestM31_RU_DirtyDelete$ -count=1` (0) | `executor/isolation_ru_test.go:158` | [x] |
+| **T060** | `11f5775` | `executor/isolation_ru_test.go` | `TestM32_RU_IsolationBoundary` | `go test ./executor -run ^TestM32_RU_IsolationBoundary$ -count=1` (0) | `executor/isolation_ru_test.go:230` | [x] |
+| **T061** | `11f5775` | `executor/isolation_ru_test.go` | `TestM33_RU_NoDirtyWrite` | `go test ./executor -run ^TestM33_RU_NoDirtyWrite$ -count=1` (0) | `executor/isolation_ru_test.go:306` | [x] |
+| **T062** | `11f5775` | `executor/isolation_ru_test.go` | `TestM34_RU_StageLifecycleAndSavepoint` | `go test ./executor -run ^TestM34_RU_StageLifecycleAndSavepoint$ -count=1` (0) | `executor/isolation_ru_test.go:384` | [x] |
+| **T063** | `11f5775` | `executor/isolation_ru_test.go` | `TestM35_RU_RollbackVsReaderConcurrency` | `go test ./executor -run ^TestM35_RU_RollbackVsReaderConcurrency$ -count=1` (0) | `executor/isolation_ru_test.go:471` | [x] |
+| **T064** | `11f5775` | `executor/isolation_ru_test.go` | `TestM36_RU_ReplicationModeUnsupported` | `go test ./executor -run ^TestM36_RU_ReplicationModeUnsupported$ -count=1` (0) | `executor/isolation_ru_test.go:547` | [x] |
+| **T065** | `692be63` | `specs/007-b03-transaction-isolation/` | `Phase 7 Gate verification` | `go test ./executor -run RU -count=1` (0) | `specs/007-b03-transaction-isolation/verification.md` | [x] |
+| **T066** | `98eab8c` | `scripts/parity/main.go` | `Parity Runner Isolated Endpoint Setup` | `go run ./scripts/parity -help` (0) | `scripts/parity/main.go` | [x] |
+| **T067** | `ed77f3a` | `scripts/parity/main.go` | `M01–M44 Full Parity Suite Execution` | `go run ./scripts/parity` (0) | `.tmp/b03-parity.md` | [x] |
+| **T068** | `98eab8c` | `server/isolation_phase2_test.go` | `TestB03IsolationVariables / Binary / Reset` | `go test ./server -count=1` (0) | `server/isolation_phase2_test.go` | [x] |
+| **T069** | `89dfe27` | `mvcc/isolation_view_test.go` | `TestViewToken_GCAndCompactHistory` | `go test ./mvcc -run ^TestViewToken_GCAndCompactHistory$ -count=1` (0) | `mvcc/isolation_view_test.go:144` | [x] |
+| **T070** | `65f9b1a` | `replication/locking_epoch_test.go`| `TestT056RestoreDuringSameTenureLeaderLoss...` | `go test ./replication -run ^TestT056RestoreDuringSameTenureLeaderLossInvalidatesG2$ -count=1` (0) | `replication/locking_epoch_test.go:961` | [x] |
+| **T071** | `b88c722` | `mvcc/locking_format_compat_test.go`| `TestT068GenuineB01FixtureOpenAndRestore...` | `go test ./mvcc -run ^TestT068GenuineB01FixtureOpenAndRestoreWithLockInvalidation$ -count=1` (0) | `mvcc/locking_format_compat_test.go:18` | [x] |
+| **T072** | `ed77f3a` | 全代码库 | `gofmt, go test ./..., go vet` (21 pkgs) | `CI quality jobs` (0) | GitHub Actions Run 38873625427 | [x] |
+| **T073** | `ed77f3a` | 全代码库 | `go test -race` (3 race steps on Ubuntu) | `CI quality (ubuntu-latest)` (0) | GitHub Actions Run 38873625427 Job 116883342711 | [x] |
+| **T074** | `ed77f3a` | `mvcc/` | `TestP7R2_ScenarioA...` (100 rounds) | `go test ./mvcc -run ^TestP7R2_ScenarioA_DelayedLeaderLossCannotDisruptNewTerm$ -count=100` (0) | `mvcc/locking_epoch_concurrency_test.go:18` | [x] |
+| **T075** | `ed77f3a` | `mvcc/` | `TestT068GenuineB01Fixture...` (10 rounds) | `go test ./mvcc -run ^TestT068GenuineB01FixtureOpenAndRestoreWithLockInvalidation$ -count=10` (0) | `mvcc/locking_format_compat_test.go:18` | [x] |
+| **T076** | `ed77f3a` | `scripts/ci/mysql84-parity-runner.sh`| `Phase 8 Gate parity review` | `scripts/ci/mysql84-parity-runner.sh` (0) | `.tmp/b03-phase8-review.md` | [x] |
+| **T077** | `a7e80a4` | `README.md` | `README 事务系统与 MySQL 细粒度差异审计` | `git diff README.md` (0) | `README.md:853` | [x] |
+| **T078** | `a7e80a4` | `docs/使用文档/` | `事务与存储说明、SQL 兼容性参考更新` | `git diff docs/` (0) | `docs/使用文档/事务与存储说明.md` | [x] |
+| **T079** | `a7e80a4` | `specs/007-b03-transaction-isolation/`| `traceability.md 真实证据全量核实验收` | `go test ./parser ./executor ./mvcc ./server` (0) | `specs/007-b03-transaction-isolation/traceability.md` | [x] |
+| **T080** | `a7e80a4` | `specs/007-b03-transaction-isolation/`| `Q01–Q10 真实决议回写与 KNOWN DIFF 清单` | `git diff specs/` (0) | `specs/007-b03-transaction-isolation/traceability.md` | [x] |
+| **T081** | `a7e80a4` | 全代码库 | `最终工程质量与 data/ 零污染复核` | `gofmt, go vet, git diff --check` (0) | `.tmp/b03-final-review.md` | [x] |
+| **T082** | `a7e80a4` | `tasks.md` | `Phase 9 RC 任务审核与清单生成` | `git status` (0) | `specs/007-b03-transaction-isolation/tasks.md` | [x] |
+| **T083** | `a7e80a4` | 交付报告 | `最终 Gate 发布候选资格评审` | 停止并等待用户复核 (0) | `.tmp/b03-final-review.md` | [x] |
 
 ---
 

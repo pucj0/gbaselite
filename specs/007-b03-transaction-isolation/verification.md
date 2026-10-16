@@ -1274,13 +1274,13 @@
   - 在 `.github/workflows/test.yml` 中新增独立 `mysql-84-parity` Job，基于官方 `mysql:8.4` 容器提供受控实例；
   - 新增 `scripts/ci/mysql84-parity-runner.sh` 自动化脚本，先执行 `--inject-fault` 验证反向失败，再执行全量对拍并输出 `.tmp/b03-parity.md` 作为 CI Artifact 保存；
   - **最新 GitHub Actions 真实通过证据**:
-    - Run ID: [`38851794722`](https://github.com/pucj0/gbaselite/actions/runs/38851794722) (Test) 全部 SUCCESS：
-      - `quality (ubuntu-latest)` (`116814415632`): **SUCCESS**
-      - `quality (windows-latest)` (`116814415761`): **SUCCESS**
+    - Run ID: [`38873625427`](https://github.com/pucj0/gbaselite/actions/runs/38873625427) (Test, 基线 HEAD `a7e80a4`) 全部 SUCCESS：
+      - `quality (ubuntu-latest)` (`116883342711`): **SUCCESS**
+      - `quality (windows-latest)` (`116883342645`): **SUCCESS**
       - `build (ubuntu-latest / windows-latest)`: **SUCCESS**
-      - `mysql-8-client` (`116817101493`): **SUCCESS**
-      - `mysql-84-parity` (`116817101498`): **SUCCESS** (Step 5 全量对拍与反向注入全部验证通过，Artifact `b03-parity-report` 成功上传)；
-    - Docker Run ID: [`38851794755`](https://github.com/pucj0/gbaselite/actions/runs/38851794755) **SUCCESS**；
+      - `mysql-8-client` (`116886347892`): **SUCCESS**
+      - `mysql-84-parity` (`116886347761`): **SUCCESS** (Step 5 全量对拍与反向注入全部验证通过，Artifact `b03-parity-report` 成功上传)；
+    - Docker Run ID: [`38873625392`](https://github.com/pucj0/gbaselite/actions/runs/38873625392) **SUCCESS**；
 - **M01–M44 全场景分类独立统计（双端 SQL 对拍与内部架构分别统计）**:
   1. **双端 SQL 对拍矩阵 (Section A: 37 项，涵盖 M01–M35, M39, M44)**:
      - **PASS**: 35 项 (94.6%) — 双端执行真实 SQL，行为一致或符合规范；
@@ -1352,7 +1352,7 @@
   - 补齐所有 12 项成功标准（SC-001–SC-012）的验证状态；
   - 回写 Q01–Q10 技术决议、替代方案原因及架构代价；
   - 汇总 B03 KNOWN DIFFERENCE 与 UNSUPPORTED 清单；
-  - 逐项填实 T001–T083 任务级执行证据表（关联最新基线 Commit `ed77f3aeeffdfae64bbf2f03742c3a9914d655c5`）。
+  - 逐项填实 T001–T083 任务级执行证据表（关联真实各阶段 Commit SHA 及当前基线 Commit `a7e80a42e3fdf6ba01e996c9a18559109650c67f`）。
 - **`scripts/parity/main.go` 证据完整性增强**:
   - 补齐 M01–M44 全场景的 `RawError` 原始错误与 `SQLSequence` 执行次序字段；
   - 在 `.tmp/b03-parity.md` 中以完整表格输出双端实际结果、原始错误、执行次序与测试引用。

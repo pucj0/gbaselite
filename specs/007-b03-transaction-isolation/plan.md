@@ -1,9 +1,9 @@
 # Implementation Plan: B03 Four Transaction Isolation Levels
 
-**Branch**: `007-b03-transaction-isolation` (suggested; not created)  
-**Date**: 2026-10-14  
-**Spec**: [`spec.md`](spec.md)  
-**Status**: DESIGN ONLY — no production changes authorized in this delivery
+**Branch**: `master` (Baseline Commit `a7e80a42e3fdf6ba01e996c9a18559109650c67f`)
+**Date**: 2026-10-16
+**Spec**: [`spec.md`](spec.md)
+**Status**: IMPLEMENTED & VERIFIED — Release Candidate Audit (Phase 9 Complete)
 
 ## Summary
 
@@ -116,3 +116,20 @@ README.md + docs/使用文档/{事务与存储说明.md,SQL兼容性参考.md}
 - Go 源变更同批更新 README；此前 README 的待办信息与实现中状态清晰标识。
 - 不因历史 B02 `tasks.md` 已勾选便跳过 B02 当前 HEAD 的独立 baseline。
 - 不对 data/ 进行写/迁移/部署；所有集成测试 temp dir；禁止自动发布 Release。
+
+---
+
+## B03 实施收敛与决议闭环 (Q01–Q10 Final Status)
+
+在 Phase 2 至 Phase 9 各阶段实施过程中，Q01–Q10 核心架构决策均已严格落地闭环：
+
+1. **Q01 (旧 Go API 保持不变)**: `storageengine/isolation.go` 新增 `IsolationEngine` / `IsolationTxn` / `StatementView` 扩展接口，旧 API 语义 100% 保持；
+2. **Q02 (RR lazy view 解耦)**: `mvcc/transaction.go` 延迟到首个普通 SELECT 建立 ViewToken 并 pin，首读前 Guard 仍受起始 TS 保护；
+3. **Q03 (RC per-statement 捕获)**: 单条语句所有算子（Scan/Join/Subquery/CTE）共享一个 `StatementView`，语句结束在 defer 中安全归还；
+4. **Q04 (B02 baseline 复制限制)**: 维持本地单机校验，复制集群下不支持未共识 baseline 写入，严格 Fail-Closed 保证集群一致性；
+5. **Q05 (RU 跨事务安全脏读)**: `mvcc/dirty_registry.go` 发布只读快照镜像，并发 Reader 深拷贝采样，杜绝 Go map 竞态 panic；
+6. **Q06 (SER 复杂形态 Fail-Closed)**: 单表加锁保护，多表 JOIN/CTE/视图/集合/聚合直接返回 Error 3108 Fail-Closed，拒绝隐式降级；
+7. **Q07 (RC 保守 Gap 锁)**: 唯一键与外键校验保留必要 Gap 锁，优先保证数据完整性；
+8. **Q08 (pendingNext 消费时机)**: 在显式 BEGIN、隐式事务首条 DML 及 autocommit=1 真正启动点统一消费，纯元数据不误消费；
+9. **Q09 (RU 内存配额硬限制)**: 根事务最大 10,000 键、16MB 内存，全局最大 64MB，超限返回 `storageengine.ErrViewBudgetLimit`，杜绝 OOM；
+10. **Q10 (RC 合规写 Baseline 校验)**: 锁下观测最新版本并更新 baseline，提交对比 `latest > baseline`，消除假冲突与丢失更新。

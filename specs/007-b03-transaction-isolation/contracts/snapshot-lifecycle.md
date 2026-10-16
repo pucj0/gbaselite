@@ -1,5 +1,7 @@
 # Contract: RR Lazy, RC Statement Views, GC and Lifetime
 
+**Status**: 最终已实现与闭环行为契约 (Phase 9 Release Candidate Verified)
+
 ## Read routing matrix
 
 | isolation | Plain consistent SELECT | Explicit `FOR UPDATE` / `FOR SHARE` | DML target / constraint reads |

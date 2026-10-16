@@ -1,5 +1,7 @@
 # Contract: Write Validation and Current-Read Baselines
 
+**Status**: 最终已实现与闭环行为契约 (Phase 9 Release Candidate Verified)
+
 ## Invariants inherited from B01/B02
 
 B01 plain snapshot validation checks `latestCommittedChange(dep) > readTS`. B02 added a **per-key observation baseline** only after a valid current-read lock grant; unobserved keys continue to use their original readTS. The baseline must be validated again at commit, including the replicated apply policy. `Command.Snapshot` / WAL / Raft schema cannot be casually expanded.

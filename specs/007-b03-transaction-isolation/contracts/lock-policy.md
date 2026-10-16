@@ -1,5 +1,7 @@
 # Contract: Isolation-Aware B02 Lock Behavior
 
+**Status**: 最终已实现与闭环行为契约 (Phase 9 Release Candidate Verified)
+
 ## Ordinary reads / locking reads / DML
 
 | Level | Plain SELECT | SELECT FOR UPDATE / SHARE | DML locked writes | Gap / phantom expectations |

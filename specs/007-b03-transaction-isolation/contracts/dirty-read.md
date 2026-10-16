@@ -1,5 +1,7 @@
 # Contract: RU Uncommitted Visibility Without Dirty Writes
 
+**Status**: 最终已实现与闭环行为契约 (Phase 9 Release Candidate Verified)
+
 **Core requirement**: RU must be capable of observing another active root's **completed, merged, not-yet-committed** stage changes. A committed `Store.Get(Head)` is RC, not RU. **No unsafe direct read of writable stage file/memory**.
 
 ## Source and visibility model

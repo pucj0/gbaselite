@@ -59,3 +59,22 @@
 - 不承诺 RU 每次都看到尚未提交的新值，只验证在受控可观测窗口中“能够看见”。
 - 不通过全局互斥锁串行化所有事务来伪造 SER。
 - 不在本轮自动创建分支、修改代码、运行测试、制作 Release、重启服务。
+
+---
+
+## Q01–Q10 最终技术决议与实施对照（Phase 9 RC 审计）
+
+依据 Commit `a7e80a42e3fdf6ba01e996c9a18559109650c67f` 的实际落地实现，回写 Q01–Q10 的最终实施结果、设计差异、现存限制与测试依据：
+
+| 问题编号 | 核心问题与设计初衷 | 最终落地实施结果 | 与早期设计的差异说明 | 现存限制与测试依据 |
+|---|---|---|---|---|
+| **Q01** | `storageengine.Txn` 旧 Go API 的 Snapshot 语义是否必须完全不变？ | **严格落实**。所有旧 Go API 契约保持原有快照隔离，`storageengine/isolation.go` 新增中立的可选扩展能力接口 `IsolationEngine` / `IsolationTxn` / `StatementView`。 | 实现完全吻合早期设计，未改动底层最小 Engine 接口。 | **限制**：非 SQL 调用方仍使用原生快照；测试依据：`storageengine/isolation_test.go:TestStorageEngineContract_PreserveExisting`。 |
+| **Q02** | RR lazy view 的 pin 与 B01 root register 的 `readTS` 是否解耦？ | **严格落实**。`Store.Begin` 初始化事务结构但不预占 pin，首次 plain SELECT 通过 `BeginConsistentView` 建立 ViewToken 并增加引用计数；提交时根据依赖类型核验。 | 实现了延迟建立，但在首读前被 Guard 的键严格保留起始时间戳基线，防止并发写绕过冲突检测。 | **限制**：锁定读不确立普通快照；测试依据：`executor/isolation_rr_test.go:TestM08_RR_LazyFirstReadTiming`。 |
+| **Q03** | RC per-statement Head 捕获时点？ | **严格落实**。在 Raft Barrier 之后、Statement Physical Bind 之前分配独立 `StatementView`，在 defer 中随语句结束调用 `view.Close()` 归还资源。 | 早期草案提议每个算子自取，最终改为单语句内所有算子（含子查询与 CTE）共享原子快照，消除了 Torn Read。 | **限制**：长复杂语句仍受单语句生命周期限制；测试依据：`executor/isolation_rc_test.go:TestM13_RC_NonRepeatableRead`。 |
+| **Q04** | B02 observed baseline 的复制集群实现？ | **严格落实 Fail-Closed**。复制集群模式下不支持跨节点 Carrying Baseline 验证，保持本地安全核验，未改动 Raft Command / WAL 格式。 | 早期曾探讨跨节点传递 baseline，但受宪法持久化格式冻结约束，正式决议采用 Fail-Closed 拒绝。 | **限制**：复制集群下拒绝未共识 baseline 写入；测试依据：`storageengine/isolation_test.go:TestP7Fix01_CompatibilityMatrixAndReplicationGate`。 |
+| **Q05** | RU 跨事务脏读的内存与锁序安全？ | **严格落实内存快照**。Writer 在语句完成时通过 `mvcc/dirty_registry.go` 发布不可变脏数据快照，Reader 进行深拷贝采样；Rollback/断连时通过代次失效条目。 | 早期曾探讨直接共享内存，最终确认为避免 Go map 并发 panic 和锁争用，采用只读发布与深拷贝。 | **限制**：极大事务可能触发 16MB 内存上限；测试依据：`executor/isolation_ru_test.go:TestM34_RU_StageLifecycleAndSavepoint`。 |
+| **Q06** | SERIALIZABLE 复杂形态支持边界？ | **严格落实 Fail-Closed (Error 3108)**。单表点查与范围查施加 IS/S/Next-Key/Gap 锁；多表 JOIN、CTE、派生表、视图、集合 UNION、聚合直接拒绝。 | 早期曾考虑对 JOIN 驱动表加锁，后因无法保证被驱动表与谓词无幻读，正式实施保守 Fail-Closed 策略。 | **限制**：复杂分析查询在 SER 报 3108；测试依据：`executor/isolation_serializable_test.go:TestM27_SER_UnsupportedQueries`。 |
+| **Q07** | RC 下是否保留超出 MySQL 的保守 Gap 锁？ | **严格落实**。对于唯一性检查和外键依赖校验，保留必要 Gap 锁以防并发插入导致重复键或孤儿行。普通非约束扫描放宽间隙锁。 | 比原生 MySQL InnoDB 更加保守，优先保证嵌入式存储的强一致性与无损性。 | **限制**：高频并发插入可能发生轻微锁等待；测试依据：`executor/isolation_rc_test.go:TestM19_RC_UniquenessAndForeignKey`。 |
+| **Q08** | pendingNext 作用域状态消费时机？ | **严格落实**。在 `executor/transaction_engine.go` 的显式 BEGIN、隐式事务首条 DML 及 autocommit=1 真实启动点统一消费；纯元数据（SET/SHOW）不误消费。 | 解析阶段不消费，仅在事务真正创建并成功后消费，重试与失败时状态保持不丢。 | **限制**：跨连接不共享 pendingNext；测试依据：`executor/isolation_phase2_test.go:TestB03SetNextTransactionIsolation`。 |
+| **Q09** | RU Stage 内存与条数配额限制？ | **严格落实配额硬边界**。根事务最大 10,000 键、16MB 内存；全局所有事务最大 64MB。超限返回 `storageengine.ErrViewBudgetLimit` 拒绝脏读。 | 从最初无限制设计收敛为硬上限防御，彻底防止并发脏读大事务导致进程 OOM。 | **限制**：超大批量导入在 RU 下无法提供完整脏读；测试依据：`mvcc/isolation_view_test.go:TestP3Fix05_HistoryHorizonAndBudgetLimit`。 |
+| **Q10** | RC 合规写入是否误报旧版本冲突？ | **严格落实 Baseline 校验**。在 X 锁保护下获取最新已发布版本并写入 baseline，提交校验器命中 baseline 时对比 `latest > baseline`，消除假冲突。 | 彻底解决了 B01 时代使用 `latest > root.readTS` 导致长 RC 事务合法写操作被频繁误杀的问题。 | **限制**：无锁快照写仍受 `latest > readTS` 保护；测试依据：`executor/isolation_rc_test.go:TestM17_RC_LegalCurrentWrite`。 |
