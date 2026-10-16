@@ -4,7 +4,7 @@
 - **Phase**: Phase 9: Documentation, Traceability & RC Gate (T077–T083)
 - **Status**: **Release Candidate Ready (待用户最终授权)**
 - **Branch**: `master`
-- **Git Baseline HEAD**: `a7e80a42e3fdf6ba01e996c9a18559109650c67f`
+- **Git Baseline HEAD**: `87192c505830603e4da4b5d433d24ad0ffed5f73`
 - **Date**: 2026-10-16
 
 ---
@@ -50,20 +50,21 @@ GBaseLite B03 实现了完整的 SQL 事务隔离级别状态机、多版本并�
 
 ## 3. 全量 CI 运行证据 (GitHub Actions 真实数据)
 
-基线提交 Commit `a7e80a42e3fdf6ba01e996c9a18559109650c67f` 的远程自动化构建与测试结果：
+基线提交 Commit `87192c505830603e4da4b5d433d24ad0ffed5f73` 的远程自动化构建与测试结果：
 
-- **Test 工作流**: [Run 38873625427](https://github.com/pucj0/gbaselite/actions/runs/38873625427) (**100% SUCCESS**)
-  - `quality (ubuntu-latest)` (Job: `116883342711`): **SUCCESS**
+- **Test 工作流**: [Run 38876080043](https://github.com/pucj0/gbaselite/actions/runs/38876080043) (**100% SUCCESS**)
+  - `build (ubuntu-latest, linux, gbaselite)`: **SUCCESS**
+  - `build (windows-latest, windows, gbaselite.exe)`: **SUCCESS**
+  - `quality (ubuntu-latest)` (Job: `116891346299`): **SUCCESS**
     - Step 7 `Failover race regression`: **SUCCESS** (10 轮 race 全部通过)
     - Step 8 `MVCC transaction race regression`: **SUCCESS**
     - Step 9 `Lock manager race regression`: **SUCCESS** (2 轮 race 全部通过)
-  - `quality (windows-latest)` (Job: `116883342645`): **SUCCESS**
-  - `build (ubuntu-latest / windows-latest)`: **SUCCESS**
-  - `mysql-8-client` (Job: `116886347892`): **SUCCESS**
-  - `mysql-84-parity` (Job: `116886347761`): **SUCCESS**
+  - `quality (windows-latest)` (Job: `116891345896`): **SUCCESS**
+  - `mysql-8-client` (Job: `116894600583`): **SUCCESS**
+  - `mysql-84-parity` (Job: `116894600579`): **SUCCESS**
     - Step 5 `Run MySQL 8.4 M01-M44 Parity Suite`: **SUCCESS**（反向注入失败校验与 44 项全量对拍全部通过）
     - Step 6 `Upload Parity Report Artifact`: **SUCCESS**（产物 `b03-parity-report`）
-- **Docker 构建工作流**: [Run 38873625392](https://github.com/pucj0/gbaselite/actions/runs/38873625392) (**SUCCESS**)
+- **Docker 构建工作流**: [Run 38876080024](https://github.com/pucj0/gbaselite/actions/runs/38876080024) (**SUCCESS**)
 
 ---
 

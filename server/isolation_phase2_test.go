@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"gbaselite/executor"
+	"gbaselite/parser"
 	"gbaselite/protocol"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -487,5 +488,101 @@ func TestB03IsolationCOMResetConnectionProtocol(t *testing.T) {
 	}
 	if !strings.Contains(string(row), "REPEATABLE-READ") {
 		t.Fatalf("after COM_RESET_CONNECTION, row = %q, want REPEATABLE-READ", string(row))
+	}
+}
+
+// TestB03IsolationPrecedenceAndReset covers T017:
+// Verifies precedence hierarchy (sessionDefault < pendingNext < activeTxn)
+// and reset lifecycle on disconnect, reconnect, and COM_RESET_CONNECTION.
+func TestB03IsolationPrecedenceAndReset(t *testing.T) {
+	engine, err := openTestEngine(t, t.TempDir(), "root", "123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	session := &executor.Session{}
+
+	// 1. Initial connection defaults to REPEATABLE READ
+	if session.SessionDefaultIsolation() != parser.LevelRepeatableRead {
+		t.Fatalf("initial sessionDefault = %v, want REPEATABLE READ", session.SessionDefaultIsolation())
+	}
+	if _, ok := session.PendingNextIsolation(); ok {
+		t.Fatalf("initial pendingNext must be unset")
+	}
+	if _, ok := session.ActiveIsolation(); ok {
+		t.Fatalf("initial activeIsolation must be unset")
+	}
+
+	// 2. Set session default to READ COMMITTED
+	if _, err := ExecuteCompatible(engine, session, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		t.Fatalf("SET SESSION RC: %v", err)
+	}
+	if session.SessionDefaultIsolation() != parser.LevelReadCommitted {
+		t.Fatalf("sessionDefault = %v, want READ COMMITTED", session.SessionDefaultIsolation())
+	}
+
+	// 3. Set pendingNext to SERIALIZABLE (precedence: pendingNext overrides sessionDefault for next txn)
+	if _, err := ExecuteCompatible(engine, session, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"); err != nil {
+		t.Fatalf("SET TRANSACTION SER: %v", err)
+	}
+	if p, ok := session.PendingNextIsolation(); !ok || p != parser.LevelSerializable {
+		t.Fatalf("pendingNext = %v, want SERIALIZABLE", p)
+	}
+
+	// 4. Begin transaction: activeTxn adopts pendingNext (SERIALIZABLE) and clears pendingNext
+	if _, err := ExecuteCompatible(engine, session, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	if a, ok := session.ActiveIsolation(); !ok || a != parser.LevelSerializable {
+		t.Fatalf("activeIsolation = %v, want SERIALIZABLE", a)
+	}
+	if _, ok := session.PendingNextIsolation(); ok {
+		t.Fatalf("pendingNext was not consumed upon BEGIN")
+	}
+
+	// 5. While activeTxn is running, change sessionDefault to READ UNCOMMITTED:
+	// Active transaction isolation must remain frozen at SERIALIZABLE (precedence: activeTxn > sessionDefault)
+	if _, err := ExecuteCompatible(engine, session, "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"); err != nil {
+		t.Fatalf("SET SESSION RU inside active txn: %v", err)
+	}
+	if a, ok := session.ActiveIsolation(); !ok || a != parser.LevelSerializable {
+		t.Fatalf("activeIsolation changed to %v, must stay frozen at SERIALIZABLE", a)
+	}
+	if session.SessionDefaultIsolation() != parser.LevelReadUncommitted {
+		t.Fatalf("sessionDefault = %v, want READ UNCOMMITTED", session.SessionDefaultIsolation())
+	}
+
+	// 6. Commit transaction: activeTxn is cleared
+	if _, err := ExecuteCompatible(engine, session, "COMMIT"); err != nil {
+		t.Fatalf("COMMIT: %v", err)
+	}
+	if _, ok := session.ActiveIsolation(); ok {
+		t.Fatalf("activeIsolation must be cleared after COMMIT")
+	}
+
+	// 7. Next transaction without pendingNext adopts sessionDefault (READ UNCOMMITTED)
+	if _, err := ExecuteCompatible(engine, session, "BEGIN"); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	if a, ok := session.ActiveIsolation(); !ok || a != parser.LevelReadUncommitted {
+		t.Fatalf("activeIsolation = %v, want READ UNCOMMITTED from sessionDefault", a)
+	}
+	if _, err := ExecuteCompatible(engine, session, "ROLLBACK"); err != nil {
+		t.Fatalf("ROLLBACK: %v", err)
+	}
+
+	// 8. ResetConnection lifecycle reset: resets sessionDefault to RR, clears pending and active
+	_ = session.SetSessionIsolation(parser.LevelReadCommitted)
+	_ = session.SetNextTransactionIsolation(parser.LevelSerializable)
+	engine.ResetConnection(session)
+
+	if session.SessionDefaultIsolation() != parser.LevelRepeatableRead {
+		t.Fatalf("after ResetConnection, sessionDefault = %v, want REPEATABLE READ", session.SessionDefaultIsolation())
+	}
+	if _, ok := session.PendingNextIsolation(); ok {
+		t.Fatalf("after ResetConnection, pendingNext must be cleared")
+	}
+	if _, ok := session.ActiveIsolation(); ok {
+		t.Fatalf("after ResetConnection, activeIsolation must be cleared")
 	}
 }
