@@ -126,11 +126,38 @@ func (s *Store) ResetLockEpoch(term uint64) int {
 	if generation == binding.storeGeneration && term < binding.storeTerm {
 		return 0
 	}
-	epochChanged := generation != binding.storeGeneration || term != binding.storeTerm
+	// Idempotency: an identical (generation, term) transition is a strict no-op.
+	if generation == binding.storeGeneration && term == binding.storeTerm {
+		return 0
+	}
 	binding.storeGeneration = generation
 	binding.storeTerm = term
-	if s.dirtyRegistry != nil && epochChanged {
+	if s.dirtyRegistry != nil {
 		s.dirtyRegistry.Reset(generation, term)
+	}
+	return binding.manager.ResetEpoch(generation, term)
+}
+
+// ForceResetLockEpoch unconditionally invalidates all lock owners, releases grants,
+// cancels pending requests, and resets the dirty registry for the current generation and term.
+// Used explicitly upon leader loss (step down) to clear all locks on the former leader even before
+// a new term has been established.
+func (s *Store) ForceResetLockEpoch(term uint64) int {
+	generation := s.generation.Load()
+	binding := s.locks
+	if binding == nil {
+		if s.dirtyRegistry != nil {
+			s.dirtyRegistry.ForceReset(generation, term)
+		}
+		return 0
+	}
+	binding.epochMu.Lock()
+	defer binding.epochMu.Unlock()
+
+	binding.storeGeneration = generation
+	binding.storeTerm = term
+	if s.dirtyRegistry != nil {
+		s.dirtyRegistry.ForceReset(generation, term)
 	}
 	return binding.manager.ResetEpoch(generation, term)
 }

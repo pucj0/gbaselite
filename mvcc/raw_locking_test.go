@@ -898,3 +898,164 @@ func TestB02ChildRawWriteLocksTheRoot(t *testing.T) {
 	}
 	f.requireIdle()
 }
+
+// TestP7FinalLock02_RealLockBindingIdempotentResetAndTransition covers P7-FINAL-LOCK-01 & 02:
+// Verifies that ResetLockEpoch is strictly idempotent when called on the same epoch,
+// preserving held locks, queued waiters, and dirty versions without releasing or invalidating them,
+// while a real term transition (N -> N+1) synchronously invalidates old locks and dirty versions.
+func TestP7FinalLock02_RealLockBindingIdempotentResetAndTransition(t *testing.T) {
+	f := newRawLockFixture(t)
+	ctx := context.Background()
+
+	// 1. Root A acquires Record X on rawKey, and publishes dirty version
+	txA := f.begin()
+	defer txA.Rollback()
+	if err := txA.Put(rawSpace, rawKey, []byte("valA")); err != nil {
+		t.Fatal(err)
+	}
+	versionsA, err := txA.CollectDirtyVersions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.DirtyRegistry().Publish(txA.ID, txA.Generation(), txA.Term(), versionsA); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify A holds Record X
+	if mode, ok := f.manager.HeldMode(txA.ID, sqlShapedRecord()); !ok || mode != lockmanager.ModeX {
+		t.Fatalf("txA does not hold ModeX: %v, %v", mode, ok)
+	}
+
+	// 2. Root B requests the same record, blocking behind A
+	txB := f.begin()
+	defer txB.Rollback()
+	bDone := make(chan error, 1)
+	go func() {
+		bDone <- txB.Put(rawSpace, rawKey, []byte("valB"))
+	}()
+	f.awaitPending(txB.ID, 1)
+
+	// Verify wait edge txB -> txA exists
+	edges := f.manager.WaitEdges()
+	if len(edges) == 0 || edges[0].FromRootID != txB.ID || edges[0].ToRootID != txA.ID {
+		t.Fatalf("unexpected wait edges: %v", edges)
+	}
+
+	// 3. Call ResetLockEpoch with the SAME term (idempotent call, generation unchanged)
+	affected := f.store.ResetLockEpoch(0)
+	if affected != 0 {
+		t.Fatalf("idempotent ResetLockEpoch affected %d owners, want 0", affected)
+	}
+
+	// Verify: A's lock MUST STILL EXIST!
+	if mode, ok := f.manager.HeldMode(txA.ID, sqlShapedRecord()); !ok || mode != lockmanager.ModeX {
+		t.Fatalf("txA lost ModeX lock after idempotent ResetLockEpoch: %v, %v", mode, ok)
+	}
+
+	// Verify: B MUST STILL BE WAITING behind A, not invalidated!
+	select {
+	case err := <-bDone:
+		t.Fatalf("txB unexpectedly unblocked after idempotent ResetLockEpoch: %v", err)
+	default:
+	}
+	if pending := f.manager.PendingRequests(txB.ID); pending != 1 {
+		t.Fatalf("txB pending requests = %d, want 1", pending)
+	}
+
+	// Verify: DirtyRegistry still has txA's version!
+	snap, err := f.store.DirtyRegistry().Sample("reader")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := snap.Get(rawSpace, rawKey); !ok || string(d.Value) != "valA" {
+		t.Fatalf("dirty registry lost valA on idempotent ResetLockEpoch: %v, %v", d, ok)
+	}
+
+	// 4. Second idempotent ResetLockEpoch call must still be a no-op
+	if affected := f.store.ResetLockEpoch(0); affected != 0 {
+		t.Fatalf("second idempotent ResetLockEpoch affected %d owners, want 0", affected)
+	}
+
+	// 5. A rolls back: releases lock, B acquires lock and finishes successfully without conflict
+	if err := txA.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-bDone:
+		if err != nil {
+			t.Fatalf("txB Put failed after txA rollback: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("txB never unblocked after txA rollback")
+	}
+	if _, err := txB.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.requireIdle()
+
+	// 6. Test real Epoch Transition (Term 0 -> Term 1)
+	txC := f.begin()
+	defer txC.Rollback()
+	k2 := []byte("k2")
+	if err := txC.Put(rawSpace, k2, []byte("valC")); err != nil {
+		t.Fatal(err)
+	}
+	versionsC, _ := txC.CollectDirtyVersions()
+	_ = f.store.DirtyRegistry().Publish(txC.ID, txC.Generation(), txC.Term(), versionsC)
+
+	txD := f.begin()
+	defer txD.Rollback()
+	dDone := make(chan error, 1)
+	go func() {
+		dDone <- txD.Put(rawSpace, k2, []byte("valD"))
+	}()
+	f.awaitPending(txD.ID, 1)
+
+	// Transition to Term 1!
+	affectedTerm := f.store.ResetLockEpoch(1)
+	if affectedTerm == 0 {
+		t.Fatal("ResetLockEpoch(1) to higher term affected 0 owners, want > 0")
+	}
+
+	// txD must receive ErrLockInvalidated!
+	select {
+	case err := <-dDone:
+		if !errors.Is(err, lockmanager.ErrLockInvalidated) {
+			t.Fatalf("txD expected ErrLockInvalidated, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("txD never unblocked on term transition")
+	}
+
+	// Dirty registry must be purged of old term versions!
+	snapTerm, err := f.store.DirtyRegistry().Sample("reader")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := snapTerm.Get(rawSpace, k2); ok {
+		t.Fatalf("old term dirty version survived term transition: %v", d)
+	}
+
+	// 7. New transaction under Term 1 can acquire locks normally
+	propTerm1 := &barrierInterleavingProposer{
+		Store: f.store,
+		term:  1,
+	}
+	txE, err := f.store.Begin(ctx, propTerm1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txE.Rollback()
+	if err := txE.Put(rawSpace, k2, []byte("valE")); err != nil {
+		t.Fatalf("txE in term 1 failed to acquire lock: %v", err)
+	}
+
+	// Repeated ResetLockEpoch(1) on same Term 1 is idempotent and does not kill txE!
+	if aff := f.store.ResetLockEpoch(1); aff != 0 {
+		t.Fatalf("repeated ResetLockEpoch(1) affected %d owners, want 0", aff)
+	}
+	if _, err := txE.Commit(ctx); err != nil {
+		t.Fatalf("txE commit failed: %v", err)
+	}
+	f.requireIdle()
+}

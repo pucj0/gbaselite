@@ -345,7 +345,7 @@ func (n *Node) onLeaderLoss(eventTenure uint64, eventTerm uint64) {
 	n.leadershipMu.Unlock()
 
 	if n.store != nil {
-		n.store.ResetLockEpoch(eventTerm)
+		n.store.ForceResetLockEpoch(eventTerm)
 	}
 }
 

@@ -1025,3 +1025,59 @@
   - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean。
 - **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
 - **最终结论**: **FIX-01 至 FIX-04 全部彻底关闭，GBaseLite B03 Phase 7 最终定点修复全部完成**。
+
+---
+
+## 32. Phase 7 Lock Epoch 最终安全修复 (P7-FINAL-LOCK-01 至 P7-FINAL-LOCK-03 + Gate)
+
+- **基线 Commit**: `09b02ea605fec96295d0aaa90fb87a548cb25f5c`
+- **核查与修复项详情**:
+
+### 1. P7-FINAL-LOCK-01：同 Epoch 重置意外释放锁彻底修复 (P0 - RESOLVED)
+- **原因与风险**: `mvcc/locking.go:ResetLockEpoch` 在 Generation 和 Term 完全不变时，原实现仍然无条件调用了底层的 `binding.manager.ResetEpoch`，导致锁管理器终止了所有活跃 Root Lock Owner、清空了所有已授予锁、并撤销了所有等待中的请求，严重违背了“同 Epoch 重复调用必须幂等、无副作用”的架构契约；
+- **红测先行**: `mvcc/raw_locking_test.go:TestP7FinalLock02_RealLockBindingIdempotentResetAndTransition`：复现持有锁与等待队列在相同 Term 下调用 `ResetLockEpoch` 被意外清空的红测失败（`idempotent ResetLockEpoch affected 2 owners, want 0`）；
+- **修复方案**:
+  1. `ResetLockEpoch` 建立严格幂等前置拦截：当 `generation == binding.storeGeneration && term == binding.storeTerm` 时，直接返回 `0`，绝不调用底层的 `binding.manager.ResetEpoch`，锁表状态、活跃 Owner、等待队列与脏注册表完全不受任何破坏；
+  2. 严格区分普通幂等代次同步与强制领导者下台清理：新增 `Store.ForceResetLockEpoch(term)` 专用于 Raft 复制节点下台（`onLeaderLoss`）时主动清理旧任期持锁；
+  3. `DirtyRegistry` 与 `LockManager` 保持严格一致的代次判定逻辑，单调递增，杜绝旧代次覆盖当前代次；
+- **绿测证据**: `TestP7FinalLock02_RealLockBindingIdempotentResetAndTransition` (PASS)。
+
+### 2. P7-FINAL-LOCK-02：真实 B02 Lock Manager 绑定与确定性并发验证 (P0 - RESOLVED)
+- **测试实现**: `mvcc/raw_locking_test.go:TestP7FinalLock02_RealLockBindingIdempotentResetAndTransition`（依托 `newRawLockFixture(t)` 真实绑定 B02 锁管理器与注入式等待时钟）：
+  1. **相同 Epoch 幂等性确证**：
+     - Root A 申请并持有 `rawKey` 的 Record X 锁，并发布脏版本；
+     - Root B 在独立 Goroutine 中请求同一记录，确定性进入等待队列（`f.awaitPending(txB.ID, 1)`，`WaitEdges` 精确记录 `txB.ID -> txA.ID`）；
+     - 连续两次调用 `f.store.ResetLockEpoch(0)`（Generation 与 Term 均不变）：返回值严格为 0；A 的 Record X 锁完好保留；B 依然处于等待队列，未收到 `ErrLockInvalidated`；脏注册表依然持有 A 的脏版本；
+     - A 正常 Rollback 后，B 立即被唤醒并成功获得锁完成提交；
+  2. **跨 Term 切换同步失效与新 Term 隔离**：
+     - Root C 持锁，Root D 排队等待；
+     - 调用 `f.store.ResetLockEpoch(1)`（Term 0 $\rightarrow$ 1）：旧 Owner C 被失效，等待者 D 立即收到 `lockmanager.ErrLockInvalidated` 唤醒并退出；Dirty Registry 中旧 Term 版本被同步清除；
+     - 在 Term 1 下启动的新事务 E 能正常获取同一键的锁；重复调用 `ResetLockEpoch(1)` 对 E 无任何副作用；
+  3. **确定性同步**：全流程基于锁队列与事件 Barrier 确证，零任意 Sleep 推测；
+- **绿测证据**: `TestP7FinalLock02_RealLockBindingIdempotentResetAndTransition` (PASS)。
+
+### 3. P7-FINAL-LOCK-03：全量状态无残留复验 (P0 - RESOLVED)
+- **复验项结果**:
+  - `TestP7FixR205_SavepointRollbackPublishErrorInjection`: PASS
+  - `TestP7FixR201_RestorePurgesDirtyRegistryAndRejectsStalePublish`: PASS
+  - `TestP7FixR202_PublishAndRollbackLinearization`: PASS
+  - `TestP7FixR203_LargeTransactionDecoupledFromDirtyBudget`: PASS
+  - `TestP7FixR204_DirtyIteratorBudgetAccounting`: PASS
+  - M29–M36（全部 8 项）: PASS
+- **残余状态审计**:
+  - `LockTableSize` = 0；
+  - `ActiveOwners` = 0；
+  - `PendingRequests` = 0；
+  - `WaitEdges` = 0；
+  - `StageReaders` 归零且物理文件删除（Stage Lease 无残留）；
+  - `DirtyRegistry.Sample("")` 条目数为 0（无 Ghost Dirty Version）。
+
+### 4. P7-FINAL-LOCK-04：全量回归与门禁结论
+- **全量测试与回归**:
+  - `mvcc` 确定性测试 100 轮全部通过（15.8s）；
+  - `executor` P7 及 P7Fix 测试 100 轮全部通过（184.3s）；
+  - 全库 21 个带测试包执行 `go test ./... -count=1` 100% 通过（总耗时 174.2s，EXIT CODE: 0）；
+  - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean；
+  - 架构规则测试 `TestSQLPackagesDoNotImportPhysicalBackends` 与 `TestProductionArchitectureBoundaries` 100% PASS。
+- **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
+- **最终结论**: **P7-FINAL-LOCK-01 至 P7-FINAL-LOCK-03 全部彻底关闭，GBaseLite B03 Phase 7 最终安全门禁正式 PASS**。
