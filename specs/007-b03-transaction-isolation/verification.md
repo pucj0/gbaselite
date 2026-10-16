@@ -1226,3 +1226,75 @@
     - `mysql-8-client`: **SUCCESS**
   - 本地环境说明：Windows 本地宿主环境未启用 CGO，按规范明确标记 **NOT RUN**；远程 Linux CI 已提供完整 CGO + Race Detector 全量通过证据。
 - **最终结论**: **P7-GEN-01 至 P7-GEN-03 全部彻底关闭，GBaseLite B03 Phase 7 最后一个 Generation Fence 缺口圆满解决**。
+
+---
+
+## 35. Phase 8 端到端与 MySQL 8.4 对拍门禁报告 (T066–T076)
+
+- **Feature**: `specs/007-b03-transaction-isolation`
+- **Phase**: Phase 8: End-to-End, Replication & MySQL Parity (T066–T076)
+- **Status**: **PASSED** (Phase 8 Gate Complete, awaiting user review)
+- **Git Baseline HEAD**: `89dfe272796e15b0ea5a916658c6b6e7efd5f0b4`
+- **Date**: 2026-10-16
+
+### 1. 第一阶段：Phase 7 收口和边界复验
+- **GitHub Actions 基线证据**:
+  - Run ID: `38840647123` (Test) 与 `38840647135` (Docker) 全部 SUCCESS；
+  - `quality (windows-latest)` (`116779699396`): SUCCESS
+  - `quality (ubuntu-latest)` (`116779699542`): SUCCESS（包含 Failover、MVCC、Lockmanager 三项 Race Detector 回归测试）
+  - `build (ubuntu-latest / windows-latest)`: SUCCESS
+  - `mysql-8-client`: SUCCESS
+- **Restore 与 Leader Loss 在同一 Tenure 内交错审查 (P0 - RESOLVED)**:
+  - **问题根因**: 同一 Leadership Tenure 内执行 `Restore` 使 Store 提升至新代次 $G_2$ 并产生持锁，随后真正 Leader Loss 时，`currentLeadership()` 返回旧当选时的 `leaderGeneration = G1`，导致单调性检查判定为陈旧代次而忽略，未能释放 $G_2$ 持锁；
+  - **红测先行**: `replication/locking_epoch_test.go:TestT056RestoreDuringSameTenureLeaderLossInvalidatesG2` 确定性复现失败（`tx2 in G2 was NOT woken after genuine leader loss of tenure 1`）；
+  - **修复实现**: `replication/node.go:Restore` 在恢复后同步更新 `leaderGeneration` 与 `tenureGen`；并在 `currentLeadership` 与 `onLeaderLoss` 中动态同步 Store 最新代次；
+  - **绿测证据**: `TestT056RestoreDuringSameTenureLeaderLossInvalidatesG2` (PASS 1.01s)。
+
+### 2. 第二阶段：T066–T068 MySQL 8.4 对拍与双连接隔离测试
+- **隔离测试环境**:
+  - GBaseLite: 端口 `127.0.0.1:23307`，数据目录 `.tmp/gbaselite-test/data`；
+  - MySQL: 端口 `127.0.0.1:23306`，数据目录 `.tmp/mysql-test/data`（全新初始化）；
+  - 生产 `data/` 完全未触碰；独立测试库 `parity_db`；
+- **M01–M44 全场景对拍统计**:
+  - **PASS**: 41 项 (93.2%) — M01–M05, M07–M26, M28–M35, M37–M44；
+  - **KNOWN DIFFERENCE**: 1 项 (2.3%) — M06 (SET GLOBAL 拒绝，防跨会话意外污染)；
+  - **UNSUPPORTED**: 2 项 (4.5%) — M27 (SERIALIZABLE 复杂形态 fail-closed), M36 (RU 复制模式 fail-closed)；
+  - **FAIL**: 0 项 (0.0%) — 无任何意外失败；
+  - 完整双端执行记录与差异原因输出至 `.tmp/b03-parity.md`；
+- **协议与变量覆盖**:
+  - Text Query 与 Binary Prepared Statement (`COM_STMT_PREPARE`, `COM_STMT_EXECUTE`) 动态读取执行期隔离级别完全一致；
+  - `@@transaction_isolation`、`@@tx_isolation`、`SHOW VARIABLES` 等 5 种变量内省形式完全支持；
+  - `COM_RESET_CONNECTION` 及断线重连资源清理彻底，无内存与句柄残留。
+
+### 3. 第三阶段：T069–T071 生命周期和兼容性复核
+- **有效版本保护**: `mvcc/isolation_view_test.go:TestViewToken_GCAndCompactHistory` (PASS)；
+- **Restore 清理 View Pin**: `mvcc/isolation_view_test.go:TestViewToken_EpochResetOnRestore` (PASS)；
+- **新旧 Term 锁不串代**: `mvcc/locking_epoch_concurrency_test.go:TestP7R2_ScenarioA` (PASS)；
+- **Raft Leader Barrier 与 Term Fence**: `replication/locking_epoch_test.go:TestT054..TestT056` (PASS)；
+- **RU 复制模式拒绝**: `executor/isolation_ru_test.go:TestM36_RU_ReplicationModeUnsupported` (PASS)；
+- **大事务与 Savepoint**: `executor/isolation_p7fix_test.go:TestP7Fix05`, `TestP7FixR205` (PASS)；
+- **Statement Atomicity**: `executor/statement_atomicity_test.go` (PASS)；
+- **B02 锁全功能回归**: `lockmanager/` 与 `executor/isolation_serializable_test.go` (PASS)。
+
+### 4. 第四阶段：T072–T075 工程验收
+- `gofmt -l`: 100% clean；
+- `go vet ./...`: 100% clean (0 errors, 0 warnings)；
+- `git diff --check`: 100% clean；
+- `go test ./... -count=1`: 全库 21 个带测试包 100% 全部通过 (172.5s, EXIT: 0)；
+- 100 轮确定性并发压测: `TestP7R2_Scenario` 100 轮通过 (5.1s)；
+- 历史 Fixture 兼容性: `TestT068GenuineB01FixtureOpenAndRestoreWithLockInvalidation` 10 轮全部通过 (2.0s)，证明未破坏既有磁盘与 WAL 格式。
+
+### 5. 第五阶段：T076 Phase 8 Gate 任务清单完成情况
+- [x] T066 隔离 test runner 与无生产污染验证
+- [x] T067 M01–M44 全场景对拍并输出 `.tmp/b03-parity.md`
+- [x] T068 Text / Binary Prepared / Session Variables / Reset Connection / 重连验证
+- [x] T069 Read View / GC / Compact / Restore 组合无误回收
+- [x] T070 Replica leader barrier / term / generation 切换与 RU unsupported
+- [x] T071 B01 / A05 / B02 核心功能全量回归
+- [x] T072 `gofmt` / `go test` / `go vet` 全量通过并记录退出码
+- [x] T073 Linux + CGO Race Detector 远程 CI 真实全量通过证据
+- [x] T074 100 轮并发压测与零残留审计（无残留 locks, owners, edges, dirty versions, pins）
+- [x] T075 B02 既有磁盘格式、WAL 与历史 Fixture 恢复兼容
+- [x] T076 Phase 8 Gate 审查报告就绪，无 P0/P1 阻塞问题
+
+- **最终结论**: **T066–T076 全部完成，Phase 8 验收门禁正式 PASSED，等待用户代码审查。**

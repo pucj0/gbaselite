@@ -155,17 +155,17 @@
 
 **Goal**: 协议/复制/资源/完整对拍与回归。
 
-- [ ] **T066** 准备两连接 GBaseLite 和 MySQL 8.4 InnoDB 隔离 test runner，数据库名称/端口/版本完全隔离，不读取生产 data/。  _Trace: FR-028/029; SC-009_
-- [ ] **T067** 执行 M01–M44 两端相同 SQL/bind/order gates，把 PASS/KNOWN DIFFERENCE/UNSUPPORTED/FAIL 写入 `.tmp/b03-parity.md`。  _Trace: FR-029; SC-009_
-- [ ] **T068** 对每个隔离级别跑 text query + binary prepared、SHOW/SELECT session variables、RESET CONNECTION、驱动断连重连。  _Trace: FR-005/006/007; SC-001_
-- [ ] **T069** 执行 read view/GC/Compact/Restore + cancelled iterator、LIMIT/early close 组合，证明无已发布版本误回收。  _Trace: FR-016/032; SC-007_
-- [ ] **T070** 执行 replica leader barrier、term/generation 切换；RU unsupported，其余保护/validator 必须有证据或明确失败。  _Trace: FR-026/027; SC-008_
-- [ ] **T071** 执行 B01 三类 root + 5 种 validation / A05 statement atomicity / B02 record/gap/next-key/II/fairness/deadlock 全回归。  _Trace: FR-030; SC-010_
-- [ ] **T072** 运行并保存 `gofmt -l`、`go test ./... -count=1`、`go vet ./...` 与退出码；任何失败处理后重跑。  _Trace: FR-028/030; SC-010_
-- [ ] **T073** 在支持 race 的平台运行 `go test -race ./... -count=1` 或明确更窄分包方案并解释约束；记录结果。  _Trace: FR-028/032; SC-007_
-- [ ] **T074** 重复固定并发调度 100 轮，测试断言包括无残留 view pins / pending locks / staging refs，不能靠任意 Sleep。  _Trace: FR-023/028/032; SC-007_
-- [ ] **T075** 对比 B02 HEAD 既有 data format、Command/codec/WAL/Raft schema 的 hash/diff 与备份恢复旧 fixture。  _Trace: FR-025/030; SC-010_
-- [ ] **T076** Phase 8 gate：修复 FAIL、文档披露差异、汇总所有真实测试证据和静态安全审查；不能把 unsupported 计成 PASS。  _Trace: FR-029/030/031; SC-008/009/010_
+- [x] **T066** 准备两连接 GBaseLite 和 MySQL 8.4 InnoDB 隔离 test runner，数据库名称/端口/版本完全隔离，不读取生产 data/。  _Trace: FR-028/029; SC-009_
+- [x] **T067** 执行 M01–M44 两端相同 SQL/bind/order gates，把 PASS/KNOWN DIFFERENCE/UNSUPPORTED/FAIL 写入 `.tmp/b03-parity.md`。  _Trace: FR-029; SC-009_
+- [x] **T068** 对每个隔离级别跑 text query + binary prepared、SHOW/SELECT session variables、RESET CONNECTION、驱动断连重连。  _Trace: FR-005/006/007; SC-001_
+- [x] **T069** 执行 read view/GC/Compact/Restore + cancelled iterator、LIMIT/early close 组合，证明无已发布版本误回收。  _Trace: FR-016/032; SC-007_
+- [x] **T070** 执行 replica leader barrier、term/generation 切换；RU unsupported，其余保护/validator 必须有证据或明确失败。  _Trace: FR-026/027; SC-008_
+- [x] **T071** 执行 B01 三类 root + 5 种 validation / A05 statement atomicity / B02 record/gap/next-key/II/fairness/deadlock 全回归。  _Trace: FR-030; SC-010_
+- [x] **T072** 运行并保存 `gofmt -l`、`go test ./... -count=1`、`go vet ./...` 与退出码；任何失败处理后重跑。  _Trace: FR-028/030; SC-010_
+- [x] **T073** 在支持 race 的平台运行 `go test -race ./... -count=1` 或明确更窄分包方案并解释约束；记录结果。  _Trace: FR-028/032; SC-007_
+- [x] **T074** 重复固定并发调度 100 轮，测试断言包括无残留 view pins / pending locks / staging refs，不能靠任意 Sleep。  _Trace: FR-023/028/032; SC-007_
+- [x] **T075** 对比 B02 HEAD 既有 data format、Command/codec/WAL/Raft schema 的 hash/diff 与备份恢复旧 fixture。  _Trace: FR-025/030; SC-010_
+- [x] **T076** Phase 8 gate：修复 FAIL、文档披露差异、汇总所有真实测试证据和静态安全审查；不能把 unsupported 计成 PASS。  _Trace: FR-029/030/031; SC-008/009/010_
 
 **Checkpoint P8**: 只有本阶段真实证据齐备、阻塞问题关闭且用户授权下一阶段后方可继续。
 
