@@ -63,6 +63,38 @@ jobs:
         shell: bash
         run: bash ./scripts/ci/mysql8-client-smoke.sh
 
+  mysql-84-parity:
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mysql84:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: parity_ci_password
+          MYSQL_DATABASE: parity_db
+        ports:
+          - 33066:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+      - name: Run MySQL 8.4 M01-M44 Parity Suite
+        shell: bash
+        run: bash ./scripts/ci/mysql84-parity-runner.sh
+        env:
+          MYSQL_PORT: "33066"
+          MYSQL_ROOT_PASSWORD: parity_ci_password
+      - name: Upload Parity Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b03-parity-report
+          path: .tmp/b03-parity.md
+
   build:
     strategy:
       matrix:

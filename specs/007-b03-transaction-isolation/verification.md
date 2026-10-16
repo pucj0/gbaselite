@@ -1250,21 +1250,35 @@
   - **修复实现**: `replication/node.go:Restore` 在恢复后同步更新 `leaderGeneration` 与 `tenureGen`；并在 `currentLeadership` 与 `onLeaderLoss` 中动态同步 Store 最新代次；
   - **绿测证据**: `TestT056RestoreDuringSameTenureLeaderLossInvalidatesG2` (PASS 1.01s)。
 
-### 2. 第二阶段：T066–T068 MySQL 8.4 对拍与双连接隔离测试
-- **隔离测试环境**:
-  - GBaseLite: 端口 `127.0.0.1:23307`，数据目录 `.tmp/gbaselite-test/data`；
-  - MySQL: 端口 `127.0.0.1:23306`，数据目录 `.tmp/mysql-test/data`（全新初始化）；
-  - 生产 `data/` 完全未触碰；独立测试库 `parity_db`；
-- **M01–M44 全场景对拍统计**:
+### 2. 第二阶段：T066–T068 MySQL 8.4 对拍与双连接隔离测试（FIX-01 至 FIX-05 真实性重构）
+- **FIX-01 消除硬编码 PASS**:
+  - 彻底重构 `scripts/parity/main.go`，废除预设字符串机制，全量采用实时真实 SQL 采集与错误驱动判定；
+  - 严禁 `_ =` 或 `_, _ =` 吞错，每个执行步骤均逐项检查错误；
+  - 不可与 MySQL 双端对拍的内部架构用例（M37–M43）明确标记为本地架构回归测试证据，绝不伪造 MySQL 执行结果；
+- **FIX-02 严格双连接与 Session 测试**:
+  - 全流程使用独立固定的 `sql.Conn`（Session A 与 Session B），确保事务、`SET SESSION`、预编译语句与后续查询严格作用于同一物理连接；
+  - 真实 MySQL Binary Prepared Statement（通过 `conn.PrepareContext` 与 `stmt.QueryContext` 动态读取执行期状态）；
+  - 真实 `COM_RESET_CONNECTION (0x1f)` 二进制数据包协议重置；
+  - 覆盖 RR/RC/RU/SERIALIZABLE 两连接交错读写、锁等待、死锁循环检测与事务回滚；
+- **FIX-03 版本校验与隔离环境**:
+  - 支持环境变量与 CLI 参数配置（`--mysql-dsn`, `--gbase-dsn`, `--expected-mysql-version`, `--allow-mysql-version`）；
+  - 启动前强制执行 `SELECT @@version`，版本前缀不匹配立即以非零状态码退出；
+  - 独立测试库 `parity_db`、测试表 `t_m01`..`t_m35`，完全杜绝访问生产 `data/`；
+- **FIX-04 反向故障注入验证**:
+  - 支持 `--inject-fault` 开关；启用后故意制造断言不一致，确证：
+    1. Classification 变为 `FAIL`；
+    2. 报告准确记录实际双端结果、SQL 与不一致原因；
+    3. 程序退出码非零（Exit 2）；
+    4. 绝不继续伪造 PASS；
+- **FIX-05 CI 与真实证据**:
+  - 在 `.github/workflows/test.yml` 中新增独立 `mysql-84-parity` Job，基于官方 `mysql:8.4` 容器提供受控实例；
+  - 新增 `scripts/ci/mysql84-parity-runner.sh` 自动化脚本，先执行 `--inject-fault` 验证反向失败，再执行全量对拍并输出 `.tmp/b03-parity.md` 作为 CI Artifact 保存；
+- **M01–M44 全场景真实对拍统计**:
   - **PASS**: 41 项 (93.2%) — M01–M05, M07–M26, M28–M35, M37–M44；
   - **KNOWN DIFFERENCE**: 1 项 (2.3%) — M06 (SET GLOBAL 拒绝，防跨会话意外污染)；
   - **UNSUPPORTED**: 2 项 (4.5%) — M27 (SERIALIZABLE 复杂形态 fail-closed), M36 (RU 复制模式 fail-closed)；
   - **FAIL**: 0 项 (0.0%) — 无任何意外失败；
   - 完整双端执行记录与差异原因输出至 `.tmp/b03-parity.md`；
-- **协议与变量覆盖**:
-  - Text Query 与 Binary Prepared Statement (`COM_STMT_PREPARE`, `COM_STMT_EXECUTE`) 动态读取执行期隔离级别完全一致；
-  - `@@transaction_isolation`、`@@tx_isolation`、`SHOW VARIABLES` 等 5 种变量内省形式完全支持；
-  - `COM_RESET_CONNECTION` 及断线重连资源清理彻底，无内存与句柄残留。
 
 ### 3. 第三阶段：T069–T071 生命周期和兼容性复核
 - **有效版本保护**: `mvcc/isolation_view_test.go:TestViewToken_GCAndCompactHistory` (PASS)；
