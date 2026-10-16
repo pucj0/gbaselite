@@ -1273,12 +1273,18 @@
 - **FIX-05 CI 与真实证据**:
   - 在 `.github/workflows/test.yml` 中新增独立 `mysql-84-parity` Job，基于官方 `mysql:8.4` 容器提供受控实例；
   - 新增 `scripts/ci/mysql84-parity-runner.sh` 自动化脚本，先执行 `--inject-fault` 验证反向失败，再执行全量对拍并输出 `.tmp/b03-parity.md` 作为 CI Artifact 保存；
-- **M01–M44 全场景真实对拍统计**:
-  - **PASS**: 41 项 (93.2%) — M01–M05, M07–M26, M28–M35, M37–M44；
-  - **KNOWN DIFFERENCE**: 1 项 (2.3%) — M06 (SET GLOBAL 拒绝，防跨会话意外污染)；
-  - **UNSUPPORTED**: 2 项 (4.5%) — M27 (SERIALIZABLE 复杂形态 fail-closed), M36 (RU 复制模式 fail-closed)；
-  - **FAIL**: 0 项 (0.0%) — 无任何意外失败；
-  - 完整双端执行记录与差异原因输出至 `.tmp/b03-parity.md`；
+- **M01–M44 全场景分类独立统计（双端 SQL 对拍与内部架构分别统计）**:
+  1. **双端 SQL 对拍矩阵 (Section A: 37 项，涵盖 M01–M35, M39, M44)**:
+     - **PASS**: 35 项 (94.6%) — 双端执行真实 SQL，行为一致或符合规范；
+     - **KNOWN DIFFERENCE**: 1 项 (2.7%) — M06 (真实断言 GBaseLite 严格拒绝 SET GLOBAL，MySQL 接受；保护多连接全局状态)；
+     - **UNSUPPORTED**: 1 项 (2.7%) — M27 (真实断言 GBaseLite 在 SERIALIZABLE 下对多表 JOIN 直接报错 Error 3108 Fail-Closed，MySQL 正常执行)；
+     - **FAIL**: 0 项 (0.0%)；
+  2. **GBaseLite 内部架构与复制验收矩阵 (Section B: 7 项，涵盖 M36, M37, M38, M40, M41, M42, M43)**:
+     - **PASS**: 6 项 (85.7%) — 全部通过独立 Go 子测试真实执行验证（退出码严格为 0）：M37 (View GC 钉住历史)、M38 (Restore 强刷代次 Token)、M40 (视图与内存配额 Fail-Closed)、M41 (100 轮确定性调度零残留)、M42 (B01 历史持久化与 WAL 格式回归)、M43 (Raft 集群屏障与同代次下台清理)；
+     - **UNSUPPORTED**: 1 项 (14.3%) — M36 (通过执行 `TestM36_RU_ReplicationModeUnsupported` 证实复制拓扑下明确 Fail-Closed 返回 `ErrUnsupported`)；
+     - **FAIL**: 0 项 (0.0%)；
+  3. **总项目数汇总**: 44 项全覆盖（PASS: 41 项，KNOWN DIFFERENCE: 1 项，UNSUPPORTED: 2 项，FAIL: 0 项）；
+  - 完整双端执行记录、真实 SQL、返回值、错误与源码证据输出至 `.tmp/b03-parity.md`；
 
 ### 3. 第三阶段：T069–T071 生命周期和兼容性复核
 - **有效版本保护**: `mvcc/isolation_view_test.go:TestViewToken_GCAndCompactHistory` (PASS)；

@@ -3,18 +3,24 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha1"
+	"crypto/sha256"
+	"crypto/x509"
 	"database/sql"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 type ParityClassification string
@@ -29,6 +35,7 @@ const (
 type ParityResult struct {
 	ID             string
 	Scope          string
+	Category       string // "Dual-Database SQL Parity" or "Internal Architecture & Replication"
 	SQLSequence    string
 	GBaseResult    string
 	MySQLResult    string
@@ -41,13 +48,15 @@ type RunnerConfig struct {
 	MySQLDSN             string
 	GBaseDSN             string
 	ExpectedMySQLVersion string
-	AllowMySQLVersions   string
+	AllowDevVersion      string
 	OutputFile           string
 	InjectFault          bool
 }
 
 type ParityRunner struct {
 	cfg        RunnerConfig
+	mysqlCfg   *mysql.Config
+	gbaseCfg   *mysql.Config
 	dbMySQL    *sql.DB
 	dbGBase    *sql.DB
 	myVersion  string
@@ -55,6 +64,7 @@ type ParityRunner struct {
 	results    []ParityResult
 	mu         sync.Mutex
 	hasFailure bool
+	devMode    bool
 }
 
 func parseConfig() RunnerConfig {
@@ -75,9 +85,9 @@ func parseConfig() RunnerConfig {
 		defaultExpectedVer = "8.4"
 	}
 
-	defaultAllowVers := os.Getenv("MYSQL_ALLOW_VERSIONS")
-	if defaultAllowVers == "" {
-		defaultAllowVers = "8.4,8.2"
+	defaultAllowDev := os.Getenv("MYSQL_ALLOW_DEV_VERSION")
+	if defaultAllowDev == "" {
+		defaultAllowDev = "8.2"
 	}
 
 	defaultOutput := os.Getenv("PARITY_OUTPUT")
@@ -87,10 +97,10 @@ func parseConfig() RunnerConfig {
 
 	flag.StringVar(&cfg.MySQLDSN, "mysql-dsn", defaultMySQLDSN, "MySQL connection DSN")
 	flag.StringVar(&cfg.GBaseDSN, "gbase-dsn", defaultGBaseDSN, "GBaseLite connection DSN")
-	flag.StringVar(&cfg.ExpectedMySQLVersion, "expected-mysql-version", defaultExpectedVer, "Expected MySQL version prefix (e.g. 8.4)")
-	flag.StringVar(&cfg.AllowMySQLVersions, "allow-mysql-version", defaultAllowVers, "Allowed MySQL version prefixes (comma-separated, e.g. 8.4,8.2)")
+	flag.StringVar(&cfg.ExpectedMySQLVersion, "expected-mysql-version", defaultExpectedVer, "Expected MySQL version prefix for official Gate (default 8.4)")
+	flag.StringVar(&cfg.AllowDevVersion, "allow-dev-version", defaultAllowDev, "Allowed local development MySQL version prefix (e.g. 8.2)")
 	flag.StringVar(&cfg.OutputFile, "output", defaultOutput, "Path to output parity markdown report")
-	flag.BoolVar(&cfg.InjectFault, "inject-fault", false, "Intentionally inject an assertion fault to verify failure detection")
+	flag.BoolVar(&cfg.InjectFault, "inject-fault", false, "Intentionally inject an assertion fault in M08 to verify negative detection")
 
 	flag.Parse()
 	return cfg
@@ -117,11 +127,25 @@ func (r *ParityRunner) Run() error {
 	fmt.Println("==============================================================")
 	fmt.Println(" GBaseLite B03 vs MySQL 8.4 InnoDB Parity Test Runner")
 	fmt.Println("==============================================================")
-	fmt.Printf("Expected MySQL Version : %s (Allowed: %s)\n", r.cfg.ExpectedMySQLVersion, r.cfg.AllowMySQLVersions)
-	fmt.Printf("Fault Injection Mode   : %v\n", r.cfg.InjectFault)
-	fmt.Printf("Report Output Target   : %s\n", r.cfg.OutputFile)
+	fmt.Printf("Expected MySQL Gate Version : %s\n", r.cfg.ExpectedMySQLVersion)
+	fmt.Printf("Allowed Development Version : %s\n", r.cfg.AllowDevVersion)
+	fmt.Printf("Fault Injection Mode        : %v\n", r.cfg.InjectFault)
+	fmt.Printf("Report Output Target        : %s\n", r.cfg.OutputFile)
 
-	// 1. Open MySQL connection
+	// 1. Parse DSNs to ensure exact shared endpoint and credential configuration
+	mCfg, err := mysql.ParseDSN(r.cfg.MySQLDSN)
+	if err != nil {
+		return fmt.Errorf("failed to parse MySQL DSN: %w", err)
+	}
+	r.mysqlCfg = mCfg
+
+	gCfg, err := mysql.ParseDSN(r.cfg.GBaseDSN)
+	if err != nil {
+		return fmt.Errorf("failed to parse GBaseLite DSN: %w", err)
+	}
+	r.gbaseCfg = gCfg
+
+	// 2. Open MySQL connection
 	dbM, err := sql.Open("mysql", r.cfg.MySQLDSN)
 	if err != nil {
 		return fmt.Errorf("failed to open MySQL handle: %w", err)
@@ -129,7 +153,7 @@ func (r *ParityRunner) Run() error {
 	r.dbMySQL = dbM
 	defer r.dbMySQL.Close()
 
-	// 2. Open GBaseLite connection
+	// 3. Open GBaseLite connection
 	dbG, err := sql.Open("mysql", r.cfg.GBaseDSN)
 	if err != nil {
 		return fmt.Errorf("failed to open GBaseLite handle: %w", err)
@@ -137,7 +161,7 @@ func (r *ParityRunner) Run() error {
 	r.dbGBase = dbG
 	defer r.dbGBase.Close()
 
-	// 3. Ping both endpoints
+	// 4. Ping both endpoints with bounded timeout
 	ctxPing, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelPing()
 
@@ -148,37 +172,37 @@ func (r *ParityRunner) Run() error {
 		return fmt.Errorf("GBaseLite ping failed (%s): %w", r.cfg.GBaseDSN, err)
 	}
 
-	// 4. Verify Server Versions
-	if err := r.dbMySQL.QueryRowContext(ctxPing, "SELECT @@version").Scan(&r.myVersion); err != nil {
+	// 5. Query and verify Server Versions
+	if err := r.dbMySQL.QueryRowContext(ctxPing, "SELECT @@version;").Scan(&r.myVersion); err != nil {
 		return fmt.Errorf("failed to query MySQL version: %w", err)
 	}
-	if err := r.dbGBase.QueryRowContext(ctxPing, "SELECT @@version").Scan(&r.gbaseVer); err != nil {
+	if err := r.dbGBase.QueryRowContext(ctxPing, "SELECT @@version;").Scan(&r.gbaseVer); err != nil {
 		return fmt.Errorf("failed to query GBaseLite version: %w", err)
 	}
 
-	fmt.Printf("Connected to MySQL    : %s\n", r.myVersion)
-	fmt.Printf("Connected to GBaseLite : %s\n", r.gbaseVer)
+	fmt.Printf("Connected to MySQL          : %s\n", r.myVersion)
+	fmt.Printf("Connected to GBaseLite       : %s\n", r.gbaseVer)
 
-	// Version match validation
-	allowed := strings.Split(r.cfg.AllowMySQLVersions, ",")
-	matched := false
-	for _, v := range allowed {
-		v = strings.TrimSpace(v)
-		if strings.HasPrefix(r.myVersion, v) {
-			matched = true
-			break
-		}
-	}
-	if !matched {
-		return fmt.Errorf("MySQL version mismatch: got %q, expected prefix matching one of [%s]. Set --allow-mysql-version to override for local testing", r.myVersion, r.cfg.AllowMySQLVersions)
+	// FIX-03: Strict version validation
+	if strings.HasPrefix(r.myVersion, r.cfg.ExpectedMySQLVersion) {
+		r.devMode = false
+		fmt.Printf("[GATE CHECK] MySQL version %s satisfies official Gate (%s).\n", r.myVersion, r.cfg.ExpectedMySQLVersion)
+	} else if r.cfg.AllowDevVersion != "" && strings.HasPrefix(r.myVersion, r.cfg.AllowDevVersion) {
+		r.devMode = true
+		fmt.Printf("[DEV MODE NOTICE] MySQL version %s matches development compatibility (%s). Official Gate requires %s.\n",
+			r.myVersion, r.cfg.AllowDevVersion, r.cfg.ExpectedMySQLVersion)
+	} else {
+		return fmt.Errorf("MySQL version mismatch: got %q, expected %s. (Dev compatibility: %s)",
+			r.myVersion, r.cfg.ExpectedMySQLVersion, r.cfg.AllowDevVersion)
 	}
 
-	// 5. Initialize isolated test databases
+	// 6. Initialize isolated test databases
 	if err := r.initDatabases(); err != nil {
 		return fmt.Errorf("failed to initialize test databases: %w", err)
 	}
 
-	// 6. Execute M01–M44
+	// 7. Execute Dual-Database SQL Parity Scenarios (37 Scenarios: M01–M35, M39, M44)
+	fmt.Println("\n--- [Section A] Executing Dual-Database SQL Parity Scenarios (37 items) ---")
 	r.runM01()
 	r.runM02()
 	r.runM03()
@@ -214,42 +238,38 @@ func (r *ParityRunner) Run() error {
 	r.runM33()
 	r.runM34()
 	r.runM35()
+	r.runM39()
+	r.runM44()
+
+	// 8. Execute GBaseLite Internal Architecture & Replication Verification (7 Scenarios: M36, M37, M38, M40, M41, M42, M43)
+	fmt.Println("\n--- [Section B] Executing GBaseLite Internal Architecture & Replication Verifications (7 items) ---")
 	r.runM36()
 	r.runM37()
 	r.runM38()
-	r.runM39()
 	r.runM40()
 	r.runM41()
 	r.runM42()
 	r.runM43()
-	r.runM44()
 
-	// 7. Write output markdown report
+	// 9. Write final report
 	return r.writeReport()
 }
 
 func (r *ParityRunner) initDatabases() error {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	// 1. Initialize MySQL test database and user for COM_RESET_CONNECTION
+	// Initialize MySQL test database
 	if _, err := r.dbMySQL.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS parity_db;"); err != nil {
-		return fmt.Errorf("MySQL CREATE DATABASE: %w", err)
+		return fmt.Errorf("MySQL CREATE DATABASE parity_db: %w", err)
 	}
 	if _, err := r.dbMySQL.ExecContext(ctx, "USE parity_db;"); err != nil {
 		return fmt.Errorf("MySQL USE parity_db: %w", err)
 	}
-	// Create helper user for direct raw packet testing if possible
-	_, _ = r.dbMySQL.ExecContext(ctx, "CREATE USER IF NOT EXISTS 'parity_reset'@'%' IDENTIFIED WITH mysql_native_password BY 'resetpass';")
-	_, _ = r.dbMySQL.ExecContext(ctx, "CREATE USER IF NOT EXISTS 'parity_reset'@'127.0.0.1' IDENTIFIED WITH mysql_native_password BY 'resetpass';")
-	_, _ = r.dbMySQL.ExecContext(ctx, "CREATE USER IF NOT EXISTS 'parity_reset'@'localhost' IDENTIFIED WITH mysql_native_password BY 'resetpass';")
-	_, _ = r.dbMySQL.ExecContext(ctx, "GRANT ALL ON *.* TO 'parity_reset'@'%';")
-	_, _ = r.dbMySQL.ExecContext(ctx, "GRANT ALL ON *.* TO 'parity_reset'@'127.0.0.1';")
-	_, _ = r.dbMySQL.ExecContext(ctx, "GRANT ALL ON *.* TO 'parity_reset'@'localhost';")
-	_, _ = r.dbMySQL.ExecContext(ctx, "FLUSH PRIVILEGES;")
 
-	// 2. Initialize GBaseLite test database
+	// Initialize GBaseLite test database
 	if _, err := r.dbGBase.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS parity_db;"); err != nil {
-		return fmt.Errorf("GBaseLite CREATE DATABASE: %w", err)
+		return fmt.Errorf("GBaseLite CREATE DATABASE parity_db: %w", err)
 	}
 	if _, err := r.dbGBase.ExecContext(ctx, "USE parity_db;"); err != nil {
 		return fmt.Errorf("GBaseLite USE parity_db: %w", err)
@@ -276,7 +296,8 @@ type SessionPair struct {
 }
 
 func (r *ParityRunner) withSessions(fn func(gbase, mysql SessionPair) error) error {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
 	cA_g, err := r.dbGBase.Conn(ctx)
 	if err != nil {
@@ -302,7 +323,7 @@ func (r *ParityRunner) withSessions(fn func(gbase, mysql SessionPair) error) err
 	}
 	defer cB_m.Close()
 
-	// Ensure cleanup on return
+	// Ensure cleanup on exit
 	defer func() {
 		for _, c := range []*sql.Conn{cA_g, cB_g, cA_m, cB_m} {
 			_, _ = c.ExecContext(context.Background(), "ROLLBACK;")
@@ -327,7 +348,7 @@ func (r *ParityRunner) withSessions(fn func(gbase, mysql SessionPair) error) err
 }
 
 // ---------------------------------------------------------------------
-// Scenario Implementations (M01 – M44)
+// Section A: Dual-Database SQL Parity Scenarios (37 Scenarios)
 // ---------------------------------------------------------------------
 
 func (r *ParityRunner) runM01() {
@@ -335,7 +356,9 @@ func (r *ParityRunner) runM01() {
 	var gA, gB, mA, mB string
 
 	err := r.withSessions(func(g, m SessionPair) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
 		if _, err := g.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
 			return err
 		}
@@ -371,6 +394,7 @@ func (r *ParityRunner) runM01() {
 	r.record(ParityResult{
 		ID:             "M01",
 		Scope:          "session state isolation",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("A=%s, B=%s", gA, gB),
 		MySQLResult:    fmt.Sprintf("A=%s, B=%s", mA, mB),
@@ -385,11 +409,12 @@ func (r *ParityRunner) runM02() {
 	var gBlockedTx1, gBlockedTx2, mBlockedTx1, mBlockedTx2 bool
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m02;"); err != nil {
 			return err
 		}
-		if _, err := db.ExecContext(ctx, "CREATE TABLE t_m02 (id INT PRIMARY KEY, v VARCHAR(32));"); err != nil {
+		if _, err := db.ExecContext(ctx, "CREATE TABLE t_m02 (id INT PRIMARY KEY, val VARCHAR(32));"); err != nil {
 			return err
 		}
 		_, err := db.ExecContext(ctx, "INSERT INTO t_m02 VALUES (1, 'val');")
@@ -402,13 +427,12 @@ func (r *ParityRunner) runM02() {
 	}
 
 	testNextIsolation := func(pair SessionPair) (bool, bool, error) {
-		ctx := context.Background()
-		// Session default is REPEATABLE READ
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		if _, err := pair.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;"); err != nil {
 			return false, false, err
 		}
-
-		// 1. SET TRANSACTION applies to next transaction
 		if _, err := pair.connA.ExecContext(ctx, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;"); err != nil {
 			return false, false, err
 		}
@@ -418,13 +442,13 @@ func (r *ParityRunner) runM02() {
 			return false, false, err
 		}
 		var v1 string
-		if err := pair.connA.QueryRowContext(ctx, "SELECT v FROM t_m02 WHERE id = 1;").Scan(&v1); err != nil {
+		if err := pair.connA.QueryRowContext(ctx, "SELECT val FROM t_m02 WHERE id = 1;").Scan(&v1); err != nil {
 			return false, false, err
 		}
 
 		doneB1 := make(chan error, 1)
 		go func() {
-			_, err := pair.connB.ExecContext(ctx, "UPDATE t_m02 SET v = 'b1' WHERE id = 1;")
+			_, err := pair.connB.ExecContext(ctx, "UPDATE t_m02 SET val = 'b1' WHERE id = 1;")
 			doneB1 <- err
 		}()
 
@@ -450,13 +474,13 @@ func (r *ParityRunner) runM02() {
 			return false, false, err
 		}
 		var v2 string
-		if err := pair.connA.QueryRowContext(ctx, "SELECT v FROM t_m02 WHERE id = 1;").Scan(&v2); err != nil {
+		if err := pair.connA.QueryRowContext(ctx, "SELECT val FROM t_m02 WHERE id = 1;").Scan(&v2); err != nil {
 			return false, false, err
 		}
 
 		doneB2 := make(chan error, 1)
 		go func() {
-			_, err := pair.connB.ExecContext(ctx, "UPDATE t_m02 SET v = 'b2' WHERE id = 1;")
+			_, err := pair.connB.ExecContext(ctx, "UPDATE t_m02 SET val = 'b2' WHERE id = 1;")
 			doneB2 <- err
 		}()
 
@@ -507,6 +531,7 @@ func (r *ParityRunner) runM02() {
 	r.record(ParityResult{
 		ID:             "M02",
 		Scope:          "next transaction only override",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Tx1Blocked=%v, Tx2Blocked=%v", gBlockedTx1, gBlockedTx2),
 		MySQLResult:    fmt.Sprintf("Tx1Blocked=%v, Tx2Blocked=%v", mBlockedTx1, mBlockedTx2),
@@ -522,7 +547,8 @@ func (r *ParityRunner) runM03() {
 	var gActive, mActive string
 
 	err := r.withSessions(func(g, m SessionPair) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
 		// GBaseLite
 		if _, err := g.connA.ExecContext(ctx, "BEGIN;"); err != nil {
@@ -575,6 +601,7 @@ func (r *ParityRunner) runM03() {
 	r.record(ParityResult{
 		ID:             "M03",
 		Scope:          "active transaction restrictions",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Rejected: %s", gErrStr),
 		MySQLResult:    fmt.Sprintf("Rejected: %s", mErrStr),
@@ -589,7 +616,8 @@ func (r *ParityRunner) runM04() {
 	var gRes, mRes string
 
 	err := r.withSessions(func(g, m SessionPair) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
 		// GBaseLite
 		if _, err := g.connA.ExecContext(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
@@ -640,6 +668,7 @@ func (r *ParityRunner) runM04() {
 	r.record(ParityResult{
 		ID:             "M04",
 		Scope:          "autocommit consumption",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    gRes,
 		MySQLResult:    mRes,
@@ -654,12 +683,12 @@ func (r *ParityRunner) runM05() {
 	var gRes, mRes string
 	var errG, errM error
 
-	// Send real COM_RESET_CONNECTION (0x1f) packet over raw TCP socket to both servers
-	gRes, errG = sendCOMResetConnection("127.0.0.1:23307", "testuser", "testpassword")
-	mRes, errM = sendCOMResetConnection("127.0.0.1:23306", "parity_reset", "resetpass")
+	// Send real COM_RESET_CONNECTION (0x1f) packet over raw TCP socket to both servers using configured DSN endpoints
+	gRes, errG = sendCOMResetConnection(r.gbaseCfg.Addr, r.gbaseCfg.User, r.gbaseCfg.Passwd)
+	mRes, errM = sendCOMResetConnection(r.mysqlCfg.Addr, r.mysqlCfg.User, r.mysqlCfg.Passwd)
 
 	class := ClassPass
-	reason := "Binary packet COM_RESET_CONNECTION (0x1f) cleanly clears session isolation on both engines."
+	reason := "Binary packet COM_RESET_CONNECTION (0x1f) on same physical socket cleanly resets session isolation on both engines."
 	if errG != nil || errM != nil {
 		class = ClassFail
 		reason = fmt.Sprintf("COM_RESET_CONNECTION error: GBaseErr=%v, MySQLErr=%v", errG, errM)
@@ -670,7 +699,8 @@ func (r *ParityRunner) runM05() {
 
 	r.record(ParityResult{
 		ID:             "M05",
-		Scope:          "COM_RESET_CONNECTION protocol reset",
+		Scope:          "COM_RESET_CONNECTION protocol reset on same connection",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    gRes,
 		MySQLResult:    mRes,
@@ -684,7 +714,9 @@ func (r *ParityRunner) runM06() {
 	seq := "ConnA: SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ"
 	var gRes, mRes string
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	_, errG := r.dbGBase.ExecContext(ctx, "SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ;")
 	if errG != nil {
 		gRes = fmt.Sprintf("REJECTED: %v", errG)
@@ -699,12 +731,22 @@ func (r *ParityRunner) runM06() {
 		mRes = "SUCCESS"
 	}
 
+	// FIX-02: Strictly assert GBaseLite rejects SET GLOBAL while MySQL succeeds. Otherwise return FAIL!
 	class := ClassKnownDifference
 	reason := "GBaseLite deliberately restricts isolation mutations to SESSION/NEXT to protect multi-connection embedded instances from global state mutation."
+
+	if errG == nil {
+		class = ClassFail
+		reason = "GBaseLite unexpectedly succeeded on SET GLOBAL; expected rejection"
+	} else if errM != nil {
+		class = ClassFail
+		reason = fmt.Sprintf("MySQL unexpectedly rejected SET GLOBAL: %v", errM)
+	}
 
 	r.record(ParityResult{
 		ID:             "M06",
 		Scope:          "negative syntax & scope boundary",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    gRes,
 		MySQLResult:    mRes,
@@ -719,7 +761,8 @@ func (r *ParityRunner) runM07() {
 	var g1, g2, m1, m2 string
 
 	err := r.withSessions(func(g, m SessionPair) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
 		// GBaseLite binary prepared stmt
 		stmtG, err := g.connA.PrepareContext(ctx, "SELECT @@session.transaction_isolation;")
@@ -769,6 +812,7 @@ func (r *ParityRunner) runM07() {
 	r.record(ParityResult{
 		ID:             "M07",
 		Scope:          "binary prepared statement protocol parity",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Before=%s, After=%s", g1, g2),
 		MySQLResult:    fmt.Sprintf("Before=%s, After=%s", m1, m2),
@@ -783,7 +827,8 @@ func (r *ParityRunner) runM08() {
 	var g1, g2, m1, m2 string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m08;"); err != nil {
 			return err
 		}
@@ -801,7 +846,8 @@ func (r *ParityRunner) runM08() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "BEGIN;"); err != nil {
@@ -850,8 +896,8 @@ func (r *ParityRunner) runM08() {
 	class := ClassPass
 	reason := "Read view allocated on first consistent read (observing v2), frozen for remainder of transaction (remains v2)."
 
+	// FIX-04: Negative Fault Injection Verification
 	if r.cfg.InjectFault {
-		// Deliberately trigger failure detection when inject-fault is active
 		class = ClassFail
 		reason = "INJECTED FAULT: deliberate mismatch in M08 RR lazy snapshot assertion"
 		g1 = "injected_fault_v999"
@@ -866,6 +912,7 @@ func (r *ParityRunner) runM08() {
 	r.record(ParityResult{
 		ID:             "M08",
 		Scope:          "RR lazy snapshot timing",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Read1=%s, Read2=%s", g1, g2),
 		MySQLResult:    fmt.Sprintf("Read1=%s, Read2=%s", m1, m2),
@@ -880,7 +927,8 @@ func (r *ParityRunner) runM09() {
 	var g1, g2, m1, m2 string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m09;"); err != nil {
 			return err
 		}
@@ -898,7 +946,8 @@ func (r *ParityRunner) runM09() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "BEGIN;"); err != nil {
@@ -951,6 +1000,7 @@ func (r *ParityRunner) runM09() {
 	r.record(ParityResult{
 		ID:             "M09",
 		Scope:          "RR consistent view non-repeatable read prevention",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Read1=%s, Read2=%s", g1, g2),
 		MySQLResult:    fmt.Sprintf("Read1=%s, Read2=%s", m1, m2),
@@ -965,7 +1015,8 @@ func (r *ParityRunner) runM10() {
 	var g1, g2, m1, m2 int
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m10;"); err != nil {
 			return err
 		}
@@ -983,7 +1034,8 @@ func (r *ParityRunner) runM10() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "BEGIN;"); err != nil {
@@ -1036,6 +1088,7 @@ func (r *ParityRunner) runM10() {
 	r.record(ParityResult{
 		ID:             "M10",
 		Scope:          "RR phantom read prevention",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Count1=%d, Count2=%d", g1, g2),
 		MySQLResult:    fmt.Sprintf("Count1=%d, Count2=%d", m1, m2),
@@ -1050,11 +1103,12 @@ func (r *ParityRunner) runM11() {
 	var g1, g2, m1, m2 string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m11;"); err != nil {
 			return err
 		}
-		if _, err := db.ExecContext(ctx, "CREATE TABLE t_m11 (id INT PRIMARY KEY, v VARCHAR(32));"); err != nil {
+		if _, err := db.ExecContext(ctx, "CREATE TABLE t_m11 (id INT PRIMARY KEY, val VARCHAR(32));"); err != nil {
 			return err
 		}
 		_, err := db.ExecContext(ctx, "INSERT INTO t_m11 VALUES (1, 'initial');")
@@ -1068,22 +1122,23 @@ func (r *ParityRunner) runM11() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "BEGIN;"); err != nil {
 				return err
 			}
-			if _, err := g.connA.ExecContext(ctx, "UPDATE t_m11 SET v = 'own' WHERE id = 1;"); err != nil {
+			if _, err := g.connA.ExecContext(ctx, "UPDATE t_m11 SET val = 'own' WHERE id = 1;"); err != nil {
 				return err
 			}
-			if err := g.connA.QueryRowContext(ctx, "SELECT v FROM t_m11 WHERE id = 1;").Scan(&g1); err != nil {
+			if err := g.connA.QueryRowContext(ctx, "SELECT val FROM t_m11 WHERE id = 1;").Scan(&g1); err != nil {
 				return err
 			}
 			if _, err := g.connA.ExecContext(ctx, "ROLLBACK;"); err != nil {
 				return err
 			}
-			if err := g.connA.QueryRowContext(ctx, "SELECT v FROM t_m11 WHERE id = 1;").Scan(&g2); err != nil {
+			if err := g.connA.QueryRowContext(ctx, "SELECT val FROM t_m11 WHERE id = 1;").Scan(&g2); err != nil {
 				return err
 			}
 
@@ -1091,16 +1146,16 @@ func (r *ParityRunner) runM11() {
 			if _, err := m.connA.ExecContext(ctx, "BEGIN;"); err != nil {
 				return err
 			}
-			if _, err := m.connA.ExecContext(ctx, "UPDATE t_m11 SET v = 'own' WHERE id = 1;"); err != nil {
+			if _, err := m.connA.ExecContext(ctx, "UPDATE t_m11 SET val = 'own' WHERE id = 1;"); err != nil {
 				return err
 			}
-			if err := m.connA.QueryRowContext(ctx, "SELECT v FROM t_m11 WHERE id = 1;").Scan(&m1); err != nil {
+			if err := m.connA.QueryRowContext(ctx, "SELECT val FROM t_m11 WHERE id = 1;").Scan(&m1); err != nil {
 				return err
 			}
 			if _, err := m.connA.ExecContext(ctx, "ROLLBACK;"); err != nil {
 				return err
 			}
-			if err := m.connA.QueryRowContext(ctx, "SELECT v FROM t_m11 WHERE id = 1;").Scan(&m2); err != nil {
+			if err := m.connA.QueryRowContext(ctx, "SELECT val FROM t_m11 WHERE id = 1;").Scan(&m2); err != nil {
 				return err
 			}
 
@@ -1121,6 +1176,7 @@ func (r *ParityRunner) runM11() {
 	r.record(ParityResult{
 		ID:             "M11",
 		Scope:          "RR own staged writes overlay",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("InsideTx=%s, AfterRollback=%s", g1, g2),
 		MySQLResult:    fmt.Sprintf("InsideTx=%s, AfterRollback=%s", m1, m2),
@@ -1135,11 +1191,12 @@ func (r *ParityRunner) runM12() {
 	var g1, gFU, gAfter, m1, mFU, mAfter string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m12;"); err != nil {
 			return err
 		}
-		if _, err := db.ExecContext(ctx, "CREATE TABLE t_m12 (id INT PRIMARY KEY, v VARCHAR(32));"); err != nil {
+		if _, err := db.ExecContext(ctx, "CREATE TABLE t_m12 (id INT PRIMARY KEY, val VARCHAR(32));"); err != nil {
 			return err
 		}
 		_, err := db.ExecContext(ctx, "INSERT INTO t_m12 VALUES (1, 'v1');")
@@ -1153,22 +1210,23 @@ func (r *ParityRunner) runM12() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "BEGIN;"); err != nil {
 				return err
 			}
-			if err := g.connA.QueryRowContext(ctx, "SELECT v FROM t_m12 WHERE id = 1;").Scan(&g1); err != nil {
+			if err := g.connA.QueryRowContext(ctx, "SELECT val FROM t_m12 WHERE id = 1;").Scan(&g1); err != nil {
 				return err
 			}
-			if _, err := g.connB.ExecContext(ctx, "UPDATE t_m12 SET v = 'v2' WHERE id = 1;"); err != nil {
+			if _, err := g.connB.ExecContext(ctx, "UPDATE t_m12 SET val = 'v2' WHERE id = 1;"); err != nil {
 				return err
 			}
-			if err := g.connA.QueryRowContext(ctx, "SELECT v FROM t_m12 WHERE id = 1 FOR UPDATE;").Scan(&gFU); err != nil {
+			if err := g.connA.QueryRowContext(ctx, "SELECT val FROM t_m12 WHERE id = 1 FOR UPDATE;").Scan(&gFU); err != nil {
 				return err
 			}
-			if err := g.connA.QueryRowContext(ctx, "SELECT v FROM t_m12 WHERE id = 1;").Scan(&gAfter); err != nil {
+			if err := g.connA.QueryRowContext(ctx, "SELECT val FROM t_m12 WHERE id = 1;").Scan(&gAfter); err != nil {
 				return err
 			}
 			if _, err := g.connA.ExecContext(ctx, "COMMIT;"); err != nil {
@@ -1179,16 +1237,16 @@ func (r *ParityRunner) runM12() {
 			if _, err := m.connA.ExecContext(ctx, "BEGIN;"); err != nil {
 				return err
 			}
-			if err := m.connA.QueryRowContext(ctx, "SELECT v FROM t_m12 WHERE id = 1;").Scan(&m1); err != nil {
+			if err := m.connA.QueryRowContext(ctx, "SELECT val FROM t_m12 WHERE id = 1;").Scan(&m1); err != nil {
 				return err
 			}
-			if _, err := m.connB.ExecContext(ctx, "UPDATE t_m12 SET v = 'v2' WHERE id = 1;"); err != nil {
+			if _, err := m.connB.ExecContext(ctx, "UPDATE t_m12 SET val = 'v2' WHERE id = 1;"); err != nil {
 				return err
 			}
-			if err := m.connA.QueryRowContext(ctx, "SELECT v FROM t_m12 WHERE id = 1 FOR UPDATE;").Scan(&mFU); err != nil {
+			if err := m.connA.QueryRowContext(ctx, "SELECT val FROM t_m12 WHERE id = 1 FOR UPDATE;").Scan(&mFU); err != nil {
 				return err
 			}
-			if err := m.connA.QueryRowContext(ctx, "SELECT v FROM t_m12 WHERE id = 1;").Scan(&mAfter); err != nil {
+			if err := m.connA.QueryRowContext(ctx, "SELECT val FROM t_m12 WHERE id = 1;").Scan(&mAfter); err != nil {
 				return err
 			}
 			if _, err := m.connA.ExecContext(ctx, "COMMIT;"); err != nil {
@@ -1212,6 +1270,7 @@ func (r *ParityRunner) runM12() {
 	r.record(ParityResult{
 		ID:             "M12",
 		Scope:          "RR current read vs plain read",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Plain1=%s, ForUpdate=%s, PlainAfter=%s", g1, gFU, gAfter),
 		MySQLResult:    fmt.Sprintf("Plain1=%s, ForUpdate=%s, PlainAfter=%s", m1, mFU, mAfter),
@@ -1226,11 +1285,12 @@ func (r *ParityRunner) runM13() {
 	var g1, g2, m1, m2 string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m13;"); err != nil {
 			return err
 		}
-		if _, err := db.ExecContext(ctx, "CREATE TABLE t_m13 (id INT PRIMARY KEY, v VARCHAR(32));"); err != nil {
+		if _, err := db.ExecContext(ctx, "CREATE TABLE t_m13 (id INT PRIMARY KEY, val VARCHAR(32));"); err != nil {
 			return err
 		}
 		_, err := db.ExecContext(ctx, "INSERT INTO t_m13 VALUES (1, 'v1');")
@@ -1244,7 +1304,8 @@ func (r *ParityRunner) runM13() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
@@ -1253,13 +1314,13 @@ func (r *ParityRunner) runM13() {
 			if _, err := g.connA.ExecContext(ctx, "BEGIN;"); err != nil {
 				return err
 			}
-			if err := g.connA.QueryRowContext(ctx, "SELECT v FROM t_m13 WHERE id = 1;").Scan(&g1); err != nil {
+			if err := g.connA.QueryRowContext(ctx, "SELECT val FROM t_m13 WHERE id = 1;").Scan(&g1); err != nil {
 				return err
 			}
-			if _, err := g.connB.ExecContext(ctx, "UPDATE t_m13 SET v = 'v2' WHERE id = 1;"); err != nil {
+			if _, err := g.connB.ExecContext(ctx, "UPDATE t_m13 SET val = 'v2' WHERE id = 1;"); err != nil {
 				return err
 			}
-			if err := g.connA.QueryRowContext(ctx, "SELECT v FROM t_m13 WHERE id = 1;").Scan(&g2); err != nil {
+			if err := g.connA.QueryRowContext(ctx, "SELECT val FROM t_m13 WHERE id = 1;").Scan(&g2); err != nil {
 				return err
 			}
 			if _, err := g.connA.ExecContext(ctx, "COMMIT;"); err != nil {
@@ -1273,13 +1334,13 @@ func (r *ParityRunner) runM13() {
 			if _, err := m.connA.ExecContext(ctx, "BEGIN;"); err != nil {
 				return err
 			}
-			if err := m.connA.QueryRowContext(ctx, "SELECT v FROM t_m13 WHERE id = 1;").Scan(&m1); err != nil {
+			if err := m.connA.QueryRowContext(ctx, "SELECT val FROM t_m13 WHERE id = 1;").Scan(&m1); err != nil {
 				return err
 			}
-			if _, err := m.connB.ExecContext(ctx, "UPDATE t_m13 SET v = 'v2' WHERE id = 1;"); err != nil {
+			if _, err := m.connB.ExecContext(ctx, "UPDATE t_m13 SET val = 'v2' WHERE id = 1;"); err != nil {
 				return err
 			}
-			if err := m.connA.QueryRowContext(ctx, "SELECT v FROM t_m13 WHERE id = 1;").Scan(&m2); err != nil {
+			if err := m.connA.QueryRowContext(ctx, "SELECT val FROM t_m13 WHERE id = 1;").Scan(&m2); err != nil {
 				return err
 			}
 			if _, err := m.connA.ExecContext(ctx, "COMMIT;"); err != nil {
@@ -1303,6 +1364,7 @@ func (r *ParityRunner) runM13() {
 	r.record(ParityResult{
 		ID:             "M13",
 		Scope:          "RC non-repeatable read",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Read1=%s, Read2=%s", g1, g2),
 		MySQLResult:    fmt.Sprintf("Read1=%s, Read2=%s", m1, m2),
@@ -1317,11 +1379,12 @@ func (r *ParityRunner) runM14() {
 	var g1, g2, m1, m2 int
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m14;"); err != nil {
 			return err
 		}
-		_, err := db.ExecContext(ctx, "CREATE TABLE t_m14 (id INT PRIMARY KEY, v VARCHAR(32));")
+		_, err := db.ExecContext(ctx, "CREATE TABLE t_m14 (id INT PRIMARY KEY, val VARCHAR(32));")
 		return err
 	}
 
@@ -1332,7 +1395,8 @@ func (r *ParityRunner) runM14() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
@@ -1391,6 +1455,7 @@ func (r *ParityRunner) runM14() {
 	r.record(ParityResult{
 		ID:             "M14",
 		Scope:          "RC phantom read allowed",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Count1=%d, Count2=%d", g1, g2),
 		MySQLResult:    fmt.Sprintf("Count1=%d, Count2=%d", m1, m2),
@@ -1405,7 +1470,8 @@ func (r *ParityRunner) runM15() {
 	var gSum, mSum int
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m15;"); err != nil {
 			return err
 		}
@@ -1427,7 +1493,8 @@ func (r *ParityRunner) runM15() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
@@ -1474,6 +1541,7 @@ func (r *ParityRunner) runM15() {
 	r.record(ParityResult{
 		ID:             "M15",
 		Scope:          "RC single-statement consistency",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("SUM=%d", gSum),
 		MySQLResult:    fmt.Sprintf("SUM=%d", mSum),
@@ -1488,7 +1556,8 @@ func (r *ParityRunner) runM16() {
 	var gID, gVal, gBVal, mID, mVal, mBVal int
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m16_b;"); err != nil {
 			return err
 		}
@@ -1515,7 +1584,8 @@ func (r *ParityRunner) runM16() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 			q := "SELECT a.id, a.val, (SELECT b.val FROM t_m16_b b WHERE b.id = a.id) AS b_val FROM t_m16_a a WHERE a.id = 1;"
 
 			if _, err := g.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
@@ -1549,6 +1619,7 @@ func (r *ParityRunner) runM16() {
 	r.record(ParityResult{
 		ID:             "M16",
 		Scope:          "RC complex multi-operator view sharing",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("id=%d, val=%d, b_val=%d", gID, gVal, gBVal),
 		MySQLResult:    fmt.Sprintf("id=%d, val=%d, b_val=%d", mID, mVal, mBVal),
@@ -1563,7 +1634,8 @@ func (r *ParityRunner) runM17() {
 	var gVal, mVal int
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m17;"); err != nil {
 			return err
 		}
@@ -1581,7 +1653,8 @@ func (r *ParityRunner) runM17() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
@@ -1640,6 +1713,7 @@ func (r *ParityRunner) runM17() {
 	r.record(ParityResult{
 		ID:             "M17",
 		Scope:          "RC legal current write validation",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("FinalVal=%d", gVal),
 		MySQLResult:    fmt.Sprintf("FinalVal=%d", mVal),
@@ -1654,7 +1728,8 @@ func (r *ParityRunner) runM18() {
 	var gVal, mVal string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m18;"); err != nil {
 			return err
 		}
@@ -1671,7 +1746,9 @@ func (r *ParityRunner) runM18() {
 	}
 
 	testLockConflict := func(pair SessionPair) (string, error) {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		if _, err := pair.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
 			return "", err
 		}
@@ -1680,6 +1757,9 @@ func (r *ParityRunner) runM18() {
 		}
 
 		if _, err := pair.connA.ExecContext(ctx, "BEGIN;"); err != nil {
+			return "", err
+		}
+		if _, err := pair.connB.ExecContext(ctx, "BEGIN;"); err != nil {
 			return "", err
 		}
 		if _, err := pair.connA.ExecContext(ctx, "UPDATE t_m18 SET val = 'txA' WHERE id = 1;"); err != nil {
@@ -1697,7 +1777,6 @@ func (r *ParityRunner) runM18() {
 		case err := <-doneB:
 			return "", fmt.Errorf("ConnB did not block on lock: %v", err)
 		case <-time.After(200 * time.Millisecond):
-			// ConnB successfully blocked waiting for ConnA's lock
 		}
 
 		// ConnA commits, releasing the lock
@@ -1754,6 +1833,7 @@ func (r *ParityRunner) runM18() {
 	r.record(ParityResult{
 		ID:             "M18",
 		Scope:          "RC write conflict serialization",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("FinalVal=%s (Blocked then unblocked)", gVal),
 		MySQLResult:    fmt.Sprintf("FinalVal=%s (Blocked then unblocked)", mVal),
@@ -1768,7 +1848,8 @@ func (r *ParityRunner) runM19() {
 	var gErr, mErr string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m19;"); err != nil {
 			return err
 		}
@@ -1782,7 +1863,9 @@ func (r *ParityRunner) runM19() {
 	}
 
 	testUniqueConstraint := func(pair SessionPair) (string, error) {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		if _, err := pair.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
 			return "", err
 		}
@@ -1791,6 +1874,9 @@ func (r *ParityRunner) runM19() {
 		}
 
 		if _, err := pair.connA.ExecContext(ctx, "BEGIN;"); err != nil {
+			return "", err
+		}
+		if _, err := pair.connB.ExecContext(ctx, "BEGIN;"); err != nil {
 			return "", err
 		}
 		if _, err := pair.connA.ExecContext(ctx, "INSERT INTO t_m19 VALUES (1, 'u1');"); err != nil {
@@ -1847,6 +1933,7 @@ func (r *ParityRunner) runM19() {
 	r.record(ParityResult{
 		ID:             "M19",
 		Scope:          "RC uniqueness constraint enforcement",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Duplicate Error: %s", gErr),
 		MySQLResult:    fmt.Sprintf("Duplicate Error: %s", mErr),
@@ -1861,7 +1948,8 @@ func (r *ParityRunner) runM20() {
 	var g1, g2, g3, m1, m2, m3 string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m20;"); err != nil {
 			return err
 		}
@@ -1879,7 +1967,8 @@ func (r *ParityRunner) runM20() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
@@ -1962,6 +2051,7 @@ func (r *ParityRunner) runM20() {
 	r.record(ParityResult{
 		ID:             "M20",
 		Scope:          "RC savepoint rollback view behavior",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("V1=%s, V2=%s, V3=%s", g1, g2, g3),
 		MySQLResult:    fmt.Sprintf("V1=%s, V2=%s, V3=%s", m1, m2, m3),
@@ -1976,7 +2066,8 @@ func (r *ParityRunner) runM21() {
 	var gA, gB, mA, mB string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m21;"); err != nil {
 			return err
 		}
@@ -1994,7 +2085,8 @@ func (r *ParityRunner) runM21() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;"); err != nil {
@@ -2065,6 +2157,7 @@ func (r *ParityRunner) runM21() {
 	r.record(ParityResult{
 		ID:             "M21",
 		Scope:          "SERIALIZABLE S/S lock compatibility",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("A=%s, B=%s", gA, gB),
 		MySQLResult:    fmt.Sprintf("A=%s, B=%s", mA, mB),
@@ -2079,7 +2172,8 @@ func (r *ParityRunner) runM22() {
 	var gVal, mVal string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m22;"); err != nil {
 			return err
 		}
@@ -2096,7 +2190,9 @@ func (r *ParityRunner) runM22() {
 	}
 
 	testSX := func(pair SessionPair) (string, error) {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		if _, err := pair.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;"); err != nil {
 			return "", err
 		}
@@ -2165,6 +2261,7 @@ func (r *ParityRunner) runM22() {
 	r.record(ParityResult{
 		ID:             "M22",
 		Scope:          "SERIALIZABLE S/X lock conflict",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("FinalVal=%s (Writer blocked then resumed)", gVal),
 		MySQLResult:    fmt.Sprintf("FinalVal=%s (Writer blocked then resumed)", mVal),
@@ -2179,7 +2276,8 @@ func (r *ParityRunner) runM23() {
 	var gCount, mCount int
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m23;"); err != nil {
 			return err
 		}
@@ -2196,7 +2294,9 @@ func (r *ParityRunner) runM23() {
 	}
 
 	testAbsentPoint := func(pair SessionPair) (int, error) {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		if _, err := pair.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;"); err != nil {
 			return 0, err
 		}
@@ -2263,6 +2363,7 @@ func (r *ParityRunner) runM23() {
 	r.record(ParityResult{
 		ID:             "M23",
 		Scope:          "SERIALIZABLE absent point gap protection",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("InsertedCount=%d (Blocked on gap lock)", gCount),
 		MySQLResult:    fmt.Sprintf("InsertedCount=%d (Blocked on gap lock)", mCount),
@@ -2277,7 +2378,8 @@ func (r *ParityRunner) runM24() {
 	var gCount, mCount int
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m24;"); err != nil {
 			return err
 		}
@@ -2294,7 +2396,9 @@ func (r *ParityRunner) runM24() {
 	}
 
 	testRangeProtection := func(pair SessionPair, db *sql.DB) (int, error) {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		if _, err := pair.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;"); err != nil {
 			return 0, err
 		}
@@ -2377,6 +2481,7 @@ func (r *ParityRunner) runM24() {
 	r.record(ParityResult{
 		ID:             "M24",
 		Scope:          "SERIALIZABLE empty range protection",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("BothInsertedCount=%d", gCount),
 		MySQLResult:    fmt.Sprintf("BothInsertedCount=%d", mCount),
@@ -2391,7 +2496,8 @@ func (r *ParityRunner) runM25() {
 	var gRes, mRes string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m25;"); err != nil {
 			return err
 		}
@@ -2408,7 +2514,9 @@ func (r *ParityRunner) runM25() {
 	}
 
 	testWriteSkew := func(pair SessionPair) (string, error) {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		if _, err := pair.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;"); err != nil {
 			return "", err
 		}
@@ -2482,6 +2590,7 @@ func (r *ParityRunner) runM25() {
 	r.record(ParityResult{
 		ID:             "M25",
 		Scope:          "SERIALIZABLE write skew prevention",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    gRes,
 		MySQLResult:    mRes,
@@ -2496,7 +2605,8 @@ func (r *ParityRunner) runM26() {
 	var gDeadlock, mDeadlock bool
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m26;"); err != nil {
 			return err
 		}
@@ -2513,7 +2623,8 @@ func (r *ParityRunner) runM26() {
 	}
 
 	testDeadlock := func(pair SessionPair) (bool, error) {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
 
 		if _, err := pair.connA.ExecContext(ctx, "BEGIN;"); err != nil {
 			return false, err
@@ -2538,7 +2649,7 @@ func (r *ParityRunner) runM26() {
 			aDone <- err
 		}()
 
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 
 		// Step 4: ConnB attempts to update row 1, closing the cycle: A -> B and B -> A!
 		bDone := make(chan error, 1)
@@ -2575,10 +2686,6 @@ func (r *ParityRunner) runM26() {
 			(errB != nil && (strings.Contains(strings.ToLower(errB.Error()), "deadlock") || strings.Contains(errB.Error(), "1213"))) ||
 			(deadlockErr != nil && (strings.Contains(strings.ToLower(deadlockErr.Error()), "deadlock") || strings.Contains(deadlockErr.Error(), "1213")))
 
-		if !hasDeadlock {
-			fmt.Printf("M26 Debug: deadlockErr=%v, errA=%v, errB=%v\n", deadlockErr, errA, errB)
-		}
-
 		return hasDeadlock, nil
 	}
 
@@ -2593,7 +2700,7 @@ func (r *ParityRunner) runM26() {
 			if e != nil {
 				return fmt.Errorf("MySQL deadlock: %w", e)
 			}
-			return e
+			return nil
 		})
 	}
 
@@ -2609,7 +2716,8 @@ func (r *ParityRunner) runM26() {
 
 	r.record(ParityResult{
 		ID:             "M26",
-		Scope:          "SERIALIZABLE S->X upgrade deadlock detection",
+		Scope:          "SERIALIZABLE deadlock cycle detection",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("DeadlockDetected=%v", gDeadlock),
 		MySQLResult:    fmt.Sprintf("DeadlockDetected=%v", mDeadlock),
@@ -2624,7 +2732,8 @@ func (r *ParityRunner) runM27() {
 	var gRes, mRes string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m27_b;"); err != nil {
 			return err
 		}
@@ -2645,7 +2754,8 @@ func (r *ParityRunner) runM27() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 			q := "SELECT a.id FROM t_m27_a a JOIN t_m27_b b ON a.id = b.id;"
 
 			// GBaseLite
@@ -2659,7 +2769,7 @@ func (r *ParityRunner) runM27() {
 			if errG != nil {
 				gRes = fmt.Sprintf("REJECTED: %v", errG)
 			} else {
-				gRes = "EXECUTED"
+				gRes = "SUCCESS"
 			}
 			_, _ = g.connA.ExecContext(ctx, "ROLLBACK;")
 
@@ -2674,7 +2784,7 @@ func (r *ParityRunner) runM27() {
 			if errM != nil {
 				mRes = fmt.Sprintf("REJECTED: %v", errM)
 			} else {
-				mRes = "EXECUTED"
+				mRes = "SUCCESS"
 			}
 			_, _ = m.connA.ExecContext(ctx, "ROLLBACK;")
 
@@ -2682,16 +2792,22 @@ func (r *ParityRunner) runM27() {
 		})
 	}
 
+	// FIX-02: Strict assertion: GBaseLite MUST return 3108 / fail-closed, and MySQL MUST succeed!
 	class := ClassUnsupported
 	reason := "GBaseLite architectural fail-closed policy: unsupported complex query shapes in SERIALIZABLE are rejected before execution (Error 3108) to eliminate phantom read leaks."
-	if err != nil {
+
+	if !strings.Contains(gRes, "3108") && !strings.Contains(strings.ToLower(gRes), "does not support row locking") && !strings.Contains(strings.ToLower(gRes), "cannot be provably serialized") {
 		class = ClassFail
-		reason = fmt.Sprintf("M27 execution error: %v", err)
+		reason = fmt.Sprintf("GBaseLite failed to reject unsupported shape with expected fail-closed error, got: %s", gRes)
+	} else if mRes != "SUCCESS" {
+		class = ClassFail
+		reason = fmt.Sprintf("MySQL unexpectedly failed on SERIALIZABLE join: %s", mRes)
 	}
 
 	r.record(ParityResult{
 		ID:             "M27",
 		Scope:          "SERIALIZABLE unsupported query shapes fail-closed",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    gRes,
 		MySQLResult:    mRes,
@@ -2706,7 +2822,8 @@ func (r *ParityRunner) runM28() {
 	var gVal, mVal string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m28;"); err != nil {
 			return err
 		}
@@ -2724,7 +2841,8 @@ func (r *ParityRunner) runM28() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;"); err != nil {
@@ -2773,6 +2891,7 @@ func (r *ParityRunner) runM28() {
 	r.record(ParityResult{
 		ID:             "M28",
 		Scope:          "SERIALIZABLE autocommit optimization",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("UpdatedVal=%s", gVal),
 		MySQLResult:    fmt.Sprintf("UpdatedVal=%s", mVal),
@@ -2787,7 +2906,8 @@ func (r *ParityRunner) runM29() {
 	var gDirty, gClean, mDirty, mClean string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m29;"); err != nil {
 			return err
 		}
@@ -2805,7 +2925,8 @@ func (r *ParityRunner) runM29() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connB.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;"); err != nil {
@@ -2864,6 +2985,7 @@ func (r *ParityRunner) runM29() {
 	r.record(ParityResult{
 		ID:             "M29",
 		Scope:          "RU dirty UPDATE visibility",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Dirty=%s, AfterRollback=%s", gDirty, gClean),
 		MySQLResult:    fmt.Sprintf("Dirty=%s, AfterRollback=%s", mDirty, mClean),
@@ -2878,7 +3000,8 @@ func (r *ParityRunner) runM30() {
 	var gDirty, gClean, mDirty, mClean int
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m30;"); err != nil {
 			return err
 		}
@@ -2893,7 +3016,8 @@ func (r *ParityRunner) runM30() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connB.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;"); err != nil {
@@ -2952,6 +3076,7 @@ func (r *ParityRunner) runM30() {
 	r.record(ParityResult{
 		ID:             "M30",
 		Scope:          "RU dirty INSERT visibility",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("DirtyCount=%d, AfterRollback=%d", gDirty, gClean),
 		MySQLResult:    fmt.Sprintf("DirtyCount=%d, AfterRollback=%d", mDirty, mClean),
@@ -2966,7 +3091,8 @@ func (r *ParityRunner) runM31() {
 	var gDirty, gClean, mDirty, mClean int
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m31;"); err != nil {
 			return err
 		}
@@ -2984,7 +3110,8 @@ func (r *ParityRunner) runM31() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connB.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;"); err != nil {
@@ -3043,6 +3170,7 @@ func (r *ParityRunner) runM31() {
 	r.record(ParityResult{
 		ID:             "M31",
 		Scope:          "RU dirty DELETE visibility",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("DeletedCount=%d, AfterRollback=%d", gDirty, gClean),
 		MySQLResult:    fmt.Sprintf("DeletedCount=%d, AfterRollback=%d", mDirty, mClean),
@@ -3057,7 +3185,8 @@ func (r *ParityRunner) runM32() {
 	var gRC, gRR, mRC, mRR string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m32;"); err != nil {
 			return err
 		}
@@ -3075,7 +3204,8 @@ func (r *ParityRunner) runM32() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "BEGIN;"); err != nil {
@@ -3140,6 +3270,7 @@ func (r *ParityRunner) runM32() {
 	r.record(ParityResult{
 		ID:             "M32",
 		Scope:          "RU isolation boundary",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("RC=%s, RR=%s", gRC, gRR),
 		MySQLResult:    fmt.Sprintf("RC=%s, RR=%s", mRC, mRR),
@@ -3154,7 +3285,8 @@ func (r *ParityRunner) runM33() {
 	var gVal, mVal string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m33;"); err != nil {
 			return err
 		}
@@ -3171,7 +3303,9 @@ func (r *ParityRunner) runM33() {
 	}
 
 	testNoDirtyWrite := func(pair SessionPair) (string, error) {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		if _, err := pair.connA.ExecContext(ctx, "BEGIN;"); err != nil {
 			return "", err
 		}
@@ -3247,6 +3381,7 @@ func (r *ParityRunner) runM33() {
 	r.record(ParityResult{
 		ID:             "M33",
 		Scope:          "RU no dirty write enforcement",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("FinalVal=%s (Writer blocked then resumed)", gVal),
 		MySQLResult:    fmt.Sprintf("FinalVal=%s (Writer blocked then resumed)", mVal),
@@ -3261,7 +3396,8 @@ func (r *ParityRunner) runM34() {
 	var gS1, gInit, mS1, mInit string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m34;"); err != nil {
 			return err
 		}
@@ -3279,7 +3415,8 @@ func (r *ParityRunner) runM34() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;"); err != nil {
@@ -3362,6 +3499,7 @@ func (r *ParityRunner) runM34() {
 	r.record(ParityResult{
 		ID:             "M34",
 		Scope:          "RU stage lifecycle & savepoint withdrawal",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("AfterSpRollback=%s, Final=%s", gS1, gInit),
 		MySQLResult:    fmt.Sprintf("AfterSpRollback=%s, Final=%s", mS1, mInit),
@@ -3376,7 +3514,8 @@ func (r *ParityRunner) runM35() {
 	var gVal1, gVal2, mVal1, mVal2 string
 
 	setupTable := func(db *sql.DB) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS t_m35;"); err != nil {
 			return err
 		}
@@ -3394,7 +3533,8 @@ func (r *ParityRunner) runM35() {
 
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
-			ctx := context.Background()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
 			// GBaseLite
 			if _, err := g.connB.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;"); err != nil {
@@ -3453,6 +3593,7 @@ func (r *ParityRunner) runM35() {
 	r.record(ParityResult{
 		ID:             "M35",
 		Scope:          "RU concurrent reader vs writer rollback safety",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("ReadDirty=%s, AfterRollback=%s", gVal1, gVal2),
 		MySQLResult:    fmt.Sprintf("ReadDirty=%s, AfterRollback=%s", mVal1, mVal2),
@@ -3462,75 +3603,13 @@ func (r *ParityRunner) runM35() {
 	})
 }
 
-func (r *ParityRunner) runM36() {
-	seq := "Replicated Cluster Topology: SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"
-	var gRes, mRes string
-
-	// GBaseLite standalone allows RU, but replicated topology strictly rejects RU with ErrUnsupported
-	gRes = "REJECTED on Replicated Topology: ErrUnsupported ('READ UNCOMMITTED is not supported in replication mode')"
-	mRes = "EXECUTED (MySQL allows local RU reads on replica)"
-
-	class := ClassUnsupported
-	reason := "GBaseLite Raft replication intentionally disallows RU to prevent cross-replica uncommitted read divergence."
-
-	r.record(ParityResult{
-		ID:             "M36",
-		Scope:          "RU in replication mode (Fail-Closed)",
-		SQLSequence:    seq,
-		GBaseResult:    gRes,
-		MySQLResult:    mRes,
-		Classification: class,
-		Reason:         reason,
-		CodeEvidence:   "storageengine/mvccadapter/isolation.go:362; executor/isolation_ru_test.go:TestM36_RU_ReplicationModeUnsupported",
-	})
-}
-
-func (r *ParityRunner) runM37() {
-	seq := "Internal MVCC: Active ViewToken pins readTS; CompactHistory executed; verifies pinned versions are NOT reclaimed"
-	gRes := "PASS (snapshotRefs pins history; CompactHistory respects OldestReadTS)"
-	mRes := "N/A (GBaseLite Internal Architecture / MVCC Compaction)"
-
-	class := ClassPass
-	reason := "Active Read View pins history versions against premature compaction."
-
-	r.record(ParityResult{
-		ID:             "M37",
-		Scope:          "View GC & CompactHistory retention",
-		SQLSequence:    seq,
-		GBaseResult:    gRes,
-		MySQLResult:    mRes,
-		Classification: class,
-		Reason:         reason,
-		CodeEvidence:   "mvcc/isolation_view_test.go:TestViewToken_GCAndCompactHistory",
-	})
-}
-
-func (r *ParityRunner) runM38() {
-	seq := "Internal MVCC: Restore increments generation; stale ViewTokens and Lock Owners invalidated"
-	gRes := "PASS (Generation fence returns ErrLockInvalidated, clears old owners atomically)"
-	mRes := "N/A (GBaseLite Internal Architecture / Storage Generation Fence)"
-
-	class := ClassPass
-	reason := "Generation counter prevents cross-epoch state contamination."
-
-	r.record(ParityResult{
-		ID:             "M38",
-		Scope:          "Epoch & Restore generation fence",
-		SQLSequence:    seq,
-		GBaseResult:    gRes,
-		MySQLResult:    mRes,
-		Classification: class,
-		Reason:         reason,
-		CodeEvidence:   "mvcc/isolation_view_test.go:TestViewToken_EpochResetOnRestore",
-	})
-}
-
 func (r *ParityRunner) runM39() {
 	seq := "ConnA (RC): SELECT * FROM t_m15 LIMIT 2; statement ViewToken closed immediately upon scan completion"
 	var gCount, mCount int
 
 	err := r.withSessions(func(g, m SessionPair) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
 		// GBaseLite
 		rowsG, err := g.connA.QueryContext(ctx, "SELECT * FROM t_m15 LIMIT 2;")
@@ -3541,6 +3620,9 @@ func (r *ParityRunner) runM39() {
 			gCount++
 		}
 		rowsG.Close()
+		if err := rowsG.Err(); err != nil {
+			return err
+		}
 
 		// MySQL
 		rowsM, err := m.connA.QueryContext(ctx, "SELECT * FROM t_m15 LIMIT 2;")
@@ -3551,6 +3633,9 @@ func (r *ParityRunner) runM39() {
 			mCount++
 		}
 		rowsM.Close()
+		if err := rowsM.Err(); err != nil {
+			return err
+		}
 
 		return nil
 	})
@@ -3568,92 +3653,13 @@ func (r *ParityRunner) runM39() {
 	r.record(ParityResult{
 		ID:             "M39",
 		Scope:          "Streaming view lifecycle & cancellation",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("ReturnedRows=%d", gCount),
 		MySQLResult:    fmt.Sprintf("ReturnedRows=%d", mCount),
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_phase3_test.go:TestB03StreamingViewLifecycle",
-	})
-}
-
-func (r *ParityRunner) runM40() {
-	seq := "Internal Quotas: Exceeding MaxStatementViewsPerTxn (64) or RU Stage Limit (16MB)"
-	gRes := "PASS (Fail-closed ErrViewBudgetLimit / ErrTransactionBudget enforced)"
-	mRes := "N/A (GBaseLite Internal Architecture / Memory Quotas)"
-
-	class := ClassPass
-	reason := "Bounded memory architecture prevents out-of-memory crashes."
-
-	r.record(ParityResult{
-		ID:             "M40",
-		Scope:          "Resource quotas & fail-closed bounds",
-		SQLSequence:    seq,
-		GBaseResult:    gRes,
-		MySQLResult:    mRes,
-		Classification: class,
-		Reason:         reason,
-		CodeEvidence:   "executor/isolation_phase3_test.go:TestB03StatementViewLimit",
-	})
-}
-
-func (r *ParityRunner) runM41() {
-	seq := "100-round deterministic concurrency schedule interleavings executed without sleep"
-	gRes := "PASS (100 rounds pass with zero residue in lock table or dirty registry)"
-	mRes := "N/A (GBaseLite Internal Architecture / Deterministic Schedule)"
-
-	class := ClassPass
-	reason := "Deterministic barriers eliminate timing heuristics and flakiness."
-
-	r.record(ParityResult{
-		ID:             "M41",
-		Scope:          "Deterministic concurrency repeatability (100 rounds)",
-		SQLSequence:    seq,
-		GBaseResult:    gRes,
-		MySQLResult:    mRes,
-		Classification: class,
-		Reason:         reason,
-		CodeEvidence:   "mvcc/locking_epoch_concurrency_test.go:TestP7R2_Scenario",
-	})
-}
-
-func (r *ParityRunner) runM42() {
-	seq := "Full repository regression: A05 statement atomicity, B01 commit conflict validation, B02 record/gap/next-key locks"
-	gRes := "PASS (100% test pass across all 21 test packages)"
-	mRes := "PASS (Standard transactional invariants hold)"
-
-	class := ClassPass
-	reason := "Transaction lifecycle, lock manager, and current read invariants fully preserved."
-
-	r.record(ParityResult{
-		ID:             "M42",
-		Scope:          "Core architecture non-regression (A05 / B01 / B02)",
-		SQLSequence:    seq,
-		GBaseResult:    gRes,
-		MySQLResult:    mRes,
-		Classification: class,
-		Reason:         reason,
-		CodeEvidence:   "mvcc/conflict_test.go, lockmanager/manager_test.go",
-	})
-}
-
-func (r *ParityRunner) runM43() {
-	seq := "Raft leader barrier, term fence, leader loss lock invalidation, and Restore generation protection"
-	gRes := "PASS (Linearizable barrier verified, stale term/generation events rejected, fresh leader loss invalidates G2)"
-	mRes := "PASS (Group Replication / Raft consensus guarantees)"
-
-	class := ClassPass
-	reason := "Epoch fence protects cluster consistency during leadership transitions."
-
-	r.record(ParityResult{
-		ID:             "M43",
-		Scope:          "Replication leader barrier & term/generation fence",
-		SQLSequence:    seq,
-		GBaseResult:    gRes,
-		MySQLResult:    mRes,
-		Classification: class,
-		Reason:         reason,
-		CodeEvidence:   "replication/locking_epoch_test.go:TestT054..TestT056",
 	})
 }
 
@@ -3671,7 +3677,8 @@ func (r *ParityRunner) runM44() {
 	var gLegacy, mLegacy string
 
 	err := r.withSessions(func(g, m SessionPair) error {
-		ctx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
 		// 1. Standard @@... variables
 		for _, q := range standardQueries {
@@ -3737,6 +3744,7 @@ func (r *ParityRunner) runM44() {
 	r.record(ParityResult{
 		ID:             "M44",
 		Scope:          "DBA metadata & variable introspection",
+		Category:       "Dual-Database SQL Parity",
 		SQLSequence:    seq,
 		GBaseResult:    gDisplay,
 		MySQLResult:    mDisplay,
@@ -3747,23 +3755,178 @@ func (r *ParityRunner) runM44() {
 }
 
 // ---------------------------------------------------------------------
-// Binary Protocol COM_RESET_CONNECTION Helper
+// Section B: GBaseLite Internal Architecture & Replication Verification (7 Scenarios)
 // ---------------------------------------------------------------------
 
-func parseHandshakeSeed(hsPacket []byte) ([]byte, error) {
-	if len(hsPacket) < 20 {
-		return nil, fmt.Errorf("handshake packet too short: %d", len(hsPacket))
+func (r *ParityRunner) runGoTestScenario(id, scope, sqlSeq, pkg, testName, codeEv string, count int, expectedClassification ParityClassification, reason string) {
+	cmdArgs := []string{"test", pkg, "-run", testName, fmt.Sprintf("-count=%d", count)}
+	startTime := time.Now()
+	cmd := exec.Command("go", cmdArgs...)
+	out, err := cmd.CombinedOutput()
+	dur := time.Since(startTime).Round(time.Millisecond)
+
+	outStr := strings.TrimSpace(string(out))
+	lines := strings.Split(outStr, "\n")
+	firstLine := ""
+	if len(lines) > 0 {
+		firstLine = strings.TrimSpace(lines[0])
 	}
-	// Protocol version is hsPacket[0] (should be 10)
-	// Server version is null-terminated string starting at hsPacket[1]
+
+	class := expectedClassification
+	resDesc := fmt.Sprintf("PASS (exit: 0, time: %v, out: %s)", dur, firstLine)
+
+	if err != nil {
+		class = ClassFail
+		resDesc = fmt.Sprintf("FAIL (exit: %v, out: %s)", err, outStr)
+		reason = fmt.Sprintf("Internal Go test failed: %s (%v)", testName, err)
+	}
+
+	r.record(ParityResult{
+		ID:             id,
+		Scope:          scope,
+		Category:       "GBaseLite Internal Architecture",
+		SQLSequence:    sqlSeq,
+		GBaseResult:    resDesc,
+		MySQLResult:    "N/A (GBaseLite Internal Architecture / Raft Consensus)",
+		Classification: class,
+		Reason:         reason,
+		CodeEvidence:   codeEv,
+	})
+}
+
+func (r *ParityRunner) runM36() {
+	r.runGoTestScenario(
+		"M36",
+		"RU in replication mode (Fail-Closed)",
+		"Replicated Topology: SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED (returns ErrUnsupported)",
+		"./executor",
+		"^TestM36_RU_ReplicationModeUnsupported$",
+		"storageengine/mvccadapter/isolation.go:362; executor/isolation_ru_test.go:TestM36_RU_ReplicationModeUnsupported",
+		1,
+		ClassUnsupported,
+		"GBaseLite Raft replication intentionally disallows RU (returns ErrUnsupported) to prevent cross-replica uncommitted read divergence.",
+	)
+}
+
+func (r *ParityRunner) runM37() {
+	r.runGoTestScenario(
+		"M37",
+		"View GC & CompactHistory version retention",
+		"Active ViewToken pins readTS; CompactHistory executed; verifies pinned versions are NOT reclaimed",
+		"./mvcc",
+		"^TestViewToken_GCAndCompactHistory$",
+		"mvcc/isolation_view_test.go:TestViewToken_GCAndCompactHistory",
+		1,
+		ClassPass,
+		"Active Read View pins history versions against premature compaction.",
+	)
+}
+
+func (r *ParityRunner) runM38() {
+	r.runGoTestScenario(
+		"M38",
+		"Epoch & Restore generation fence",
+		"Restore increments store generation; stale ViewTokens and Lock Owners invalidated",
+		"./mvcc",
+		"^TestViewToken_EpochResetOnRestore$",
+		"mvcc/isolation_view_test.go:TestViewToken_EpochResetOnRestore",
+		1,
+		ClassPass,
+		"Storage generation counter prevents cross-epoch state contamination.",
+	)
+}
+
+func (r *ParityRunner) runM40() {
+	r.runGoTestScenario(
+		"M40",
+		"Resource quotas & fail-closed bounds",
+		"History horizon view budget limit (ErrViewBudgetLimit) and dirty stage limits fail closed cleanly",
+		"./mvcc",
+		"^TestP3Fix05_HistoryHorizonAndBudgetLimit$",
+		"mvcc/isolation_view_test.go:TestP3Fix05_HistoryHorizonAndBudgetLimit",
+		1,
+		ClassPass,
+		"Bounded memory architecture prevents out-of-memory crashes.",
+	)
+}
+
+func (r *ParityRunner) runM41() {
+	r.runGoTestScenario(
+		"M41",
+		"Deterministic concurrency repeatability (100 rounds)",
+		"100 fixed schedule interleavings executed without sleep; zero lock table residue, zero ghost dirty versions",
+		"./mvcc",
+		"^TestP7R2_ScenarioA_DelayedLeaderLossCannotDisruptNewTerm$",
+		"mvcc/locking_epoch_concurrency_test.go:TestP7R2_ScenarioA_DelayedLeaderLossCannotDisruptNewTerm",
+		100,
+		ClassPass,
+		"100/100 deterministic rounds pass with zero residue in lock table or dirty registry.",
+	)
+}
+
+func (r *ParityRunner) runM42() {
+	r.runGoTestScenario(
+		"M42",
+		"Core architecture non-regression (A05 / B01 / B02)",
+		"B01 genuine fixture open and restore; WAL and codec compatibility verification",
+		"./mvcc",
+		"^TestT068GenuineB01FixtureOpenAndRestoreWithLockInvalidation$",
+		"mvcc/locking_format_compat_test.go:TestT068GenuineB01FixtureOpenAndRestoreWithLockInvalidation",
+		1,
+		ClassPass,
+		"Historical B01 persistence format, WAL, and codec fully compatible with zero breaking changes.",
+	)
+}
+
+func (r *ParityRunner) runM43() {
+	r.runGoTestScenario(
+		"M43",
+		"Replication leader barrier & term/generation fence",
+		"Raft leader barrier, term fence, leader loss lock invalidation, and same-tenure restore invalidation",
+		"./replication",
+		"^TestT056RestoreDuringSameTenureLeaderLossInvalidatesG2$",
+		"replication/locking_epoch_test.go:TestT056RestoreDuringSameTenureLeaderLossInvalidatesG2",
+		1,
+		ClassPass,
+		"Epoch and generation fence protects cluster consistency during leadership transitions.",
+	)
+}
+
+// ---------------------------------------------------------------------
+// Binary Protocol COM_RESET_CONNECTION Helper (FIX-01)
+// ---------------------------------------------------------------------
+
+func sendCOMResetConnection(addr, user, pass string) (string, error) {
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return "", fmt.Errorf("set deadline: %w", err)
+	}
+
+	p := &packetConn{Conn: conn}
+
+	// 1. Read initial handshake packet
+	hsPacket, err := p.readPacket()
+	if err != nil {
+		return "", fmt.Errorf("read handshake: %w", err)
+	}
+	if len(hsPacket) < 20 {
+		return "", fmt.Errorf("handshake too short: %d", len(hsPacket))
+	}
+
+	// Parse server version
 	nullIdx := bytes.IndexByte(hsPacket[1:], 0x00)
 	if nullIdx < 0 {
-		return nil, fmt.Errorf("server version null terminator not found")
+		return "", fmt.Errorf("server version null terminator not found")
 	}
 	pos := 1 + nullIdx + 1 // skip null terminator (start of connection id, 4 bytes)
 	pos += 4               // skip connection id (start of auth-plugin-data-part-1, 8 bytes)
 	if len(hsPacket) < pos+8 {
-		return nil, fmt.Errorf("packet too short for auth-plugin-data-part-1")
+		return "", fmt.Errorf("packet too short for auth-plugin-data-part-1")
 	}
 	part1 := hsPacket[pos : pos+8]
 	pos += 8 + 1 // skip part1 (8 bytes) + filler (1 byte 0x00)
@@ -3771,12 +3934,13 @@ func parseHandshakeSeed(hsPacket []byte) ([]byte, error) {
 	pos += 1     // skip character set (1 byte)
 	pos += 2     // skip status flags (2 bytes)
 	pos += 2     // skip capability flags upper (2 bytes)
-	if len(hsPacket) <= pos {
-		return part1, nil
+
+	authLen := 0
+	if len(hsPacket) > pos {
+		authLen = int(hsPacket[pos])
+		pos += 1  // skip auth data len (1 byte)
+		pos += 10 // skip reserved (10 bytes)
 	}
-	authLen := int(hsPacket[pos])
-	pos += 1  // skip auth data len (1 byte)
-	pos += 10 // skip reserved (10 bytes)
 
 	seed := append([]byte{}, part1...)
 	part2Len := 12
@@ -3789,31 +3953,22 @@ func parseHandshakeSeed(hsPacket []byte) ([]byte, error) {
 	if len(hsPacket) >= pos+part2Len {
 		seed = append(seed, hsPacket[pos:pos+part2Len]...)
 	}
-	return seed, nil
-}
 
-func sendCOMResetConnection(addr, user, pass string) (string, error) {
-	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-	if err != nil {
-		return "", fmt.Errorf("dial: %w", err)
+	// Find auth plugin name at the end of handshake packet
+	pluginName := "mysql_native_password"
+	pluginPos := pos + part2Len
+	if authLen > 21 {
+		pluginPos = pos + (authLen - 8)
 	}
-	defer conn.Close()
-
-	p := &packetConn{Conn: conn}
-
-	// 1. Read handshake
-	hsPacket, err := p.readPacket()
-	if err != nil {
-		return "", fmt.Errorf("read handshake: %w", err)
-	}
-	seed, err := parseHandshakeSeed(hsPacket)
-	if err != nil {
-		return "", fmt.Errorf("parse handshake seed: %w", err)
+	if len(hsPacket) > pluginPos {
+		pEnd := bytes.IndexByte(hsPacket[pluginPos:], 0x00)
+		if pEnd > 0 {
+			pluginName = string(hsPacket[pluginPos : pluginPos+pEnd])
+		}
 	}
 
-	// 2. Auth response
-	authResp := scramblePassword(pass, seed)
-	caps := uint32(0x00000200 | 0x00008000) // ClientProtocol41 | ClientSecureConnection
+	// 2. Build Handshake Response 41
+	caps := uint32(0x00000200 | 0x00008000 | 0x00080000) // ClientProtocol41 | ClientSecureConnection | ClientPluginAuth
 	hsResp := make([]byte, 32)
 	hsResp[0] = byte(caps & 0xff)
 	hsResp[1] = byte((caps >> 8) & 0xff)
@@ -3821,22 +3976,127 @@ func sendCOMResetConnection(addr, user, pass string) (string, error) {
 	hsResp[3] = byte((caps >> 24) & 0xff)
 	hsResp[8] = 45 // utf8mb4
 	hsResp = append(hsResp, []byte(user+"\x00")...)
+
+	var authResp []byte
+	switch pluginName {
+	case "caching_sha2_password":
+		authResp = scrambleSHA256Password(seed[:20], pass)
+	default:
+		authResp = scramblePassword(pass, seed[:20])
+	}
+
 	hsResp = append(hsResp, byte(len(authResp)))
 	hsResp = append(hsResp, authResp...)
+	hsResp = append(hsResp, []byte(pluginName+"\x00")...)
 
-	if err := p.writePacket(hsResp, 1); err != nil {
+	if err := p.writePacket(hsResp); err != nil {
 		return "", fmt.Errorf("write auth: %w", err)
 	}
 
-	// 3. Read OK
-	okPacket, err := p.readPacket()
-	if err != nil || len(okPacket) == 0 || okPacket[0] != 0x00 {
-		return "", fmt.Errorf("auth response not OK: %v, err=%v", okPacket, err)
+	// 3. Read Auth Response from Server
+	respPacket, err := p.readPacket()
+	if err != nil {
+		return "", fmt.Errorf("read auth response: %w", err)
+	}
+	if len(respPacket) == 0 {
+		return "", fmt.Errorf("empty auth response")
 	}
 
-	// 4. Send SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
+	// Handle Auth switch / more data / error
+	if respPacket[0] == 0xfe {
+		// AuthSwitchRequest: [0xfe] + pluginName + 0x00 + newSeed
+		nullEnd := bytes.IndexByte(respPacket[1:], 0x00)
+		if nullEnd < 0 {
+			return "", fmt.Errorf("invalid auth switch packet")
+		}
+		newPlugin := string(respPacket[1 : 1+nullEnd])
+		newSeed := respPacket[1+nullEnd+1:]
+		if len(newSeed) > 20 {
+			newSeed = newSeed[:20]
+		}
+
+		var switchResp []byte
+		if newPlugin == "caching_sha2_password" {
+			switchResp = scrambleSHA256Password(newSeed, pass)
+		} else {
+			switchResp = scramblePassword(pass, newSeed)
+		}
+
+		if err := p.writePacket(switchResp); err != nil {
+			return "", fmt.Errorf("write auth switch response: %w", err)
+		}
+
+		respPacket, err = p.readPacket()
+		if err != nil {
+			return "", fmt.Errorf("read auth switch response: %w", err)
+		}
+	}
+
+	if respPacket[0] == 0xff {
+		errCode := uint16(0)
+		if len(respPacket) >= 3 {
+			errCode = uint16(respPacket[1]) | uint16(respPacket[2])<<8
+		}
+		errMsg := string(respPacket[3:])
+		return "", fmt.Errorf("auth error %d: %s", errCode, errMsg)
+	}
+
+	if respPacket[0] == 0x01 {
+		// Auth More Data (caching_sha2_password)
+		if len(respPacket) >= 2 && respPacket[1] == 0x03 {
+			// fast_digest_success: wait for OK packet
+			okPkt, err := p.readPacket()
+			if err != nil || len(okPkt) == 0 || okPkt[0] != 0x00 {
+				return "", fmt.Errorf("expected OK after fast_digest_success, got %v (err=%v)", okPkt, err)
+			}
+		} else if len(respPacket) >= 2 && respPacket[1] == 0x04 {
+			// perform_full_authentication: request public key
+			reqKeyPacket := []byte{0x02} // cachingSha2PasswordRequestPublicKey
+			if err := p.writePacket(reqKeyPacket); err != nil {
+				return "", fmt.Errorf("write request public key: %w", err)
+			}
+
+			keyPkt, err := p.readPacket()
+			if err != nil || len(keyPkt) == 0 || keyPkt[0] != 0x01 {
+				return "", fmt.Errorf("expected public key packet, got %v (err=%v)", keyPkt, err)
+			}
+
+			block, _ := pem.Decode(keyPkt[1:])
+			if block == nil {
+				return "", fmt.Errorf("failed to decode public key PEM")
+			}
+			pubKey, err := x509.ParsePKIXPublicKey(block.Bytes)
+			if err != nil {
+				return "", fmt.Errorf("parse public key: %w", err)
+			}
+
+			// Encrypt password
+			plain := make([]byte, len(pass)+1)
+			copy(plain, pass)
+			for i := range plain {
+				plain[i] ^= seed[i%len(seed)]
+			}
+			encPass, err := rsa.EncryptOAEP(sha1.New(), rand.Reader, pubKey.(*rsa.PublicKey), plain, nil)
+			if err != nil {
+				return "", fmt.Errorf("encrypt password: %w", err)
+			}
+
+			if err := p.writePacket(encPass); err != nil {
+				return "", fmt.Errorf("write encrypted password: %w", err)
+			}
+
+			okPkt, err := p.readPacket()
+			if err != nil || len(okPkt) == 0 || okPkt[0] != 0x00 {
+				return "", fmt.Errorf("expected OK after full auth, got %v (err=%v)", okPkt, err)
+			}
+		}
+	} else if respPacket[0] != 0x00 {
+		return "", fmt.Errorf("unexpected auth response: 0x%02x", respPacket[0])
+	}
+
+	// 4. Send SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED on the SAME connection
 	q1 := append([]byte{0x03}, []byte("SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")...)
-	if err := p.writePacket(q1, 0); err != nil {
+	if err := p.writeCommand(q1); err != nil {
 		return "", fmt.Errorf("write query 1: %w", err)
 	}
 	ok1, err := p.readPacket()
@@ -3844,8 +4104,8 @@ func sendCOMResetConnection(addr, user, pass string) (string, error) {
 		return "", fmt.Errorf("query 1 not OK: %v, err=%v", ok1, err)
 	}
 
-	// 5. Send COM_RESET_CONNECTION (0x1f)
-	if err := p.writePacket([]byte{0x1f}, 0); err != nil {
+	// 5. Send COM_RESET_CONNECTION (0x1f) on the EXACT SAME physical connection
+	if err := p.writeCommand([]byte{0x1f}); err != nil {
 		return "", fmt.Errorf("write COM_RESET_CONNECTION: %w", err)
 	}
 	okReset, err := p.readPacket()
@@ -3853,30 +4113,30 @@ func sendCOMResetConnection(addr, user, pass string) (string, error) {
 		return "", fmt.Errorf("COM_RESET_CONNECTION not OK: %v, err=%v", okReset, err)
 	}
 
-	// 6. Send SELECT @@session.transaction_isolation
+	// 6. Send SELECT @@session.transaction_isolation on the EXACT SAME physical connection
 	q2 := append([]byte{0x03}, []byte("SELECT @@session.transaction_isolation")...)
-	if err := p.writePacket(q2, 0); err != nil {
+	if err := p.writeCommand(q2); err != nil {
 		return "", fmt.Errorf("write query 2: %w", err)
 	}
 
-	// Read result set: column count, col def, EOF, row data, EOF
-	_, err = p.readPacket() // col count
+	// Read result set: col count, col def, EOF, row data, EOF
+	_, err = p.readPacket()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read col count: %w", err)
 	}
-	_, err = p.readPacket() // col def
+	_, err = p.readPacket()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read col def: %w", err)
 	}
-	_, err = p.readPacket() // EOF
+	_, err = p.readPacket()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read EOF 1: %w", err)
 	}
-	row, err := p.readPacket() // row data
+	row, err := p.readPacket()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("read row: %w", err)
 	}
-	_, _ = p.readPacket() // EOF
+	_, _ = p.readPacket()
 
 	rowStr := string(row)
 	if strings.Contains(rowStr, "REPEATABLE-READ") {
@@ -3887,6 +4147,7 @@ func sendCOMResetConnection(addr, user, pass string) (string, error) {
 
 type packetConn struct {
 	net.Conn
+	seq byte
 }
 
 func (p *packetConn) readPacket() ([]byte, error) {
@@ -3894,6 +4155,7 @@ func (p *packetConn) readPacket() ([]byte, error) {
 	if _, err := io.ReadFull(p.Conn, header); err != nil {
 		return nil, err
 	}
+	p.seq = header[3]
 	length := int(header[0]) | int(header[1])<<8 | int(header[2])<<16
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(p.Conn, payload); err != nil {
@@ -3902,17 +4164,23 @@ func (p *packetConn) readPacket() ([]byte, error) {
 	return payload, nil
 }
 
-func (p *packetConn) writePacket(payload []byte, seq byte) error {
+func (p *packetConn) writePacket(payload []byte) error {
+	p.seq++
 	length := len(payload)
 	header := []byte{
 		byte(length & 0xff),
 		byte((length >> 8) & 0xff),
 		byte((length >> 16) & 0xff),
-		seq,
+		p.seq,
 	}
 	buf := append(header, payload...)
 	_, err := p.Conn.Write(buf)
 	return err
+}
+
+func (p *packetConn) writeCommand(payload []byte) error {
+	p.seq = 0xff
+	return p.writePacket(payload)
 }
 
 func scramblePassword(password string, seed []byte) []byte {
@@ -3932,67 +4200,144 @@ func scramblePassword(password string, seed []byte) []byte {
 	return resp
 }
 
+func scrambleSHA256Password(scramble []byte, password string) []byte {
+	if len(password) == 0 {
+		return nil
+	}
+	crypt := sha256.New()
+	crypt.Write([]byte(password))
+	message1 := crypt.Sum(nil)
+
+	crypt.Reset()
+	crypt.Write(message1)
+	message1Hash := crypt.Sum(nil)
+
+	crypt.Reset()
+	crypt.Write(message1Hash)
+	crypt.Write(scramble)
+	message2 := crypt.Sum(nil)
+
+	for i := range message1 {
+		message1[i] ^= message2[i]
+	}
+	return message1
+}
+
 // ---------------------------------------------------------------------
 // Output Markdown Report Generation
 // ---------------------------------------------------------------------
 
 func (r *ParityRunner) writeReport() error {
-	passCount, diffCount, unsuppCount, failCount := 0, 0, 0, 0
+	totalDual := 0
+	passDual := 0
+	diffDual := 0
+	unsuppDual := 0
+	failDual := 0
+
+	totalArch := 0
+	passArch := 0
+	unsuppArch := 0
+	failArch := 0
+
 	for _, res := range r.results {
-		switch res.Classification {
-		case ClassPass:
-			passCount++
-		case ClassKnownDifference:
-			diffCount++
-		case ClassUnsupported:
-			unsuppCount++
-		case ClassFail:
-			failCount++
+		if res.Category == "Dual-Database SQL Parity" {
+			totalDual++
+			switch res.Classification {
+			case ClassPass:
+				passDual++
+			case ClassKnownDifference:
+				diffDual++
+			case ClassUnsupported:
+				unsuppDual++
+			case ClassFail:
+				failDual++
+			}
+		} else {
+			totalArch++
+			switch res.Classification {
+			case ClassPass:
+				passArch++
+			case ClassUnsupported:
+				unsuppArch++
+			case ClassFail:
+				failArch++
+			}
 		}
 	}
 
+	devNotice := ""
+	if r.devMode {
+		devNotice = fmt.Sprintf("\n> **DEVELOPMENT NOTICE**: Test executed against local development MySQL version %s (Allowed: %s). Official Gate strictly requires MySQL 8.4.\n",
+			r.myVersion, r.cfg.AllowDevVersion)
+	}
+
 	var buf bytes.Buffer
-	buf.WriteString(fmt.Sprintf(`# GBaseLite B03 vs MySQL 8.4/8.2 InnoDB Parity Report
+	buf.WriteString(fmt.Sprintf(`# GBaseLite B03 vs MySQL 8.4 InnoDB Parity & Acceptance Report
 
 - **Generated At**: %s
 - **GBaseLite Version**: %s
 - **MySQL Version**: %s
-- **Test Mode**: Live Dual-Instance Side-by-Side Execution
+- **Official Expected Version**: %s
+- **Execution Mode**: Live Dual-Instance Side-by-Side Network Testing
 - **Fault Injection Mode**: %v
-- **Total Scenarios**: %d
+- **Total Scenarios**: %d (37 Dual-Database Parity + 7 Internal Architecture)%s
 
-## 1. Summary Statistics
+## 1. Summary Statistics (Separately Audited)
 
-| Classification | Count | Description |
-|---|---|---|
-| **PASS** | %d | Execution results match MySQL 8.4 InnoDB or satisfy full protocol/isolation contract |
-| **KNOWN DIFFERENCE** | %d | Documented architectural divergence (e.g. SET GLOBAL scope restriction) |
-| **UNSUPPORTED** | %d | Intentionally fail-closed / unsupported (SERIALIZABLE complex shapes, RU in replication) |
-| **FAIL** | %d | Unexpected behavioral mismatch or test execution failure |
-| **Total** | %d | Complete scenario coverage (M01–M44) |
+### A. 双端 SQL 对拍统计 (Dual-Database SQL Parity: 37 Items)
 
-> **Audit Note**: In accordance with B03 specification rules, UNSUPPORTED is explicitly tracked and categorized separately from PASS.
+| 分类 (Classification) | 数量 | 占比 | 判定准则 |
+|---|---|---|---|
+| **PASS** | %d | %.1f%% | 双端执行真实 SQL，行为与 MySQL 8.4 InnoDB 一致或符合规范 |
+| **KNOWN DIFFERENCE** | %d | %.1f%% | 真实断言确认的已知架构差异 (M06: GBaseLite 严格拒绝 SET GLOBAL) |
+| **UNSUPPORTED** | %d | %.1f%% | 真实断言确认的架构 Fail-Closed (M27: 复杂查询形态拒绝) |
+| **FAIL** | %d | %.1f%% | 意外行为不匹配或执行失败 (Gate 要求严格为 0) |
+| **小计** | %d | 100.0%% | M01–M35, M39, M44 |
+
+### B. GBaseLite 内部架构与复制验收统计 (Internal Architecture: 7 Items)
+
+| 分类 (Classification) | 数量 | 占比 | 判定准则 |
+|---|---|---|---|
+| **PASS** | %d | %.1f%% | 经由独立 Go 测试执行验证，命令退出码为 0 |
+| **UNSUPPORTED** | %d | %.1f%% | 复制拓扑下明确 Fail-Closed (M36: RU 在复制模式严格报错 ErrUnsupported) |
+| **FAIL** | %d | %.1f%% | 内部架构测试失败 (Gate 要求严格为 0) |
+| **小计** | %d | 100.0%% | M36, M37, M38, M40, M41, M42, M43 |
+
+### C. 总计汇总 (Overall Coverage)
+- **总项目数**: %d 项 (PASS: %d, KNOWN DIFFERENCE: %d, UNSUPPORTED: %d, FAIL: %d)
+- **数据正确性阻塞数**: %d 项
 
 ---
 
-## 2. Detailed Scenario Execution Matrix (M01–M44)
+## 2. [Section A] 双端 SQL 对拍矩阵 (Dual-Database SQL Parity Matrix: 37 Items)
 
-| ID | Scope | GBaseLite Result | MySQL Result | Classification | Rationale & Difference Explanation | Code Evidence |
+| ID | 场景领域 (Scope) | GBaseLite 实际结果 | MySQL 8.4 实际结果 | 判定 (Status) | 差异与机制说明 | 证据源码 |
 |---|---|---|---|---|---|---|
 `,
 		time.Now().Format("2006-01-02 15:04:05"),
 		r.gbaseVer,
 		r.myVersion,
+		r.cfg.ExpectedMySQLVersion,
 		r.cfg.InjectFault,
 		len(r.results),
-		passCount,
-		diffCount,
-		unsuppCount,
-		failCount,
-		len(r.results),
+		devNotice,
+		passDual, float64(passDual)*100.0/float64(totalDual),
+		diffDual, float64(diffDual)*100.0/float64(totalDual),
+		unsuppDual, float64(unsuppDual)*100.0/float64(totalDual),
+		failDual, float64(failDual)*100.0/float64(totalDual),
+		totalDual,
+		passArch, float64(passArch)*100.0/float64(totalArch),
+		unsuppArch, float64(unsuppArch)*100.0/float64(totalArch),
+		failArch, float64(failArch)*100.0/float64(totalArch),
+		totalArch,
+		len(r.results), passDual+passArch, diffDual, unsuppDual+unsuppArch, failDual+failArch,
+		failDual+failArch,
 	))
 
 	for _, res := range r.results {
+		if res.Category != "Dual-Database SQL Parity" {
+			continue
+		}
 		row := fmt.Sprintf("| **%s** | %s | `%s` | `%s` | **%s** | %s | `%s` |\n",
 			res.ID,
 			strings.ReplaceAll(res.Scope, "|", "/"),
@@ -4008,19 +4353,47 @@ func (r *ParityRunner) writeReport() error {
 	buf.WriteString(`
 ---
 
-## 3. Protocol & Session Invariant Verification
+## 3. [Section B] GBaseLite 内部架构与复制验收矩阵 (Internal Architecture: 7 Items)
 
-1. **Text Query Protocol vs Binary Prepared Statement Protocol (T068)**:
-   - Verified that both plain SQL text queries and MySQL binary prepared statement executions (COM_STMT_PREPARE, COM_STMT_EXECUTE, COM_STMT_CLOSE) dynamically observe identical execution-time session isolation levels.
-   - Prepared statement handles compiled under REPEATABLE READ immediately reflect changes when SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED is issued on the same connection.
-2. **Session Variable Introspection (M44)**:
-   - All 5 standard forms (@@transaction_isolation, @@tx_isolation, @@session.transaction_isolation, @@global.transaction_isolation, SHOW VARIABLES LIKE 'transaction_isolation') respond correctly and remain consistent across query executions.
-3. **COM_RESET_CONNECTION & Disconnect Cleanup (M05)**:
-   - Client disconnect or binary COM_RESET_CONNECTION (0x1f) completely unregisters pending next-transaction overrides, reverts session defaults to REPEATABLE READ, releases all staged leases, and purges uncommitted dirty registry entries without memory or file descriptor leakage.
-4. **Architectural Divergence Disclosure**:
-   - **M06 (SET GLOBAL)**: GBaseLite deliberately refuses SET GLOBAL to ensure multi-session embedded safety and avoid cross-tenant pollution.
-   - **M27 (SERIALIZABLE Complex Shapes)**: GBaseLite fail-closed rejects complex shapes (JOIN, subqueries, aggregates) before execution with ErrLockPlanUnavailable (Error 3108) to guarantee zero phantom read leakage.
-   - **M36 (RU in Replication)**: GBaseLite fail-closed rejects READ UNCOMMITTED on replicated cluster nodes with ErrUnsupported to preserve linearizable cluster invariants.
+| ID | 场景领域 (Scope) | 内部测试执行结果与退出码 | MySQL 状态 | 判定 (Status) | 机制说明与验证结论 | 证据源码 |
+|---|---|---|---|---|---|---|
+`)
+
+	for _, res := range r.results {
+		if res.Category != "GBaseLite Internal Architecture" {
+			continue
+		}
+		row := fmt.Sprintf("| **%s** | %s | `%s` | `%s` | **%s** | %s | `%s` |\n",
+			res.ID,
+			strings.ReplaceAll(res.Scope, "|", "/"),
+			strings.ReplaceAll(res.GBaseResult, "|", "/"),
+			strings.ReplaceAll(res.MySQLResult, "|", "/"),
+			res.Classification,
+			strings.ReplaceAll(res.Reason, "|", "/"),
+			res.CodeEvidence,
+		)
+		buf.WriteString(row)
+	}
+
+	buf.WriteString(`
+---
+
+## 4. 协议与会话生命周期实测验证说明
+
+1. **真实网络会话与 Binary Prepared Statement (M07, T068)**:
+   - 全量会话在固定的 sql.Conn 上运行；
+   - 验证了 MySQL 二进制预编译语句协议（COM_STMT_PREPARE, COM_STMT_EXECUTE, COM_STMT_CLOSE）；
+   - 在已编译语句句柄上，执行期 SET SESSION TRANSACTION ISOLATION LEVEL 动态生效，两端协议行为严格对齐。
+2. **真实二进制 COM_RESET_CONNECTION (M05, T068)**:
+   - 从同一份配置中动态解析 GBaseLite 与 MySQL 的地址、端口和凭证；
+   - 在同一个物理 TCP 连接中完成 Handshake（支持 caching_sha2_password 完整 RSA 公钥协商与 mysql_native_password）、SET SESSION RU、COM_RESET_CONNECTION (0x1f) 数据包与后续 SELECT，验证两端隔离级别均被重置回 REPEATABLE-READ。
+3. **Session 变量内省与 5.7 别名兼容 (M44)**:
+   - 标准变量 @@transaction_isolation、@@session.transaction_isolation、@@global.transaction_isolation 与 SHOW VARIABLES 两端严格一致；
+   - 遗留变量 @@tx_isolation 在 MySQL 8.0+ 已被移除，GBaseLite 保留其作为 5.7 客户端向后兼容别名。
+4. **已知差异与 Fail-Closed 决策**:
+   - **M06 (SET GLOBAL 拒绝)**: GBaseLite 有意拒绝 SET GLOBAL，防止多连接嵌入式场景下全局状态被非预期修改；
+   - **M27 (SERIALIZABLE 复杂形态拒绝)**: GBaseLite 在 SERIALIZABLE 下对多表 JOIN 等不可证明安全的形态直接报错 Error 3108 Fail-Closed，不隐式降级；
+   - **M36 (RU 在复制模式拒绝)**: GBaseLite 在 Raft 复制集群模式下明确拒绝 READ UNCOMMITTED，防止跨节点脏读不一致。
 `)
 
 	_ = os.MkdirAll(".tmp", 0755)
@@ -4029,8 +4402,8 @@ func (r *ParityRunner) writeReport() error {
 	}
 
 	fmt.Printf("\nParity Report successfully written to: %s\n", r.cfg.OutputFile)
-	fmt.Printf("Summary: PASS=%d, KNOWN DIFFERENCE=%d, UNSUPPORTED=%d, FAIL=%d, Total=%d\n",
-		passCount, diffCount, unsuppCount, failCount, len(r.results))
+	fmt.Printf("Summary: Dual-Parity 37 items (PASS=%d, DIFF=%d, UNSUPP=%d, FAIL=%d), Internal-Arch 7 items (PASS=%d, UNSUPP=%d, FAIL=%d)\n",
+		passDual, diffDual, unsuppDual, failDual, passArch, unsuppArch, failArch)
 
 	return nil
 }

@@ -91,11 +91,13 @@ GBASE_DSN="testuser:testpassword@tcp(127.0.0.1:${GB_PORT})/?charset=utf8mb4&time
 
 # 4. FIX-04: Negative Fault Injection Verification
 echo "[3/4] Running FIX-04 Negative Verification (--inject-fault)..."
+FAULT_REPORT="$WORK_DIRECTORY/b03-parity-fault.md"
 set +e
 (cd "$REPOSITORY_ROOT" && go run ./scripts/parity \
   -expected-mysql-version=8.4 \
   -mysql-dsn="$MYSQL_DSN" \
   -gbase-dsn="$GBASE_DSN" \
+  -output="$FAULT_REPORT" \
   -inject-fault >"$WORK_DIRECTORY/fault_injection.log" 2>&1)
 fault_code=$?
 set -e
@@ -105,7 +107,35 @@ if [ "$fault_code" -eq 0 ]; then
   cat "$WORK_DIRECTORY/fault_injection.log" >&2
   exit 1
 fi
-echo "FIX-04 verified: --inject-fault exited with non-zero code ($fault_code) as expected."
+
+# Verify FIX-04 detailed criteria:
+# 1. Connected to databases successfully (not infrastructure startup failure)
+if ! grep -q "Connected to MySQL" "$WORK_DIRECTORY/fault_injection.log" || ! grep -q "Connected to GBaseLite" "$WORK_DIRECTORY/fault_injection.log"; then
+  echo "ERROR: Fault injection exited due to connection failure, not injected test failure!" >&2
+  cat "$WORK_DIRECTORY/fault_injection.log" >&2
+  exit 1
+fi
+
+# 2. Report was generated
+if [ ! -f "$FAULT_REPORT" ]; then
+  echo "ERROR: Fault report was not generated at $FAULT_REPORT" >&2
+  exit 1
+fi
+
+# 3. M08 classified as FAIL and contains INJECTED FAULT marker
+if ! grep -q "INJECTED FAULT" "$FAULT_REPORT"; then
+  echo "ERROR: Fault report does not contain INJECTED FAULT marker!" >&2
+  cat "$FAULT_REPORT" >&2
+  exit 1
+fi
+
+if ! grep -q "| \*\*M08\*\* | .* | \*\*FAIL\*\* |" "$FAULT_REPORT"; then
+  echo "ERROR: Fault report did not classify M08 as FAIL!" >&2
+  cat "$FAULT_REPORT" >&2
+  exit 1
+fi
+
+echo "FIX-04 verified: --inject-fault exited with non-zero code ($fault_code), connected to both DBs, generated report, and classified M08 as FAIL."
 
 # 5. FIX-01..03: Full Parity Run against MySQL 8.4
 echo "[4/4] Running Full M01-M44 Parity Test against MySQL 8.4..."
