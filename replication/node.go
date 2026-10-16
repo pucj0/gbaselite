@@ -350,6 +350,15 @@ func (n *Node) onLeaderElected(term uint64) {
 
 func (n *Node) onLeaderLoss(eventTenure uint64, eventTerm uint64, eventGeneration uint64) {
 	n.leadershipMu.Lock()
+	if n.store != nil {
+		storeGen := n.store.Generation()
+		if storeGen > n.leaderGeneration {
+			n.leaderGeneration = storeGen
+			if n.tenureGen != nil {
+				n.tenureGen[n.tenure] = storeGen
+			}
+		}
+	}
 	if eventGeneration == 0 {
 		if g, ok := n.tenureGen[eventTenure]; ok && g > 0 {
 			eventGeneration = g
@@ -383,6 +392,15 @@ func (n *Node) currentLeadership() (uint64, uint64, uint64) {
 	term := n.leaderTerm
 	if term == 0 {
 		term = n.Term()
+	}
+	if n.store != nil {
+		storeGen := n.store.Generation()
+		if storeGen > n.leaderGeneration {
+			n.leaderGeneration = storeGen
+			if n.tenureGen != nil {
+				n.tenureGen[n.tenure] = storeGen
+			}
+		}
 	}
 	gen := n.leaderGeneration
 	if gen == 0 && n.store != nil {
@@ -515,6 +533,14 @@ func (n *Node) Restore(reader io.ReadCloser) error {
 		n.fail(err)
 		return err
 	}
+	n.leadershipMu.Lock()
+	if n.store != nil {
+		n.leaderGeneration = n.store.Generation()
+		if n.tenureGen != nil {
+			n.tenureGen[n.tenure] = n.leaderGeneration
+		}
+	}
+	n.leadershipMu.Unlock()
 	return nil
 }
 

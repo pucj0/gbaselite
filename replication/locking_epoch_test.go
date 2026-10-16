@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -916,5 +917,127 @@ func TestT055DelayedLeaderLossCannotInvalidateNewGenerationRoot(t *testing.T) {
 	_, err = ltxG2.ReadCurrent(ctx, grantG2, "row/test", []byte("k1"))
 	if err == nil {
 		t.Fatal("expected failure for txG2 after genuine loss of tenure 2, got nil")
+	}
+}
+
+// TestT056RestoreDuringSameTenureLeaderLossInvalidatesG2 verifies that when a Restore
+// occurs within the SAME leadership tenure (advancing generation from G1 to G2),
+// subsequent leader loss for that tenure must invalidate G2's locks and waiters.
+func TestT056RestoreDuringSameTenureLeaderLossInvalidatesG2(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.Close()
+	leaderIdx := tc.WaitForLeader(15 * time.Second)
+	leaderEng := tc.engines[leaderIdx]
+	ctx := context.Background()
+
+	nodeA := leaderEng.(storageengine.ReplicatedEngine).Replica().(interface{ Node() *replication.Node }).Node()
+	tenure1, term1 := nodeA.CurrentTenureForTesting()
+	store := nodeA.StoreForTesting()
+	gen1 := store.Generation()
+
+	// 1. Snapshot and Restore on Node A without tenure transition
+	snap, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := snap.WriteTo(&buf); err != nil {
+		t.Fatal(err)
+	}
+	_ = snap.Rollback()
+
+	// Use nodeA.Restore (supported path)
+	if err := nodeA.Restore(io.NopCloser(bytes.NewReader(buf.Bytes()))); err != nil {
+		t.Fatalf("nodeA.Restore failed: %v", err)
+	}
+
+	gen2 := store.Generation()
+	if gen2 <= gen1 {
+		t.Fatalf("gen2 (%d) must be greater than gen1 (%d)", gen2, gen1)
+	}
+
+	// 2. In G2 (still tenure 1, term 1), create Tx 1 acquiring Record X
+	tx1, err := leaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx1.Rollback()
+
+	locks1 := tx1.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	ltx1, _ := locks1.LockingTxn()
+	scope1, err := ltx1.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tableRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeIX,
+		Kind:    storageengine.LockComponentTableIntent,
+		Space:   "row/test",
+		TableID: "t1",
+	}
+	rowRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeX,
+		Kind:    storageengine.LockComponentRecord,
+		Space:   "row/test",
+		TableID: "t1",
+		Key:     []byte("k1"),
+	}
+
+	grant1, err := ltx1.Acquire(ctx, scope1, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}})
+	if err != nil {
+		t.Fatalf("tx1 Acquire in G2 failed: %v", err)
+	}
+
+	// Tx 2 in G2 waits for Record X
+	tx2, err := leaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx2.Rollback()
+
+	locks2 := tx2.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	ltx2, _ := locks2.LockingTxn()
+	scope2, err := ltx2.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done2 := make(chan error, 1)
+	go func() {
+		_, err := ltx2.Acquire(ctx, scope2, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}})
+		done2 <- err
+	}()
+
+	lmA := mvccadapter.LockManagerOf(leaderEng)
+	waitDeadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(waitDeadline) {
+		if len(lmA.WaitEdges()) > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 3. Node A genuinely loses leadership of tenure 1
+	nodeA.HandleLeaderLossForTesting(tenure1, term1)
+
+	// Waiter Tx 2 MUST be woken with ErrLockInvalidated
+	select {
+	case err := <-done2:
+		if !errors.Is(err, storageengine.ErrLockInvalidated) {
+			t.Fatalf("expected ErrLockInvalidated for tx2, got: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("tx2 in G2 was NOT woken after genuine leader loss of tenure 1")
+	}
+
+	// Grant 1 MUST be invalidated
+	_, err = ltx1.ReadCurrent(ctx, grant1, "row/test", []byte("k1"))
+	if err == nil {
+		t.Fatal("expected tx1 grant in G2 to be invalidated after leader loss, but it succeeded")
 	}
 }
