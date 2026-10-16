@@ -142,7 +142,10 @@ func (e *Engine) rollbackToSavepoint(session *Session, name string) (*Result, er
 		// is decided; only a resource release failed, and that error is reported.
 		return nil, cleanupErr
 	}
-	_ = e.publishSessionDirtyWrites(session)
+	if err := e.publishSessionDirtyWrites(session); err != nil {
+		rollbackSessionTransaction(session)
+		return nil, err
+	}
 	return &Result{Message: "rolled back to savepoint"}, nil
 }
 

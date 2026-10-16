@@ -191,3 +191,52 @@ func TestP7FixR205_SavepointRollbackPublishesErrorHandling(t *testing.T) {
 
 	_, _ = e.Execute(sA, "COMMIT;")
 }
+
+// TestP7FixR205_SavepointRollbackPublishErrorInjection covers FIX-01:
+// Verifies that when a publish failure is injected during ROLLBACK TO SAVEPOINT,
+// the error is returned to the SQL caller, and the transaction is cleanly aborted
+// per failure policy rather than returning a false success message.
+func TestP7FixR205_SavepointRollbackPublishErrorInjection(t *testing.T) {
+	e, cleanup := newIsolationTestEngine(t)
+	defer cleanup()
+
+	s := newRUSession("db")
+
+	if _, err := e.Execute(s, "INSERT INTO t VALUES (1, 'V0');"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := e.Execute(s, "BEGIN;"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Execute(s, "UPDATE t SET v = 'V1' WHERE id = 1;"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Execute(s, "SAVEPOINT sp1;"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Execute(s, "UPDATE t SET v = 'V2' WHERE id = 1;"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Install error injection hook
+	injectedErr := errors.New("injected publish failure")
+	sessionPublishDirtyHook = func(session *Session) error {
+		return injectedErr
+	}
+	defer func() { sessionPublishDirtyHook = nil }()
+
+	// ROLLBACK TO sp1 MUST fail with injected error!
+	_, err := e.Execute(s, "ROLLBACK TO sp1;")
+	if err == nil || !errors.Is(err, injectedErr) {
+		t.Fatalf("expected injected publish error, got %v", err)
+	}
+
+	// Failure policy check: session must be cleanly aborted, not left in partial state!
+	if s.InTransaction() {
+		t.Fatal("transaction was not rolled back after publish failure during rollback to savepoint")
+	}
+	if len(s.savepoints) != 0 {
+		t.Fatalf("savepoints leaked after failure: %d", len(s.savepoints))
+	}
+}

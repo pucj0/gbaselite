@@ -982,3 +982,46 @@
   - 架构规则测试 `TestSQLPackagesDoNotImportPhysicalBackends` 与 `TestProductionArchitectureBoundaries` 100% PASS。
 - **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
 - **第三轮最终结论**: **P7-FIX-R2-01 至 P7-FIX-R2-06 全部彻底关闭，GBaseLite B03 Phase 7 第三轮最终验收正式 PASS**。
+
+---
+
+## 31. Phase 7 最终定点修复 (FIX-01 至 FIX-04)
+
+- **基线 Commit**: `194b0dcea325fa5116c26625f70abc98b23351b0`
+- **核查与修复项详情**:
+
+### 1. FIX-01：Savepoint 发布错误显式处理与红测注入 (P0 - RESOLVED)
+- **原因与风险**: `executor/savepoint_mvcc.go:rollbackToSavepoint` 原先仍有 `_ = e.publishSessionDirtyWrites(session)` 忽略返回值代码，在脏发布超限或失败时向客户端返回虚假成功；
+- **红测先行**: `executor/isolation_p7fix_test.go:TestP7FixR205_SavepointRollbackPublishErrorInjection`：通过 `sessionPublishDirtyHook` 真实注入发布错误，复现若忽略错误导致事务未回滚、返回成功虚假消息的红测失败；
+- **修复方案**:
+  1. `rollbackToSavepoint` 显式判断 `if err := e.publishSessionDirtyWrites(session); err != nil`；
+  2. 发生错误时，严格按照事务失败策略调用 `rollbackSessionTransaction(session)` 清理所有 Savepoint 层与根事务，并如实向 SQL 调用方返回原始错误；
+- **绿测证据**: `TestP7FixR205_SavepointRollbackPublishErrorInjection` (PASS)。
+
+### 2. FIX-02：Lock Epoch 与 Dirty Registry 同步且幂等 (P0 - RESOLVED)
+- **原因与风险**:
+  1. `ResetLockEpoch` 在相同 Generation/Term 重复调用时，原实现无条件清空 Dirty Registry，导致合法脏数据意外丢失；
+  2. `SyncLockEpoch` 在发生 Term 漂移切换时，原实现仅重置了锁管理器，遗漏了重置 Dirty Registry，导致旧 Term 脏数据残留；
+- **修复方案**:
+  1. `DirtyRegistry.Reset` 升级为严格单调幂等模型：若传入相同代次/任期，直接返回 `false`，不破坏现有合法脏版本；若传入较旧代次/任期，单调性直接拒绝；仅当检测到更高代次/任期切换时执行清空重置；
+  2. `ResetLockEpoch` 仅在 `epochChanged` 为 true 时触发 Dirty Registry 重置；
+  3. `SyncLockEpoch` 在检测到 Term 切换时，同步调用 `s.dirtyRegistry.Reset(generation, term)`，保持锁与脏数据完全同步失效；
+  4. 备份还原 `Store.Restore` 显式使用 `s.dirtyRegistry.ForceReset(newGen, currentTerm)` 无条件彻底净化前代遗留数据；
+- **绿测证据**: `mvcc/dirty_registry_test.go:TestP7FixR206_EpochTransitionSynchronizationAndIdempotence` (PASS)。
+
+### 3. FIX-03：增强并发证明 (P1 - RESOLVED)
+- **改进测试**: `mvcc/dirty_registry_test.go:TestP7FixR202_PublishAndRollbackLinearization`：
+  1. **确定性 Hook 拦截 (发布前暂停 $\rightarrow$ 回滚 $\rightarrow$ 恢复发布)**：挂载 `dirtyPublishHook("before_publish")`，在 Publisher 采集完成但发布前暂停，Goroutine 2 执行 `Rollback()` 完成注销，解除暂停后 Publisher 在锁内检测到 `closed` 状态并返回 `ErrClosed`，断言注册表中泄漏条目严格为 0；
+  2. **相反顺序确证 (回滚完成 $\rightarrow$ 尝试发布)**：断言已回滚事务调用发布直接返回 `ErrClosed`，零残留；
+  3. **随机并发压力**：保留 50 轮并发发布与回滚交错压力测试；
+- **绿测证据**: `TestP7FixR202_PublishAndRollbackLinearization` (PASS)。
+
+### 4. FIX-04：全量回归与 CI 超时加固 (P1 - RESOLVED)
+- **CI 稳定性加固**: 在 `.github/workflows/test.yml` 的 `go test` 步骤中增加 `-timeout 30m`，彻底消除 2 核 Windows 虚拟机因磁盘 fsync 累积而触及 Go 默认 10m 报警超时的问题；
+- **全量测试与回归**:
+  - `executor` P7 及 P7Fix 测试 100 轮全部通过（145.5s）；
+  - `mvcc` 确定性测试 100 轮全部通过（35.5s）；
+  - 全库 21 个带测试包执行 `go test ./... -count=1` 100% 通过（总耗时 179.5s，EXIT CODE: 0）；
+  - `gofmt -l`、`go vet ./...`、`git diff --check` 全部 100% clean。
+- **Race Detector 说明**: Windows 宿主环境缺少 C 工具链（CGO 未启用），执行 `go test -race` 提示 `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`；已按要求明确标记 **NOT RUN**，不伪称通过。
+- **最终结论**: **FIX-01 至 FIX-04 全部彻底关闭，GBaseLite B03 Phase 7 最终定点修复全部完成**。

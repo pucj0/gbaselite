@@ -170,8 +170,33 @@ func (r *DirtyRegistry) Withdraw(rootID string) {
 	}
 }
 
-// Reset clears all dirty versions upon generation or term reset.
-func (r *DirtyRegistry) Reset(generation, term uint64) {
+// Reset clears all dirty versions upon advancing to a higher generation or term.
+// It is strictly monotonic and idempotent: calls with older or identical epochs are no-ops.
+func (r *DirtyRegistry) Reset(generation, term uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Monotonicity: an older epoch cannot roll back registry state
+	if generation < r.generation || (generation == r.generation && term < r.term) {
+		return false
+	}
+	// Idempotence: an identical epoch does not wipe out legitimate dirty versions
+	if generation == r.generation && term == r.term {
+		return false
+	}
+
+	r.generation = generation
+	r.term = term
+	r.byRoot = make(map[string]map[string]DirtyVersion)
+	r.overflowedRoots = make(map[string]bool)
+	r.globalCount = 0
+	r.globalBytes = 0
+	return true
+}
+
+// ForceReset unconditionally clears all dirty versions and resets to the given generation and term.
+// Used during RestoreBackup to purge all dirty versions from the restored-over store.
+func (r *DirtyRegistry) ForceReset(generation, term uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.generation = generation

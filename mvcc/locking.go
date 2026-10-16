@@ -111,21 +111,25 @@ func (s *Store) CloseLocks() {
 // monotonic: a stale term cannot overwrite a newer term, and identical (generation, term)
 // transitions are idempotent.
 func (s *Store) ResetLockEpoch(term uint64) int {
+	generation := s.generation.Load()
 	binding := s.locks
 	if binding == nil {
+		if s.dirtyRegistry != nil {
+			s.dirtyRegistry.Reset(generation, term)
+		}
 		return 0
 	}
 	binding.epochMu.Lock()
 	defer binding.epochMu.Unlock()
 
-	generation := s.generation.Load()
 	// Monotonicity: an epoch reset for an older term cannot roll back epoch state.
 	if generation == binding.storeGeneration && term < binding.storeTerm {
 		return 0
 	}
+	epochChanged := generation != binding.storeGeneration || term != binding.storeTerm
 	binding.storeGeneration = generation
 	binding.storeTerm = term
-	if s.dirtyRegistry != nil {
+	if s.dirtyRegistry != nil && epochChanged {
 		s.dirtyRegistry.Reset(generation, term)
 	}
 	return binding.manager.ResetEpoch(generation, term)
@@ -139,19 +143,25 @@ func (s *Store) ResetLockEpoch(term uint64) int {
 // the updated state and returns false without performing a redundant reset that could kill
 // newly registered roots.
 func (s *Store) SyncLockEpoch(term uint64) bool {
+	generation := s.generation.Load()
 	binding := s.locks
 	if binding == nil {
+		if s.dirtyRegistry != nil {
+			return s.dirtyRegistry.Reset(generation, term)
+		}
 		return false
 	}
 	binding.epochMu.Lock()
 	defer binding.epochMu.Unlock()
 
-	generation := s.generation.Load()
 	if generation == binding.storeGeneration && term <= binding.storeTerm {
 		return false
 	}
 	binding.storeGeneration = generation
 	binding.storeTerm = term
+	if s.dirtyRegistry != nil {
+		s.dirtyRegistry.Reset(generation, term)
+	}
 	binding.manager.ResetEpoch(generation, term)
 	return true
 }

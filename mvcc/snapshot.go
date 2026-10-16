@@ -82,7 +82,7 @@ func (s *Store) Restore(reader io.Reader) error {
 	newGen := s.generation.Load()
 	currentTerm := s.currentTerm()
 	if s.dirtyRegistry != nil {
-		s.dirtyRegistry.Reset(newGen, currentTerm)
+		s.dirtyRegistry.ForceReset(newGen, currentTerm)
 	}
 	// Purge the registry with the generation change: transactions from the
 	// replaced generation are invalid and must not keep pinning history for the

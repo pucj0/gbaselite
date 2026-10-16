@@ -178,9 +178,9 @@ func TestP7FixR203_LargeTransactionDecoupledFromDirtyBudget(t *testing.T) {
 	}
 }
 
-// TestP7FixR202_PublishAndRollbackLinearization covers P7-FIX-R2-02:
-// Verifies that concurrent PublishDirtyWrites and Rollback are strictly serialized
-// under t.mu protection, guaranteeing that no rolled-back transaction ever leaks ghost dirty entries.
+// TestP7FixR202_PublishAndRollbackLinearization covers P7-FIX-R2-02 & FIX-03:
+// Verifies deterministic linearization between PublishDirtyWrites and Rollback via test hooks,
+// proving no rolled-back transaction ever leaks ghost dirty entries regardless of execution order.
 func TestP7FixR202_PublishAndRollbackLinearization(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "store")
 	s, err := Open(dir)
@@ -191,39 +191,196 @@ func TestP7FixR202_PublishAndRollbackLinearization(t *testing.T) {
 
 	ctx := context.Background()
 
-	for iter := 0; iter < 50; iter++ {
+	// 1. Deterministic hook: Pause before publish, execute rollback, resume publisher
+	t.Run("PauseBeforePublishThenRollback", func(t *testing.T) {
 		txA, err := s.Begin(ctx, s)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = txA.Put("rows", []byte("k"), []byte("val"))
 
-		startGate := make(chan struct{})
-		var wg sync.WaitGroup
-		wg.Add(2)
+		inHook := make(chan struct{})
+		allowPublish := make(chan struct{})
+		var hookOnce sync.Once
 
+		dirtyPublishHook = func(stage string) {
+			if stage == "before_publish" {
+				hookOnce.Do(func() {
+					close(inHook)
+					<-allowPublish
+				})
+			}
+		}
+		defer func() { dirtyPublishHook = nil }()
+
+		publishErr := make(chan error, 1)
 		go func() {
-			defer wg.Done()
-			<-startGate
-			_ = txA.PublishDirtyWrites(s.DirtyRegistry())
+			publishErr <- txA.PublishDirtyWrites(s.DirtyRegistry())
 		}()
 
-		go func() {
-			defer wg.Done()
-			<-startGate
-			_ = txA.Rollback()
-		}()
+		// Wait until publisher is paused right before publishing
+		<-inHook
 
-		close(startGate)
-		wg.Wait()
+		// Concurrently execute Rollback
+		if err := txA.Rollback(); err != nil {
+			t.Fatalf("Rollback failed: %v", err)
+		}
 
-		// Reader must NEVER see rolled-back dirty entries
+		// Resume publisher
+		close(allowPublish)
+
+		// Publisher must detect aborted state and return ErrClosed
+		err = <-publishErr
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("expected ErrClosed from aborted publisher, got %v", err)
+		}
+
+		// Assert zero dirty entries in registry
 		snap, err := s.DirtyRegistry().Sample("reader")
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, ok := snap.Get("rows", []byte("k")); ok {
-			t.Fatalf("iter %d: rolled-back transaction leaked ghost dirty entry into registry!", iter)
+			t.Fatal("ghost dirty entry leaked into registry after rollback!")
 		}
+	})
+
+	// 2. Reverse order: Rollback completes first, then call PublishDirtyWrites
+	t.Run("RollbackFirstThenPublish", func(t *testing.T) {
+		txA, err := s.Begin(ctx, s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = txA.Put("rows", []byte("k"), []byte("val"))
+
+		if err := txA.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Calling PublishDirtyWrites on a rolled-back transaction must return ErrClosed
+		err = txA.PublishDirtyWrites(s.DirtyRegistry())
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("expected ErrClosed, got %v", err)
+		}
+
+		snap, err := s.DirtyRegistry().Sample("reader")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := snap.Get("rows", []byte("k")); ok {
+			t.Fatal("ghost dirty entry leaked when publishing after rollback!")
+		}
+	})
+
+	// 3. 50-round randomized concurrent stress test
+	t.Run("RandomizedStress50Rounds", func(t *testing.T) {
+		for iter := 0; iter < 50; iter++ {
+			txA, err := s.Begin(ctx, s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = txA.Put("rows", []byte("k"), []byte("val"))
+
+			startGate := make(chan struct{})
+			var wg sync.WaitGroup
+			wg.Add(2)
+
+			go func() {
+				defer wg.Done()
+				<-startGate
+				_ = txA.PublishDirtyWrites(s.DirtyRegistry())
+			}()
+
+			go func() {
+				defer wg.Done()
+				<-startGate
+				_ = txA.Rollback()
+			}()
+
+			close(startGate)
+			wg.Wait()
+
+			// Reader must NEVER see rolled-back dirty entries
+			snap, err := s.DirtyRegistry().Sample("reader")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := snap.Get("rows", []byte("k")); ok {
+				t.Fatalf("iter %d: rolled-back transaction leaked ghost dirty entry into registry!", iter)
+			}
+		}
+	})
+}
+
+// TestP7FixR206_EpochTransitionSynchronizationAndIdempotence covers FIX-02:
+// Verifies that ResetLockEpoch on the same epoch is idempotent and preserves dirty versions,
+// while SyncLockEpoch to a higher term synchronously purges old dirty versions.
+func TestP7FixR206_EpochTransitionSynchronizationAndIdempotence(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "store")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+
+	// 1. Transaction A publishes a dirty version at generation 0, term 0
+	txA, err := s.Begin(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txA.Rollback()
+	_ = txA.Put("rows", []byte("k1"), []byte("V_A"))
+	versions, err := txA.CollectDirtyVersions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DirtyRegistry().Publish(txA.ID, txA.Generation(), txA.Term(), versions); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Call ResetLockEpoch with the SAME term (idempotent call)
+	s.ResetLockEpoch(0)
+
+	// Dirty version k1 MUST STILL BE PRESENT!
+	snap1, err := s.DirtyRegistry().Sample("reader")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := snap1.Get("rows", []byte("k1")); !ok || string(d.Value) != "V_A" {
+		t.Fatalf("dirty version was wiped by idempotent ResetLockEpoch: %v, %v", d, ok)
+	}
+
+	// 3. Call SyncLockEpoch with a HIGHER term (transition to term 1)
+	if acted := s.SyncLockEpoch(1); !acted {
+		t.Fatal("SyncLockEpoch(1) did not act on term transition")
+	}
+
+	// Dirty version k1 MUST BE PURGED!
+	snap2, err := s.DirtyRegistry().Sample("reader")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := snap2.Get("rows", []byte("k1")); ok {
+		t.Fatalf("stale dirty version survived SyncLockEpoch to higher term: %v", d)
+	}
+
+	// 4. Stale term call must not roll back or wipe registry
+	txB, err := s.Begin(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txB.Rollback()
+	_ = txB.Put("rows", []byte("k2"), []byte("V_B"))
+	versionsB, _ := txB.CollectDirtyVersions()
+	_ = s.DirtyRegistry().Publish(txB.ID, txB.Generation(), 1, versionsB)
+
+	// Calling Reset with older term 0 must be ignored by monotonicity
+	s.ResetLockEpoch(0)
+
+	snap3, _ := s.DirtyRegistry().Sample("reader")
+	if d, ok := snap3.Get("rows", []byte("k2")); !ok || string(d.Value) != "V_B" {
+		t.Fatalf("stale ResetLockEpoch wiped legitimate term 1 version: %v, %v", d, ok)
 	}
 }

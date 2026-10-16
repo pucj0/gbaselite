@@ -741,7 +741,14 @@ func validateSerializableStatementShape(statement parser.Statement, session *Ses
 	return nil
 }
 
+var sessionPublishDirtyHook func(session *Session) error
+
 func (e *Engine) publishSessionDirtyWrites(session *Session) error {
+	if sessionPublishDirtyHook != nil {
+		if err := sessionPublishDirtyHook(session); err != nil {
+			return err
+		}
+	}
 	if session.transaction == nil {
 		return nil
 	}

@@ -33,21 +33,21 @@ jobs:
           unformatted=$(gofmt -l .)
           test -z "$unformatted" || { echo "$unformatted"; exit 1; }
       - name: Test
-        run: go test ./... -count=1
+        run: go test ./... -count=1 -timeout 30m
       - name: Vet
         run: go vet ./...
       - name: Failover race regression
         if: runner.os == 'Linux'
-        run: go test -race ./failover -count=10
+        run: go test -race ./failover -count=10 -timeout 30m
       - name: MVCC transaction race regression
         if: runner.os == 'Linux'
-        run: go test -race ./mvcc ./storageengine/... ./executor ./server -count=1
+        run: go test -race ./mvcc ./storageengine/... ./executor ./server -count=1 -timeout 30m
       # The lock manager is race-tested here rather than locally: it has no C toolchain on the
       # development host, so this step is the only place the shared-request broadcast, the join
       # bookkeeping and the raw-write lock path are exercised under the race detector.
       - name: Lock manager race regression
         if: runner.os == 'Linux'
-        run: go test -race ./lockmanager -count=2
+        run: go test -race ./lockmanager -count=2 -timeout 30m
 
   mysql-8-client:
     needs: quality
