@@ -1273,6 +1273,14 @@
 - **FIX-05 CI 与真实证据**:
   - 在 `.github/workflows/test.yml` 中新增独立 `mysql-84-parity` Job，基于官方 `mysql:8.4` 容器提供受控实例；
   - 新增 `scripts/ci/mysql84-parity-runner.sh` 自动化脚本，先执行 `--inject-fault` 验证反向失败，再执行全量对拍并输出 `.tmp/b03-parity.md` 作为 CI Artifact 保存；
+  - **最新 GitHub Actions 真实通过证据**:
+    - Run ID: [`38851794722`](https://github.com/pucj0/gbaselite/actions/runs/38851794722) (Test) 全部 SUCCESS：
+      - `quality (ubuntu-latest)` (`116814415632`): **SUCCESS**
+      - `quality (windows-latest)` (`116814415761`): **SUCCESS**
+      - `build (ubuntu-latest / windows-latest)`: **SUCCESS**
+      - `mysql-8-client` (`116817101493`): **SUCCESS**
+      - `mysql-84-parity` (`116817101498`): **SUCCESS** (Step 5 全量对拍与反向注入全部验证通过，Artifact `b03-parity-report` 成功上传)；
+    - Docker Run ID: [`38851794755`](https://github.com/pucj0/gbaselite/actions/runs/38851794755) **SUCCESS**；
 - **M01–M44 全场景分类独立统计（双端 SQL 对拍与内部架构分别统计）**:
   1. **双端 SQL 对拍矩阵 (Section A: 37 项，涵盖 M01–M35, M39, M44)**:
      - **PASS**: 35 项 (94.6%) — 双端执行真实 SQL，行为一致或符合规范；

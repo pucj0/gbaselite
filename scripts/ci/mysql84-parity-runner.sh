@@ -37,9 +37,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# 1. Build GBaseLite binary
-echo "[1/4] Building GBaseLite..."
+# 1. Build GBaseLite and Parity Runner binaries
+echo "[1/4] Building GBaseLite and Parity Runner binaries..."
 (cd "$REPOSITORY_ROOT" && CGO_ENABLED=0 go build -trimpath -o "$BINARY" ./cmd/gbaselite)
+PARITY_BIN="$WORK_DIRECTORY/parity-runner"
+(cd "$REPOSITORY_ROOT" && go build -trimpath -o "$PARITY_BIN" ./scripts/parity)
 
 # 2. Prepare GBaseLite configuration
 cat <<EOF >"$CONFIG"
@@ -93,17 +95,17 @@ GBASE_DSN="testuser:testpassword@tcp(127.0.0.1:${GB_PORT})/?charset=utf8mb4&time
 echo "[3/4] Running FIX-04 Negative Verification (--inject-fault)..."
 FAULT_REPORT="$WORK_DIRECTORY/b03-parity-fault.md"
 set +e
-(cd "$REPOSITORY_ROOT" && go run ./scripts/parity \
+"$PARITY_BIN" \
   -expected-mysql-version=8.4 \
   -mysql-dsn="$MYSQL_DSN" \
   -gbase-dsn="$GBASE_DSN" \
   -output="$FAULT_REPORT" \
-  -inject-fault >"$WORK_DIRECTORY/fault_injection.log" 2>&1)
+  -inject-fault >"$WORK_DIRECTORY/fault_injection.log" 2>&1
 fault_code=$?
 set -e
 
-if [ "$fault_code" -eq 0 ]; then
-  echo "ERROR: --inject-fault unexpectedly exited with 0; runner failed to detect injected fault!" >&2
+if [ "$fault_code" -ne 2 ]; then
+  echo "ERROR: --inject-fault exited with code $fault_code, expected exit code 2 (Gate Failed)!" >&2
   cat "$WORK_DIRECTORY/fault_injection.log" >&2
   exit 1
 fi
@@ -135,14 +137,27 @@ if ! grep -q "| \*\*M08\*\* | .* | \*\*FAIL\*\* |" "$FAULT_REPORT"; then
   exit 1
 fi
 
-echo "FIX-04 verified: --inject-fault exited with non-zero code ($fault_code), connected to both DBs, generated report, and classified M08 as FAIL."
+# 4. Normal test cases did not fail (FAIL count must be exactly 1)
+if ! grep -q "FAIL=1" "$WORK_DIRECTORY/fault_injection.log"; then
+  echo "ERROR: Unexpected failures occurred during fault injection test!" >&2
+  cat "$WORK_DIRECTORY/fault_injection.log" >&2
+  exit 1
+fi
+
+echo "FIX-04 verified: --inject-fault exited with code 2, connected to both DBs, generated report, classified M08 as FAIL, and had zero unexpected failures."
 
 # 5. FIX-01..03: Full Parity Run against MySQL 8.4
 echo "[4/4] Running Full M01-M44 Parity Test against MySQL 8.4..."
-(cd "$REPOSITORY_ROOT" && go run ./scripts/parity \
+OFFICIAL_LOG="$WORK_DIRECTORY/official_parity.log"
+"$PARITY_BIN" \
   -expected-mysql-version=8.4 \
   -mysql-dsn="$MYSQL_DSN" \
   -gbase-dsn="$GBASE_DSN" \
-  -output="$TEMPORARY_ROOT/b03-parity.md")
+  -output="$TEMPORARY_ROOT/b03-parity.md" | tee "$OFFICIAL_LOG"
+
+if ! grep -q "OFFICIAL GATE PASSED" "$OFFICIAL_LOG"; then
+  echo "ERROR: Official Gate Passed confirmation missing in output!" >&2
+  exit 1
+fi
 
 echo "Parity run completed successfully. Deliverable generated at $TEMPORARY_ROOT/b03-parity.md"

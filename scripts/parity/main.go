@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -9,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"database/sql"
+	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -39,9 +42,28 @@ type ParityResult struct {
 	SQLSequence    string
 	GBaseResult    string
 	MySQLResult    string
+	RawError       string // RAW error for Section A
 	Classification ParityClassification
 	Reason         string
 	CodeEvidence   string
+
+	// Specific fields for Section B (Internal Architecture Tests)
+	Package      string
+	TestName     string
+	TargetRuns   int
+	ActualRuns   int
+	ActualPasses int
+	ExitCode     int
+	Duration     time.Duration
+}
+
+type GoTestEvent struct {
+	Time    time.Time `json:"Time"`
+	Action  string    `json:"Action"`
+	Package string    `json:"Package"`
+	Test    string    `json:"Test"`
+	Elapsed float64   `json:"Elapsed"`
+	Output  string    `json:"Output"`
 }
 
 type RunnerConfig struct {
@@ -55,6 +77,7 @@ type RunnerConfig struct {
 
 type ParityRunner struct {
 	cfg        RunnerConfig
+	repoRoot   string
 	mysqlCfg   *mysql.Config
 	gbaseCfg   *mysql.Config
 	dbMySQL    *sql.DB
@@ -120,10 +143,16 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Println("\n[GATE PASSED] All parity and isolation scenarios executed successfully with 0 FAILs.")
+	if runner.devMode {
+		fmt.Printf("\n[DEV ONLY / NOT OFFICIAL GATE] Parity scenarios completed under local development MySQL %s. Official Gate strictly requires MySQL %s.\n", runner.myVersion, cfg.ExpectedMySQLVersion)
+		os.Exit(0)
+	}
+
+	fmt.Println("\n[OFFICIAL GATE PASSED] All parity and isolation scenarios executed successfully with 0 FAILs on MySQL 8.4.")
 }
 
 func (r *ParityRunner) Run() error {
+	r.repoRoot, _ = filepath.Abs(".")
 	fmt.Println("==============================================================")
 	fmt.Println(" GBaseLite B03 vs MySQL 8.4 InnoDB Parity Test Runner")
 	fmt.Println("==============================================================")
@@ -3758,27 +3787,90 @@ func (r *ParityRunner) runM44() {
 // Section B: GBaseLite Internal Architecture & Replication Verification (7 Scenarios)
 // ---------------------------------------------------------------------
 
-func (r *ParityRunner) runGoTestScenario(id, scope, sqlSeq, pkg, testName, codeEv string, count int, expectedClassification ParityClassification, reason string) {
-	cmdArgs := []string{"test", pkg, "-run", testName, fmt.Sprintf("-count=%d", count)}
+func (r *ParityRunner) runGoTestScenario(id, scope, sqlSeq, pkg, testName, codeEv string, targetCount int, expectedClassification ParityClassification, reason string) {
+	cmdArgs := []string{"test", pkg, "-run", testName, fmt.Sprintf("-count=%d", targetCount), "-json"}
 	startTime := time.Now()
 	cmd := exec.Command("go", cmdArgs...)
+	cmd.Dir = r.repoRoot
+	gotmp := filepath.Join(r.repoRoot, ".tmp", "gotmp")
+	_ = os.MkdirAll(gotmp, 0755)
+	cmd.Env = append(os.Environ(), "GOTMPDIR="+gotmp)
+
 	out, err := cmd.CombinedOutput()
 	dur := time.Since(startTime).Round(time.Millisecond)
 
-	outStr := strings.TrimSpace(string(out))
-	lines := strings.Split(outStr, "\n")
-	firstLine := ""
-	if len(lines) > 0 {
-		firstLine = strings.TrimSpace(lines[0])
+	var runs, passes, fails, skips int
+	var matchedTests []string
+	seenTests := make(map[string]bool)
+
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		var ev GoTestEvent
+		if err := json.Unmarshal(line, &ev); err != nil {
+			continue
+		}
+		if ev.Test == "" {
+			continue
+		}
+		if !seenTests[ev.Test] {
+			seenTests[ev.Test] = true
+			matchedTests = append(matchedTests, ev.Test)
+		}
+		switch ev.Action {
+		case "run":
+			runs++
+		case "pass":
+			passes++
+		case "fail":
+			fails++
+		case "skip":
+			skips++
+		}
+	}
+
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = 1
+		}
 	}
 
 	class := expectedClassification
-	resDesc := fmt.Sprintf("PASS (exit: 0, time: %v, out: %s)", dur, firstLine)
+	testList := strings.Join(matchedTests, ", ")
+	if len(testList) > 35 {
+		testList = testList[:32] + "..."
+	}
 
-	if err != nil {
+	resDesc := fmt.Sprintf("PASS (runs: %d, passes: %d, exit: 0, time: %v, tests: [%s])", runs, passes, dur, testList)
+
+	// FIX-03 Strict Assertions:
+	if runs == 0 {
 		class = ClassFail
-		resDesc = fmt.Sprintf("FAIL (exit: %v, out: %s)", err, outStr)
-		reason = fmt.Sprintf("Internal Go test failed: %s (%v)", testName, err)
+		resDesc = fmt.Sprintf("FAIL (0 tests matched pattern %s)", testName)
+		reason = fmt.Sprintf("Pattern %s did not match any executed test in %s", testName, pkg)
+	} else if runs < targetCount {
+		class = ClassFail
+		resDesc = fmt.Sprintf("FAIL (incomplete runs: got %d, want %d)", runs, targetCount)
+		reason = fmt.Sprintf("Test %s ran %d times, expected %d", testName, runs, targetCount)
+	} else if passes < targetCount {
+		class = ClassFail
+		resDesc = fmt.Sprintf("FAIL (incomplete passes: %d/%d passed)", passes, targetCount)
+		reason = fmt.Sprintf("Test %s passed %d times, expected %d", testName, passes, targetCount)
+	} else if fails > 0 {
+		class = ClassFail
+		resDesc = fmt.Sprintf("FAIL (%d failures in %s)", fails, testName)
+		reason = fmt.Sprintf("Test %s had %d failures", testName, fails)
+	} else if skips > 0 {
+		class = ClassFail
+		resDesc = fmt.Sprintf("FAIL (%d tests skipped)", skips)
+		reason = fmt.Sprintf("Test %s was skipped", testName)
+	} else if exitCode != 0 {
+		class = ClassFail
+		resDesc = fmt.Sprintf("FAIL (exit code %d)", exitCode)
+		reason = fmt.Sprintf("go test %s exited with code %d", pkg, exitCode)
 	}
 
 	r.record(ParityResult{
@@ -3791,6 +3883,13 @@ func (r *ParityRunner) runGoTestScenario(id, scope, sqlSeq, pkg, testName, codeE
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   codeEv,
+		Package:        pkg,
+		TestName:       testName,
+		TargetRuns:     targetCount,
+		ActualRuns:     runs,
+		ActualPasses:   passes,
+		ExitCode:       exitCode,
+		Duration:       dur,
 	})
 }
 
@@ -4311,8 +4410,8 @@ func (r *ParityRunner) writeReport() error {
 
 ## 2. [Section A] 双端 SQL 对拍矩阵 (Dual-Database SQL Parity Matrix: 37 Items)
 
-| ID | 场景领域 (Scope) | GBaseLite 实际结果 | MySQL 8.4 实际结果 | 判定 (Status) | 差异与机制说明 | 证据源码 |
-|---|---|---|---|---|---|---|
+| ID | 场景领域 (Scope) | GBaseLite 实际结果 | MySQL 8.4 实际结果 | 原始错误 (Raw Error) | 判定 (Status) | 差异与机制说明 | 证据源码 |
+|---|---|---|---|---|---|---|---|
 `,
 		time.Now().Format("2006-01-02 15:04:05"),
 		r.gbaseVer,
@@ -4338,11 +4437,16 @@ func (r *ParityRunner) writeReport() error {
 		if res.Category != "Dual-Database SQL Parity" {
 			continue
 		}
-		row := fmt.Sprintf("| **%s** | %s | `%s` | `%s` | **%s** | %s | `%s` |\n",
+		rawErr := res.RawError
+		if rawErr == "" {
+			rawErr = "none"
+		}
+		row := fmt.Sprintf("| **%s** | %s | `%s` | `%s` | `%s` | **%s** | %s | `%s` |\n",
 			res.ID,
 			strings.ReplaceAll(res.Scope, "|", "/"),
 			strings.ReplaceAll(res.GBaseResult, "|", "/"),
 			strings.ReplaceAll(res.MySQLResult, "|", "/"),
+			strings.ReplaceAll(rawErr, "|", "/"),
 			res.Classification,
 			strings.ReplaceAll(res.Reason, "|", "/"),
 			res.CodeEvidence,
@@ -4355,19 +4459,22 @@ func (r *ParityRunner) writeReport() error {
 
 ## 3. [Section B] GBaseLite 内部架构与复制验收矩阵 (Internal Architecture: 7 Items)
 
-| ID | 场景领域 (Scope) | 内部测试执行结果与退出码 | MySQL 状态 | 判定 (Status) | 机制说明与验证结论 | 证据源码 |
-|---|---|---|---|---|---|---|
+| ID | 场景领域 (Scope) | 测试包名 (Package) | 目标测试正则 (Test Pattern) | 执行次数/通过次数 | 退出码 | 运行耗时 | 判定 (Status) | 机制说明与验证结论 | 证据源码 |
+|---|---|---|---|---|---|---|---|---|---|
 `)
 
 	for _, res := range r.results {
 		if res.Category != "GBaseLite Internal Architecture" {
 			continue
 		}
-		row := fmt.Sprintf("| **%s** | %s | `%s` | `%s` | **%s** | %s | `%s` |\n",
+		row := fmt.Sprintf("| **%s** | %s | `%s` | `%s` | `%d/%d` | `%d` | `%v` | **%s** | %s | `%s` |\n",
 			res.ID,
 			strings.ReplaceAll(res.Scope, "|", "/"),
-			strings.ReplaceAll(res.GBaseResult, "|", "/"),
-			strings.ReplaceAll(res.MySQLResult, "|", "/"),
+			res.Package,
+			res.TestName,
+			res.ActualRuns, res.ActualPasses,
+			res.ExitCode,
+			res.Duration,
 			res.Classification,
 			strings.ReplaceAll(res.Reason, "|", "/"),
 			res.CodeEvidence,
