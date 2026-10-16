@@ -924,6 +924,25 @@ MVCC 默认查询预算：排序内存 4 MiB、结果内存 16 MiB、查询临�
 配置相应预算为 0 时使用这些默认值；`transaction_write_mb: 0` 不限制逻辑写集总量。
 它们不是进程物理内存或整机磁盘总量上限。
 
+### 事务隔离级别与 MySQL 8.4 兼容性细粒度差异 (B03)
+
+GBaseLite B03 实现了受控的四级事务隔离系统与完整的协议/内省接口，**但绝不代表完全兼容 MySQL 8.4 InnoDB 的所有行为与内部机制**。生产接入前须明确知悉以下细粒度契约、已知差异（KNOWN DIFFERENCE）与拒绝策略（UNSUPPORTED）：
+
+1. **四级隔离级别支持全景**：
+   - **REPEATABLE READ（默认级别）**：遵循快照隔离（Snapshot Isolation），首次普通 SELECT 确立快照 ViewToken 并复用至事务结束；当前事务自身写优先可见；锁定读（`FOR UPDATE`/`FOR SHARE`）严格采用 Current Read 获取最新提交版本并加锁，不刷新普通快照视图。
+   - **READ COMMITTED**：每条语句动态分配独立的语句快照 ViewToken，允许不可重复读与幻读；在行锁保护下的写操作基于最新已提交版本递增更新，不误报陈旧冲突；单语句内部保证时点原子一致；SAVEPOINT 撤回不冻结语句快照。
+   - **SERIALIZABLE**：长事务中的普通 SELECT 隐式获取共享锁（IS/S/Next-Key/Gap），严格保护缺席点与空区间，防止 Write Skew 与 Phantom Read；单语句 `autocommit=1` 的独立只读 SELECT 保留非锁定快速路径优化。
+   - **READ UNCOMMITTED（单机模式）**：单机模式下支持读取其他并发活跃事务已完成语句的未提交脏版本（通过内存态 `DirtyRegistry` 实现原子发布与回滚清理）；自身写优先于外部脏版本；写操作强制校验已提交基线并申请互斥排他锁（X Lock），**严格杜绝脏写（Dirty Write）与丢失更新（Lost Update）**。
+
+2. **已知差异披露（KNOWN DIFFERENCE）**：
+   - **M06（SET GLOBAL 显式拒绝）**：GBaseLite **不支持** `SET GLOBAL TRANSACTION ISOLATION LEVEL`，执行将返回 Error 1064。GBaseLite 定位为嵌入式与中轻量级多租户服务，为杜绝单连接意外篡改全局隔离级别污染同进程内其他业务连接，有意将隔离级别变更严格限制在 `SESSION` 与 `NEXT TRANSACTION` 范围。
+   - **5.7 遗留别名兼容**：支持标准变量 `@@transaction_isolation`、`@@session.transaction_isolation`、`@@global.transaction_isolation` 及 `SHOW VARIABLES LIKE 'transaction_isolation'`；同时保留 MySQL 5.7 遗留别名 `@@tx_isolation` 向后兼容老旧驱动（MySQL 8.0+ 官方已移除该别名）。
+
+3. **架构 Fail-Closed 拒绝清单（UNSUPPORTED）**：
+   - **M27（SERIALIZABLE 复杂形态拒绝）**：在 SERIALIZABLE 级别下，为防止由于无法精准施加谓词范围锁而导致幻读泄漏，GBaseLite 采取保守的 Fail-Closed 策略：多表 JOIN、CTE、派生表、视图、集合 UNION、聚合及非谓词保护查询直接报错 Error 3108（`this statement shape does not support row locking yet`），拒绝隐式降级执行。
+   - **M36（Raft 复制模式禁用 RU）**：在三节点 Raft 复制集群模式下，显式执行 `SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED` 将返回 `storageengine.ErrUnsupported`（Error 1064）。因为未共识的脏数据无法在线性一致性 Quorum 间同步，为防止副本状态机发散，复制模式强制禁止 RU。
+   - **不提供能力承诺**：不支持 `READ ONLY` / `READ WRITE` 事务特征设置，不支持 `LOCK TABLES`，不支持快照回滚到过去任意时间点，不支持分布式跨节点事务或 XA 协议。
+
 ## 旧数据迁移
 
 先用原版本停止旧实例，保留完整源目录；不要直接把旧配置的 mode 改成 mvcc 后打开

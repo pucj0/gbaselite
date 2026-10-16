@@ -175,13 +175,13 @@
 
 **Goal**: 文档同步与发布候选审计。
 
-- [ ] **T077** 根据真实支持矩阵同时更新仓库 `README.md`：四级作用域、RU standby 限制、SER shape 与 MySQL 细粒度差异。  _Trace: FR-031/034; SC-008/010_
-- [ ] **T078** 更新 `docs/使用文档/事务与存储说明.md`、`SQL兼容性参考.md`：示例 SQL、事务/锁/异常边界。  _Trace: FR-031; SC-011_
-- [ ] **T079** 补 `traceability.md` 实际测试名/文件/Commit SHA/结果，对每个 FR/SC 建立证据，不凭勾选总数验收。  _Trace: FR-029/036; SC-011_
-- [ ] **T080** 将 Q01–Q10 的真实答案、选择与代价回写 research/plan/contracts，补 B03 KNOWN DIFFERENCE/UNSUPPORTED 表。  _Trace: FR-027/031; SC-008/011_
-- [ ] **T081** 做最后一次 go test/vet/race/固定调度/源格式/diff 检查，逐项校验 data/ 未碰并出 `.tmp/b03-final-review.md`。  _Trace: FR-025/028/030; SC-007/010_
-- [ ] **T082** 审核任务完成状态，只勾选有命令与测试证据者；产生可审查 PR 摘要及 Release candidate 清单。  _Trace: FR-031; SC-011_
-- [ ] **T083** 最终 Gate：向用户报告可发布候选资格及限制；**不得**未获单独授权实际打 tag、Release、替换 bin 或部署。  _Trace: FR-031; SC-012_
+- [x] **T077** 根据真实支持矩阵同时更新仓库 `README.md`：四级作用域、RU standby 限制、SER shape 与 MySQL 细粒度差异。  _Trace: FR-031/034; SC-008/010_
+- [x] **T078** 更新 `docs/使用文档/事务与存储说明.md`、`SQL兼容性参考.md`：示例 SQL、事务/锁/异常边界。  _Trace: FR-031; SC-011_
+- [x] **T079** 补 `traceability.md` 实际测试名/文件/Commit SHA/结果，对每个 FR/SC 建立证据，不凭勾选总数验收。  _Trace: FR-029/036; SC-011_
+- [x] **T080** 将 Q01–Q10 的真实答案、选择与代价回写 research/plan/contracts，补 B03 KNOWN DIFFERENCE/UNSUPPORTED 表。  _Trace: FR-027/031; SC-008/011_
+- [x] **T081** 做最后一次 go test/vet/race/固定调度/源格式/diff 检查，逐项校验 data/ 未碰并出 `.tmp/b03-final-review.md`。  _Trace: FR-025/028/030; SC-007/010_
+- [x] **T082** 审核任务完成状态，只勾选有命令与测试证据者；产生可审查 PR 摘要及 Release candidate 清单。  _Trace: FR-031; SC-011_
+- [x] **T083** 最终 Gate：向用户报告可发布候选资格及限制；**不得**未获单独授权实际打 tag、Release、替换 bin 或部署。  _Trace: FR-031; SC-012_
 
 **Checkpoint P9**: 只有本阶段真实证据齐备、阻塞问题关闭且用户授权下一阶段后方可继续。
 

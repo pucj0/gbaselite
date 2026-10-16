@@ -427,6 +427,7 @@ func (r *ParityRunner) runM01() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("A=%s, B=%s", gA, gB),
 		MySQLResult:    fmt.Sprintf("A=%s, B=%s", mA, mB),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_phase2_test.go:TestB03SessionIsolationDefault",
@@ -564,6 +565,7 @@ func (r *ParityRunner) runM02() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Tx1Blocked=%v, Tx2Blocked=%v", gBlockedTx1, gBlockedTx2),
 		MySQLResult:    fmt.Sprintf("Tx1Blocked=%v, Tx2Blocked=%v", mBlockedTx1, mBlockedTx2),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_phase2_test.go:TestB03SetNextTransactionIsolation",
@@ -634,6 +636,7 @@ func (r *ParityRunner) runM03() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Rejected: %s", gErrStr),
 		MySQLResult:    fmt.Sprintf("Rejected: %s", mErrStr),
+		RawError:       fmt.Sprintf("GBase: %s; MySQL: %s", gErrStr, mErrStr),
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_phase2_test.go:TestB03IsolationActiveTransaction",
@@ -701,6 +704,7 @@ func (r *ParityRunner) runM04() {
 		SQLSequence:    seq,
 		GBaseResult:    gRes,
 		MySQLResult:    mRes,
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_phase2_test.go:TestB03IsolationAutocommit",
@@ -718,9 +722,11 @@ func (r *ParityRunner) runM05() {
 
 	class := ClassPass
 	reason := "Binary packet COM_RESET_CONNECTION (0x1f) on same physical socket cleanly resets session isolation on both engines."
+	rawErr := "none"
 	if errG != nil || errM != nil {
 		class = ClassFail
-		reason = fmt.Sprintf("COM_RESET_CONNECTION error: GBaseErr=%v, MySQLErr=%v", errG, errM)
+		rawErr = fmt.Sprintf("GBaseErr=%v; MySQLErr=%v", errG, errM)
+		reason = fmt.Sprintf("COM_RESET_CONNECTION error: %s", rawErr)
 	} else if gRes != "REPEATABLE-READ" || mRes != "REPEATABLE-READ" {
 		class = ClassFail
 		reason = fmt.Sprintf("Expected REPEATABLE-READ after COM_RESET_CONNECTION: GBase=%s, MySQL=%s", gRes, mRes)
@@ -733,6 +739,7 @@ func (r *ParityRunner) runM05() {
 		SQLSequence:    seq,
 		GBaseResult:    gRes,
 		MySQLResult:    mRes,
+		RawError:       rawErr,
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "server/isolation_phase2_test.go:TestB03IsolationCOMResetConnectionProtocol",
@@ -779,6 +786,7 @@ func (r *ParityRunner) runM06() {
 		SQLSequence:    seq,
 		GBaseResult:    gRes,
 		MySQLResult:    mRes,
+		RawError:       fmt.Sprintf("GBase: %v; MySQL: %v", errG, errM),
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "server/handler.go:41-45",
@@ -845,6 +853,7 @@ func (r *ParityRunner) runM07() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Before=%s, After=%s", g1, g2),
 		MySQLResult:    fmt.Sprintf("Before=%s, After=%s", m1, m2),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "server/isolation_phase2_test.go:TestB03IsolationBinaryPreparedProtocol",
@@ -925,13 +934,15 @@ func (r *ParityRunner) runM08() {
 	class := ClassPass
 	reason := "Read view allocated on first consistent read (observing v2), frozen for remainder of transaction (remains v2)."
 
-	// FIX-04: Negative Fault Injection Verification
+	rawErr := "none"
 	if r.cfg.InjectFault {
 		class = ClassFail
 		reason = "INJECTED FAULT: deliberate mismatch in M08 RR lazy snapshot assertion"
+		rawErr = "INJECTED FAULT: deliberate mismatch in M08"
 		g1 = "injected_fault_v999"
 	} else if err != nil {
 		class = ClassFail
+		rawErr = err.Error()
 		reason = fmt.Sprintf("Execution error: %v", err)
 	} else if g1 != "v2" || g2 != "v2" || m1 != "v2" || m2 != "v2" {
 		class = ClassFail
@@ -945,6 +956,7 @@ func (r *ParityRunner) runM08() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Read1=%s, Read2=%s", g1, g2),
 		MySQLResult:    fmt.Sprintf("Read1=%s, Read2=%s", m1, m2),
+		RawError:       rawErr,
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rr_test.go:TestM08_RR_LazyFirstReadTiming",
@@ -1033,6 +1045,7 @@ func (r *ParityRunner) runM09() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Read1=%s, Read2=%s", g1, g2),
 		MySQLResult:    fmt.Sprintf("Read1=%s, Read2=%s", m1, m2),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rr_test.go:TestM09_RR_ConsistentViewReused",
@@ -1121,6 +1134,7 @@ func (r *ParityRunner) runM10() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Count1=%d, Count2=%d", g1, g2),
 		MySQLResult:    fmt.Sprintf("Count1=%d, Count2=%d", m1, m2),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rr_test.go:TestM10_RR_PhantomFreeRange",
@@ -1209,6 +1223,7 @@ func (r *ParityRunner) runM11() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("InsideTx=%s, AfterRollback=%s", g1, g2),
 		MySQLResult:    fmt.Sprintf("InsideTx=%s, AfterRollback=%s", m1, m2),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rr_test.go:TestM11_RR_OwnStagedWrites",
@@ -1303,6 +1318,7 @@ func (r *ParityRunner) runM12() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Plain1=%s, ForUpdate=%s, PlainAfter=%s", g1, gFU, gAfter),
 		MySQLResult:    fmt.Sprintf("Plain1=%s, ForUpdate=%s, PlainAfter=%s", m1, mFU, mAfter),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rr_test.go:TestM12_RR_CurrentReadSeparation",
@@ -1397,6 +1413,7 @@ func (r *ParityRunner) runM13() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Read1=%s, Read2=%s", g1, g2),
 		MySQLResult:    fmt.Sprintf("Read1=%s, Read2=%s", m1, m2),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rc_test.go:TestM13_RC_NonRepeatableRead",
@@ -1488,6 +1505,7 @@ func (r *ParityRunner) runM14() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Count1=%d, Count2=%d", g1, g2),
 		MySQLResult:    fmt.Sprintf("Count1=%d, Count2=%d", m1, m2),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rc_test.go:TestM14_RC_Phantom",
@@ -1574,6 +1592,7 @@ func (r *ParityRunner) runM15() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("SUM=%d", gSum),
 		MySQLResult:    fmt.Sprintf("SUM=%d", mSum),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rc_test.go:TestM15_RC_SingleStatementAtomicity",
@@ -1652,6 +1671,7 @@ func (r *ParityRunner) runM16() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("id=%d, val=%d, b_val=%d", gID, gVal, gBVal),
 		MySQLResult:    fmt.Sprintf("id=%d, val=%d, b_val=%d", mID, mVal, mBVal),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rc_test.go:TestM16_RC_ComplexQuerySharesOneView",
@@ -1746,6 +1766,7 @@ func (r *ParityRunner) runM17() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("FinalVal=%d", gVal),
 		MySQLResult:    fmt.Sprintf("FinalVal=%d", mVal),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rc_test.go:TestM17_RC_LegalCurrentWrite",
@@ -1774,25 +1795,25 @@ func (r *ParityRunner) runM18() {
 		err = setupTable(r.dbMySQL)
 	}
 
-	testLockConflict := func(pair SessionPair) (string, error) {
+	testLockConflict := func(pair SessionPair) (string, string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		if _, err := pair.connA.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
-			return "", err
+			return "", "", err
 		}
 		if _, err := pair.connB.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;"); err != nil {
-			return "", err
+			return "", "", err
 		}
 
 		if _, err := pair.connA.ExecContext(ctx, "BEGIN;"); err != nil {
-			return "", err
+			return "", "", err
 		}
 		if _, err := pair.connB.ExecContext(ctx, "BEGIN;"); err != nil {
-			return "", err
+			return "", "", err
 		}
 		if _, err := pair.connA.ExecContext(ctx, "UPDATE t_m18 SET val = 'txA' WHERE id = 1;"); err != nil {
-			return "", err
+			return "", "", err
 		}
 
 		doneB := make(chan error, 1)
@@ -1804,13 +1825,13 @@ func (r *ParityRunner) runM18() {
 		// Verify B is blocked
 		select {
 		case err := <-doneB:
-			return "", fmt.Errorf("ConnB did not block on lock: %v", err)
+			return "", "", fmt.Errorf("ConnB did not block on lock: %v", err)
 		case <-time.After(200 * time.Millisecond):
 		}
 
 		// ConnA commits, releasing the lock
 		if _, err := pair.connA.ExecContext(ctx, "COMMIT;"); err != nil {
-			return "", err
+			return "", "", err
 		}
 
 		// ConnB should now unblock
@@ -1818,10 +1839,12 @@ func (r *ParityRunner) runM18() {
 		select {
 		case errB = <-doneB:
 		case <-time.After(3 * time.Second):
-			return "", fmt.Errorf("ConnB never unblocked after ConnA commit")
+			return "", "", fmt.Errorf("ConnB never unblocked after ConnA commit")
 		}
 
+		rawErr := "none"
 		if errB != nil {
+			rawErr = errB.Error()
 			_, _ = pair.connB.ExecContext(ctx, "ROLLBACK;")
 		} else {
 			_, _ = pair.connB.ExecContext(ctx, "COMMIT;")
@@ -1829,22 +1852,23 @@ func (r *ParityRunner) runM18() {
 
 		var res string
 		if err := pair.connA.QueryRowContext(ctx, "SELECT val FROM t_m18 WHERE id = 1;").Scan(&res); err != nil {
-			return "", err
+			return "", "", err
 		}
 		if res != "txA" && res != "txB" {
-			return "", fmt.Errorf("unexpected value: %s, want txA or txB", res)
+			return "", "", fmt.Errorf("unexpected value: %s, want txA or txB", res)
 		}
-		return res, nil
+		return res, rawErr, nil
 	}
 
+	var gErrB, mErrB string
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
 			var e error
-			gVal, e = testLockConflict(g)
+			gVal, gErrB, e = testLockConflict(g)
 			if e != nil {
 				return e
 			}
-			mVal, e = testLockConflict(m)
+			mVal, mErrB, e = testLockConflict(m)
 			return e
 		})
 	}
@@ -1866,6 +1890,7 @@ func (r *ParityRunner) runM18() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("FinalVal=%s (Blocked then unblocked)", gVal),
 		MySQLResult:    fmt.Sprintf("FinalVal=%s (Blocked then unblocked)", mVal),
+		RawError:       fmt.Sprintf("GBase: %s; MySQL: %s", gErrB, mErrB),
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rc_test.go:TestM18_RC_PreventLostUpdate",
@@ -1966,6 +1991,7 @@ func (r *ParityRunner) runM19() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Duplicate Error: %s", gErr),
 		MySQLResult:    fmt.Sprintf("Duplicate Error: %s", mErr),
+		RawError:       fmt.Sprintf("GBase: %s; MySQL: %s", gErr, mErr),
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rc_test.go:TestM19_RC_UniquenessAndForeignKey",
@@ -2084,6 +2110,7 @@ func (r *ParityRunner) runM20() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("V1=%s, V2=%s, V3=%s", g1, g2, g3),
 		MySQLResult:    fmt.Sprintf("V1=%s, V2=%s, V3=%s", m1, m2, m3),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_rc_test.go:TestM20_RC_SavepointDoesNotFreezeView",
@@ -2190,6 +2217,7 @@ func (r *ParityRunner) runM21() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("A=%s, B=%s", gA, gB),
 		MySQLResult:    fmt.Sprintf("A=%s, B=%s", mA, mB),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_serializable_test.go:TestM21_SER_SSCompatibility",
@@ -2294,6 +2322,7 @@ func (r *ParityRunner) runM22() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("FinalVal=%s (Writer blocked then resumed)", gVal),
 		MySQLResult:    fmt.Sprintf("FinalVal=%s (Writer blocked then resumed)", mVal),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_serializable_test.go:TestM22_SER_SXConflict",
@@ -2396,6 +2425,7 @@ func (r *ParityRunner) runM23() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("InsertedCount=%d (Blocked on gap lock)", gCount),
 		MySQLResult:    fmt.Sprintf("InsertedCount=%d (Blocked on gap lock)", mCount),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_serializable_test.go:TestM23_SER_AbsentPointProtection",
@@ -2514,6 +2544,7 @@ func (r *ParityRunner) runM24() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("BothInsertedCount=%d", gCount),
 		MySQLResult:    fmt.Sprintf("BothInsertedCount=%d", mCount),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_serializable_test.go:TestM24_SER_EmptyRangeProtection",
@@ -2623,6 +2654,7 @@ func (r *ParityRunner) runM25() {
 		SQLSequence:    seq,
 		GBaseResult:    gRes,
 		MySQLResult:    mRes,
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_serializable_test.go:TestM25_SER_WriteSkew",
@@ -2651,24 +2683,24 @@ func (r *ParityRunner) runM26() {
 		err = setupTable(r.dbMySQL)
 	}
 
-	testDeadlock := func(pair SessionPair) (bool, error) {
+	testDeadlock := func(pair SessionPair) (bool, string, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		if _, err := pair.connA.ExecContext(ctx, "BEGIN;"); err != nil {
-			return false, err
+			return false, "", err
 		}
 		if _, err := pair.connB.ExecContext(ctx, "BEGIN;"); err != nil {
-			return false, err
+			return false, "", err
 		}
 
 		// Step 1: ConnA locks row 1
 		if _, err := pair.connA.ExecContext(ctx, "UPDATE t_m26 SET val = 11 WHERE id = 1;"); err != nil {
-			return false, err
+			return false, "", err
 		}
 		// Step 2: ConnB locks row 2
 		if _, err := pair.connB.ExecContext(ctx, "UPDATE t_m26 SET val = 22 WHERE id = 2;"); err != nil {
-			return false, err
+			return false, "", err
 		}
 
 		// Step 3: ConnA attempts to update row 2, blocking behind ConnB
@@ -2708,24 +2740,34 @@ func (r *ParityRunner) runM26() {
 		case <-time.After(8 * time.Second):
 			_, _ = pair.connA.ExecContext(ctx, "ROLLBACK;")
 			_, _ = pair.connB.ExecContext(ctx, "ROLLBACK;")
-			return false, fmt.Errorf("deadlock did not trigger within 8 seconds")
+			return false, "", fmt.Errorf("deadlock did not trigger within 8 seconds")
 		}
 
 		hasDeadlock := (errA != nil && (strings.Contains(strings.ToLower(errA.Error()), "deadlock") || strings.Contains(errA.Error(), "1213"))) ||
 			(errB != nil && (strings.Contains(strings.ToLower(errB.Error()), "deadlock") || strings.Contains(errB.Error(), "1213"))) ||
 			(deadlockErr != nil && (strings.Contains(strings.ToLower(deadlockErr.Error()), "deadlock") || strings.Contains(deadlockErr.Error(), "1213")))
 
-		return hasDeadlock, nil
+		rawErr := "none"
+		if deadlockErr != nil {
+			rawErr = deadlockErr.Error()
+		} else if errA != nil {
+			rawErr = errA.Error()
+		} else if errB != nil {
+			rawErr = errB.Error()
+		}
+
+		return hasDeadlock, rawErr, nil
 	}
 
+	var gErrStr, mErrStr string
 	if err == nil {
 		err = r.withSessions(func(g, m SessionPair) error {
 			var e error
-			gDeadlock, e = testDeadlock(g)
+			gDeadlock, gErrStr, e = testDeadlock(g)
 			if e != nil {
 				return fmt.Errorf("GBase deadlock: %w", e)
 			}
-			mDeadlock, e = testDeadlock(m)
+			mDeadlock, mErrStr, e = testDeadlock(m)
 			if e != nil {
 				return fmt.Errorf("MySQL deadlock: %w", e)
 			}
@@ -2750,6 +2792,7 @@ func (r *ParityRunner) runM26() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("DeadlockDetected=%v", gDeadlock),
 		MySQLResult:    fmt.Sprintf("DeadlockDetected=%v", mDeadlock),
+		RawError:       fmt.Sprintf("GBase: %s; MySQL: %s", gErrStr, mErrStr),
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_serializable_test.go:TestM26_SER_DualSXUpgradeDeadlock",
@@ -2840,6 +2883,7 @@ func (r *ParityRunner) runM27() {
 		SQLSequence:    seq,
 		GBaseResult:    gRes,
 		MySQLResult:    mRes,
+		RawError:       fmt.Sprintf("GBase: %s; MySQL: %s", gRes, mRes),
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_serializable_test.go:TestM27_SER_UnsupportedQueries",
@@ -2924,6 +2968,7 @@ func (r *ParityRunner) runM28() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("UpdatedVal=%s", gVal),
 		MySQLResult:    fmt.Sprintf("UpdatedVal=%s", mVal),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_serializable_test.go:TestM28_SER_AutocommitOptimization",
@@ -3018,6 +3063,7 @@ func (r *ParityRunner) runM29() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("Dirty=%s, AfterRollback=%s", gDirty, gClean),
 		MySQLResult:    fmt.Sprintf("Dirty=%s, AfterRollback=%s", mDirty, mClean),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_ru_test.go:TestM29_RU_DirtyUpdate",
@@ -3109,6 +3155,7 @@ func (r *ParityRunner) runM30() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("DirtyCount=%d, AfterRollback=%d", gDirty, gClean),
 		MySQLResult:    fmt.Sprintf("DirtyCount=%d, AfterRollback=%d", mDirty, mClean),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_ru_test.go:TestM30_RU_DirtyInsert",
@@ -3203,6 +3250,7 @@ func (r *ParityRunner) runM31() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("DeletedCount=%d, AfterRollback=%d", gDirty, gClean),
 		MySQLResult:    fmt.Sprintf("DeletedCount=%d, AfterRollback=%d", mDirty, mClean),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_ru_test.go:TestM31_RU_DirtyDelete",
@@ -3303,6 +3351,7 @@ func (r *ParityRunner) runM32() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("RC=%s, RR=%s", gRC, gRR),
 		MySQLResult:    fmt.Sprintf("RC=%s, RR=%s", mRC, mRR),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_ru_test.go:TestM32_RU_IsolationBoundary",
@@ -3414,6 +3463,7 @@ func (r *ParityRunner) runM33() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("FinalVal=%s (Writer blocked then resumed)", gVal),
 		MySQLResult:    fmt.Sprintf("FinalVal=%s (Writer blocked then resumed)", mVal),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_ru_test.go:TestM33_RU_NoDirtyWrite",
@@ -3532,6 +3582,7 @@ func (r *ParityRunner) runM34() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("AfterSpRollback=%s, Final=%s", gS1, gInit),
 		MySQLResult:    fmt.Sprintf("AfterSpRollback=%s, Final=%s", mS1, mInit),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_ru_test.go:TestM34_RU_StageLifecycleAndSavepoint",
@@ -3626,6 +3677,7 @@ func (r *ParityRunner) runM35() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("ReadDirty=%s, AfterRollback=%s", gVal1, gVal2),
 		MySQLResult:    fmt.Sprintf("ReadDirty=%s, AfterRollback=%s", mVal1, mVal2),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_ru_test.go:TestM35_RU_RollbackVsReaderConcurrency",
@@ -3686,6 +3738,7 @@ func (r *ParityRunner) runM39() {
 		SQLSequence:    seq,
 		GBaseResult:    fmt.Sprintf("ReturnedRows=%d", gCount),
 		MySQLResult:    fmt.Sprintf("ReturnedRows=%d", mCount),
+		RawError:       "none",
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "executor/isolation_phase3_test.go:TestB03StreamingViewLifecycle",
@@ -3777,6 +3830,7 @@ func (r *ParityRunner) runM44() {
 		SQLSequence:    seq,
 		GBaseResult:    gDisplay,
 		MySQLResult:    mDisplay,
+		RawError:       fmt.Sprintf("GBase: none; MySQL legacy @@tx_isolation: %s", mLegacy),
 		Classification: class,
 		Reason:         reason,
 		CodeEvidence:   "server/isolation_phase2_test.go:TestB03IsolationVariables",
@@ -4410,8 +4464,8 @@ func (r *ParityRunner) writeReport() error {
 
 ## 2. [Section A] 双端 SQL 对拍矩阵 (Dual-Database SQL Parity Matrix: 37 Items)
 
-| ID | 场景领域 (Scope) | GBaseLite 实际结果 | MySQL 8.4 实际结果 | 原始错误 (Raw Error) | 判定 (Status) | 差异与机制说明 | 证据源码 |
-|---|---|---|---|---|---|---|---|
+| ID | 场景领域 (Scope) | SQL 执行次序 (SQL Sequence) | GBaseLite 实际结果 | MySQL 8.4 实际结果 | 原始错误 (Raw Error) | 判定 (Status) | 差异与机制说明 | 证据源码 |
+|---|---|---|---|---|---|---|---|---|
 `,
 		time.Now().Format("2006-01-02 15:04:05"),
 		r.gbaseVer,
@@ -4441,9 +4495,10 @@ func (r *ParityRunner) writeReport() error {
 		if rawErr == "" {
 			rawErr = "none"
 		}
-		row := fmt.Sprintf("| **%s** | %s | `%s` | `%s` | `%s` | **%s** | %s | `%s` |\n",
+		row := fmt.Sprintf("| **%s** | %s | `%s` | `%s` | `%s` | `%s` | **%s** | %s | `%s` |\n",
 			res.ID,
 			strings.ReplaceAll(res.Scope, "|", "/"),
+			strings.ReplaceAll(res.SQLSequence, "|", "/"),
 			strings.ReplaceAll(res.GBaseResult, "|", "/"),
 			strings.ReplaceAll(res.MySQLResult, "|", "/"),
 			strings.ReplaceAll(rawErr, "|", "/"),
@@ -4459,17 +4514,18 @@ func (r *ParityRunner) writeReport() error {
 
 ## 3. [Section B] GBaseLite 内部架构与复制验收矩阵 (Internal Architecture: 7 Items)
 
-| ID | 场景领域 (Scope) | 测试包名 (Package) | 目标测试正则 (Test Pattern) | 执行次数/通过次数 | 退出码 | 运行耗时 | 判定 (Status) | 机制说明与验证结论 | 证据源码 |
-|---|---|---|---|---|---|---|---|---|---|
+| ID | 场景领域 (Scope) | 验证动作 (Action) | 测试包名 (Package) | 目标测试正则 (Test Pattern) | 执行次数/通过次数 | 退出码 | 运行耗时 | 判定 (Status) | 机制说明与验证结论 | 证据源码 |
+|---|---|---|---|---|---|---|---|---|---|---|
 `)
 
 	for _, res := range r.results {
 		if res.Category != "GBaseLite Internal Architecture" {
 			continue
 		}
-		row := fmt.Sprintf("| **%s** | %s | `%s` | `%s` | `%d/%d` | `%d` | `%v` | **%s** | %s | `%s` |\n",
+		row := fmt.Sprintf("| **%s** | %s | `%s` | `%s` | `%s` | `%d/%d` | `%d` | `%v` | **%s** | %s | `%s` |\n",
 			res.ID,
 			strings.ReplaceAll(res.Scope, "|", "/"),
+			strings.ReplaceAll(res.SQLSequence, "|", "/"),
 			res.Package,
 			res.TestName,
 			res.ActualRuns, res.ActualPasses,

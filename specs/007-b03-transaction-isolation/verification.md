@@ -1325,4 +1325,54 @@
 - [x] T075 B02 既有磁盘格式、WAL 与历史 Fixture 恢复兼容
 - [x] T076 Phase 8 Gate 审查报告就绪，无 P0/P1 阻塞问题
 
-- **最终结论**: **T066–T076 全部完成，Phase 8 验收门禁正式 PASSED，等待用户代码审查。**
+- **最终结论**: **T066–T076 全部完成，Phase 8 验收门禁正式 PASSED。**
+
+---
+
+## 36. Phase 9: 文档同步、证据追溯与 Release Candidate 门禁审查 (T077–T083)
+
+### 1. 文档全面同步 (T077–T078)
+- **`README.md` 事务与差异章节更新**:
+  - 新增《事务隔离级别与 MySQL 8.4 兼容性细粒度差异 (B03)》小节；
+  - 完整记录 REPEATABLE READ、READ COMMITTED、SERIALIZABLE、READ UNCOMMITTED 四个隔离级别的具体行为与实现机制；
+  - 详尽披露已知差异（M06 SET GLOBAL 拒绝）与 Fail-Closed 策略（M27 SERIALIZABLE 复杂形态拒绝、M36 Raft 复制模式禁用 RU）；
+  - 严正声明 GBaseLite 仅实现受控事务隔离子集，绝不宣传为完全兼容 MySQL。
+- **`docs/使用文档/事务与存储说明.md` 重构**:
+  - 彻底废除 snapshot/paged 历史过期说明；
+  - 系统阐述 MVCC 多版本存储架构、Read View 与 ViewToken 机制、四种隔离级别、作用域状态机、32 层嵌套保存点、锁管理器、死锁受害者检测及 Raft 复制约束。
+- **`docs/使用文档/SQL兼容性参考.md` 同步**:
+  - 移除已作废的“不支持行级锁与事务隔离”陈述；
+  - 补充 `SET [SESSION] TRANSACTION ISOLATION LEVEL` 与 `SET TRANSACTION ISOLATION LEVEL` 语法规范；
+  - 补充新增错误码：Error 1205（锁等待超时）、Error 1213（死锁回滚）、Error 3108（Fail-Closed 复杂形态拒绝）；
+  - 更新接受但不执行的命令与明确不支持清单。
+
+### 2. 证据追溯与决议回写 (T079–T080)
+- **`traceability.md` 证据闭环**:
+  - 补齐所有 36 项功能需求（FR-001–FR-036）至具体代码文件、测试函数、命令、退出码与证据产物的端到端映射；
+  - 补齐所有 12 项成功标准（SC-001–SC-012）的验证状态；
+  - 回写 Q01–Q10 技术决议、替代方案原因及架构代价；
+  - 汇总 B03 KNOWN DIFFERENCE 与 UNSUPPORTED 清单；
+  - 逐项填实 T001–T083 任务级执行证据表（关联最新基线 Commit `ed77f3aeeffdfae64bbf2f03742c3a9914d655c5`）。
+- **`scripts/parity/main.go` 证据完整性增强**:
+  - 补齐 M01–M44 全场景的 `RawError` 原始错误与 `SQLSequence` 执行次序字段；
+  - 在 `.tmp/b03-parity.md` 中以完整表格输出双端实际结果、原始错误、执行次序与测试引用。
+
+### 3. 最终工程验收 (T081)
+- `gofmt -l scripts/ .`: 100% clean；
+- `go vet ./...`: 0 warnings, 0 errors；
+- `git diff --check`: 100% clean，无空格与合并冲突；
+- 100 轮确定性并发压测 (`TestP7R2_ScenarioA_DelayedLeaderLossCannotDisruptNewTerm`): 100/100 全部通过 (6.57s)，零锁残留；
+- 历史兼容 Fixture (`TestT068GenuineB01FixtureOpenAndRestoreWithLockInvalidation`): 10/10 全部通过 (1.56s)；
+- 生产目录检查 (`git status -- data/`): 生产 `data/` 目录完全保持原始状态，未受到任何测试写入污染；
+- 产出最终审查报告：`.tmp/b03-final-review.md`。
+
+### 4. 任务清单完成情况 (T082–T083)
+- [x] T077 根据真实支持矩阵同时更新仓库 `README.md`
+- [x] T078 更新 `docs/使用文档/事务与存储说明.md`、`SQL兼容性参考.md`
+- [x] T079 补齐 `traceability.md` 实际测试名/文件/Commit SHA/结果
+- [x] T080 将 Q01–Q10 真实决议回写，补齐 KNOWN DIFFERENCE/UNSUPPORTED 表
+- [x] T081 最终工程质量与零污染复核，产出 `.tmp/b03-final-review.md`
+- [x] T082 审核任务完成状态，确认满足 Release Candidate 资格
+- [x] T083 最终 Gate：报告可发布候选资格及限制，遵守门禁规则，未实际打 tag、Release、替换 bin 或部署。
+
+- **最终结论**: **T001–T083 全量 83 项任务 100% 达成，Phase 9 文档同步与 Release Candidate 门禁审查正式通过，进入待发布候选状态，停止自动操作，等待用户最终审查授权。**

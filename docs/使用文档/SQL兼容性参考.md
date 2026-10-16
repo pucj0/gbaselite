@@ -247,33 +247,40 @@ ENUM 和 JSON 载荷校验。
 SET NULL 的全部子列必须可空。级联修改支持多层传播，并检测循环；TRUNCATE 不执行级
 联。跨库外键不支持。
 
-## 事务和并发语义
+## 事务和并发语义 (B03)
 
 ```sql
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
 BEGIN;
-UPDATE users SET balance=balance-1 WHERE id=1;
-INSERT INTO course_ledger(user_id,change_amount) VALUES (1,-1);
+SELECT val FROM accounts WHERE id = 1 FOR UPDATE;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+SAVEPOINT sp1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
 COMMIT;
 ```
 
-支持 `BEGIN`、`COMMIT` 和 `ROLLBACK`。默认显式事务使用实例级独占事务门：当前会话
-读取自己的事务快照，其他会话的读取和写入等待事务结束。当前没有可选择的隔离级别、
-行级锁、死锁检测或锁等待超时。
+支持 `BEGIN`、`COMMIT` 和 `ROLLBACK`，支持完整四级事务隔离级别与行级锁管理器：
 
-`SELECT ... FOR UPDATE` 语法可用于业务事务，但当前正确性来自实例级事务门，并不是
-只锁命中行。支持真实 `SAVEPOINT name`、`ROLLBACK [WORK] TO [SAVEPOINT] name` 和
-`RELEASE SAVEPOINT name`。名称不区分大小写、最多 64 字符；每事务最多 32 个，同名
-替换旧位置。回滚保留目标、删除其后保存点；释放只删除目标。事务外 SAVEPOINT 不保留，
-回滚或释放不存在的点返回 1305。提交、完整回滚和断连释放全部保存点。
-
-保存点可恢复普通 DML、外键级联以及建表/视图/索引、增加列等受支持 DDL；当前 DDL
-不会采用 MySQL 的隐式提交。存在保存点时拒绝 DROP DATABASE/TABLE、TRUNCATE、
-表重命名、列 DROP/MODIFY/CHANGE/RENAME（含批量 ALTER），须先释放全部保存点。
-账号/授权、USE、会话变量和 LAST_INSERT_ID 不回滚；不支持用户 CREATE TEMPORARY TABLE。
-保存点不触发落盘，复制的行头/元数据仍占内存；回滚需恢复表并重建索引。
-
-事务中分配的 AUTO_INCREMENT ID 在回滚后不会复用；普通 DELETE 不重置计数，
-TRUNCATE 会重置计数。
+- **四级隔离级别支持**：
+  - **REPEATABLE READ**（默认）：基于首次一致性读快照（Snapshot Isolation），自身写优先可见，防不可重复读与幻读；
+  - **READ COMMITTED**：每条语句动态分配独立语句视图，允许不可重复读与幻读，锁保护下的写操作基于最新已提交版本安全递增；
+  - **SERIALIZABLE**：普通 SELECT 隐式获取 S/Next-Key/Gap 锁，防止 Write Skew 与 Phantom Read；单语句 autocommit=1 保留无锁优化；
+  - **READ UNCOMMITTED**（单机模式）：支持读取未提交暂存脏数据，写操作强制申请 X 锁校验已提交基线，严禁脏写与丢失更新。
+- **作用域控制**：
+  - `SET [SESSION] TRANSACTION ISOLATION LEVEL <level>`：修改当前会话默认隔离级别；
+  - `SET TRANSACTION ISOLATION LEVEL <level>`：仅修改下一事务（pendingNext），消费后自动回退；
+  - `SET GLOBAL TRANSACTION ISOLATION LEVEL`：**显式拒绝并报错 Error 1064**（KNOWN DIFFERENCE，用于保护嵌入式多连接环境）；
+- **锁与并发控制**：
+  - 行级锁管理器支持表意向（IS/IX）、记录（S/X）、间隙（Gap）、临键（Next-Key）及插入意向锁（Insert Intention）；
+  - `SELECT ... FOR UPDATE` 与 `SELECT ... FOR SHARE` 执行当前读并加锁；
+  - 等待超时由 `innodb_lock_wait_timeout` 控制（超时返回 Error 1205）；
+  - 自动检测死锁等待闭环并回滚受害者，返回 MySQL Error 1213；
+- **保存点（SAVEPOINT）**：
+  - 支持 `SAVEPOINT <name>`、`ROLLBACK TO [SAVEPOINT] <name>`、`RELEASE SAVEPOINT <name>`；
+  - 每个事务最多支持 32 层活跃保存点；RC 级别下保存点撤回不冻结语句快照；
+- **限制与 Fail-Closed 策略**：
+  - SERIALIZABLE 级别下多表 JOIN/CTE/视图/集合/聚合等复杂无谓词形态直接报错 Error 3108 Fail-Closed 拒绝执行（M27）；
+  - Raft 复制集群模式下禁止 READ UNCOMMITTED（返回 ErrUnsupported，M36）。
 
 ## SHOW 和 information_schema
 
@@ -348,11 +355,14 @@ DELETE FROM workout_part_options WHERE enabled=? LIMIT 1;
 | 1064 | SQL 解析错误或未单独映射的执行错误 |
 | 1091 | 删除不存在的索引或约束 |
 | 1142 | 当前账号缺少对象权限 |
+| 1205 | 锁等待超时（超过 `innodb_lock_wait_timeout` 设置，仅终止当前语句） |
+| 1213 | 死锁环路检测触发，当前事务被选为受害者并回滚，客户端应重试整个事务 |
 | 1305 | 保存点不存在或已被释放 |
 | 1396 | CREATE/ALTER/DROP USER 的对象状态错误 |
 | 1451 | 父行仍被引用，RESTRICT/NO ACTION 拒绝修改或删除 |
 | 1452 | 子行引用了不存在的父行 |
 | 1826 | 约束名称已存在 |
+| 3108 | 存储引擎能力不支持（SERIALIZABLE 下复杂查询形态 Fail-Closed 拒绝） |
 | 3159 | 服务要求 TLS，但客户端使用明文连接 |
 | 3819 | CHECK、ENUM 或 JSON 载荷校验失败 |
 
@@ -364,7 +374,7 @@ DELETE FROM workout_part_options WHERE enabled=? LIMIT 1;
 以下命令用于 MySQL 工具导入或能力探测，不能据此推断对应引擎能力已经实现：
 
 - SET 会话兼容项、FLUSH PRIVILEGES、FLUSH TABLES
-- LOCK TABLES / UNLOCK TABLES
+- LOCK TABLES / UNLOCK TABLES（仅语法兼容空桩，不提供完整表级物理锁定）
 - ALTER TABLE ... ENABLE/DISABLE KEYS
 - SHOW WARNINGS / SHOW ERRORS
 - SHOW PROCEDURE/FUNCTION STATUS、SHOW TRIGGERS、SHOW EVENTS
@@ -374,6 +384,9 @@ DELETE FROM workout_part_options WHERE enabled=? LIMIT 1;
 
 ## 明确不支持或仍有限制
 
+- `SET GLOBAL TRANSACTION ISOLATION LEVEL` 明确拒绝（M06 KNOWN DIFFERENCE，限制在 SESSION/NEXT 保护多连接）
+- SERIALIZABLE 下多表 JOIN/CTE/视图/集合/聚合等复杂无谓词保护查询形态（M27 UNSUPPORTED Fail-Closed）
+- Raft 复制集群模式下运行 READ UNCOMMITTED 隔离级别（M36 UNSUPPORTED Fail-Closed）
 - 跨库外键和跨库 RENAME TABLE
 - 触发器、存储过程、存储函数和事件
 - 通过视图执行 INSERT、UPDATE 或 DELETE
@@ -382,9 +395,9 @@ DELETE FROM workout_part_options WHERE enabled=? LIMIT 1;
 - 完整 information_schema/mysql 系统目录
 - 可更新视图和 WITH CHECK OPTION 执行
 - 命名窗口、显式窗口 frame 和完整优化器成本模型
-- 行级锁、可配置事务隔离、死锁检测和锁等待超时
-- 复制、集群、分片、自动故障转移、在线物理备份和物理 WAL
+- 复制集群下的分布式事务、多主写入、混合版本滚动升级或生产容灾保证
 - 客户端证书认证与证书自动签发/轮换
+- `READ ONLY` / `READ WRITE` 事务特征设置
 
 迁移包含这些能力的 MySQL 应用时，应先改写设计或选择 MySQL/PostgreSQL 等成熟数据
 库，不能通过忽略错误或只放开解析器规避。
