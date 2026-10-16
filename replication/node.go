@@ -47,10 +47,12 @@ type Node struct {
 	failure     sync.Mutex
 	fatal       error
 
-	leadershipMu sync.Mutex
-	isLeader     bool
-	leaderTerm   uint64
-	tenure       uint64
+	leadershipMu     sync.Mutex
+	isLeader         bool
+	leaderTerm       uint64
+	tenure           uint64
+	leaderGeneration uint64
+	tenureGen        map[uint64]uint64
 }
 type Status struct {
 	ID, State, Leader, LeaderID string
@@ -115,7 +117,7 @@ func Open(store *mvcc.Store, options Options) (*Node, error) {
 	config.MaxAppendEntries = 16
 	config.SnapshotThreshold = 2048
 	config.TrailingLogs = 256
-	node := &Node{fatalSignal: make(chan struct{}, 1), stopped: make(chan struct{}), id: options.ID, store: store, logs: logs, transport: transport}
+	node := &Node{fatalSignal: make(chan struct{}, 1), stopped: make(chan struct{}), id: options.ID, store: store, logs: logs, transport: transport, tenureGen: make(map[uint64]uint64)}
 	exists, err := raft.HasExistingState(logs, logs, snapshots)
 	if err != nil {
 		node.Close()
@@ -158,20 +160,28 @@ func Open(store *mvcc.Store, options Options) (*Node, error) {
 					if term == 0 {
 						term = node.Term()
 					}
+					gen := node.leaderGeneration
+					if gen == 0 {
+						if g, ok := node.tenureGen[tenure]; ok && g > 0 {
+							gen = g
+						} else if node.store != nil {
+							gen = node.store.Generation()
+						}
+					}
 					isCurrentLeader := node.isLeader && node.raft != nil && node.raft.State() == raft.Leader
 					node.leadershipMu.Unlock()
 					if isCurrentLeader {
 						continue
 					}
-					node.onLeaderLoss(tenure, term)
+					node.onLeaderLoss(tenure, term, gen)
 				}
 			case <-node.fatalSignal:
-				tenure, term := node.currentTenureAndTerm()
-				node.onLeaderLoss(tenure, term)
+				tenure, term, gen := node.currentLeadership()
+				node.onLeaderLoss(tenure, term, gen)
 				_ = node.raft.Shutdown().Error()
 			case <-node.stopped:
-				tenure, term := node.currentTenureAndTerm()
-				node.onLeaderLoss(tenure, term)
+				tenure, term, gen := node.currentLeadership()
+				node.onLeaderLoss(tenure, term, gen)
 				return
 			}
 		}
@@ -217,8 +227,8 @@ func (n *Node) check() error {
 		return n.fatal
 	}
 	if n.raft.State() != raft.Leader {
-		tenure, term := n.currentTenureAndTerm()
-		n.onLeaderLoss(tenure, term)
+		tenure, term, gen := n.currentLeadership()
+		n.onLeaderLoss(tenure, term, gen)
 		return fmt.Errorf("%w; raft leader=%s", ErrNotLeader, n.Status().Leader)
 	}
 	return nil
@@ -277,8 +287,8 @@ func (n *Node) VerifyLeader(ctx context.Context) error {
 	if err := wait(ctx, n.raft.VerifyLeader()); err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			if n.raft != nil && n.raft.State() != raft.Leader {
-				tenure, term := n.currentTenureAndTerm()
-				n.onLeaderLoss(tenure, term)
+				tenure, term, gen := n.currentLeadership()
+				n.onLeaderLoss(tenure, term, gen)
 			}
 		}
 		return err
@@ -292,8 +302,8 @@ func (n *Node) Barrier(ctx context.Context) error {
 	if err := wait(ctx, n.raft.VerifyLeader()); err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			if n.raft != nil && n.raft.State() != raft.Leader {
-				tenure, term := n.currentTenureAndTerm()
-				n.onLeaderLoss(tenure, term)
+				tenure, term, gen := n.currentLeadership()
+				n.onLeaderLoss(tenure, term, gen)
 			}
 		}
 		return err
@@ -301,8 +311,8 @@ func (n *Node) Barrier(ctx context.Context) error {
 	if err := wait(ctx, n.raft.Barrier(timeout(ctx))); err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			if n.raft != nil && n.raft.State() != raft.Leader {
-				tenure, term := n.currentTenureAndTerm()
-				n.onLeaderLoss(tenure, term)
+				tenure, term, gen := n.currentLeadership()
+				n.onLeaderLoss(tenure, term, gen)
 			}
 		}
 		return err
@@ -324,15 +334,33 @@ func (n *Node) onLeaderElected(term uint64) {
 	n.isLeader = true
 	n.leaderTerm = term
 	n.tenure++
+	var gen uint64
+	if n.store != nil {
+		gen = n.store.Generation()
+	}
+	n.leaderGeneration = gen
+	if n.tenureGen == nil {
+		n.tenureGen = make(map[uint64]uint64)
+	}
+	n.tenureGen[n.tenure] = gen
 	n.leadershipMu.Unlock()
 
 	n.SyncLockEpoch()
 }
 
-func (n *Node) onLeaderLoss(eventTenure uint64, eventTerm uint64) {
+func (n *Node) onLeaderLoss(eventTenure uint64, eventTerm uint64, eventGeneration uint64) {
 	n.leadershipMu.Lock()
-	// Stale event check: if node is currently active Leader in a newer tenure or newer term, ignore!
-	if n.isLeader && (n.tenure > eventTenure || n.leaderTerm > eventTerm) {
+	if eventGeneration == 0 {
+		if g, ok := n.tenureGen[eventTenure]; ok && g > 0 {
+			eventGeneration = g
+		} else if n.leaderGeneration > 0 {
+			eventGeneration = n.leaderGeneration
+		} else if n.store != nil {
+			eventGeneration = n.store.Generation()
+		}
+	}
+	// Stale event check: if node is currently active Leader in a newer tenure or newer term or newer generation, ignore!
+	if n.isLeader && (n.tenure > eventTenure || n.leaderTerm > eventTerm || (eventGeneration > 0 && n.leaderGeneration > eventGeneration)) {
 		n.leadershipMu.Unlock()
 		return
 	}
@@ -345,18 +373,27 @@ func (n *Node) onLeaderLoss(eventTenure uint64, eventTerm uint64) {
 	n.leadershipMu.Unlock()
 
 	if n.store != nil {
-		n.store.ForceResetLockEpoch(eventTerm)
+		n.store.ForceResetLockEpoch(eventGeneration, eventTerm)
 	}
 }
 
-func (n *Node) currentTenureAndTerm() (uint64, uint64) {
+func (n *Node) currentLeadership() (uint64, uint64, uint64) {
 	n.leadershipMu.Lock()
 	defer n.leadershipMu.Unlock()
 	term := n.leaderTerm
 	if term == 0 {
 		term = n.Term()
 	}
-	return n.tenure, term
+	gen := n.leaderGeneration
+	if gen == 0 && n.store != nil {
+		gen = n.store.Generation()
+	}
+	return n.tenure, term, gen
+}
+
+func (n *Node) currentTenureAndTerm() (uint64, uint64) {
+	tenure, term, _ := n.currentLeadership()
+	return tenure, term
 }
 
 // SyncLockEpoch synchronizes the underlying store's lock epoch with the node's current Raft term.

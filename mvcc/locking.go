@@ -122,7 +122,10 @@ func (s *Store) ResetLockEpoch(term uint64) int {
 	binding.epochMu.Lock()
 	defer binding.epochMu.Unlock()
 
-	// Monotonicity: an epoch reset for an older term cannot roll back epoch state.
+	// Monotonicity: an epoch reset for an older generation or older term cannot roll back epoch state.
+	if generation < binding.storeGeneration {
+		return 0
+	}
 	if generation == binding.storeGeneration && term < binding.storeTerm {
 		return 0
 	}
@@ -138,18 +141,17 @@ func (s *Store) ResetLockEpoch(term uint64) int {
 	return binding.manager.ResetEpoch(generation, term)
 }
 
-var forceResetLockEpochHook func(stage string, term uint64)
+var forceResetLockEpochHook func(stage string, generation, term uint64)
 
 // ForceResetLockEpoch unconditionally invalidates all lock owners, releases grants,
-// cancels pending requests, and resets the dirty registry for the current generation and term,
+// cancels pending requests, and resets the dirty registry for the expected generation and term,
 // provided that the store has not already advanced to a newer generation or higher term.
 // If the store is already in a newer generation or higher term, the stale reset is rejected
 // and returns 0 without touching newer lock owners or dirty versions.
-func (s *Store) ForceResetLockEpoch(term uint64) int {
+func (s *Store) ForceResetLockEpoch(generation, term uint64) int {
 	if forceResetLockEpochHook != nil {
-		forceResetLockEpochHook("before_acquire_epoch_mu", term)
+		forceResetLockEpochHook("before_acquire_epoch_mu", generation, term)
 	}
-	generation := s.generation.Load()
 	binding := s.locks
 	if binding == nil {
 		if s.dirtyRegistry != nil {
@@ -161,16 +163,20 @@ func (s *Store) ForceResetLockEpoch(term uint64) int {
 	defer binding.epochMu.Unlock()
 
 	if forceResetLockEpochHook != nil {
-		forceResetLockEpochHook("inside_epoch_mu", term)
+		forceResetLockEpochHook("inside_epoch_mu", generation, term)
 	}
 
 	// Monotonicity & Stale Event Protection:
 	// A force reset from an older generation or older term must NOT roll back or
 	// disrupt a newer generation or term that has already been established.
-	if generation < binding.storeGeneration {
+	currentGen := s.generation.Load()
+	if generation < currentGen || generation < binding.storeGeneration {
 		return 0
 	}
 	if generation == binding.storeGeneration && term < binding.storeTerm {
+		return 0
+	}
+	if generation > currentGen {
 		return 0
 	}
 
@@ -201,6 +207,9 @@ func (s *Store) SyncLockEpoch(term uint64) bool {
 	binding.epochMu.Lock()
 	defer binding.epochMu.Unlock()
 
+	if generation < binding.storeGeneration {
+		return false
+	}
 	if generation == binding.storeGeneration && term <= binding.storeTerm {
 		return false
 	}

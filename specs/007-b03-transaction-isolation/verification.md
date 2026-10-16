@@ -1147,3 +1147,82 @@
   - 架构规则测试 `TestSQLPackagesDoNotImportPhysicalBackends` 与 `TestProductionArchitectureBoundaries` 100% PASS。
 - **Race Detector 说明**: Windows 本地开发机缺少 C 工具链（CGO 未启用），按规则标记 **NOT RUN**；远程 CI Linux Ubuntu 虚拟机带有完整 CGO，已在上述 GitHub Actions Run `38834144434` 中取得真实通过证据。
 - **最终结论**: **FIX-01 至 FIX-04 全部彻底关闭，GBaseLite B03 Phase 7 Raft Epoch 最终并发安全审查正式 PASS**。
+
+---
+
+## 34. Phase 7 最后一个 Generation Fence 缺口修复 (P7-GEN-01 至 P7-GEN-03)
+
+- **基线 Commit**: `692be63379378b80affb901a38644ce18c1a6ebd`
+- **核查与修复项详情**:
+
+### 1. P7-GEN-01：保留触发事件的原始 Generation 与彻底消除 TOCTOU 缺口 (P0 - RESOLVED)
+- **原因与风险**:
+  - 原实现中，`Store.ForceResetLockEpoch(term)` 在执行时才通过 `s.generation.Load()` 读取 Store 的当前 Generation。
+  - 当发生 Restore（例如备份恢复或 Raft 快照恢复）导致 Store 推进至新代次 $G_2$ 时，若旧代次 $G_1$ 的 Leader Loss 事件发生延迟调度并在 Restore 后到达，该迟到事件会错误读取到新代次 $G_2$。
+  - 由于传入的 term 等于当前 term，单调性检查被绕过，迟到的旧下台事件误将 $G_2$ 的活跃事务锁、等待队列（WaitEdges）以及脏数据（Dirty Registry）全部强制清空，违背了代次隔离原则。
+- **修复方案**:
+  1. **存储层接口升级与代次校验**:
+     - `mvcc/store.go` 导出 `Store.Generation() uint64`，便于调用方与状态机获取当前代次；
+     - `mvcc/locking.go` 调整接口为 `ForceResetLockEpoch(generation, term uint64) int`，将触发事件发生时的有效代次与任期显式绑定；
+     - 严格在 `binding.epochMu.Lock()` 互斥锁保护下执行原子单调性校验：
+       ```go
+       currentGen := s.generation.Load()
+       if generation < currentGen || generation < binding.storeGeneration {
+           return 0
+       }
+       if generation == binding.storeGeneration && term < binding.storeTerm {
+           return 0
+       }
+       if generation > currentGen {
+           return 0
+       }
+       ```
+       彻底消除检验与重置之间的 TOCTOU 竞争窗口；
+  2. **复制层领导权代次与任期绑定**:
+     - `replication/node.go` 增加 `leaderGeneration uint64` 与 `tenureGen map[uint64]uint64`；
+     - 在 `onLeaderElected(term)` 时记录当选时的代次与任期映射；
+     - 提供 `currentLeadership() (tenure, term, gen)`，确保从 ticker、fatalSignal、stopped、check() 或 wait() 触发的下台事件全部携带触发时的真实代次；
+     - `onLeaderLoss(eventTenure, eventTerm, eventGeneration)` 增加新代次/新任期保护，并将绑定的代次直接传递给 `Store.ForceResetLockEpoch(eventGeneration, eventTerm)`；
+  3. **Restore 强制净化与同 Epoch 幂等性保留**:
+     - `mvcc/snapshot.go:Restore` 在 `s.generation.Add(1)` 之后，直接原子调用 `s.ForceResetLockEpoch(newGen, currentTerm)`，确保锁管理器与脏注册表在同一锁保护下完成强制净化；
+     - `mvcc/locking.go:ResetLockEpoch` 与 `SyncLockEpoch` 补充 `generation < binding.storeGeneration` 拦截，同 Epoch 幂等性与真实同代次/同任期下台锁释放行为完全保持不变。
+- **源码审查清单**:
+  - `mvcc/store.go`: 增加 `Store.Generation() uint64`
+  - `mvcc/locking.go`: 更新 `ForceResetLockEpoch(generation, term uint64)`、`ResetLockEpoch`、`SyncLockEpoch` 及测试 Hook
+  - `mvcc/snapshot.go`: `Restore` 原子调用 `ForceResetLockEpoch(newGen, currentTerm)`
+  - `replication/node.go`: 绑定 `leaderGeneration`、`tenureGen` 及下台事件代次传递
+  - `replication/export_test.go`: 扩展测试桩 `HandleLeaderLossWithGenForTesting` 与 `StoreForTesting`
+
+### 2. P7-GEN-02：修复场景 C 的测试与红绿测证据 (P0 - RESOLVED)
+- **红测先行（基于未修改生产代码执行）**:
+  - 构造完整 Store 调用路径的确定性测试：在 $G_1$ 下创建旧 Leader Loss 事件，在获取 `epochMu` 前暂停；模拟合法 Restore 切换至 $G_2$；在 $G_2$ 下创建 Root A 持有 Record X 锁并发布脏数据，Root B 排队等待确立等待边；恢复 $G_1$ 的迟到事件；
+  - 运行结果：**确定性红测失败**：
+    ```text
+    === RUN   TestP7R2_ScenarioC_RestoreGenerationProtectsAgainstDelayedForceReset
+        locking_epoch_concurrency_test.go:322: stale G1 ForceResetLockEpoch affected 2 owners, want 0
+    --- FAIL: TestP7R2_ScenarioC_RestoreGenerationProtectsAgainstDelayedForceReset (0.02s)
+    ```
+    证实原代码中旧事件误读新 Generation 导致 $G_2$ 的活跃持锁与排队等待被意外清空；
+- **绿测闭环（修复后）**:
+  - `TestP7R2_ScenarioA_DelayedLeaderLossCannotDisruptNewTerm`: **PASS**（旧 Term 迟到事件被单调性拒绝，不影响新 Term）
+  - `TestP7R2_ScenarioB_NormalLeaderLossAndRepeatedEvents`: **PASS**（正常下台安全释放锁，重复下台幂等返回 0）
+  - `TestP7R2_ScenarioC_RestoreGenerationProtectsAgainstDelayedForceReset`: **PASS**（旧 Generation 迟到事件被拒绝返回 0；$G_2$ 的 ModeX 锁、Owner、WaitEdges、Dirty Registry 均保持不变；Root A 释放后 Root B 正常被唤醒并提交）
+  - `TestT055DelayedLeaderLossCannotInvalidateNewGenerationRoot`: **PASS**（集群级验证：真实 Restore 递增代次后，迟到的旧代次下台事件不影响新代次事务持有锁与当前读）
+
+### 3. P7-GEN-03：完整回归与 CI 证据核查 (P0 - RESOLVED)
+- **本地全量回归测试**:
+  - `go test ./mvcc ./replication ./lockmanager -count=1`: **PASS** (全部通过，mvcc 28.8s, replication 13.4s, lockmanager 1.7s)
+  - `go test ./... -count=1`: **PASS** (全库 21 个带测试包 100% 全部通过，总耗时 175s，EXIT CODE: 0)
+  - `go vet ./...`: **PASS** (0 warnings, 0 errors)
+  - `git diff --check`: **PASS** (无冲突标记、无异常空白，工作区干净)
+- **远程 CI 真实结果 (Linux + CGO 环境)**:
+  - 关联 GitHub Actions 最新 Run `38838346949`（Test，针对基线 Commit `692be63379378b80affb901a38644ce18c1a6ebd`）：
+    - `quality (ubuntu-latest)` (Job ID: `116772412524`): **SUCCESS**
+      - Step 7 `Failover race regression`: **SUCCESS**
+      - Step 8 `MVCC transaction race regression`: **SUCCESS**
+      - Step 9 `Lock manager race regression`: **SUCCESS**
+    - `quality (windows-latest)` (Job ID: `116772412520`): **SUCCESS**
+    - `build (ubuntu-latest / windows-latest)`: **SUCCESS**
+    - `mysql-8-client`: **SUCCESS**
+  - 本地环境说明：Windows 本地宿主环境未启用 CGO，按规范明确标记 **NOT RUN**；远程 Linux CI 已提供完整 CGO + Race Detector 全量通过证据。
+- **最终结论**: **P7-GEN-01 至 P7-GEN-03 全部彻底关闭，GBaseLite B03 Phase 7 最后一个 Generation Fence 缺口圆满解决**。

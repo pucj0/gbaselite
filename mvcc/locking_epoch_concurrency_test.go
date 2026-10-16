@@ -21,14 +21,15 @@ func TestP7R2_ScenarioA_DelayedLeaderLossCannotDisruptNewTerm(t *testing.T) {
 
 	// 1. Initialize store in Term 10
 	f.store.ResetLockEpoch(10)
+	g1 := f.store.Generation()
 
 	// 2. Set up deterministic hook to pause Term 10 ForceResetLockEpoch before acquiring epochMu
 	inHook := make(chan struct{})
 	allowStepDown := make(chan struct{})
 	var hookOnce sync.Once
 
-	forceResetLockEpochHook = func(stage string, term uint64) {
-		if stage == "before_acquire_epoch_mu" && term == 10 {
+	forceResetLockEpochHook = func(stage string, generation, term uint64) {
+		if stage == "before_acquire_epoch_mu" && generation == g1 && term == 10 {
 			hookOnce.Do(func() {
 				close(inHook)
 				<-allowStepDown
@@ -39,7 +40,7 @@ func TestP7R2_ScenarioA_DelayedLeaderLossCannotDisruptNewTerm(t *testing.T) {
 
 	stepDownResult := make(chan int, 1)
 	go func() {
-		stepDownResult <- f.store.ForceResetLockEpoch(10)
+		stepDownResult <- f.store.ForceResetLockEpoch(g1, 10)
 	}()
 
 	// Wait until Term 10 step-down is paused before epochMu
@@ -176,6 +177,7 @@ func TestP7R2_ScenarioB_NormalLeaderLossAndRepeatedEvents(t *testing.T) {
 
 	// Initialize in Term 10
 	f.store.ResetLockEpoch(10)
+	g1 := f.store.Generation()
 
 	propTerm10 := &barrierInterleavingProposer{
 		Store: f.store,
@@ -203,9 +205,9 @@ func TestP7R2_ScenarioB_NormalLeaderLossAndRepeatedEvents(t *testing.T) {
 	f.awaitPending(txB.ID, 1)
 
 	// Normal Leader Loss in Term 10
-	affected := f.store.ForceResetLockEpoch(10)
+	affected := f.store.ForceResetLockEpoch(g1, 10)
 	if affected == 0 {
-		t.Fatal("ForceResetLockEpoch(10) affected 0 owners, want > 0")
+		t.Fatal("ForceResetLockEpoch(g1, 10) affected 0 owners, want > 0")
 	}
 
 	// Waiter txB must be woken with ErrLockInvalidated
@@ -218,34 +220,156 @@ func TestP7R2_ScenarioB_NormalLeaderLossAndRepeatedEvents(t *testing.T) {
 		t.Fatal("waiter was not woken with ErrLockInvalidated")
 	}
 
-	// Repeated ForceResetLockEpoch(10) must be a safe no-op
-	if aff := f.store.ForceResetLockEpoch(10); aff != 0 {
+	// Repeated ForceResetLockEpoch(g1, 10) must be a safe no-op
+	if aff := f.store.ForceResetLockEpoch(g1, 10); aff != 0 {
 		t.Fatalf("repeated ForceResetLockEpoch affected %d owners, want 0", aff)
 	}
 
 	f.requireIdle()
 }
 
-// TestP7R2_ScenarioC_RestoreGenerationProtectsAgainstDelayedForceReset covers FIX-02 Scenario C:
+// TestP7R2_ScenarioC_RestoreGenerationProtectsAgainstDelayedForceReset covers FIX-02 / P7-GEN-02 Scenario C:
 // Verifies that when a store restores and increments its generation,
-// a late ForceReset from an older generation cannot roll back the generation or disrupt locks.
+// a late ForceReset from an older generation cannot roll back the generation or disrupt locks/waiters/dirty registry.
 func TestP7R2_ScenarioC_RestoreGenerationProtectsAgainstDelayedForceReset(t *testing.T) {
 	f := newRawLockFixture(t)
+	ctx := context.Background()
 
-	// Term 0, initial generation
-	txA := f.begin()
+	// 1. Initialize store in Generation G1, Term 10
+	f.store.ResetLockEpoch(10)
+	g1 := f.store.Generation()
+
+	// 2. Set up deterministic hook to pause G1 Leader Loss before ForceResetLockEpoch reads generation / acquires epochMu
+	inHook := make(chan struct{})
+	allowStepDown := make(chan struct{})
+	var hookOnce sync.Once
+
+	forceResetLockEpochHook = func(stage string, generation, term uint64) {
+		if stage == "before_acquire_epoch_mu" && generation == g1 && term == 10 {
+			hookOnce.Do(func() {
+				close(inHook)
+				<-allowStepDown
+			})
+		}
+	}
+	defer func() { forceResetLockEpochHook = nil }()
+
+	stepDownResult := make(chan int, 1)
+	go func() {
+		stepDownResult <- f.store.ForceResetLockEpoch(g1, 10)
+	}()
+
+	// Wait until G1 step-down is paused before epochMu
+	<-inHook
+
+	// 3. Simulate legitimate Restore / Generation switch to G2
+	f.store.generation.Add(1)
+	g2 := f.store.Generation()
+	if g2 <= g1 {
+		t.Fatalf("g2 (%d) must be greater than g1 (%d)", g2, g1)
+	}
+	f.store.ForceResetLockEpoch(g2, 10)
+
+	propG2 := &barrierInterleavingProposer{
+		Store: f.store,
+		term:  10,
+	}
+
+	// G2: Root A acquires Record X and publishes dirty version
+	txA, err := f.store.Begin(ctx, propG2)
+	if err != nil {
+		t.Fatalf("txA begin in G2 failed: %v", err)
+	}
 	defer txA.Rollback()
-	if err := txA.Put(rawSpace, rawKey, []byte("valA")); err != nil {
+
+	if err := txA.Put(rawSpace, rawKey, []byte("valA_gen2")); err != nil {
+		t.Fatalf("txA Put failed: %v", err)
+	}
+	versionsA, err := txA.CollectDirtyVersions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.DirtyRegistry().Publish(txA.ID, txA.Generation(), txA.Term(), versionsA); err != nil {
 		t.Fatal(err)
 	}
 
-	// Simulate generation increment (like Restore does)
-	f.store.generation.Add(1)
-	f.store.ResetLockEpoch(0)
-
-	// Now a late ForceReset from generation 0 attempts to reset
-	// Calling DirtyRegistry.ForceReset with old generation 0 must be rejected!
-	if reset := f.store.DirtyRegistry().ForceReset(0, 0); reset {
-		t.Fatal("DirtyRegistry.ForceReset accepted older generation 0, want false")
+	// Verify A holds ModeX
+	if mode, ok := f.manager.HeldMode(txA.ID, sqlShapedRecord()); !ok || mode != lockmanager.ModeX {
+		t.Fatalf("txA does not hold ModeX: %v, %v", mode, ok)
 	}
+
+	// G2: Root B starts and requests the same record, blocking behind A
+	txB, err := f.store.Begin(ctx, propG2)
+	if err != nil {
+		t.Fatalf("txB begin in G2 failed: %v", err)
+	}
+	defer txB.Rollback()
+
+	bDone := make(chan error, 1)
+	go func() {
+		bDone <- txB.Put(rawSpace, rawKey, []byte("valB_gen2"))
+	}()
+	f.awaitPending(txB.ID, 1)
+
+	// Verify wait edge txB -> txA exists
+	edges := f.manager.WaitEdges()
+	if len(edges) == 0 || edges[0].FromRootID != txB.ID || edges[0].ToRootID != txA.ID {
+		t.Fatalf("unexpected wait edges in G2: %v", edges)
+	}
+
+	// 4. Resume the delayed G1 Leader Loss event
+	close(allowStepDown)
+	affected := <-stepDownResult
+	if affected != 0 {
+		t.Fatalf("stale G1 ForceResetLockEpoch affected %d owners, want 0", affected)
+	}
+
+	// 5. Assert G2 state was NOT disrupted:
+	// A's lock must still be held
+	if mode, ok := f.manager.HeldMode(txA.ID, sqlShapedRecord()); !ok || mode != lockmanager.ModeX {
+		t.Fatalf("txA lost ModeX lock after delayed G1 step-down: %v, %v", mode, ok)
+	}
+
+	// B must still be waiting behind A, NOT invalidated
+	select {
+	case err := <-bDone:
+		t.Fatalf("txB unexpectedly unblocked by delayed G1 step-down: %v", err)
+	default:
+	}
+	if pending := f.manager.PendingRequests(txB.ID); pending != 1 {
+		t.Fatalf("txB pending requests = %d, want 1", pending)
+	}
+
+	// Wait edge must still exist
+	edgesAfter := f.manager.WaitEdges()
+	if len(edgesAfter) == 0 || edgesAfter[0].FromRootID != txB.ID || edgesAfter[0].ToRootID != txA.ID {
+		t.Fatalf("wait edge destroyed by delayed G1 step-down: %v", edgesAfter)
+	}
+
+	// Dirty registry must still have txA's dirty version
+	snap, err := f.store.DirtyRegistry().Sample("reader")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, ok := snap.Get(rawSpace, rawKey); !ok || string(d.Value) != "valA_gen2" {
+		t.Fatalf("dirty registry lost G2 version: %v, %v", d, ok)
+	}
+
+	// 6. Tx A rolls back: Tx B unblocks, acquires lock, and finishes
+	if err := txA.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-bDone:
+		if err != nil {
+			t.Fatalf("txB Put failed after txA rollback: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("txB never unblocked after txA rollback")
+	}
+
+	if _, err := txB.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.requireIdle()
 }

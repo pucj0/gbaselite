@@ -81,9 +81,6 @@ func (s *Store) Restore(reader io.Reader) error {
 	s.generation.Add(1)
 	newGen := s.generation.Load()
 	currentTerm := s.currentTerm()
-	if s.dirtyRegistry != nil {
-		s.dirtyRegistry.ForceReset(newGen, currentTerm)
-	}
 	// Purge the registry with the generation change: transactions from the
 	// replaced generation are invalid and must not keep pinning history for the
 	// new one.
@@ -93,7 +90,7 @@ func (s *Store) Restore(reader io.Reader) error {
 	// one definite status and drops owners the registry just discarded, which is what keeps a
 	// replaced generation from leaving a grant behind that nobody will release and a waiter
 	// blocked on a transaction that no longer exists.
-	s.ResetLockEpoch(s.currentTerm())
+	s.ForceResetLockEpoch(newGen, currentTerm)
 	if err = s.db.Close(); err != nil {
 		return err
 	}

@@ -1,6 +1,7 @@
 package replication_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -815,5 +816,105 @@ func TestT054DelayedLeaderLossEventCannotInvalidateNewTermRoot(t *testing.T) {
 	_, err = ltx3.ReadCurrent(ctx, grant3, "row/test", []byte("k1"))
 	if err == nil {
 		t.Fatal("expected failure for tx3 after genuine loss of tenure 2, got nil")
+	}
+}
+
+// TestT055DelayedLeaderLossCannotInvalidateNewGenerationRoot verifies P7-GEN-01:
+// A delayed Leader Loss event from an old Generation (e.g. before Restore) cannot
+// invalidate locks, waiters, or dirty data of a new Generation.
+func TestT055DelayedLeaderLossCannotInvalidateNewGenerationRoot(t *testing.T) {
+	tc := newTestCluster(t, 3)
+	defer tc.Close()
+	leaderIdx := tc.WaitForLeader(15 * time.Second)
+	leaderEng := tc.engines[leaderIdx]
+	ctx := context.Background()
+
+	nodeA := leaderEng.(storageengine.ReplicatedEngine).Replica().(interface{ Node() *replication.Node }).Node()
+	tenure1, term1 := nodeA.CurrentTenureForTesting()
+	store := nodeA.StoreForTesting()
+	gen1 := store.Generation()
+
+	// 1. In Generation 1, take snapshot and then restore it to increment generation
+	snap, err := store.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if _, err := snap.WriteTo(&buf); err != nil {
+		t.Fatal(err)
+	}
+	_ = snap.Rollback()
+
+	// Perform Restore -> advances to Generation 2
+	if err := store.Restore(bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+	gen2 := store.Generation()
+	if gen2 <= gen1 {
+		t.Fatalf("gen2 (%d) must be greater than gen1 (%d)", gen2, gen1)
+	}
+
+	// 2. Node A is elected Leader in new Generation 2
+	term2 := term1 + 1
+	nodeA.HandleLeaderElectedForTesting(term2)
+
+	// 3. New Root in Generation 2 acquires lock on k1
+	txG2, err := leaderEng.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txG2.Rollback()
+
+	locksG2 := txG2.(interface {
+		LockingTxn() (storageengine.LockingTxn, bool)
+	})
+	ltxG2, _ := locksG2.LockingTxn()
+	scopeG2, err := ltxG2.BeginLockScope(ctx, storageengine.LockScopeStatement)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tableRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeIX,
+		Kind:    storageengine.LockComponentTableIntent,
+		Space:   "row/test",
+		TableID: "t1",
+	}
+	rowRef := storageengine.LockComponent{
+		Mode:    storageengine.LockModeX,
+		Kind:    storageengine.LockComponentRecord,
+		Space:   "row/test",
+		TableID: "t1",
+		Key:     []byte("k1"),
+	}
+
+	grantG2, err := ltxG2.Acquire(ctx, scopeG2, storageengine.LockRequest{Components: []storageengine.LockComponent{tableRef, rowRef}})
+	if err != nil {
+		t.Fatalf("txG2 Acquire failed: %v", err)
+	}
+
+	// 4. Deliver delayed Leader Loss event from tenure 1 (which was in Generation 1)
+	nodeA.HandleLeaderLossForTesting(tenure1, term1)
+
+	// Also directly test delivering a delayed ForceResetLockEpoch with Generation 1 to the store
+	if aff := store.ForceResetLockEpoch(gen1, term1); aff != 0 {
+		t.Fatalf("stale generation 1 ForceResetLockEpoch affected %d owners, want 0", aff)
+	}
+
+	// 5. Confirm Root in Generation 2 was NOT invalidated by the old Generation 1 event!
+	obs, err := ltxG2.ReadCurrent(ctx, grantG2, "row/test", []byte("k1"))
+	if err != nil {
+		t.Fatalf("txG2 was erroneously invalidated by delayed old generation loss event: %v", err)
+	}
+	_ = obs
+
+	// 6. When genuine leader loss occurs for tenure 2 (Generation 2):
+	tenure2, _ := nodeA.CurrentTenureForTesting()
+	nodeA.HandleLeaderLossForTesting(tenure2, term2)
+
+	// Now Root in Generation 2 IS invalidated!
+	_, err = ltxG2.ReadCurrent(ctx, grantG2, "row/test", []byte("k1"))
+	if err == nil {
+		t.Fatal("expected failure for txG2 after genuine loss of tenure 2, got nil")
 	}
 }

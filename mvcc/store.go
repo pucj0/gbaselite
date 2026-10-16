@@ -200,6 +200,11 @@ func (s *Store) Head() (uint64, error) {
 	err := s.db.View(func(tx *bolt.Tx) error { n = number(tx.Bucket(metaBucket).Get([]byte("head"))); return nil })
 	return n, err
 }
+
+// Generation returns the current generation counter of the store.
+func (s *Store) Generation() uint64 {
+	return s.generation.Load()
+}
 func number(value []byte) uint64 {
 	if len(value) != 8 {
 		return 0
